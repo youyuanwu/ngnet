@@ -1,0 +1,15 @@
+[package]
+name = "nghttp2"
+version = "0.1.0"
+description = "Safe, sans-I/O Rust bindings to libnghttp2 for cleartext HTTP/2 (h2c)"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Exactly one runtime dependency. SC-021 fails the build if this grows.
+[dependencies]
+nghttp2-sys = { path = "../nghttp2-sys" }
+
+[dev-dependencies]
+trybuild = "1.0"

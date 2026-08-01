@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/nghttp2-sys"]
+members = ["crates/nghttp2", "crates/nghttp2-sys"]
 
 [workspace.package]
 edition = "2024"
