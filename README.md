@@ -9,6 +9,7 @@ Rust bindings for [nghttp2](https://nghttp2.org), targeting cleartext HTTP/2
 | --- | --- |
 | [`nghttp2`](crates/nghttp2) | Safe, sans-I/O API. Drives a client or server connection; the caller owns the transport. |
 | [`nghttp2-sys`](crates/nghttp2-sys) | Raw FFI bindings. Builds libnghttp2 from source and generates bindings with `bindgen`. |
+| [`nghttp2-tests`](crates/nghttp2-tests) | Not published. Drives `nghttp2` over a real async transport, so the wrapper needs no runtime dependency of its own. |
 
 ## Usage
 
@@ -47,6 +48,30 @@ example and for the guarantees the type system enforces.
 
 Cleartext only: TLS and ALPN are the caller's concern, and server push, HTTP/3
 and stream priorities are out of scope.
+
+### Running it over a real socket
+
+Because the crate owns no transport, attaching one is the caller's job. Three
+worked answers ship with the repo:
+
+- [`examples/h2c_server.rs`](crates/nghttp2/examples/h2c_server.rs) — a blocking
+  h2c server on `std::net`, one thread per connection.
+- [`tests/std_net.rs`](crates/nghttp2/tests/std_net.rs) — a client and a server
+  exchanging requests over loopback TCP, covering multiplexed streams and bodies
+  large enough to exercise flow control.
+- [`nghttp2-tests`](crates/nghttp2-tests) — the same exchanges over `tokio`,
+  plus many connections in flight at once. The adapter between session and
+  socket is the same three functions in both cases; only the `.await` points
+  differ.
+
+The example answers any HTTP/2 client that speaks cleartext with prior
+knowledge, so it can be driven with `curl`:
+
+```sh
+cargo run -p nghttp2 --example h2c_server
+curl --http2-prior-knowledge -i http://127.0.0.1:8080/hello
+curl --http2-prior-knowledge -i --data 'ping' http://127.0.0.1:8080/echo
+```
 
 ## Dependencies
 

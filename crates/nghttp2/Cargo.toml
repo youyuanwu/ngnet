@@ -9,4 +9,4 @@ rust-version.workspace = true
 
 # Exactly one runtime dependency. SC-021 fails the build if this grows.
 [dependencies]
-nghttp2-sys = { path = "../nghttp2-sys" }
+nghttp2-sys.workspace = true
