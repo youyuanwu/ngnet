@@ -16,6 +16,69 @@
 //! one of them aborts the process; this is the documented contract rather than a defect,
 //! and it is what the `extern "C"` ABI does by construction.
 //!
+//! # Example
+//!
+//! A complete request and response, with a client and a server wired directly together
+//! in memory. No socket is opened and nothing blocks — the caller moves every byte.
+//!
+//! ```
+//! use nghttp2::{BytesBody, Header, HeaderAction, Session, SessionBuilder};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // Whatever the caller wants to accumulate. Handlers receive it by mutable reference.
+//! #[derive(Default)]
+//! struct Response {
+//!     status: String,
+//!     body: Vec<u8>,
+//! }
+//!
+//! let mut client = SessionBuilder::<Response>::client()
+//!     .on_header(|res: &mut Response, _frame, name: &[u8], value: &[u8]| {
+//!         if name == b":status" {
+//!             res.status = String::from_utf8_lossy(value).into_owned();
+//!         }
+//!         HeaderAction::Continue
+//!     })
+//!     .on_data_chunk(|res: &mut Response, _stream, chunk: &[u8]| {
+//!         res.body.extend_from_slice(chunk);
+//!     })
+//!     .build()?;
+//!
+//! let mut server = SessionBuilder::<()>::server().build()?;
+//!
+//! let stream = client.submit_request(&[
+//!     Header::new(":method", "GET"),
+//!     Header::new(":scheme", "http"),
+//!     Header::new(":authority", "example.test"),
+//!     Header::new(":path", "/hello"),
+//! ])?;
+//!
+//! // Hand the client's output to the server. In a real program these bytes would come
+//! // from, and go to, a socket the caller owns.
+//! let mut response = Response::default();
+//! while let Some(block) = client.send(&mut response)? {
+//!     let block = block.to_vec();
+//!     server.recv(&block, &mut ())?;
+//! }
+//!
+//! server.submit_response_with_body(
+//!     stream,
+//!     &[Header::new(":status", "200")],
+//!     BytesBody::new(b"hello".to_vec()),
+//! )?;
+//!
+//! // ...and the server's output back to the client.
+//! while let Some(block) = server.send(&mut ())? {
+//!     let block = block.to_vec();
+//!     client.recv(&block, &mut response)?;
+//! }
+//!
+//! assert_eq!(response.status, "200");
+//! assert_eq!(response.body, b"hello");
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Compile-time guarantees
 //!
 //! Several of this crate's safety properties are enforced by the type system rather than

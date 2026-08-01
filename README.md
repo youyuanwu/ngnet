@@ -7,7 +7,46 @@ Rust bindings for [nghttp2](https://nghttp2.org), targeting cleartext HTTP/2
 
 | Crate | Description |
 | --- | --- |
+| [`nghttp2`](crates/nghttp2) | Safe, sans-I/O API. Drives a client or server connection; the caller owns the transport. |
 | [`nghttp2-sys`](crates/nghttp2-sys) | Raw FFI bindings. Builds libnghttp2 from source and generates bindings with `bindgen`. |
+
+## Usage
+
+`nghttp2` performs no I/O. It never opens a socket, never blocks and creates no
+threads: you hand it the bytes you read from wherever your data came from, and
+it hands back the bytes to write. That makes it usable from blocking code, from
+any async runtime, and from tests that wire a client to a server entirely in
+memory.
+
+```rust
+let mut client = SessionBuilder::<Response>::client()
+    .on_header(|res, _frame, name, value| { /* borrowed, not copied */ HeaderAction::Continue })
+    .on_data_chunk(|res, _stream, chunk| res.body.extend_from_slice(chunk))
+    .build()?;
+
+let stream = client.submit_request(&[
+    Header::new(":method", "GET"),
+    Header::new(":scheme", "http"),
+    Header::new(":path", "/hello"),
+    Header::new(":authority", "example.test"),
+])?;
+
+// Write what the session wants to send, then feed it what you read back.
+while let Some(block) = client.send(&mut response)? {
+    socket.write_all(block)?;
+}
+```
+
+Incoming headers and body chunks reach your handlers as borrowed slices into
+libnghttp2's own buffers, so receiving allocates nothing. Your application state
+is passed in at call time rather than captured, so handlers can mutate it
+directly.
+
+See the [crate documentation](crates/nghttp2/src/lib.rs) for a complete worked
+example and for the guarantees the type system enforces.
+
+Cleartext only: TLS and ALPN are the caller's concern, and server push, HTTP/3
+and stream priorities are out of scope.
 
 ## Dependencies
 
