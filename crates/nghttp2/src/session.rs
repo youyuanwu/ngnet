@@ -131,26 +131,32 @@ impl<C> SessionBuilder<C> {
     /// at all — RFC 9113 forbids it and libnghttp2 only range-checks the value, so the
     /// rejection has to happen here.
     fn resolve_settings(&self) -> Result<Vec<Setting>> {
-        let stated_push = self
+        // Every occurrence must be examined, not just the first. Duplicate identifiers are
+        // legal on the wire and libnghttp2 applies the last one, so checking only the
+        // first would let `EnablePush(false)` followed by `EnablePush(true)` through.
+        if self.role == Role::Server
+            && self
+                .settings
+                .iter()
+                .any(|setting| matches!(setting, Setting::EnablePush(true)))
+        {
+            return Err(Error::new(
+                "SessionBuilder::build",
+                ErrorKind::InvalidInput,
+                "a server may not advertise SETTINGS_ENABLE_PUSH = 1",
+            ));
+        }
+
+        let states_push = self
             .settings
             .iter()
-            .find(|setting| matches!(setting, Setting::EnablePush(_)));
+            .any(|setting| matches!(setting, Setting::EnablePush(_)));
 
-        match (self.role, stated_push) {
-            (Role::Server, Some(Setting::EnablePush(true))) => {
-                return Err(Error::new(
-                    "SessionBuilder::build",
-                    ErrorKind::InvalidInput,
-                    "a server may not advertise SETTINGS_ENABLE_PUSH = 1",
-                ));
-            }
-            (Role::Client, None) => {
-                let mut settings = Vec::with_capacity(self.settings.len() + 1);
-                settings.push(Setting::EnablePush(false));
-                settings.extend_from_slice(&self.settings);
-                return Ok(settings);
-            }
-            _ => {}
+        if self.role == Role::Client && !states_push {
+            let mut settings = Vec::with_capacity(self.settings.len() + 1);
+            settings.push(Setting::EnablePush(false));
+            settings.extend_from_slice(&self.settings);
+            return Ok(settings);
         }
 
         Ok(self.settings.clone())
@@ -526,6 +532,47 @@ mod tests {
         let entries = settings_entries(&drain(&mut session), false);
 
         assert!(entries.contains(&(ENABLE_PUSH_ID, 0)), "got {entries:?}");
+    }
+
+    #[test]
+    fn a_server_cannot_smuggle_push_enabled_past_a_duplicate() {
+        // Duplicate identifiers are legal on the wire and libnghttp2 applies the last
+        // one, so a check that only inspected the first entry would be bypassed here.
+        for settings in [
+            vec![Setting::EnablePush(false), Setting::EnablePush(true)],
+            vec![Setting::EnablePush(true), Setting::EnablePush(false)],
+            vec![
+                Setting::MaxConcurrentStreams(3),
+                Setting::EnablePush(false),
+                Setting::EnablePush(true),
+            ],
+        ] {
+            let mut builder = SessionBuilder::<()>::server();
+            for setting in &settings {
+                builder = builder.setting(*setting);
+            }
+
+            let error = builder
+                .build()
+                .expect_err("ENABLE_PUSH = 1 anywhere in a server's settings must be rejected");
+            assert_eq!(error.kind(), ErrorKind::InvalidInput, "for {settings:?}");
+        }
+    }
+
+    #[test]
+    fn a_client_with_duplicate_push_settings_gets_no_injection() {
+        let mut session = SessionBuilder::<()>::client()
+            .setting(Setting::EnablePush(true))
+            .setting(Setting::EnablePush(false))
+            .build()
+            .unwrap();
+        let entries = settings_entries(&drain(&mut session), true);
+
+        assert_eq!(
+            entries.iter().filter(|(id, _)| *id == ENABLE_PUSH_ID).count(),
+            2,
+            "the caller's entries should pass through untouched, got {entries:?}"
+        );
     }
 
     #[test]
