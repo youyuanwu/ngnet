@@ -469,18 +469,19 @@ impl<C> Session<C> {
 
     /// Whether `stream` is currently open on this session.
     ///
-    /// libnghttp2 offers no direct existence predicate; querying a stream's effective
-    /// local window size reports -1 for a stream it does not know, which serves.
+    /// Uses the half-closed predicate, which returns -1 exactly when no such stream
+    /// exists and 0 or 1 otherwise. A window-size query would be the obvious probe but is
+    /// wrong: a stream's local window legitimately goes negative when the local initial
+    /// window size is reduced while data is in flight, so a negative result there does
+    /// not mean the stream is absent.
     fn stream_exists(&self, stream: StreamId) -> bool {
         if stream.is_connection() {
             return false;
         }
         // SAFETY: `self.raw` is live; this only inspects session state and accepts any
         // stream identifier.
-        let window = unsafe {
-            sys::nghttp2_session_get_stream_effective_local_window_size(self.raw, stream.get())
-        };
-        window >= 0
+        let state = unsafe { sys::nghttp2_session_get_stream_local_close(self.raw, stream.get()) };
+        state >= 0
     }
 
     /// Submits a trailing header block on an open stream.
