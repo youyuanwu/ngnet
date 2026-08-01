@@ -31,17 +31,24 @@
 #[path = "alloc.rs"]
 mod alloc_state;
 #[allow(unsafe_code)]
+mod callbacks;
+#[allow(unsafe_code)]
 mod error;
 #[allow(unsafe_code)]
 mod options;
 #[allow(unsafe_code)]
 mod session;
 
+mod handlers;
 mod settings;
+mod state;
+mod stream;
 
 pub use error::{ALL_NATIVE_CODES, Error, ErrorCode, ErrorKind, NativeCode, Result};
+pub use handlers::HeaderAction;
 pub use session::{Session, SessionBuilder};
 pub use settings::Setting;
+pub use stream::{FrameInfo, FrameType, StreamId};
 
 /// The raw, unsafe FFI bindings this crate is built on.
 ///

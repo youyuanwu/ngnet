@@ -7,9 +7,13 @@ use core::marker::PhantomData;
 use nghttp2_sys as sys;
 
 use crate::alloc_state::{AllocState, mem_for};
-use crate::error::{Error, ErrorKind, Result};
+use crate::callbacks::{self, Bridge};
+use crate::error::{Error, ErrorCode, ErrorKind, Result};
+use crate::handlers::{HeaderAction, Handlers};
 use crate::options::Options;
 use crate::settings::Setting;
+use crate::state::{BodyRegistry, PendingErrors, ResponseGuard};
+use crate::stream::{FrameInfo, StreamId};
 
 /// Which side of the connection a session drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +32,7 @@ pub struct SessionBuilder<C> {
     role: Role,
     settings: Vec<Setting>,
     manual_flow_control: bool,
+    handlers: Handlers<C>,
     _context: PhantomData<fn(&mut C)>,
 }
 
@@ -37,6 +42,7 @@ impl<C> SessionBuilder<C> {
             role,
             settings: Vec::new(),
             manual_flow_control: false,
+            handlers: Handlers::default(),
             _context: PhantomData,
         }
     }
@@ -74,6 +80,58 @@ impl<C> SessionBuilder<C> {
         self
     }
 
+    /// Called when a header block begins, before any of its headers are reported.
+    ///
+    /// Returning [`HeaderAction::CancelStream`] resets the stream.
+    pub fn on_begin_headers(
+        mut self,
+        handler: impl FnMut(&mut C, FrameInfo) -> HeaderAction + Send + 'static,
+    ) -> Self {
+        self.handlers.begin_headers = Some(Box::new(handler));
+        self
+    }
+
+    /// Called once per received header, with the name and value borrowed in place.
+    ///
+    /// Returning [`HeaderAction::CancelStream`] resets the stream.
+    pub fn on_header(
+        mut self,
+        handler: impl FnMut(&mut C, FrameInfo, &[u8], &[u8]) -> HeaderAction + Send + 'static,
+    ) -> Self {
+        self.handlers.header = Some(Box::new(handler));
+        self
+    }
+
+    /// Called for each chunk of a message body, borrowed in place.
+    ///
+    /// A chunk carrying the end-of-stream flag is not necessarily the last callback for
+    /// that stream; wait for the stream-close handler to know it is finished.
+    pub fn on_data_chunk(
+        mut self,
+        handler: impl FnMut(&mut C, StreamId, &[u8]) + Send + 'static,
+    ) -> Self {
+        self.handlers.data_chunk = Some(Box::new(handler));
+        self
+    }
+
+    /// Called once a complete frame has been received.
+    ///
+    /// Header blocks are reported through the header handlers rather than here, and
+    /// `CONTINUATION` frames are never reported at all.
+    pub fn on_frame(mut self, handler: impl FnMut(&mut C, FrameInfo) + Send + 'static) -> Self {
+        self.handlers.frame_recv = Some(Box::new(handler));
+        self
+    }
+
+    /// Called when a stream closes, for any reason.
+    pub fn on_stream_close(
+        mut self,
+        handler: impl FnMut(&mut C, StreamId, ErrorCode) + Send + 'static,
+    ) -> Self {
+        self.handlers.stream_close = Some(Box::new(handler));
+        self
+    }
+
     /// Builds the session and queues its initial `SETTINGS` frame.
     pub fn build(self) -> Result<Session<C>> {
         // Resolved before anything is allocated, so a rejected configuration cannot leave
@@ -86,7 +144,8 @@ impl<C> SessionBuilder<C> {
         let mut options = Options::new()?;
         options.set_no_auto_window_update(self.manual_flow_control);
 
-        let callbacks = Callbacks::new()?;
+        let mut callbacks = Callbacks::new()?;
+        callbacks.install::<C>();
 
         let mut raw: *mut sys::nghttp2_session = core::ptr::null_mut();
         let constructor = match self.role {
@@ -117,6 +176,10 @@ impl<C> SessionBuilder<C> {
         let mut session = Session {
             raw,
             allocation,
+            handlers: self.handlers,
+            bodies: BodyRegistry::default(),
+            pending: PendingErrors::default(),
+            responded: ResponseGuard::default(),
             _context: PhantomData,
         };
 
@@ -175,6 +238,11 @@ pub struct Session<C> {
     // Order matters only for clarity: `Drop` below releases `raw` before this field is
     // dropped, so the allocator outlives every native free it must account for.
     allocation: Arc<AllocState>,
+    // Reached from trampolines as disjoint mutable borrows, never through `self`.
+    handlers: Handlers<C>,
+    bodies: BodyRegistry,
+    pending: PendingErrors,
+    responded: ResponseGuard,
     _context: PhantomData<fn(&mut C)>,
 }
 
@@ -221,30 +289,102 @@ impl<C> Session<C> {
     /// not only while receiving: libnghttp2 reports stream closure and asks body sources
     /// for payload while it serialises.
     pub fn send(&mut self, context: &mut C) -> Result<Option<&[u8]>> {
-        // Handlers arrive in a later phase; the context is threaded through the same
-        // bridge that the receive half will install.
-        let _ = context;
-
         let mut data: *const u8 = core::ptr::null();
-        // SAFETY: `self.raw` is live and `data` is a valid out-parameter.
-        let len = unsafe { sys::nghttp2_session_mem_send2(self.raw, &mut data) };
+
+        let len = self.with_context(context, |raw| {
+            // SAFETY: `raw` is live and `data` is a valid out-parameter. Handlers may run
+            // inside this call, which is why it goes through the bridge.
+            unsafe { sys::nghttp2_session_mem_send2(raw, &mut data) }
+        });
 
         if len < 0 {
-            return Err(Error::from_native(
-                "nghttp2_session_mem_send2",
-                len as i32,
-            ));
+            return Err(Error::from_native("nghttp2_session_mem_send2", len as i32));
         }
         if len == 0 {
             return Ok(None);
         }
         debug_assert!(!data.is_null());
 
-        // SAFETY: libnghttp2 returned a non-null pointer to `len` initialised bytes. The
-        // slice borrows `self`, so it cannot outlive the next call that would invalidate
-        // it.
+        // SAFETY: libnghttp2 returned a non-null pointer to `len` initialised bytes,
+        // valid until the next send on this session. The slice borrows `self`, so the
+        // borrow checker prevents reaching that next call while it is still held.
         let bytes = unsafe { core::slice::from_raw_parts(data, len as usize) };
         Ok(Some(bytes))
+    }
+
+    /// Submits bytes received from the peer, returning how many were consumed.
+    ///
+    /// Handlers registered on this session are invoked during the call, each receiving
+    /// `context` by mutable reference.
+    ///
+    /// # Errors
+    ///
+    /// Only connection-fatal conditions produce an error: memory exhaustion, an invalid
+    /// client preface on a server session, peer flooding, an excessive run of
+    /// `CONTINUATION` frames, or an internal callback failure.
+    ///
+    /// Ordinary protocol violations are **not** errors. libnghttp2 handles them by
+    /// queueing a `GOAWAY` or `RST_STREAM` for the peer and reporting the input as
+    /// processed, so they surface through [`Session::send`] and the stream-close handler
+    /// instead. A caller that treated a successful return as "the peer behaved" would be
+    /// mistaken; check [`Session::want_read`] and the events it observed.
+    pub fn recv(&mut self, input: &[u8], context: &mut C) -> Result<usize> {
+        if input.is_empty() {
+            return Ok(0);
+        }
+
+        let consumed = self.with_context(context, |raw| {
+            // SAFETY: `raw` is live and `input` is valid for `input.len()` octets for the
+            // duration of the call. libnghttp2 does not retain the pointer afterwards.
+            unsafe { sys::nghttp2_session_mem_recv2(raw, input.as_ptr(), input.len()) }
+        });
+
+        if consumed < 0 {
+            return Err(Error::from_native(
+                "nghttp2_session_mem_recv2",
+                consumed as i32,
+            ));
+        }
+        Ok(consumed as usize)
+    }
+
+    /// Runs one call into libnghttp2 with the caller's context reachable from callbacks.
+    ///
+    /// The raw session pointer is copied out *before* any field is borrowed: borrowing a
+    /// field and then calling an `&mut self` method would not compile, and letting a
+    /// trampoline reach the whole `self` while `&mut self` is live would alias. What the
+    /// bridge holds instead is disjoint mutable borrows of individual fields, which the
+    /// borrow checker accepts and which never overlaps the session libnghttp2 is
+    /// executing inside.
+    fn with_context<R>(
+        &mut self,
+        context: &mut C,
+        call: impl FnOnce(*mut sys::nghttp2_session) -> R,
+    ) -> R {
+        let raw = self.raw;
+
+        let mut bridge = Bridge {
+            handlers: &mut self.handlers,
+            context,
+            bodies: &mut self.bodies,
+            pending: &mut self.pending,
+            responded: &mut self.responded,
+        };
+
+        // Restores the session's user data however this scope is left, so a panic
+        // escaping the call cannot leave libnghttp2 holding a pointer to a dead bridge.
+        let _guard = UserDataGuard { raw };
+
+        // SAFETY: `raw` is live, and `bridge` outlives the call below because it is a
+        // local of this frame and `call` returns before it is dropped.
+        unsafe {
+            sys::nghttp2_session_set_user_data(
+                raw,
+                (&raw mut bridge).cast::<core::ffi::c_void>(),
+            );
+        }
+
+        call(raw)
     }
 
     /// Whether the session still wants to read from the peer.
@@ -273,6 +413,19 @@ impl<C> Session<C> {
     #[cfg(test)]
     fn allocation_state(&self) -> Arc<AllocState> {
         Arc::clone(&self.allocation)
+    }
+}
+
+/// Clears a session's user data on the way out of [`Session::with_context`].
+struct UserDataGuard {
+    raw: *mut sys::nghttp2_session,
+}
+
+impl Drop for UserDataGuard {
+    fn drop(&mut self) {
+        // SAFETY: `raw` is live for as long as the session that created this guard, and
+        // clearing the pointer is always valid.
+        unsafe { sys::nghttp2_session_set_user_data(self.raw, core::ptr::null_mut()) };
     }
 }
 
@@ -328,6 +481,38 @@ impl Callbacks {
         }
         debug_assert!(!raw.is_null());
         Ok(Self { raw })
+    }
+
+    /// Points every callback slot this crate uses at its trampoline.
+    ///
+    /// Every trampoline is registered regardless of which handlers the caller supplied;
+    /// each returns immediately when its slot is empty, which is what makes an
+    /// unregistered event a silent no-op.
+    fn install<C>(&mut self) {
+        // SAFETY: `self.raw` is a live callbacks object. Each setter stores a function
+        // pointer, and the session constructor later copies them out.
+        unsafe {
+            sys::nghttp2_session_callbacks_set_on_begin_headers_callback(
+                self.raw,
+                Some(callbacks::on_begin_headers::<C>),
+            );
+            sys::nghttp2_session_callbacks_set_on_header_callback(
+                self.raw,
+                Some(callbacks::on_header::<C>),
+            );
+            sys::nghttp2_session_callbacks_set_on_data_chunk_recv_callback(
+                self.raw,
+                Some(callbacks::on_data_chunk_recv::<C>),
+            );
+            sys::nghttp2_session_callbacks_set_on_frame_recv_callback(
+                self.raw,
+                Some(callbacks::on_frame_recv::<C>),
+            );
+            sys::nghttp2_session_callbacks_set_on_stream_close_callback(
+                self.raw,
+                Some(callbacks::on_stream_close::<C>),
+            );
+        }
     }
 
     fn as_ptr(&self) -> *const sys::nghttp2_session_callbacks {
