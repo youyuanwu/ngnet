@@ -16,6 +16,113 @@
 //! one of them aborts the process; this is the documented contract rather than a defect,
 //! and it is what the `extern "C"` ABI does by construction.
 //!
+//! # Compile-time guarantees
+//!
+//! Several of this crate's safety properties are enforced by the type system rather than
+//! by convention. Each is stated below as a pair of examples: one that must compile and
+//! one that must not, so neither can pass for the wrong reason.
+//!
+//! ## A session may move between threads, but never be shared
+//!
+//! Moving is fine:
+//!
+//! ```
+//! # use nghttp2::Session;
+//! fn assert_send<T: Send>() {}
+//! assert_send::<Session<()>>();
+//! ```
+//!
+//! Sharing is not. libnghttp2 does no internal locking, so two threads must never touch
+//! one session at once:
+//!
+//! ```compile_fail
+//! # use nghttp2::Session;
+//! fn assert_sync<T: Sync>() {}
+//! assert_sync::<Session<()>>();
+//! ```
+//!
+//! ## Pending output cannot outlive the call that invalidates it
+//!
+//! libnghttp2 invalidates the block returned by [`Session::send`] on the next send, so
+//! the block borrows the session. Finish with it first:
+//!
+//! ```
+//! # use nghttp2::SessionBuilder;
+//! let mut session = SessionBuilder::<()>::client().build().unwrap();
+//! let first = session.send(&mut ()).unwrap().unwrap().to_vec();
+//! let second = session.send(&mut ()).unwrap();
+//! # let _ = (first, second);
+//! ```
+//!
+//! Holding one across another call does not compile:
+//!
+//! ```compile_fail
+//! # use nghttp2::SessionBuilder;
+//! let mut session = SessionBuilder::<()>::client().build().unwrap();
+//! let held = session.send(&mut ()).unwrap().unwrap();
+//! let _next = session.send(&mut ()).unwrap();
+//! println!("{}", held.len());
+//! ```
+//!
+//! ## Only header-phase handlers can cancel a stream
+//!
+//! libnghttp2 treats a nonzero return from the body, frame and stream-close callbacks as
+//! fatal to the whole connection rather than to one stream, so only the header-phase
+//! handlers offer cancellation:
+//!
+//! ```
+//! # use nghttp2::{HeaderAction, SessionBuilder};
+//! SessionBuilder::<()>::client()
+//!     .on_header(|_ctx, _frame, _name, _value| HeaderAction::CancelStream);
+//! ```
+//!
+//! A body-chunk handler has no such return, so the mistake is unrepresentable:
+//!
+//! ```compile_fail
+//! # use nghttp2::{HeaderAction, SessionBuilder};
+//! SessionBuilder::<()>::client()
+//!     .on_data_chunk(|_ctx, _stream, _chunk| HeaderAction::CancelStream);
+//! ```
+//!
+//! ## The context type is fixed when the session is built
+//!
+//! Handlers are registered before the session exists and a Rust closure cannot be generic
+//! over the type it is later handed, so the context type is part of the session's own
+//! type:
+//!
+//! ```
+//! # use nghttp2::SessionBuilder;
+//! let mut session = SessionBuilder::<Vec<u8>>::client().build().unwrap();
+//! let mut log: Vec<u8> = Vec::new();
+//! session.send(&mut log).unwrap();
+//! ```
+//!
+//! Handing it a different type does not compile:
+//!
+//! ```compile_fail
+//! # use nghttp2::SessionBuilder;
+//! let mut session = SessionBuilder::<Vec<u8>>::client().build().unwrap();
+//! let mut wrong = String::new();
+//! session.send(&mut wrong).unwrap();
+//! ```
+//!
+//! ## Handlers are never given the session
+//!
+//! A handler receives only the caller's context and the event, so it cannot re-enter the
+//! session libnghttp2 is executing inside. A closure that tries to capture the session it
+//! is being registered on does not compile, because the session does not yet exist:
+//!
+//! ```compile_fail
+//! # use nghttp2::{HeaderAction, SessionBuilder};
+//! let mut session = SessionBuilder::<()>::client()
+//!     .on_header(move |_ctx, _frame, _name, _value| {
+//!         let _ = session.want_read();
+//!         HeaderAction::Continue
+//!     })
+//!     .build()
+//!     .unwrap();
+//! ```
+//!
 //! # Escape hatch
 //!
 //! Capabilities this crate does not yet wrap remain reachable through [`raw`], so a
