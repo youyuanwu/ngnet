@@ -28,9 +28,20 @@
 // `unsafe` is confined to the modules that touch the raw bindings. The crate-level deny
 // above makes a stray `unsafe` anywhere else a compile error.
 #[allow(unsafe_code)]
+#[path = "alloc.rs"]
+mod alloc_state;
+#[allow(unsafe_code)]
 mod error;
+#[allow(unsafe_code)]
+mod options;
+#[allow(unsafe_code)]
+mod session;
+
+mod settings;
 
 pub use error::{ALL_NATIVE_CODES, Error, ErrorCode, ErrorKind, NativeCode, Result};
+pub use session::{Session, SessionBuilder};
+pub use settings::Setting;
 
 /// The raw, unsafe FFI bindings this crate is built on.
 ///
