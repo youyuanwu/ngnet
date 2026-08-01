@@ -1,5 +1,8 @@
 //! Message bodies and flow control (Spec SC-001, SC-011, SC-013, SC-018, US-4).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
 use nghttp2::{
     BodyOutcome, BodySource, BytesBody, ErrorCode, ErrorKind, FrameInfo, Header, HeaderAction,
     Session, SessionBuilder, Setting, StreamId,
@@ -41,10 +44,18 @@ struct Seen {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     closed: Vec<(i32, u32, Option<String>)>,
+    begun: Vec<i32>,
 }
 
 fn recorder() -> SessionBuilder<Seen> {
     SessionBuilder::<Seen>::server()
+        .on_begin_headers(|seen: &mut Seen, info: FrameInfo| {
+            let stream = info.stream_id().get();
+            if !seen.begun.contains(&stream) {
+                seen.begun.push(stream);
+            }
+            HeaderAction::Continue
+        })
         .on_header(
             |seen: &mut Seen, _info: FrameInfo, name: &[u8], value: &[u8]| {
                 seen.headers.push((
@@ -385,50 +396,124 @@ fn manual_flow_control_withholds_data_until_consumption_is_reported() {
         payload.len()
     );
 
-    // Now report it, and the rest should flow.
-    for _ in 0..64 {
+    assert!(
+        stalled_at > 0,
+        "some data should have arrived before the stall"
+    );
+
+    // Now report consumption and the rest must flow to completion.
+    let mut total_received = server_seen.body.len();
+    for _ in 0..512 {
         let outstanding = server_seen.body.len();
-        server
-            .consume(StreamId::new(1), outstanding)
-            .expect("consume should succeed on a manual-flow-control session");
-        server_seen.body.clear();
+        if outstanding > 0 {
+            server
+                .consume(StreamId::new(1), outstanding)
+                .expect("consume should succeed on a manual-flow-control session");
+            server_seen.body.clear();
+        }
 
         let to_client = drain(&mut server, &mut server_seen);
         if !to_client.is_empty() {
             client.recv(&to_client, &mut client_seen).unwrap();
         }
         let to_server = drain(&mut client, &mut client_seen);
-        if to_server.is_empty() {
+        if to_server.is_empty() && server_seen.body.is_empty() {
             break;
         }
-        server.recv(&to_server, &mut server_seen).unwrap();
+        if !to_server.is_empty() {
+            server.recv(&to_server, &mut server_seen).unwrap();
+        }
+        total_received += server_seen.body.len();
     }
+    total_received += server_seen.body.len();
 
-    assert!(
-        stalled_at > 0,
-        "some data should have arrived before the stall"
+    assert_eq!(
+        total_received,
+        payload.len(),
+        "reporting consumption must let the whole body through; got {total_received} of {}",
+        payload.len()
     );
+}
+
+/// Counts its own drops, so body release can be observed rather than assumed.
+struct CountedBody {
+    inner: BytesBody,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl BodySource for CountedBody {
+    fn fill(&mut self, buf: &mut [u8]) -> BodyOutcome {
+        self.inner.fill(buf)
+    }
+}
+
+impl Drop for CountedBody {
+    fn drop(&mut self) {
+        self.dropped.fetch_add(1, AtomicOrdering::Relaxed);
+    }
 }
 
 #[test]
 fn a_body_source_is_dropped_when_its_stream_closes() {
-    // Bodies are owned by the session for exactly the life of their stream.
+    // Bodies are owned by the session for exactly the life of their stream, so they must
+    // be released as each stream closes rather than accumulating until teardown.
+    let dropped = Arc::new(AtomicUsize::new(0));
+
     let mut client = client_recorder().build().unwrap();
     let mut server = recorder().build().unwrap();
     let (mut client_seen, mut server_seen) = (Seen::default(), Seen::default());
 
-    for _ in 0..64 {
-        client
-            .submit_request_with_body(&request_headers(), BytesBody::new(vec![b'x'; 1024]))
+    const BODIES: usize = 64;
+    for _ in 0..BODIES {
+        let stream = client
+            .submit_request_with_body(
+                &request_headers(),
+                CountedBody {
+                    inner: BytesBody::new(vec![b'x'; 1024]),
+                    dropped: Arc::clone(&dropped),
+                },
+            )
             .unwrap();
+
+        pump(&mut client, &mut client_seen, &mut server, &mut server_seen);
+
+        // The server must actually answer: a stream stays open awaiting a response, and
+        // an unanswered stream never closes, so nothing would be released.
+        server
+            .submit_response(stream, &[Header::new(":status", "200")])
+            .expect("responding should succeed");
+
         pump(&mut client, &mut client_seen, &mut server, &mut server_seen);
         server_seen.body.clear();
     }
 
-    // The session's Drop asserts every native allocation was released; reaching here with
-    // sixty-four completed bodies means none of them leaked their entry either.
+    assert_eq!(
+        dropped.load(AtomicOrdering::Relaxed),
+        BODIES,
+        "every body should have been released as its stream closed, not held until teardown"
+    );
+
+    // The sessions' Drop additionally asserts every native allocation was released.
     drop(client);
     drop(server);
+}
+
+#[test]
+fn a_body_may_not_be_attached_to_a_stream_that_is_not_open() {
+    // Without an open stream there is nothing whose closure releases the body entry, and
+    // libnghttp2 would already be holding its address in a queued item.
+    let mut server = recorder().build().unwrap();
+
+    let error = server
+        .submit_response_with_body(
+            StreamId::new(99),
+            &[Header::new(":status", "200")],
+            BytesBody::new(b"body".to_vec()),
+        )
+        .expect_err("a body needs an open stream");
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("not open"));
 }
 
 #[test]

@@ -57,8 +57,19 @@ impl BodyRegistry {
     /// Records a prepared entry against the stream it was assigned.
     pub(crate) fn attach(&mut self, stream: StreamId, entry: NonNull<BodyEntry>) {
         if let Some(previous) = self.entries.insert(stream, entry) {
-            // A stream cannot carry two bodies; if it somehow did, the old one would leak.
-            Self::release_raw(previous);
+            // Reaching here would mean one stream carried two bodies. Callers prevent it:
+            // a request is always given a fresh identifier, and a response requires an
+            // open stream that the duplicate guard has not already claimed.
+            //
+            // The previous entry is deliberately NOT freed. libnghttp2 may still hold its
+            // address in a queued outbound item, so freeing it would be a use-after-free
+            // waiting to happen, whereas leaking it merely wastes memory. Given the choice
+            // between unsound and untidy, this takes untidy.
+            debug_assert!(
+                false,
+                "two bodies attached to stream {stream}; the previous entry was leaked"
+            );
+            let _ = previous;
         }
     }
 

@@ -557,8 +557,22 @@ impl<C> Session<C> {
     ) -> Result<()> {
         let nva = header::to_nv_vec(headers)?;
 
-        let track = self.stream_exists(stream);
-        if track && !self.responded.claim(stream) {
+        // A response *without* a body may name a stream that is not open: libnghttp2
+        // accepts it and drops the frame. A response *with* one may not. libnghttp2 would
+        // queue the outbound item holding this entry's address, but with no stream there
+        // is nothing whose closure releases it, and a later submission for the same
+        // identifier would replace the entry while the queued item still pointed at it.
+        // Rejecting here is what keeps that address valid for exactly as long as C holds
+        // it.
+        if !self.stream_exists(stream) {
+            return Err(Error::new(
+                "nghttp2_submit_response2",
+                ErrorKind::InvalidInput,
+                "cannot attach a body to a stream that is not open",
+            ));
+        }
+
+        if !self.responded.claim(stream) {
             return Err(Error::new(
                 "nghttp2_submit_response2",
                 ErrorKind::InvalidInput,
@@ -582,9 +596,7 @@ impl<C> Session<C> {
 
         if rc != 0 {
             BodyRegistry::discard(entry);
-            if track {
-                self.responded.release(stream);
-            }
+            self.responded.release(stream);
             return Err(Error::from_native("nghttp2_submit_response2", rc));
         }
 
