@@ -41,6 +41,20 @@ pub(crate) struct PendingErrors {
 /// error that may crash, so it has to be caught before the call is made.
 #[derive(Debug, Default)]
 pub(crate) struct ResponseGuard {
-    #[expect(dead_code, reason = "populated in the phase that adds message submission")]
     responded: HashSet<StreamId>,
+}
+
+impl ResponseGuard {
+    /// Records that `stream` now carries a response.
+    ///
+    /// Returns `false` if one was already submitted, which the caller must treat as a
+    /// rejection rather than forwarding to libnghttp2.
+    pub(crate) fn claim(&mut self, stream: StreamId) -> bool {
+        self.responded.insert(stream)
+    }
+
+    /// Forgets a stream, so a later stream reusing the identifier starts clean.
+    pub(crate) fn release(&mut self, stream: StreamId) {
+        self.responded.remove(&stream);
+    }
 }

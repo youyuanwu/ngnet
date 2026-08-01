@@ -40,12 +40,14 @@ mod options;
 mod session;
 
 mod handlers;
+mod header;
 mod settings;
 mod state;
 mod stream;
 
 pub use error::{ALL_NATIVE_CODES, Error, ErrorCode, ErrorKind, NativeCode, Result};
 pub use handlers::HeaderAction;
+pub use header::Header;
 pub use session::{Session, SessionBuilder};
 pub use settings::Setting;
 pub use stream::{FrameInfo, FrameType, StreamId};

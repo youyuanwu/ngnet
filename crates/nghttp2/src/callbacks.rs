@@ -39,7 +39,6 @@ pub(crate) struct Bridge<'a, C> {
     pub(crate) bodies: &'a mut BodyRegistry,
     #[expect(dead_code, reason = "read by the phase that adds message bodies")]
     pub(crate) pending: &'a mut PendingErrors,
-    #[expect(dead_code, reason = "read by the phase that adds message submission")]
     pub(crate) responded: &'a mut ResponseGuard,
 }
 
@@ -197,8 +196,11 @@ pub(crate) unsafe extern "C" fn on_stream_close<C>(
 
     let stream = StreamId::new(stream_id);
 
-    // Body entries and parked errors are released here whether or not the caller
-    // registered a handler, so a stream never leaks state it accumulated.
+    // Per-stream bookkeeping is released here whether or not the caller registered a
+    // handler, so a stream never leaks state it accumulated. This is why the bridge must
+    // be installed during send as well as receive: nghttp2 closes streams while it
+    // serialises, not only while it parses.
+    bridge.responded.release(stream);
 
     if let Some(handler) = bridge.handlers.stream_close.as_mut() {
         handler(bridge.context, stream, ErrorCode::new(error_code));

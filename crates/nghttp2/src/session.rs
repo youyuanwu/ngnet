@@ -10,6 +10,7 @@ use crate::alloc_state::{AllocState, mem_for};
 use crate::callbacks::{self, Bridge};
 use crate::error::{Error, ErrorCode, ErrorKind, Result};
 use crate::handlers::{HeaderAction, Handlers};
+use crate::header::{self, Header};
 use crate::options::Options;
 use crate::settings::Setting;
 use crate::state::{BodyRegistry, PendingErrors, ResponseGuard};
@@ -385,6 +386,139 @@ impl<C> Session<C> {
         }
 
         call(raw)
+    }
+
+    /// Submits a request, returning the stream it was assigned.
+    ///
+    /// The header set must carry its pseudo-header fields first and must already use
+    /// lowercase names; it is validated before anything reaches libnghttp2, so a rejected
+    /// set leaves the session untouched and usable.
+    ///
+    /// This phase submits requests without a body, so the headers carry end-of-stream.
+    pub fn submit_request(&mut self, headers: &[Header<'_>]) -> Result<StreamId> {
+        let nva = header::to_nv_vec(headers)?;
+
+        // SAFETY: `self.raw` is live and `nva` is valid for its length. libnghttp2 copies
+        // every name and value, so the borrowed header data need not outlive this call.
+        // A null priority spec and null data provider are both documented as accepted.
+        let rc = unsafe {
+            sys::nghttp2_submit_request2(
+                self.raw,
+                core::ptr::null(),
+                nva.as_ptr(),
+                nva.len(),
+                core::ptr::null(),
+                core::ptr::null_mut(),
+            )
+        };
+
+        if rc < 0 {
+            return Err(Error::from_native("nghttp2_submit_request2", rc));
+        }
+        Ok(StreamId::new(rc))
+    }
+
+    /// Submits a response on an open stream.
+    ///
+    /// Submitting a second response for one stream is rejected here rather than passed
+    /// on: libnghttp2 documents that as a programming error that may crash the process.
+    ///
+    /// A well-formed identifier naming a stream that is not open is accepted by
+    /// libnghttp2 and simply produces no frame, so it is not reported as an error.
+    ///
+    /// This phase submits responses without a body, so the headers carry end-of-stream.
+    pub fn submit_response(&mut self, stream: StreamId, headers: &[Header<'_>]) -> Result<()> {
+        let nva = header::to_nv_vec(headers)?;
+
+        if !self.responded.claim(stream) {
+            return Err(Error::new(
+                "nghttp2_submit_response2",
+                ErrorKind::InvalidInput,
+                "a response has already been submitted for this stream",
+            ));
+        }
+
+        // SAFETY: as for `submit_request`, with the stream identifier checked by
+        // libnghttp2 itself.
+        let rc = unsafe {
+            sys::nghttp2_submit_response2(
+                self.raw,
+                stream.get(),
+                nva.as_ptr(),
+                nva.len(),
+                core::ptr::null(),
+            )
+        };
+
+        if rc != 0 {
+            // The claim is rolled back so a caller that corrects the arguments and retries
+            // is not blocked by its own failed attempt.
+            self.responded.release(stream);
+            return Err(Error::from_native("nghttp2_submit_response2", rc));
+        }
+        Ok(())
+    }
+
+    /// Submits a trailing header block on an open stream.
+    ///
+    /// Trailers may only follow a message whose body signalled that they were coming. A
+    /// message submitted without a body carries end-of-stream on its headers, after which
+    /// nothing further can be sent on that stream.
+    pub fn submit_trailer(&mut self, stream: StreamId, headers: &[Header<'_>]) -> Result<()> {
+        let nva = header::to_trailer_nv_vec(headers)?;
+
+        // SAFETY: `self.raw` is live and `nva` is valid for its length; libnghttp2 copies
+        // the contents.
+        let rc = unsafe {
+            sys::nghttp2_submit_trailer(self.raw, stream.get(), nva.as_ptr(), nva.len())
+        };
+
+        if rc != 0 {
+            return Err(Error::from_native("nghttp2_submit_trailer", rc));
+        }
+        Ok(())
+    }
+
+    /// Cancels a single stream, so the peer observes a `RST_STREAM`.
+    pub fn reset_stream(&mut self, stream: StreamId, code: ErrorCode) -> Result<()> {
+        // SAFETY: `self.raw` is live. Flags are documented as ignored and must be NONE.
+        let rc = unsafe {
+            sys::nghttp2_submit_rst_stream(
+                self.raw,
+                sys::NGHTTP2_FLAG_NONE as u8,
+                stream.get(),
+                code.get(),
+            )
+        };
+
+        if rc != 0 {
+            return Err(Error::from_native("nghttp2_submit_rst_stream", rc));
+        }
+        Ok(())
+    }
+
+    /// Begins a graceful connection shutdown.
+    ///
+    /// `last_stream` names the highest peer-initiated stream that was processed; streams
+    /// above it are abandoned and may be retried by the peer on a new connection.
+    pub fn shutdown(&mut self, last_stream: StreamId, code: ErrorCode) -> Result<()> {
+        // SAFETY: `self.raw` is live. The debug payload is empty, so a null pointer with
+        // length zero is passed, which libnghttp2 documents as accepted.
+        let rc = unsafe {
+            sys::nghttp2_submit_goaway(
+                self.raw,
+                sys::NGHTTP2_FLAG_NONE as u8,
+                last_stream.get(),
+                code.get(),
+                core::ptr::null(),
+                0,
+            )
+        };
+
+        if rc != 0 {
+            return Err(Error::from_native("nghttp2_submit_goaway", rc));
+        }
+        Ok(())
     }
 
     /// Whether the session still wants to read from the peer.
