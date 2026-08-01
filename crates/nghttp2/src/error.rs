@@ -32,10 +32,19 @@ impl NativeCode {
 
     /// libnghttp2's own description of this code.
     ///
-    /// Returns `None` if the library hands back a string that is not valid UTF-8, which
-    /// it is not expected to do.
+    /// Returns `None` for a code libnghttp2 does not define, and in the unexpected case
+    /// that the library hands back a string that is not valid UTF-8.
+    ///
+    /// The guard on [`ALL_NATIVE_CODES`] is deliberate: `nghttp2_strerror` documents
+    /// that its argument must be one of the `nghttp2_error` values. Its implementation
+    /// happens to be defensive about unknown input, but relying on that would be relying
+    /// on undocumented behaviour.
     pub fn describe(self) -> Option<&'static str> {
-        // SAFETY: `nghttp2_strerror` accepts any integer and returns a pointer to a
+        if !ALL_NATIVE_CODES.contains(&self) {
+            return None;
+        }
+        // SAFETY: `self` was just confirmed to be one of the `nghttp2_error` values, which
+        // is `nghttp2_strerror`'s documented precondition. It returns a pointer to a
         // static, NUL-terminated string with the same lifetime as the library itself.
         let ptr = unsafe { nghttp2_sys::nghttp2_strerror(self.0) };
         if ptr.is_null() {
@@ -219,7 +228,6 @@ pub(crate) const fn classify(code: i32) -> ErrorKind {
         | sys::NGHTTP2_ERR_REFUSED_STREAM
         | sys::NGHTTP2_ERR_SETTINGS_EXPECTED
         | sys::NGHTTP2_ERR_TOO_MANY_SETTINGS
-        | sys::NGHTTP2_ERR_TOO_MANY_INFLIGHT_SETTINGS
         | sys::NGHTTP2_ERR_TOO_MANY_CONTINUATIONS
         | sys::NGHTTP2_ERR_BAD_CLIENT_MAGIC
         | sys::NGHTTP2_ERR_FLOODED => ErrorKind::Protocol,
@@ -241,7 +249,10 @@ pub(crate) const fn classify(code: i32) -> ErrorKind {
         | sys::NGHTTP2_ERR_PUSH_DISABLED
         | sys::NGHTTP2_ERR_DATA_EXIST
         | sys::NGHTTP2_ERR_SESSION_CLOSING
-        | sys::NGHTTP2_ERR_INSUFF_BUFSIZE => ErrorKind::InvalidInput,
+        | sys::NGHTTP2_ERR_INSUFF_BUFSIZE
+        // Not peer misconduct: the local endpoint has too many SETTINGS frames in
+        // flight and may not transmit another yet.
+        | sys::NGHTTP2_ERR_TOO_MANY_INFLIGHT_SETTINGS => ErrorKind::InvalidInput,
 
         // Control-flow signals and internal markers. None of these should escape the
         // safe API; if one does, this crate mishandled it.

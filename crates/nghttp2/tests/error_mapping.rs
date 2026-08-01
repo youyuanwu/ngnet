@@ -32,13 +32,22 @@ fn native_codes_declared_in_header() -> BTreeSet<i32> {
         "vendored nghttp2 header not found; run `git submodule update --init deps/nghttp2`",
     );
 
+    // Every line that begins a declaration must parse. Silently skipping an
+    // unparsable one would turn this guard into a false negative precisely when the
+    // header format changes, which is the case it exists to catch.
     header
         .lines()
         .map(str::trim)
-        .filter_map(|line| {
-            let rest = line.strip_prefix("NGHTTP2_ERR_")?;
-            let (_name, value) = rest.split_once('=')?;
-            value.trim().trim_end_matches(',').parse::<i32>().ok()
+        .filter(|line| line.starts_with("NGHTTP2_ERR_"))
+        .map(|line| {
+            let (_name, value) = line
+                .split_once('=')
+                .unwrap_or_else(|| panic!("declaration line has no `=`: {line:?}"));
+            value
+                .trim()
+                .trim_end_matches(',')
+                .parse::<i32>()
+                .unwrap_or_else(|e| panic!("could not parse value from {line:?}: {e}"))
         })
         .collect()
 }
@@ -137,20 +146,35 @@ fn the_three_specified_categories_are_distinguishable() {
 }
 
 #[test]
-fn display_names_the_failing_operation() {
-    let rendered = Error::from_native("submit_request", nghttp2_sys_codes::NOMEM).to_string();
+fn display_names_the_failing_operation_for_every_category() {
+    // SC-019 requires the operation to be named whatever the category, so drive one
+    // representative code from each rather than trusting a single sample.
+    let mut categories_covered: BTreeSet<&'static str> = BTreeSet::new();
 
-    assert!(
-        rendered.contains("submit_request"),
-        "the message must name the operation that failed, got: {rendered}"
-    );
-    assert!(
-        rendered.contains("resource exhausted"),
-        "the message must describe the category, got: {rendered}"
-    );
-    assert!(
-        rendered.contains("-901"),
-        "the message must carry the underlying condition, got: {rendered}"
+    for code in ALL_NATIVE_CODES {
+        let error = Error::from_native("submit_request", code.get());
+        let rendered = error.to_string();
+
+        assert!(
+            rendered.contains("submit_request"),
+            "the message must name the operation that failed, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(error.kind().description()),
+            "the message must describe the category, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&code.get().to_string()),
+            "the message must carry the underlying condition, got: {rendered}"
+        );
+
+        categories_covered.insert(error.kind().description());
+    }
+
+    assert_eq!(
+        categories_covered.len(),
+        4,
+        "every category should have been rendered at least once, saw: {categories_covered:?}"
     );
 }
 
