@@ -37,8 +37,8 @@ while let Some(block) = client.send(&mut response)? {
 }
 ```
 
-Incoming headers and body chunks reach your handlers as borrowed slices into
-libnghttp2's own buffers, so receiving allocates nothing. Your application state
+Incoming headers and body chunks reach your handlers as borrowed slices, valid
+for the duration of the call, so receiving allocates nothing in the wrapper. Your application state
 is passed in at call time rather than captured, so handlers can mutate it
 directly.
 

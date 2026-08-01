@@ -2,8 +2,9 @@
 //!
 //! Handlers are closures registered when a session is built. They receive the caller's
 //! own application state by mutable reference — supplied at the time bytes are submitted
-//! or collected — together with borrowed views into libnghttp2's buffers. Nothing is
-//! copied on the way through.
+//! or collected — together with borrowed views valid for the duration of the call.
+//! Nothing is copied on the way through; depending on the frame, libnghttp2 may point
+//! these at its own storage or directly into the buffer the caller submitted.
 //!
 //! Handlers are never handed the session. Their only influence over it is their return
 //! value, which is why only the header-phase handlers can ask for a stream to be
