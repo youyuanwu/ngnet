@@ -140,6 +140,32 @@ fn the_crate_reaches_for_no_io_threading_or_time_facility() {
     );
 }
 
+/// Whether `code` uses `unsafe` as a keyword rather than merely containing the letters.
+///
+/// A substring search is not enough: an identifier such as `uses_unsafe` contains the
+/// text but is not a use of the keyword, and mistaking one for the other would make this
+/// file fail its own check.
+fn uses_unsafe_keyword(code: &str) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+
+    code.match_indices("unsafe").any(|(index, _)| {
+        let before_ok = index == 0 || !code[..index].chars().next_back().is_some_and(is_ident);
+        let after = &code[index + "unsafe".len()..];
+        let after_ok = !after.chars().next().is_some_and(is_ident);
+        before_ok && after_ok
+    })
+}
+
+#[test]
+fn the_unsafe_keyword_detector_distinguishes_identifiers() {
+    assert!(uses_unsafe_keyword("let x = unsafe { 1 };"));
+    assert!(uses_unsafe_keyword("unsafe impl Send for T {}"));
+    assert!(uses_unsafe_keyword("unsafe extern \"C\" {}"));
+    assert!(!uses_unsafe_keyword("let uses_unsafe = true;"));
+    assert!(!uses_unsafe_keyword("fn check_unsafely() {}"));
+    assert!(!uses_unsafe_keyword("UNSAFE_TEST_EXEMPTIONS"));
+}
+
 #[test]
 fn the_comment_stripper_actually_strips() {
     // Guards the scan above against passing because stripping removed everything, or
@@ -163,11 +189,13 @@ fn the_crate_declares_exactly_one_runtime_dependency() {
     // promise to be a thin, self-contained layer over the raw bindings.
     let manifest = std::fs::read_to_string(crate_root().join("Cargo.toml")).expect("manifest");
 
+    // Sections are delimited by a bracket at the start of a line, so inline arrays such
+    // as `features = [...]` do not truncate the section.
     let dependencies: Vec<&str> = manifest
         .split("[dependencies]")
         .nth(1)
         .expect("no [dependencies] section")
-        .split('[')
+        .split("\n[")
         .next()
         .expect("dependencies section")
         .lines()
@@ -199,37 +227,91 @@ fn unsafe_is_confined_to_the_modules_that_wrap_the_bindings() {
         "the crate root must deny unsafe_code; without it the allows below confine nothing"
     );
 
-    let allowed: BTreeSet<String> = lib
-        .lines()
-        .map(str::trim)
-        .scan(false, |pending, line| {
-            let was_pending = *pending;
-            if line == "#[allow(unsafe_code)]" {
-                *pending = true;
-                return Some(None);
-            }
-            *pending = false;
-            if was_pending && line.starts_with("mod ") {
-                let name = line.trim_start_matches("mod ").trim_end_matches(';');
-                return Some(Some(name.to_string()));
-            }
-            Some(None)
-        })
-        .flatten()
-        .collect();
+    // Other attributes may sit between the allow and the module it applies to — the
+    // `#[path = "..."]` on the allocator module does exactly that — so intervening
+    // attribute lines are skipped rather than resetting the search.
+    let mut allowed: BTreeSet<String> = BTreeSet::new();
+    let mut pending = false;
+    for line in lib.lines().map(str::trim) {
+        if line == "#[allow(unsafe_code)]" {
+            pending = true;
+            continue;
+        }
+        if !pending {
+            continue;
+        }
+        if line.starts_with("#[") || line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("mod ") {
+            allowed.insert(rest.trim_end_matches(';').to_string());
+        }
+        pending = false;
+    }
 
     // Modules that legitimately touch the raw bindings. Adding to this list should be a
     // deliberate act, which is exactly why the test names them.
-    let expected: BTreeSet<String> = ["callbacks", "error", "options", "session", "state"]
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
+    let expected: BTreeSet<String> = [
+        "alloc_state",
+        "callbacks",
+        "error",
+        "options",
+        "session",
+        "state",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
 
     assert_eq!(
         allowed, expected,
         "the set of modules permitted to use `unsafe` changed; if that is intended, update \
          this test deliberately"
     );
+}
+
+#[test]
+fn every_module_using_unsafe_is_in_the_pinned_set() {
+    // The counterpart to the pinned list: derive the set of modules that actually contain
+    // `unsafe` from the source itself, so a module cannot use it while escaping the list
+    // through a parsing quirk.
+    let lib = std::fs::read_to_string(crate_root().join("src/lib.rs")).expect("lib.rs");
+    let mut declared_allowed = BTreeSet::new();
+    let mut pending = false;
+    for line in lib.lines().map(str::trim) {
+        if line == "#[allow(unsafe_code)]" {
+            pending = true;
+            continue;
+        }
+        if !pending || line.starts_with("#[") || line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("mod ") {
+            declared_allowed.insert(rest.trim_end_matches(';').to_string());
+        }
+        pending = false;
+    }
+
+    // `alloc.rs` is mounted as `alloc_state`, so map file stems onto module names.
+    let module_name = |stem: &str| match stem {
+        "alloc" => "alloc_state".to_string(),
+        other => other.to_string(),
+    };
+
+    for file in rust_files(&crate_root().join("src")) {
+        let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        if stem == "lib" {
+            continue;
+        }
+        let code = strip_comments_and_strings(&std::fs::read_to_string(&file).expect("reading"));
+        if uses_unsafe_keyword(&code) {
+            assert!(
+                declared_allowed.contains(&module_name(stem)),
+                "{} uses unsafe but is not in the pinned allow list ({declared_allowed:?})",
+                file.display()
+            );
+        }
+    }
 }
 
 #[test]
@@ -253,7 +335,7 @@ fn no_test_needs_unsafe_to_use_the_api() {
         }
 
         let code = strip_comments_and_strings(&std::fs::read_to_string(&file).expect("reading"));
-        if code.contains("unsafe ") || code.contains("unsafe{") || code.contains("unsafe {") {
+        if uses_unsafe_keyword(&code) {
             offenders.push(file.display().to_string());
         }
     }
@@ -274,7 +356,7 @@ fn every_unsafe_exemption_is_still_earned() {
         let code = strip_comments_and_strings(&std::fs::read_to_string(&path).expect("reading"));
 
         assert!(
-            code.contains("unsafe"),
+            uses_unsafe_keyword(&code),
             "{name} no longer uses unsafe ({reason}); drop its exemption"
         );
     }

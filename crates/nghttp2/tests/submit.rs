@@ -471,3 +471,51 @@ fn responding_to_an_unopened_stream_does_not_poison_it() {
         .expect_err("a genuine duplicate must still be rejected");
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
 }
+
+#[test]
+fn a_request_submitted_after_the_peer_goes_away_is_never_transmitted() {
+    // US-1 scenario 4. Counterintuitively, libnghttp2 does not reject this: it assigns a
+    // stream identifier and then silently declines to send anything for it. A caller that
+    // needs to know the connection is closing has to observe the GOAWAY, not rely on
+    // submission failing.
+    let mut client = SessionBuilder::<()>::client().build().unwrap();
+    let mut server = recording().build().unwrap();
+    let mut seen = Seen::default();
+
+    let first = client.submit_request(&request_headers()).unwrap();
+    let wire = drain(&mut client, &mut ());
+    server.recv(&wire, &mut seen).unwrap();
+
+    server
+        .shutdown(first, ErrorCode::NO_ERROR)
+        .expect("announcing shutdown");
+    let goaway = drain(&mut server, &mut seen);
+    assert!(
+        parse_frames(&goaway)
+            .iter()
+            .any(|(kind, _, _)| *kind == FrameType::GOAWAY.get()),
+        "the server should have emitted a GOAWAY"
+    );
+    client.recv(&goaway, &mut ()).unwrap();
+
+    let later = client
+        .submit_request(&request_headers())
+        .expect("libnghttp2 accepts the submission rather than rejecting it");
+    assert_eq!(later.get(), 3, "a stream identifier is still assigned");
+
+    let after = drain(&mut client, &mut ());
+    let frames = parse_frames(&after);
+    assert!(
+        !frames
+            .iter()
+            .any(|(kind, _, stream)| *kind == FrameType::HEADERS.get() && *stream == 3),
+        "no request should have been transmitted for the new stream, saw {frames:?}"
+    );
+
+    // The session is not corrupted: what remains legal still works.
+    assert!(
+        client.reset_stream(first, ErrorCode::CANCEL).is_ok(),
+        "the session should still be usable"
+    );
+    let _ = drain(&mut client, &mut ());
+}

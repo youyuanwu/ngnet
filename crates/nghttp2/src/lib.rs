@@ -76,12 +76,29 @@
 //!     .on_header(|_ctx, _frame, _name, _value| HeaderAction::CancelStream);
 //! ```
 //!
-//! A body-chunk handler has no such return, so the mistake is unrepresentable:
+//! The other three have no such return, so the mistake is unrepresentable. A body-chunk
+//! handler:
 //!
 //! ```compile_fail
 //! # use nghttp2::{HeaderAction, SessionBuilder};
 //! SessionBuilder::<()>::client()
 //!     .on_data_chunk(|_ctx, _stream, _chunk| HeaderAction::CancelStream);
+//! ```
+//!
+//! a completed-frame handler:
+//!
+//! ```compile_fail
+//! # use nghttp2::{HeaderAction, SessionBuilder};
+//! SessionBuilder::<()>::client()
+//!     .on_frame(|_ctx, _frame| HeaderAction::CancelStream);
+//! ```
+//!
+//! and a stream-close handler:
+//!
+//! ```compile_fail
+//! # use nghttp2::{HeaderAction, SessionBuilder};
+//! SessionBuilder::<()>::client()
+//!     .on_stream_close(|_ctx, _stream, _code, _err| HeaderAction::CancelStream);
 //! ```
 //!
 //! ## The context type is fixed when the session is built
