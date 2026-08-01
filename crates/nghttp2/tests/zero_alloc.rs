@@ -1,8 +1,10 @@
 //! Receiving performs no heap allocation attributable to the wrapper (Spec SC-005).
 //!
-//! Header names, header values and body chunks reach a handler as borrowed slices into
-//! libnghttp2's own buffers. Nothing is copied on the way through, so processing a large
-//! response costs no Rust allocations.
+//! Header names, header values and body chunks reach a handler as borrowed slices valid
+//! for the duration of the call, which the wrapper neither copies nor allocates. Depending
+//! on the frame, libnghttp2 may point them at its own storage or directly into the buffer
+//! the caller submitted; either way, processing a large response costs no Rust
+//! allocations.
 //!
 //! This lives in its own integration test because it installs a global allocator, which
 //! is a per-binary choice.
