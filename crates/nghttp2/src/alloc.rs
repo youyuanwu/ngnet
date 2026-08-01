@@ -119,9 +119,18 @@ unsafe extern "C" fn realloc_cb(
     // Reallocating from null is a fresh allocation. Reallocating an existing block frees
     // the old and returns the new, so the live count is unchanged; and if it fails, the
     // old block survives, which is also unchanged.
-    if was_null && !out.is_null() {
+    //
+    // The remaining case is `realloc(non_null, 0)`, which C permits to free the block and
+    // return null. Current nghttp2 never reallocates to zero, but accounting for it costs
+    // nothing and stops a future upgrade silently skewing the balance.
+    if was_null {
+        if !out.is_null() {
+            // SAFETY: `user_data` is the pointer installed by `mem_for`.
+            unsafe { state(user_data) }.record_alloc();
+        }
+    } else if out.is_null() && size == 0 {
         // SAFETY: `user_data` is the pointer installed by `mem_for`.
-        unsafe { state(user_data) }.record_alloc();
+        unsafe { state(user_data) }.record_free();
     }
     out
 }

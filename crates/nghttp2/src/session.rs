@@ -1,12 +1,13 @@
 //! HTTP/2 sessions: construction, teardown, and the outbound half of the sans-I/O loop.
 
 use std::sync::Arc;
+use core::fmt;
 use core::marker::PhantomData;
 
 use nghttp2_sys as sys;
 
 use crate::alloc_state::{AllocState, mem_for};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 use crate::options::Options;
 use crate::settings::Setting;
 
@@ -22,6 +23,7 @@ enum Role {
 /// The type parameter `C` is the caller's own application context: the type that will be
 /// handed by mutable reference to [`Session::send`] and, once handlers exist, to every
 /// handler invoked during a call. It is fixed when the session is built.
+#[derive(Debug)]
 pub struct SessionBuilder<C> {
     role: Role,
     settings: Vec<Setting>,
@@ -74,6 +76,10 @@ impl<C> SessionBuilder<C> {
 
     /// Builds the session and queues its initial `SETTINGS` frame.
     pub fn build(self) -> Result<Session<C>> {
+        // Resolved before anything is allocated, so a rejected configuration cannot leave
+        // a half-built session behind.
+        let settings = self.resolve_settings()?;
+
         let allocation = Arc::new(AllocState::default());
         let mut mem = mem_for(&allocation);
 
@@ -114,8 +120,40 @@ impl<C> SessionBuilder<C> {
             _context: PhantomData,
         };
 
-        session.submit_settings(&self.settings)?;
+        session.submit_settings(&settings)?;
         Ok(session)
+    }
+
+    /// Resolves the settings actually advertised, applying this crate's push policy.
+    ///
+    /// Server push is out of scope, so a client advertises `ENABLE_PUSH = 0` unless the
+    /// caller states a preference explicitly. A server may not advertise `ENABLE_PUSH = 1`
+    /// at all — RFC 9113 forbids it and libnghttp2 only range-checks the value, so the
+    /// rejection has to happen here.
+    fn resolve_settings(&self) -> Result<Vec<Setting>> {
+        let stated_push = self
+            .settings
+            .iter()
+            .find(|setting| matches!(setting, Setting::EnablePush(_)));
+
+        match (self.role, stated_push) {
+            (Role::Server, Some(Setting::EnablePush(true))) => {
+                return Err(Error::new(
+                    "SessionBuilder::build",
+                    ErrorKind::InvalidInput,
+                    "a server may not advertise SETTINGS_ENABLE_PUSH = 1",
+                ));
+            }
+            (Role::Client, None) => {
+                let mut settings = Vec::with_capacity(self.settings.len() + 1);
+                settings.push(Setting::EnablePush(false));
+                settings.extend_from_slice(&self.settings);
+                return Ok(settings);
+            }
+            _ => {}
+        }
+
+        Ok(self.settings.clone())
     }
 }
 
@@ -147,8 +185,9 @@ impl<C> Session<C> {
             settings.iter().copied().map(Setting::entry).collect();
 
         // SAFETY: `self.raw` is live. `entries` is a valid slice for the given length and
-        // libnghttp2 copies every entry, so it need not outlive this call. A null pointer
-        // with length zero is what the library expects for an empty settings list.
+        // libnghttp2 copies every entry, so it need not outlive this call. When the list
+        // is empty `as_ptr` yields a dangling-but-aligned pointer, which is sound because
+        // libnghttp2 does not dereference it when the count is zero.
         let rc = unsafe {
             sys::nghttp2_submit_settings(
                 self.raw,
@@ -228,6 +267,17 @@ impl<C> Session<C> {
     #[cfg(test)]
     fn allocation_state(&self) -> Arc<AllocState> {
         Arc::clone(&self.allocation)
+    }
+}
+
+impl<C> fmt::Debug for Session<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Deliberately reports observable state rather than the raw pointer, which would
+        // be noise to a caller and unstable between runs.
+        f.debug_struct("Session")
+            .field("want_read", &self.want_read())
+            .field("want_write", &self.want_write())
+            .finish_non_exhaustive()
     }
 }
 
@@ -404,6 +454,89 @@ mod tests {
             };
             assert_eq!(counters.live_blocks(), 0);
         }
+    }
+
+    /// Parses the SETTINGS payload that follows a client preface into (id, value) pairs.
+    fn settings_entries(wire: &[u8], skip_preface: bool) -> Vec<(u16, u32)> {
+        let start = if skip_preface { CLIENT_MAGIC.len() } else { 0 } + 9;
+        wire[start..]
+            .chunks_exact(6)
+            .map(|c| {
+                (
+                    u16::from_be_bytes([c[0], c[1]]),
+                    u32::from_be_bytes([c[2], c[3], c[4], c[5]]),
+                )
+            })
+            .collect()
+    }
+
+    const ENABLE_PUSH_ID: u16 = 0x02;
+
+    #[test]
+    fn a_client_disables_push_by_default() {
+        // Server push is out of scope, so PUSH_PROMISE must never reach a handler. The
+        // cheapest way to guarantee that is to tell the peer not to send any.
+        let mut session = SessionBuilder::<()>::client().build().unwrap();
+        let entries = settings_entries(&drain(&mut session), true);
+
+        assert!(
+            entries.contains(&(ENABLE_PUSH_ID, 0)),
+            "a client should advertise ENABLE_PUSH = 0 by default, got {entries:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_client_push_preference_is_respected() {
+        let mut session = SessionBuilder::<()>::client()
+            .setting(Setting::EnablePush(true))
+            .build()
+            .unwrap();
+        let entries = settings_entries(&drain(&mut session), true);
+
+        assert!(
+            entries.contains(&(ENABLE_PUSH_ID, 1)),
+            "an explicit preference must win over the default, got {entries:?}"
+        );
+        assert_eq!(
+            entries.iter().filter(|(id, _)| *id == ENABLE_PUSH_ID).count(),
+            1,
+            "the default must not be injected alongside an explicit value"
+        );
+    }
+
+    #[test]
+    fn a_server_may_not_advertise_push_enabled() {
+        // RFC 9113 forbids it, and libnghttp2 only range-checks the value, so rejecting
+        // it is this crate's job.
+        let error = SessionBuilder::<()>::server()
+            .setting(Setting::EnablePush(true))
+            .build()
+            .expect_err("a server advertising ENABLE_PUSH = 1 must be rejected");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("ENABLE_PUSH"));
+    }
+
+    #[test]
+    fn a_server_may_advertise_push_disabled() {
+        let mut session = SessionBuilder::<()>::server()
+            .setting(Setting::EnablePush(false))
+            .build()
+            .expect("advertising ENABLE_PUSH = 0 is legal for a server");
+        let entries = settings_entries(&drain(&mut session), false);
+
+        assert!(entries.contains(&(ENABLE_PUSH_ID, 0)), "got {entries:?}");
+    }
+
+    #[test]
+    fn a_server_gets_no_injected_push_setting() {
+        let mut session = SessionBuilder::<()>::server().build().unwrap();
+        let entries = settings_entries(&drain(&mut session), false);
+
+        assert!(
+            !entries.iter().any(|(id, _)| *id == ENABLE_PUSH_ID),
+            "the client-side default must not leak into server sessions, got {entries:?}"
+        );
     }
 
     #[test]

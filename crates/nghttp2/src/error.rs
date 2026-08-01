@@ -111,6 +111,16 @@ pub struct Error {
 }
 
 impl Error {
+    /// Builds an error this crate detected itself, rather than one libnghttp2 reported.
+    pub(crate) const fn new(op: &'static str, kind: ErrorKind, detail: &'static str) -> Self {
+        Self {
+            op,
+            kind,
+            native: None,
+            detail: Some(detail),
+        }
+    }
+
     /// Translates a negative return value from `op` into a typed error.
     ///
     /// The mapping is total: every `NGHTTP2_ERR_*` value maps to exactly one
