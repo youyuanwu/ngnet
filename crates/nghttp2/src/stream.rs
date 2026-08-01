@@ -131,7 +131,13 @@ impl FrameInfo {
     }
 
     /// Whether this frame completes a header block.
+    ///
+    /// Only meaningful for the frame types that carry one. As with
+    /// [`Self::is_end_stream`], the flag bit is reused for other purposes elsewhere.
     pub const fn is_end_headers(self) -> bool {
-        self.flags & (sys::NGHTTP2_FLAG_END_HEADERS as u8) != 0
+        (self.kind.0 == FrameType::HEADERS.0
+            || self.kind.0 == FrameType::PUSH_PROMISE.0
+            || self.kind.0 == FrameType::CONTINUATION.0)
+            && self.flags & (sys::NGHTTP2_FLAG_END_HEADERS as u8) != 0
     }
 }

@@ -41,6 +41,14 @@ pub trait BodySource: Send {
     ///
     /// Returning [`BodyOutcome::Wrote`] with zero octets is permitted but will simply be
     /// asked again; prefer [`BodyOutcome::Eof`] when there is nothing left.
+    ///
+    /// The reported count must not exceed `buf.len()`. A larger one is treated as a body
+    /// failure and terminates the stream rather than being forwarded, since acting on it
+    /// would read past the buffer.
+    ///
+    /// `buf` is cleared before each call, so reading from it yields zeros rather than
+    /// anything left by an earlier frame. There is nothing useful to read; it is an
+    /// output buffer.
     fn fill(&mut self, buf: &mut [u8]) -> BodyOutcome;
 }
 
