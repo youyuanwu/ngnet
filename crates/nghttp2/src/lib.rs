@@ -188,19 +188,32 @@
 //!
 //! ## Handlers are never given the session
 //!
-//! A handler receives only the caller's context and the event, so it cannot re-enter the
-//! session libnghttp2 is executing inside. A closure that tries to capture the session it
-//! is being registered on does not compile, because the session does not yet exist:
+//! A handler receives only the caller's context and the event. It is handed no session,
+//! so it cannot re-enter the one libnghttp2 is executing inside.
 //!
-//! ```compile_fail
+//! What a handler does get is the caller's own state, by mutable reference:
+//!
+//! ```
 //! # use nghttp2::{HeaderAction, SessionBuilder};
-//! let mut session = SessionBuilder::<()>::client()
-//!     .on_header(move |_ctx, _frame, _name, _value| {
-//!         let _ = session.want_read();
+//! let mut count = 0usize;
+//! let mut session = SessionBuilder::<usize>::client()
+//!     .on_header(|seen: &mut usize, _frame, _name, _value| {
+//!         *seen += 1;
 //!         HeaderAction::Continue
 //!     })
 //!     .build()
 //!     .unwrap();
+//! session.send(&mut count).unwrap();
+//! ```
+//!
+//! There is no parameter through which a session could arrive, so a handler expecting one
+//! does not compile:
+//!
+//! ```compile_fail
+//! # use nghttp2::{HeaderAction, Session, SessionBuilder};
+//! SessionBuilder::<()>::client().on_header(
+//!     |_session: &mut Session<()>, _ctx, _frame, _name, _value| HeaderAction::Continue,
+//! );
 //! ```
 //!
 //! # Escape hatch

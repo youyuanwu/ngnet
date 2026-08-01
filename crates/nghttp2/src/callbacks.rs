@@ -234,11 +234,48 @@ pub(crate) unsafe extern "C" fn read_body<C>(
     // `ptr` member is the address of a live `BodyEntry` owned by the session's registry.
     let entry = unsafe { &mut *(*source).ptr.cast::<BodyEntry>() };
 
+    // The buffer libnghttp2 hands over is a reused frame buffer that it does not
+    // initialise. Two problems follow, and zeroing solves both.
+    //
+    // First, forming a `&mut [u8]` over uninitialised memory is undefined behaviour in
+    // Rust, whether or not anything reads it.
+    //
+    // Second, `fill` receives a readable slice, so a body source could observe whatever
+    // the previous frame left there — including another stream's body on the same
+    // connection. Handing a caller a window onto unrelated plaintext is exactly the class
+    // of hazard this crate exists to remove, so the cost of the memset is well spent.
     // SAFETY: libnghttp2 guarantees `buf` is writable for `length` octets.
+    unsafe { core::ptr::write_bytes(buf, 0, length) };
+
+    // SAFETY: `buf` is writable for `length` octets and was just fully initialised.
     let out = unsafe { core::slice::from_raw_parts_mut(buf, length) };
 
+    // A source that claims to have written more than it was given would make libnghttp2
+    // read past the buffer, so the claim is checked rather than trusted. It is also how
+    // an absurd length avoids being cast into something that happens to collide with a
+    // negative control code such as NGHTTP2_ERR_DEFERRED.
+    let checked = |written: usize| -> Option<sys::nghttp2_ssize> {
+        (written <= length).then_some(written as sys::nghttp2_ssize)
+    };
+
+    let overrun = |user_data: *mut c_void| -> sys::nghttp2_ssize {
+        park_body_error::<C>(
+            user_data,
+            StreamId::new(stream_id),
+            Box::new(BodyOverrun { length }),
+        );
+        sys::NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE as sys::nghttp2_ssize
+    };
+
     match entry.source.fill(out) {
-        BodyOutcome::Wrote(written) => written as sys::nghttp2_ssize,
+        BodyOutcome::Wrote(written) => match checked(written) {
+            Some(written) => written,
+            None => overrun(user_data),
+        },
+        BodyOutcome::Eof(written) if checked(written).is_none() => overrun(user_data),
+        BodyOutcome::EofWithTrailers(written) if checked(written).is_none() => {
+            overrun(user_data)
+        }
         BodyOutcome::Eof(written) => {
             // SAFETY: libnghttp2 passes a valid pointer to its flags word.
             unsafe { *data_flags |= sys::NGHTTP2_DATA_FLAG_EOF };
@@ -262,6 +299,24 @@ pub(crate) unsafe extern "C" fn read_body<C>(
         }
     }
 }
+
+/// Reported when a body source claims to have written more than it was given.
+#[derive(Debug)]
+struct BodyOverrun {
+    length: usize,
+}
+
+impl core::fmt::Display for BodyOverrun {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "body source reported writing more than the {} octets it was given",
+            self.length
+        )
+    }
+}
+
+impl core::error::Error for BodyOverrun {}
 
 /// Parks a body failure so the stream-close handler can report it.
 fn park_body_error<C>(user_data: *mut c_void, stream: StreamId, error: BodyError) {

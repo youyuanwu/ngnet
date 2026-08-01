@@ -112,8 +112,22 @@ impl FrameInfo {
     }
 
     /// Whether this frame closes its stream in the sending direction.
+    ///
+    /// Only meaningful for frames that carry message content. HTTP/2 reuses the `0x01`
+    /// flag bit as ACK on `SETTINGS` and `PING`, so reporting it as end-of-stream there
+    /// would be wrong — and those frames belong to the connection, not a stream.
     pub const fn is_end_stream(self) -> bool {
-        self.flags & (sys::NGHTTP2_FLAG_END_STREAM as u8) != 0
+        (self.kind.0 == FrameType::DATA.0 || self.kind.0 == FrameType::HEADERS.0)
+            && self.flags & (sys::NGHTTP2_FLAG_END_STREAM as u8) != 0
+    }
+
+    /// Whether this frame acknowledges an earlier one.
+    ///
+    /// Only `SETTINGS` and `PING` carry an acknowledgement, using the same flag bit that
+    /// means end-of-stream elsewhere.
+    pub const fn is_ack(self) -> bool {
+        (self.kind.0 == FrameType::SETTINGS.0 || self.kind.0 == FrameType::PING.0)
+            && self.flags & (sys::NGHTTP2_FLAG_ACK as u8) != 0
     }
 
     /// Whether this frame completes a header block.

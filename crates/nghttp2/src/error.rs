@@ -82,10 +82,11 @@ pub enum ErrorKind {
     InvalidInput,
     /// A resource was exhausted; in practice, memory allocation failed.
     Exhausted,
-    /// A condition that should not be observable through the safe API.
+    /// A condition that is neither the caller's doing nor a plain protocol violation.
     ///
-    /// This covers libnghttp2's internal control-flow signals. Receiving one indicates a
-    /// defect in this crate rather than in the caller or the peer.
+    /// This covers libnghttp2's internal control-flow signals, which should not escape the
+    /// safe API and would indicate a defect in this crate if one did, together with
+    /// genuine internal failures such as a callback failing.
     Internal,
 }
 

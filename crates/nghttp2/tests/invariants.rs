@@ -128,8 +128,11 @@ fn the_crate_reaches_for_no_io_threading_or_time_facility() {
                 offences.push(format!("{}: {facility}", file.display()));
             }
         }
-        if code.contains(".await") {
-            offences.push(format!("{}: .await", file.display()));
+        // Bare `async` and `await` as keywords, not only the `.await` postfix form.
+        for keyword in ["async", "await"] {
+            if uses_keyword(&code, keyword) {
+                offences.push(format!("{}: {keyword}", file.display()));
+            }
         }
     }
 
@@ -146,11 +149,16 @@ fn the_crate_reaches_for_no_io_threading_or_time_facility() {
 /// text but is not a use of the keyword, and mistaking one for the other would make this
 /// file fail its own check.
 fn uses_unsafe_keyword(code: &str) -> bool {
+    uses_keyword(code, "unsafe")
+}
+
+/// Whether `code` uses `keyword` as a token rather than merely containing the letters.
+fn uses_keyword(code: &str, keyword: &str) -> bool {
     let is_ident = |c: char| c.is_alphanumeric() || c == '_';
 
-    code.match_indices("unsafe").any(|(index, _)| {
+    code.match_indices(keyword).any(|(index, _)| {
         let before_ok = index == 0 || !code[..index].chars().next_back().is_some_and(is_ident);
-        let after = &code[index + "unsafe".len()..];
+        let after = &code[index + keyword.len()..];
         let after_ok = !after.chars().next().is_some_and(is_ident);
         before_ok && after_ok
     })
@@ -164,6 +172,12 @@ fn the_unsafe_keyword_detector_distinguishes_identifiers() {
     assert!(!uses_unsafe_keyword("let uses_unsafe = true;"));
     assert!(!uses_unsafe_keyword("fn check_unsafely() {}"));
     assert!(!uses_unsafe_keyword("UNSAFE_TEST_EXEMPTIONS"));
+
+    // The same rule is what makes the async/await scan meaningful.
+    assert!(uses_keyword("async fn f() {}", "async"));
+    assert!(uses_keyword("x.await;", "await"));
+    assert!(!uses_keyword("let asynchronous = 1;", "async"));
+    assert!(!uses_keyword("fn awaited() {}", "await"));
 }
 
 #[test]

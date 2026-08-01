@@ -498,6 +498,18 @@ impl<C> Session<C> {
     pub fn submit_trailer(&mut self, stream: StreamId, headers: &[Header<'_>]) -> Result<()> {
         let nva = header::to_trailer_nv_vec(headers)?;
 
+        // libnghttp2 accepts a trailer block for a stream that cannot carry one and then
+        // emits nothing, which reads as success and is not. Trailers are legal only once
+        // this stream's body has reported EofWithTrailers.
+        if !self.bodies.trailers_ready(stream) {
+            return Err(Error::new(
+                "nghttp2_submit_trailer",
+                ErrorKind::InvalidInput,
+                "this stream has no open trailer window; a body source must first report \
+                 BodyOutcome::EofWithTrailers",
+            ));
+        }
+
         // SAFETY: `self.raw` is live and `nva` is valid for its length; libnghttp2 copies
         // the contents.
         let rc = unsafe {
@@ -647,8 +659,19 @@ impl<C> Session<C> {
             ));
         }
 
-        // SAFETY: `self.raw` is live; the stream identifier and length are validated by
-        // libnghttp2 itself.
+        // libnghttp2 narrows the length internally, so a value that does not fit would be
+        // silently truncated and corrupt the flow-control accounting rather than being
+        // rejected. Check it here instead of claiming the callee validates it.
+        if i32::try_from(len).is_err() {
+            return Err(Error::new(
+                "nghttp2_session_consume",
+                ErrorKind::InvalidInput,
+                "consumed length does not fit in the range libnghttp2 accounts in",
+            ));
+        }
+
+        // SAFETY: `self.raw` is live and `len` has been range-checked above; the stream
+        // identifier is validated by libnghttp2.
         let rc = unsafe { sys::nghttp2_session_consume(self.raw, stream.get(), len) };
         if rc != 0 {
             return Err(Error::from_native("nghttp2_session_consume", rc));

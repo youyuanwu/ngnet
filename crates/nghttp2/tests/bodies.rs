@@ -535,3 +535,120 @@ fn frames_show_the_body_split_across_data_frames() {
          {data_frames}"
     );
 }
+
+/// Reads the buffer it is handed before writing, to prove nothing leaks through.
+struct Peeking {
+    saw_nonzero: Arc<AtomicUsize>,
+}
+
+impl BodySource for Peeking {
+    fn fill(&mut self, buf: &mut [u8]) -> BodyOutcome {
+        // The buffer libnghttp2 hands over is reused between frames. If it were not
+        // cleared, this would be a window onto whatever the previous frame left there,
+        // including another stream's body.
+        let nonzero = buf.iter().filter(|b| **b != 0).count();
+        self.saw_nonzero.fetch_add(nonzero, AtomicOrdering::Relaxed);
+        BodyOutcome::Eof(0)
+    }
+}
+
+#[test]
+fn a_body_source_never_sees_residue_from_earlier_frames() {
+    let saw_nonzero = Arc::new(AtomicUsize::new(0));
+
+    let mut client = client_recorder().build().unwrap();
+    let mut server = recorder().build().unwrap();
+    let (mut client_seen, mut server_seen) = (Seen::default(), Seen::default());
+
+    // Push a recognisable payload through first, so there is something to leak.
+    let secret = b"SUPERSECRETTOKEN".repeat(512);
+    client
+        .submit_request_with_body(&request_headers(), BytesBody::new(secret))
+        .unwrap();
+    pump(&mut client, &mut client_seen, &mut server, &mut server_seen);
+    server_seen.body.clear();
+
+    // Then hand a source that inspects whatever it is given.
+    for _ in 0..8 {
+        client
+            .submit_request_with_body(
+                &request_headers(),
+                Peeking {
+                    saw_nonzero: Arc::clone(&saw_nonzero),
+                },
+            )
+            .unwrap();
+        pump(&mut client, &mut client_seen, &mut server, &mut server_seen);
+    }
+
+    assert_eq!(
+        saw_nonzero.load(AtomicOrdering::Relaxed),
+        0,
+        "a body source must be handed a cleared buffer, never residue from earlier frames"
+    );
+}
+
+/// Claims to have written far more than it was given.
+struct Overrunning;
+
+impl BodySource for Overrunning {
+    fn fill(&mut self, buf: &mut [u8]) -> BodyOutcome {
+        BodyOutcome::Wrote(buf.len() + 1_000_000)
+    }
+}
+
+#[test]
+fn a_body_source_claiming_to_overrun_is_caught() {
+    // Trusting the claim would make libnghttp2 read past its buffer, and an absurd value
+    // could also cast onto a negative control code and stall the stream silently.
+    let mut client = client_recorder().build().unwrap();
+    let mut server = recorder().build().unwrap();
+    let (mut client_seen, mut server_seen) = (Seen::default(), Seen::default());
+
+    client
+        .submit_request_with_body(&request_headers(), Overrunning)
+        .unwrap();
+
+    pump(&mut client, &mut client_seen, &mut server, &mut server_seen);
+
+    let failure = client_seen
+        .closed
+        .iter()
+        .find(|(stream, _, _)| *stream == 1)
+        .expect("the stream should have been terminated");
+    assert!(
+        failure.2.as_deref().is_some_and(|e| e.contains("more than")),
+        "the overrun should be reported to the caller, saw {failure:?}"
+    );
+}
+
+#[test]
+fn consume_rejects_a_length_it_could_not_account_for() {
+    let mut server = SessionBuilder::<Seen>::server()
+        .manual_flow_control(true)
+        .build()
+        .unwrap();
+
+    let error = server
+        .consume(StreamId::new(1), usize::MAX)
+        .expect_err("a length libnghttp2 would truncate must be rejected");
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+}
+
+#[test]
+fn trailers_are_rejected_without_an_open_trailer_window() {
+    // libnghttp2 accepts this and emits nothing, which reads as success and is not.
+    let mut client = client_recorder().build().unwrap();
+    let mut client_seen = Seen::default();
+
+    let stream = client
+        .submit_request_with_body(&request_headers(), BytesBody::new(b"no trailers".to_vec()))
+        .unwrap();
+    let _ = drain(&mut client, &mut client_seen);
+
+    let error = client
+        .submit_trailer(stream, &[Header::new("x-checksum", "deadbeef")])
+        .expect_err("a body that did not announce trailers leaves no window for them");
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("EofWithTrailers"));
+}
