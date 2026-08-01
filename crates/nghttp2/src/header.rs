@@ -146,10 +146,15 @@ pub(crate) fn validate(headers: &[Header<'_>]) -> Result<()> {
             seen_regular = true;
         }
 
+        // RFC 9110 field-value: HTAB, SP, VCHAR and obs-text only. Every other control
+        // character and DEL is forbidden, not merely NUL, CR and LF — libnghttp2 applies
+        // the same rule, so accepting more here would only defer the rejection.
         for &byte in header.value {
-            if matches!(byte, 0 | b'\r' | b'\n') {
+            let permitted = matches!(byte, b'\t' | b' '..=b'~') && byte != 0x7f;
+            let obs_text = byte >= 0x80;
+            if !permitted && !obs_text {
                 return Err(invalid(
-                    "a header value must not contain NUL, CR or LF",
+                    "a header value may only contain visible characters, spaces and tabs",
                 ));
             }
         }

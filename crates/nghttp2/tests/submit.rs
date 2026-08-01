@@ -240,6 +240,31 @@ fn invalid_header_sets_are_rejected_and_the_session_survives() {
             ],
         ),
         (
+            "SOH control character in value",
+            vec![
+                Header::new(":method", "GET"),
+                Header::from_bytes(b"x-bad", b"a\x01b"),
+            ],
+        ),
+        (
+            "DEL in value",
+            vec![
+                Header::new(":method", "GET"),
+                Header::from_bytes(b"x-bad", b"a\x7fb"),
+            ],
+        ),
+        (
+            "vertical tab in value",
+            vec![
+                Header::new(":method", "GET"),
+                Header::from_bytes(b"x-bad", b"a\x0bb"),
+            ],
+        ),
+        (
+            "colon inside a name",
+            vec![Header::new(":method", "GET"), Header::new("x-a:b", "1")],
+        ),
+        (
             "leading whitespace in value",
             vec![Header::new(":method", "GET"), Header::new("x-bad", " oops")],
         ),
@@ -397,4 +422,52 @@ fn a_sensitive_header_is_still_delivered() {
         "marking a header sensitive must not stop it being sent, saw {:?}",
         seen.headers
     );
+}
+
+#[test]
+fn a_value_may_contain_tabs_spaces_and_high_bytes() {
+    // The tightened control-character rule must not reject legitimate values: HTAB, SP
+    // and obs-text are all permitted by RFC 9110.
+    let mut client = SessionBuilder::<()>::client().build().unwrap();
+
+    let mut headers = request_headers();
+    headers.push(Header::new("x-inner", "a\tb c"));
+    headers.push(Header::from_bytes(b"x-obs", b"caf\xc3\xa9"));
+
+    client
+        .submit_request(&headers)
+        .expect("tabs, spaces and high bytes are legal inside a value");
+}
+
+#[test]
+fn responding_to_an_unopened_stream_does_not_poison_it() {
+    // A response for a stream that is not open is dropped by libnghttp2 without ever
+    // closing a stream. If the duplicate guard recorded that, the identifier would be
+    // unusable once a genuine stream claimed it.
+    let mut client = SessionBuilder::<()>::client().build().unwrap();
+    let mut server = recording().build().unwrap();
+    let mut seen = Seen::default();
+
+    // Stream 3 does not exist yet.
+    server
+        .submit_response(StreamId::new(3), &[Header::new(":status", "204")])
+        .expect("an unopened stream identifier is accepted");
+
+    // Now open streams 1 and 3 for real.
+    client.submit_request(&request_headers()).unwrap();
+    let second = client.submit_request(&request_headers()).unwrap();
+    assert_eq!(second.get(), 3);
+
+    let wire = drain(&mut client, &mut ());
+    server.recv(&wire, &mut seen).unwrap();
+
+    server
+        .submit_response(StreamId::new(3), &[Header::new(":status", "200")])
+        .expect("the genuine stream 3 must still accept its response");
+
+    // And the duplicate guard still works on it.
+    let error = server
+        .submit_response(StreamId::new(3), &[Header::new(":status", "200")])
+        .expect_err("a genuine duplicate must still be rejected");
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
 }

@@ -430,7 +430,13 @@ impl<C> Session<C> {
     pub fn submit_response(&mut self, stream: StreamId, headers: &[Header<'_>]) -> Result<()> {
         let nva = header::to_nv_vec(headers)?;
 
-        if !self.responded.claim(stream) {
+        // The duplicate guard only applies to streams that actually exist. libnghttp2
+        // accepts a response for an unopened stream and silently drops the frame without
+        // ever closing a stream, so claiming one here would leave an entry that nothing
+        // releases — poisoning a later, genuine stream that reused the identifier.
+        let track = self.stream_exists(stream);
+
+        if track && !self.responded.claim(stream) {
             return Err(Error::new(
                 "nghttp2_submit_response2",
                 ErrorKind::InvalidInput,
@@ -453,10 +459,28 @@ impl<C> Session<C> {
         if rc != 0 {
             // The claim is rolled back so a caller that corrects the arguments and retries
             // is not blocked by its own failed attempt.
-            self.responded.release(stream);
+            if track {
+                self.responded.release(stream);
+            }
             return Err(Error::from_native("nghttp2_submit_response2", rc));
         }
         Ok(())
+    }
+
+    /// Whether `stream` is currently open on this session.
+    ///
+    /// libnghttp2 offers no direct existence predicate; querying a stream's effective
+    /// local window size reports -1 for a stream it does not know, which serves.
+    fn stream_exists(&self, stream: StreamId) -> bool {
+        if stream.is_connection() {
+            return false;
+        }
+        // SAFETY: `self.raw` is live; this only inspects session state and accepts any
+        // stream identifier.
+        let window = unsafe {
+            sys::nghttp2_session_get_stream_effective_local_window_size(self.raw, stream.get())
+        };
+        window >= 0
     }
 
     /// Submits a trailing header block on an open stream.
