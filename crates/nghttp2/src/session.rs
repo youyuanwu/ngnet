@@ -13,7 +13,8 @@ use crate::handlers::{HeaderAction, Handlers};
 use crate::header::{self, Header};
 use crate::options::Options;
 use crate::settings::Setting;
-use crate::state::{BodyRegistry, PendingErrors, ResponseGuard};
+use crate::body::{BodyError, BodySource};
+use crate::state::{BodyEntry, BodyRegistry, PendingErrors, ResponseGuard};
 use crate::stream::{FrameInfo, StreamId};
 
 /// Which side of the connection a session drives.
@@ -125,9 +126,12 @@ impl<C> SessionBuilder<C> {
     }
 
     /// Called when a stream closes, for any reason.
+    ///
+    /// The final argument carries the error a body source reported, if the stream ended
+    /// because the caller's own body production failed.
     pub fn on_stream_close(
         mut self,
-        handler: impl FnMut(&mut C, StreamId, ErrorCode) + Send + 'static,
+        handler: impl FnMut(&mut C, StreamId, ErrorCode, Option<BodyError>) + Send + 'static,
     ) -> Self {
         self.handlers.stream_close = Some(Box::new(handler));
         self
@@ -178,6 +182,7 @@ impl<C> SessionBuilder<C> {
             raw,
             allocation,
             handlers: self.handlers,
+            manual_flow_control: self.manual_flow_control,
             bodies: BodyRegistry::default(),
             pending: PendingErrors::default(),
             responded: ResponseGuard::default(),
@@ -241,6 +246,7 @@ pub struct Session<C> {
     allocation: Arc<AllocState>,
     // Reached from trampolines as disjoint mutable borrows, never through `self`.
     handlers: Handlers<C>,
+    manual_flow_control: bool,
     bodies: BodyRegistry,
     pending: PendingErrors,
     responded: ResponseGuard,
@@ -500,6 +506,140 @@ impl<C> Session<C> {
 
         if rc != 0 {
             return Err(Error::from_native("nghttp2_submit_trailer", rc));
+        }
+        Ok(())
+    }
+
+    /// Submits a request with a body.
+    ///
+    /// The body is produced progressively by `body` as capacity becomes available. To
+    /// send trailers afterwards, the source must report
+    /// [`BodyOutcome::EofWithTrailers`](crate::BodyOutcome::EofWithTrailers).
+    pub fn submit_request_with_body(
+        &mut self,
+        headers: &[Header<'_>],
+        body: impl BodySource + 'static,
+    ) -> Result<StreamId> {
+        let nva = header::to_nv_vec(headers)?;
+        let entry = BodyRegistry::prepare(BodyEntry::new(Box::new(body)));
+        let provider = Self::provider::<C>(entry);
+
+        // SAFETY: `self.raw` is live, `nva` is valid for its length and is copied by
+        // libnghttp2, and `provider` is copied too — the entry it points at is owned by
+        // this session's registry and outlives the stream.
+        let rc = unsafe {
+            sys::nghttp2_submit_request2(
+                self.raw,
+                core::ptr::null(),
+                nva.as_ptr(),
+                nva.len(),
+                &provider,
+                core::ptr::null_mut(),
+            )
+        };
+
+        if rc < 0 {
+            BodyRegistry::discard(entry);
+            return Err(Error::from_native("nghttp2_submit_request2", rc));
+        }
+
+        let stream = StreamId::new(rc);
+        self.bodies.attach(stream, entry);
+        Ok(stream)
+    }
+
+    /// Submits a response with a body.
+    pub fn submit_response_with_body(
+        &mut self,
+        stream: StreamId,
+        headers: &[Header<'_>],
+        body: impl BodySource + 'static,
+    ) -> Result<()> {
+        let nva = header::to_nv_vec(headers)?;
+
+        let track = self.stream_exists(stream);
+        if track && !self.responded.claim(stream) {
+            return Err(Error::new(
+                "nghttp2_submit_response2",
+                ErrorKind::InvalidInput,
+                "a response has already been submitted for this stream",
+            ));
+        }
+
+        let entry = BodyRegistry::prepare(BodyEntry::new(Box::new(body)));
+        let provider = Self::provider::<C>(entry);
+
+        // SAFETY: as for `submit_request_with_body`.
+        let rc = unsafe {
+            sys::nghttp2_submit_response2(
+                self.raw,
+                stream.get(),
+                nva.as_ptr(),
+                nva.len(),
+                &provider,
+            )
+        };
+
+        if rc != 0 {
+            BodyRegistry::discard(entry);
+            if track {
+                self.responded.release(stream);
+            }
+            return Err(Error::from_native("nghttp2_submit_response2", rc));
+        }
+
+        self.bodies.attach(stream, entry);
+        Ok(())
+    }
+
+    /// Builds the data provider libnghttp2 copies at submission.
+    ///
+    /// The union member is a bare pointer, which cannot hold a trait object, so it holds
+    /// the address of the owning entry instead.
+    fn provider<T>(entry: core::ptr::NonNull<BodyEntry>) -> sys::nghttp2_data_provider2 {
+        sys::nghttp2_data_provider2 {
+            source: sys::nghttp2_data_source {
+                ptr: entry.as_ptr().cast::<core::ffi::c_void>(),
+            },
+            read_callback: Some(callbacks::read_body::<T>),
+        }
+    }
+
+    /// Whether this stream's body has announced that trailers may follow.
+    ///
+    /// Trailers are only legal once the body source has reported
+    /// [`BodyOutcome::EofWithTrailers`](crate::BodyOutcome::EofWithTrailers), which
+    /// happens while the session is serialising rather than when the caller submits. This
+    /// reports when that moment has arrived.
+    ///
+    /// Note the session stops wanting to write once a body ends without closing its
+    /// stream, so a loop that drains until idle must check this before concluding the
+    /// exchange is over.
+    pub fn trailers_ready(&self, stream: StreamId) -> bool {
+        self.bodies.trailers_ready(stream)
+    }
+
+    /// Reports that received data has been consumed, replenishing flow-control windows.
+    ///
+    /// Only available on sessions built with
+    /// [`SessionBuilder::manual_flow_control`]. Sessions replenish windows automatically
+    /// by default, and calling this on one of those is rejected rather than silently
+    /// doing nothing.
+    pub fn consume(&mut self, stream: StreamId, len: usize) -> Result<()> {
+        if !self.manual_flow_control {
+            return Err(Error::new(
+                "nghttp2_session_consume",
+                ErrorKind::InvalidInput,
+                "this session replenishes flow-control windows automatically; \
+                 build it with manual_flow_control(true) to report consumption",
+            ));
+        }
+
+        // SAFETY: `self.raw` is live; the stream identifier and length are validated by
+        // libnghttp2 itself.
+        let rc = unsafe { sys::nghttp2_session_consume(self.raw, stream.get(), len) };
+        if rc != 0 {
+            return Err(Error::from_native("nghttp2_session_consume", rc));
         }
         Ok(())
     }

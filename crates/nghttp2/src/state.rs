@@ -2,27 +2,110 @@
 //!
 //! These types are reached from `extern "C"` callbacks by way of disjoint mutable
 //! borrows of individual [`crate::session::Session`] fields, never through the session
-//! itself. They are introduced here, in the phase that establishes the bridge, so that
-//! later phases add capability without widening the aliasing surface.
+//! itself.
 
+use core::ptr::NonNull;
 use std::collections::{HashMap, HashSet};
 
+use crate::body::{BodyError, BodySource};
 use crate::stream::StreamId;
+
+/// One outgoing body, at an address libnghttp2 holds for the life of its stream.
+pub(crate) struct BodyEntry {
+    pub(crate) source: Box<dyn BodySource>,
+    /// Set once the source reports that trailers will follow.
+    pub(crate) trailers_ready: bool,
+}
+
+impl BodyEntry {
+    pub(crate) fn new(source: Box<dyn BodySource>) -> Self {
+        Self {
+            source,
+            trailers_ready: false,
+        }
+    }
+}
 
 /// Outgoing message bodies, keyed by the stream they belong to.
 ///
-/// Entries are boxed so that adding a stream never moves an existing one: libnghttp2
-/// holds the address of each entry in its data-source union, and that pointer must stay
-/// valid for the life of the stream.
-#[derive(Debug, Default)]
+/// Entries are owned as raw pointers rather than `Box`es. That is deliberate: libnghttp2
+/// keeps the address of each entry in its data-source union and writes through it while a
+/// mutable borrow of this registry is live. Holding the entries in `Box`es would assert a
+/// uniqueness guarantee those writes violate, so ownership here is manual and released
+/// explicitly.
+#[derive(Default)]
 pub(crate) struct BodyRegistry {
-    #[expect(dead_code, reason = "populated in the phase that adds message bodies")]
-    entries: HashMap<StreamId, Box<BodyEntry>>,
+    entries: HashMap<StreamId, NonNull<BodyEntry>>,
 }
 
-/// One outgoing body, at a stable address.
-#[derive(Debug, Default)]
-pub(crate) struct BodyEntry {}
+// SAFETY: the registry owns its entries exclusively, and `BodyEntry` holds only a
+// `Box<dyn BodySource>` where `BodySource: Send`. Moving the registry between threads
+// therefore moves only data that is itself `Send`.
+unsafe impl Send for BodyRegistry {}
+
+impl BodyRegistry {
+    /// Takes ownership of `entry`, returning the address libnghttp2 should hold.
+    ///
+    /// The entry is not yet associated with a stream: submission assigns the identifier,
+    /// and only then can it be recorded with [`Self::attach`].
+    pub(crate) fn prepare(entry: BodyEntry) -> NonNull<BodyEntry> {
+        let raw = Box::into_raw(Box::new(entry));
+        // SAFETY: `Box::into_raw` never yields null.
+        unsafe { NonNull::new_unchecked(raw) }
+    }
+
+    /// Records a prepared entry against the stream it was assigned.
+    pub(crate) fn attach(&mut self, stream: StreamId, entry: NonNull<BodyEntry>) {
+        if let Some(previous) = self.entries.insert(stream, entry) {
+            // A stream cannot carry two bodies; if it somehow did, the old one would leak.
+            Self::release_raw(previous);
+        }
+    }
+
+    /// Drops a prepared entry that was never attached, because submission failed.
+    pub(crate) fn discard(entry: NonNull<BodyEntry>) {
+        Self::release_raw(entry);
+    }
+
+    /// Drops the entry belonging to `stream`, if any.
+    pub(crate) fn detach(&mut self, stream: StreamId) {
+        if let Some(entry) = self.entries.remove(&stream) {
+            Self::release_raw(entry);
+        }
+    }
+
+    /// Whether this stream's body has announced that trailers may follow.
+    pub(crate) fn trailers_ready(&self, stream: StreamId) -> bool {
+        self.entries.get(&stream).is_some_and(|entry| {
+            // SAFETY: the pointer came from `prepare` and is owned by this registry, so it
+            // is live. No trampoline can be running while this shared borrow exists: both
+            // require the session, and the caller holds it.
+            unsafe { entry.as_ref() }.trailers_ready
+        })
+    }
+
+    fn release_raw(entry: NonNull<BodyEntry>) {
+        // SAFETY: every pointer in this registry came from `prepare`, which produced it
+        // with `Box::into_raw`, and each is released exactly once.
+        drop(unsafe { Box::from_raw(entry.as_ptr()) });
+    }
+}
+
+impl Drop for BodyRegistry {
+    fn drop(&mut self) {
+        for (_, entry) in self.entries.drain() {
+            Self::release_raw(entry);
+        }
+    }
+}
+
+impl core::fmt::Debug for BodyRegistry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BodyRegistry")
+            .field("streams", &self.entries.len())
+            .finish()
+    }
+}
 
 /// Errors reported by a caller's body source, held until the stream closes.
 ///
@@ -31,8 +114,17 @@ pub(crate) struct BodyEntry {}
 /// stream-close handler hand it back to the caller.
 #[derive(Debug, Default)]
 pub(crate) struct PendingErrors {
-    #[expect(dead_code, reason = "populated in the phase that adds message bodies")]
-    by_stream: HashMap<StreamId, ()>,
+    by_stream: HashMap<StreamId, BodyError>,
+}
+
+impl PendingErrors {
+    pub(crate) fn park(&mut self, stream: StreamId, error: BodyError) {
+        self.by_stream.insert(stream, error);
+    }
+
+    pub(crate) fn take(&mut self, stream: StreamId) -> Option<BodyError> {
+        self.by_stream.remove(&stream)
+    }
 }
 
 /// Streams that already carry a response.

@@ -30,6 +30,7 @@
 #[allow(unsafe_code)]
 #[path = "alloc.rs"]
 mod alloc_state;
+mod body;
 #[allow(unsafe_code)]
 mod callbacks;
 #[allow(unsafe_code)]
@@ -42,10 +43,12 @@ mod session;
 mod handlers;
 mod header;
 mod settings;
+#[allow(unsafe_code)]
 mod state;
 mod stream;
 
 pub use error::{ALL_NATIVE_CODES, Error, ErrorCode, ErrorKind, NativeCode, Result};
+pub use body::{BodyError, BodyOutcome, BodySource, BytesBody};
 pub use handlers::HeaderAction;
 pub use header::Header;
 pub use session::{Session, SessionBuilder};

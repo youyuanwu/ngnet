@@ -59,7 +59,7 @@ fn recording() -> SessionBuilder<Seen> {
                 HeaderAction::Continue
             },
         )
-        .on_stream_close(|seen: &mut Seen, stream: StreamId, code: ErrorCode| {
+        .on_stream_close(|seen: &mut Seen, stream: StreamId, code: ErrorCode, _body_error| {
             seen.closed.push((stream.get(), code.get()));
         })
 }

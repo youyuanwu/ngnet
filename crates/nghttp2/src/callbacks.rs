@@ -23,9 +23,10 @@ use core::ffi::c_void;
 
 use nghttp2_sys as sys;
 
+use crate::body::{BodyOutcome, BodyError};
 use crate::error::ErrorCode;
 use crate::handlers::{HeaderAction, Handlers};
-use crate::state::{BodyRegistry, PendingErrors, ResponseGuard};
+use crate::state::{BodyEntry, BodyRegistry, PendingErrors, ResponseGuard};
 use crate::stream::{FrameInfo, StreamId};
 
 /// Everything a trampoline may touch during one FFI call.
@@ -35,9 +36,7 @@ use crate::stream::{FrameInfo, StreamId};
 pub(crate) struct Bridge<'a, C> {
     pub(crate) handlers: &'a mut Handlers<C>,
     pub(crate) context: &'a mut C,
-    #[expect(dead_code, reason = "read by the phase that adds message bodies")]
     pub(crate) bodies: &'a mut BodyRegistry,
-    #[expect(dead_code, reason = "read by the phase that adds message bodies")]
     pub(crate) pending: &'a mut PendingErrors,
     pub(crate) responded: &'a mut ResponseGuard,
 }
@@ -201,9 +200,73 @@ pub(crate) unsafe extern "C" fn on_stream_close<C>(
     // be installed during send as well as receive: nghttp2 closes streams while it
     // serialises, not only while it parses.
     bridge.responded.release(stream);
+    bridge.bodies.detach(stream);
+    let body_error = bridge.pending.take(stream);
 
     if let Some(handler) = bridge.handlers.stream_close.as_mut() {
-        handler(bridge.context, stream, ErrorCode::new(error_code));
+        handler(
+            bridge.context,
+            stream,
+            ErrorCode::new(error_code),
+            body_error,
+        );
     }
     0
+}
+
+/// Asks a caller's body source for the next chunk of an outgoing message.
+///
+/// Runs inside `nghttp2_session_mem_send2`, which is the other reason the context bridge
+/// must be installed for sends and not only receives.
+pub(crate) unsafe extern "C" fn read_body<C>(
+    _session: *mut sys::nghttp2_session,
+    stream_id: i32,
+    buf: *mut u8,
+    length: usize,
+    data_flags: *mut u32,
+    source: *mut sys::nghttp2_data_source,
+    user_data: *mut c_void,
+) -> sys::nghttp2_ssize {
+    // The entry is reached through the data source alone, never by looking it up in the
+    // registry: a lookup would reborrow through the bridge's mutable borrow, which is
+    // live for the whole call.
+    // SAFETY: libnghttp2 hands back the union this crate populated at submission, whose
+    // `ptr` member is the address of a live `BodyEntry` owned by the session's registry.
+    let entry = unsafe { &mut *(*source).ptr.cast::<BodyEntry>() };
+
+    // SAFETY: libnghttp2 guarantees `buf` is writable for `length` octets.
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, length) };
+
+    match entry.source.fill(out) {
+        BodyOutcome::Wrote(written) => written as sys::nghttp2_ssize,
+        BodyOutcome::Eof(written) => {
+            // SAFETY: libnghttp2 passes a valid pointer to its flags word.
+            unsafe { *data_flags |= sys::NGHTTP2_DATA_FLAG_EOF };
+            written as sys::nghttp2_ssize
+        }
+        BodyOutcome::EofWithTrailers(written) => {
+            // Ending the body without closing the stream is what keeps a trailing header
+            // block legal; without NO_END_STREAM the stream ends here and trailers could
+            // never be sent.
+            // SAFETY: libnghttp2 passes a valid pointer to its flags word.
+            unsafe {
+                *data_flags |= sys::NGHTTP2_DATA_FLAG_EOF | sys::NGHTTP2_DATA_FLAG_NO_END_STREAM;
+            }
+            entry.trailers_ready = true;
+            written as sys::nghttp2_ssize
+        }
+        BodyOutcome::Fail(error) => {
+            park_body_error::<C>(user_data, StreamId::new(stream_id), error);
+            // Resets this stream rather than failing the connection.
+            sys::NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE as sys::nghttp2_ssize
+        }
+    }
+}
+
+/// Parks a body failure so the stream-close handler can report it.
+fn park_body_error<C>(user_data: *mut c_void, stream: StreamId, error: BodyError) {
+    // SAFETY: `user_data` is whatever `with_context` installed, or null.
+    if let Some(bridge) = unsafe { bridge::<C>(user_data) } {
+        bridge.pending.park(stream, error);
+    }
 }

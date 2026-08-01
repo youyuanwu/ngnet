@@ -60,7 +60,7 @@ fn handlers_receive_the_caller_context_and_borrowed_data() {
         .on_frame(|observed: &mut Observed, info: FrameInfo| {
             observed.frames.push(info.kind().get());
         })
-        .on_stream_close(|observed: &mut Observed, stream: StreamId, code| {
+        .on_stream_close(|observed: &mut Observed, stream: StreamId, code, _body_error| {
             observed.closed.push((stream.get(), code.get()));
         })
         .build()
@@ -312,7 +312,7 @@ fn a_header_handler_can_cancel_its_stream() {
                 }
             },
         )
-        .on_stream_close(|observed: &mut Observed, stream: StreamId, code| {
+        .on_stream_close(|observed: &mut Observed, stream: StreamId, code, _body_error| {
             observed.closed.push((stream.get(), code.get()));
         })
         .build()

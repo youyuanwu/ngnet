@@ -10,6 +10,7 @@
 //! cancelled: libnghttp2 treats a nonzero return from the other callbacks as fatal to
 //! the whole connection rather than to one stream.
 
+use crate::body::BodyError;
 use crate::error::ErrorCode;
 use crate::stream::{FrameInfo, StreamId};
 
@@ -27,7 +28,8 @@ type BeginHeaders<C> = Box<dyn FnMut(&mut C, FrameInfo) -> HeaderAction + Send>;
 type Header<C> = Box<dyn FnMut(&mut C, FrameInfo, &[u8], &[u8]) -> HeaderAction + Send>;
 type DataChunk<C> = Box<dyn FnMut(&mut C, StreamId, &[u8]) + Send>;
 type FrameRecv<C> = Box<dyn FnMut(&mut C, FrameInfo) + Send>;
-type StreamClose<C> = Box<dyn FnMut(&mut C, StreamId, ErrorCode) + Send>;
+type StreamClose<C> =
+    Box<dyn FnMut(&mut C, StreamId, ErrorCode, Option<BodyError>) + Send>;
 
 /// The set of handlers registered on a session.
 ///

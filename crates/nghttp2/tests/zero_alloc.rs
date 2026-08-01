@@ -151,7 +151,7 @@ fn receiving_allocates_nothing_in_the_wrapper() {
         .on_frame(|tally: &mut Tally, _: FrameInfo| {
             tally.frames += 1;
         })
-        .on_stream_close(|tally: &mut Tally, _: StreamId, _| {
+        .on_stream_close(|tally: &mut Tally, _: StreamId, _, _| {
             tally.closed += 1;
         })
         .build()
