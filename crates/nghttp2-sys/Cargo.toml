@@ -18,5 +18,5 @@ build = "build.rs"
 doctest = false
 
 [build-dependencies]
-cmake = "0.1"
-bindgen = "0.72"
+cmake.workspace = true
+bindgen.workspace = true
