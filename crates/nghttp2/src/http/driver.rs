@@ -477,7 +477,7 @@ where
             flush(&mut session, &mut writer, &mut events).await?;
             // A body announces its trailers while it is being serialised, so they can only
             // be submitted once that pass is over — and then written by a second one.
-            if submit_trailers(&mut session, &shared)? {
+            if submit_trailers(&mut session, &shared, &registry)? {
                 flush(&mut session, &mut writer, &mut events).await?;
             }
             // Serialising fires the stream-close handler, so what it observed is
@@ -742,7 +742,11 @@ fn recover(failure: crate::BodyError) -> Error {
 ///
 /// Returns whether anything was submitted, since submitting makes the session want to
 /// write again.
-fn submit_trailers(session: &mut Session<Events>, shared: &Shared) -> Result<bool> {
+fn submit_trailers(
+    session: &mut Session<Events>,
+    shared: &Shared,
+    registry: &Registry,
+) -> Result<bool> {
     let mut submitted = false;
 
     for (stream, trailers) in shared.take_trailers() {
@@ -754,12 +758,41 @@ fn submit_trailers(session: &mut Session<Events>, shared: &Shared) -> Result<boo
             continue;
         }
 
-        let fields = head::trailer_fields(&trailers)?;
+        let fields = match head::trailer_fields(&trailers) {
+            Ok(fields) => fields,
+            Err(error) => {
+                // A trailing block this crate cannot encode is one message's problem, not
+                // the connection's. The receive side treats the mirror image the same way,
+                // and the asymmetry would otherwise be that a caller's own bad trailer is
+                // more destructive than a peer's.
+                fail_stream(registry, stream, error);
+                session.reset_stream(StreamId::new(stream), ErrorCode::INTERNAL_ERROR)?;
+                continue;
+            }
+        };
+
         session.submit_trailer(StreamId::new(stream), &fields.views())?;
         submitted = true;
     }
 
     Ok(submitted)
+}
+
+/// Tells whoever is waiting on `stream` why it is going away.
+///
+/// The response future if it has not been answered, and the receiving body otherwise —
+/// which is the only channel left once a head has been delivered.
+fn fail_stream(registry: &Registry, stream: i32, error: Error) {
+    let Some(slot) = registry.slot(stream) else {
+        return;
+    };
+    if slot.is_settled() {
+        if let Some(incoming) = registry.incoming(stream) {
+            incoming.fail(error);
+        }
+    } else {
+        slot.fail(error);
+    }
 }
 
 /// Writes out everything the session currently has to say.

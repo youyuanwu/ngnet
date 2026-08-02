@@ -54,6 +54,12 @@ use super::super::waker::StreamWaker;
 /// rather than forwarded. The bound is what stops a body yielding nothing but empty frames
 /// from spinning inside `Session::send`, where there is no yield point and the whole
 /// connection would be held up behind it.
+///
+/// It bounds the freeze, not the waste: a body that produces empty frames without end
+/// still costs one empty frame on the wire for every sixteen it produces, because
+/// [`BodyOutcome::Wrote`] with zero octets emits one and reschedules the stream. That is
+/// the deliberate trade — a slow leak the peer can see, rather than a connection that has
+/// stopped moving and nobody can see. A body behaving that way is broken either way.
 const EMPTY_FRAME_LIMIT: usize = 16;
 
 /// Presents an [`http_body::Body`] to the session.

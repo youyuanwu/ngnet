@@ -338,6 +338,117 @@ fn outgoing_trailers_reach_the_peer_after_the_final_data() {
 }
 
 #[test]
+fn two_streams_trailing_in_one_pass_each_get_their_own_block() {
+    // Trailers are stashed by stream and drained in one place, so two bodies announcing
+    // in the same serialisation pass are exactly the case where a stash keyed wrongly —
+    // or drained assuming one entry — would go unnoticed. Their blocks differ, so a
+    // crossed wire is visible rather than merely possible.
+    let (client_side, server_side) = duplex(false);
+    let (requests, connection) =
+        nghttp2::http::handshake::<_, Scripted>(client_side).expect("handshake");
+
+    let mut sent = Vec::new();
+    for (index, mark) in ["first", "second"].into_iter().enumerate() {
+        let (body, script) = scripted();
+        script.send(payload(1_000 + index));
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-mark", http::HeaderValue::from_static(mark));
+        script.finish_with_trailers(trailers);
+        sent.push(requests.send_request(upload(&format!("/{mark}"), body)));
+    }
+
+    let exchange = async {
+        for response in sent {
+            response.await.expect("a response");
+        }
+        for _ in 0..32 {
+            yield_now().await;
+        }
+        drop(requests);
+    };
+
+    let mut peer = Peer::default();
+    let () = block_on(alongside(
+        alongside(exchange, connection),
+        serve(server_side, peer_session(), &mut peer, answer_at_once),
+    ));
+
+    assert_eq!(
+        peer.trailers.get(&1).map(Vec::as_slice),
+        Some(&[("x-mark".to_owned(), "first".to_owned())][..]),
+    );
+    assert_eq!(
+        peer.trailers.get(&3).map(Vec::as_slice),
+        Some(&[("x-mark".to_owned(), "second".to_owned())][..]),
+    );
+    assert_eq!(peer.bodies.get(&1).map(Vec::len), Some(1_000));
+    assert_eq!(peer.bodies.get(&3).map(Vec::len), Some(1_001));
+}
+
+#[test]
+fn a_forbidden_outgoing_trailer_fails_only_its_own_stream() {
+    // A trailing block this crate cannot encode is one message's problem. Failing the
+    // connection instead would make a caller's own bad trailer more destructive than a
+    // peer's — the receive side resets just the stream for the mirror image of this.
+    let (client_side, server_side) = duplex(false);
+    let (requests, connection) =
+        nghttp2::http::handshake::<_, Scripted>(client_side).expect("handshake");
+
+    let (bad_body, bad) = scripted();
+    bad.send(payload(500));
+    let mut forbidden = http::HeaderMap::new();
+    // Connection-specific, and RFC 9113 §8.2.2 makes a message carrying one malformed.
+    forbidden.insert("connection", http::HeaderValue::from_static("keep-alive"));
+    bad.finish_with_trailers(forbidden);
+    let first = requests.send_request(upload("/forbidden", bad_body));
+
+    let (good_body, good) = scripted();
+    good.send(payload(700));
+    let mut allowed = http::HeaderMap::new();
+    allowed.insert("x-mark", http::HeaderValue::from_static("fine"));
+    good.finish_with_trailers(allowed);
+    let second = requests.send_request(upload("/allowed", good_body));
+
+    let exchange = async {
+        // Whichever channel is still open is the one the caller hears through: the
+        // response future while it is unanswered, the receiving body once it is not.
+        let rejected = first.await.err();
+        let second = second.await.expect("a response");
+
+        for _ in 0..32 {
+            yield_now().await;
+        }
+
+        drop((second, requests));
+        rejected
+    };
+
+    let mut peer = Peer::default();
+    let reported = block_on(alongside(
+        alongside(exchange, connection),
+        serve(server_side, peer_session(), &mut peer, answer_at_once),
+    ));
+
+    let reported = reported.expect("the rejected trailer was never reported");
+    assert_eq!(reported.kind(), nghttp2::http::ErrorKind::Protocol);
+    assert!(
+        reported.to_string().contains("connection-specific"),
+        "the caller was not told which field was the problem: {reported}",
+    );
+
+    assert!(
+        !peer.trailers.contains_key(&1),
+        "a forbidden trailing block reached the peer",
+    );
+    assert_eq!(
+        peer.trailers.get(&3).map(Vec::as_slice),
+        Some(&[("x-mark".to_owned(), "fine".to_owned())][..]),
+        "the other stream's trailers were lost with it",
+    );
+    assert_eq!(peer.bodies.get(&3).map(Vec::len), Some(700));
+}
+
+#[test]
 fn a_failing_body_resets_the_stream_and_surfaces_its_error() {
     // Spec SC-010. Two halves: the peer must see the stream go away, and the caller must
     // get back the error their own body produced rather than a rendering of it.

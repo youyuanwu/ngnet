@@ -320,6 +320,59 @@ mod tests {
     }
 
     #[test]
+    fn a_trailing_block_is_encoded_as_ordinary_fields() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-checksum", http::HeaderValue::from_static("deadbeef"));
+        trailers.append("x-note", http::HeaderValue::from_static("one"));
+        trailers.append("x-note", http::HeaderValue::from_static("two"));
+
+        let encoded = trailer_fields(&trailers).expect("a valid trailing block");
+        let mut seen: Vec<(String, String)> = encoded
+            .fields
+            .iter()
+            .map(|(name, value)| {
+                (
+                    String::from_utf8_lossy(name).into_owned(),
+                    String::from_utf8_lossy(value).into_owned(),
+                )
+            })
+            .collect();
+        seen.sort();
+
+        assert_eq!(
+            seen,
+            [
+                ("x-checksum".to_owned(), "deadbeef".to_owned()),
+                ("x-note".to_owned(), "one".to_owned()),
+                ("x-note".to_owned(), "two".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_connection_specific_trailer_is_rejected_rather_than_dropped() {
+        // The same rule as request heads, from the trailing side. Silently discarding a
+        // field a caller deliberately set would be worse than saying no.
+        for name in ["connection", "transfer-encoding", "keep-alive", "upgrade"] {
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert(
+                http::HeaderName::from_bytes(name.as_bytes()).expect("a field name"),
+                http::HeaderValue::from_static("whatever"),
+            );
+
+            let outcome = trailer_fields(&trailers);
+            assert!(outcome.is_err(), "a `{name}` trailer was accepted");
+            assert_eq!(outcome.unwrap_err().kind(), ErrorKind::Protocol);
+        }
+    }
+
+    #[test]
+    fn an_empty_trailing_block_encodes_to_nothing() {
+        let encoded = trailer_fields(&http::HeaderMap::new()).expect("an empty block");
+        assert!(encoded.views().is_empty());
+    }
+
+    #[test]
     fn a_repeated_trailer_keeps_every_value() {
         let map = trailers(&fields(&[
             ("x-note", "one"),
