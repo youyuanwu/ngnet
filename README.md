@@ -3,6 +3,9 @@
 Rust bindings for [nghttp2](https://nghttp2.org), targeting cleartext HTTP/2
 (**h2c**).
 
+Design notes, the invariants the test suite pins, and the tracked backlog live in
+[`docs/`](docs/).
+
 ## Crates
 
 | Crate | Description |
