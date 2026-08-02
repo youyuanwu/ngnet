@@ -285,3 +285,98 @@ fn the_sans_io_surface_is_unchanged() {
     error_surface(&Error::from_native("nghttp2_session_send", -901));
     session_surface().expect("the session surface should still work as well as compile");
 }
+
+/// The asynchronous surface, present only when the `http` feature is on.
+///
+/// Kept in the same fixture as the sans-I/O surface, and gated rather than split out, so
+/// there is one place to look for "what does this crate promise". The feature is on by
+/// default, so this compiles in the ordinary build.
+#[cfg(feature = "http")]
+mod asynchronous {
+    use std::error::Error as StdError;
+
+    use nghttp2::http::testing::{http_body_crate as http_body, http_crate as http};
+    use nghttp2::http::{
+        Error, ErrorKind, ResponseFuture, SendRequest, Transport, TransportRead, TransportWrite,
+        handshake,
+    };
+
+    /// The error taxonomy, left open so it can grow without breaking a caller's match.
+    pub(super) fn error_surface(error: &Error) {
+        let _: ErrorKind = error.kind();
+        let _: bool = error.is_closed();
+        let _: Option<&(dyn StdError + 'static)> = StdError::source(error);
+        let _: String = error.to_string();
+
+        match error.kind() {
+            ErrorKind::Transport
+            | ErrorKind::Connection
+            | ErrorKind::Stream
+            | ErrorKind::Protocol
+            | ErrorKind::Closed
+            | ErrorKind::Body => {}
+            // Deliberate: adding a kind must not break a downstream match.
+            _ => {}
+        }
+    }
+
+    /// The client entry point, pinned by naming its shape rather than by calling it.
+    ///
+    /// `handshake` is generic over both the transport and the body, and returns an
+    /// unnameable future, so it cannot be pinned with a `fn` pointer. Naming the pieces a
+    /// caller would name is the next best thing.
+    pub(super) fn client_surface<T, B>(transport: T) -> core::result::Result<(), Error>
+    where
+        T: Transport,
+        T::Reader: TransportRead,
+        T::Writer: TransportWrite,
+        B: http_body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let (requests, connection): (SendRequest<B>, _) = handshake::<T, B>(transport)?;
+        let cloned: SendRequest<B> = requests.clone();
+        let _: bool = cloned.is_closed();
+        let _: fn(&SendRequest<B>) -> bool = SendRequest::<B>::is_closed;
+        let response: ResponseFuture = requests.send_request(
+            http::Request::builder()
+                .uri("http://example.test/")
+                .body(unreachable_body::<B>())
+                .expect("a request"),
+        );
+        drop((response, connection));
+        Ok(())
+    }
+
+    /// Never called. Its only job is to give the fixture above a `B` to hand over.
+    fn unreachable_body<B>() -> B {
+        unreachable!("the client surface fixture is never executed")
+    }
+}
+
+#[cfg(feature = "http")]
+#[test]
+fn the_asynchronous_surface_is_unchanged() {
+    use nghttp2::http::testing::{Duplex, Empty};
+
+    let _: fn(&nghttp2::http::Error) = asynchronous::error_surface;
+    let _: fn(Duplex) -> core::result::Result<(), nghttp2::http::Error> =
+        asynchronous::client_surface::<Duplex, Empty>;
+
+    // The ecosystem types are part of the promise too: a caller hands over an
+    // `http::Request` and gets back an `http::Response`, not a bespoke type.
+    let (client_side, _peer) = nghttp2::http::testing::duplex(false);
+    let (requests, connection) =
+        nghttp2::http::handshake::<Duplex, Empty>(client_side).expect("handshake");
+    let response: nghttp2::http::ResponseFuture = requests.send_request(
+        nghttp2::http::testing::http_crate::Request::builder()
+            .uri("http://example.test/")
+            .body(Empty)
+            .expect("a request"),
+    );
+    drop(connection);
+
+    let error = nghttp2::http::testing::block_on(response).expect_err("the driver is gone");
+    asynchronous::error_surface(&error);
+    assert_eq!(error.kind(), nghttp2::http::ErrorKind::Closed);
+}
