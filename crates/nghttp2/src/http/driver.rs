@@ -35,7 +35,6 @@ use core::task::Poll;
 use std::collections::VecDeque;
 use std::error::Error as StdError;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::task::Waker;
 
 use bytes::BytesMut;
 use http_body::Body;
@@ -105,7 +104,12 @@ enum Event {
     /// The peer ended the message.
     End { stream: i32 },
     /// The stream closed.
-    Close { stream: i32, code: ErrorCode },
+    Close {
+        stream: i32,
+        code: ErrorCode,
+        /// What the outgoing body reported, if the stream ended because it failed.
+        failure: Option<crate::BodyError>,
+    },
 }
 
 /// What the session's handlers observed, accumulated for the driver to act on.
@@ -206,11 +210,12 @@ pub(crate) fn client_session() -> crate::Result<Session<Events>> {
                 },
             });
         })
-        .on_stream_close(|events: &mut Events, stream, code, _failure| {
+        .on_stream_close(|events: &mut Events, stream, code, failure| {
             events.open.remove(&stream.get());
             events.list.push(Event::Close {
                 stream: stream.get(),
                 code,
+                failure,
             });
         })
         .manual_flow_control(MANUAL_FLOW_CONTROL)
@@ -470,6 +475,11 @@ where
 
             dispatch(&mut session, &mut events, &registry, &shared)?;
             flush(&mut session, &mut writer, &mut events).await?;
+            // A body announces its trailers while it is being serialised, so they can only
+            // be submitted once that pass is over — and then written by a second one.
+            if submit_trailers(&mut session, &shared)? {
+                flush(&mut session, &mut writer, &mut events).await?;
+            }
             // Serialising fires the stream-close handler, so what it observed is
             // dispatched too rather than waiting for the next pass.
             dispatch(&mut session, &mut events, &registry, &shared)?;
@@ -507,6 +517,7 @@ where
                 let idle = queue.is_empty()
                     && shared.ready_len() == 0
                     && shared.credits_len() == 0
+                    && !shared.trailers_pending()
                     && lock(&inbox).is_empty()
                     && !lock(&intake).finished
                     && !wants_write
@@ -581,7 +592,7 @@ where
             Arc::clone(shared),
             Arc::downgrade(&liveness),
         ));
-        let outgoing = Outgoing::new(body, Waker::from(Arc::clone(&waker)));
+        let outgoing = Outgoing::new(body, Arc::clone(&waker), Arc::clone(shared));
         let stream = session.submit_request_with_body(&views, outgoing)?;
         // The identifier only exists now. Nothing can have consulted the body yet — that
         // happens inside `Session::send` — so no wake can have been lost.
@@ -665,19 +676,31 @@ fn dispatch(
                 }
             }
 
-            Event::Close { stream, code } => {
+            Event::Close {
+                stream,
+                code,
+                failure,
+            } => {
                 let Some(entry) = registry.remove(stream) else {
                     continue;
                 };
+                let reported = failure.map(recover);
                 if !entry.slot.is_settled() {
-                    entry.slot.fail(if code == ErrorCode::NO_ERROR {
-                        Error::new(
-                            ErrorKind::Stream,
-                            "the stream closed before a response head arrived",
-                        )
-                    } else {
-                        Error::new(ErrorKind::Stream, "the peer reset the stream")
-                    });
+                    entry.slot.fail(reported.unwrap_or_else(|| {
+                        if code == ErrorCode::NO_ERROR {
+                            Error::new(
+                                ErrorKind::Stream,
+                                "the stream closed before a response head arrived",
+                            )
+                        } else {
+                            Error::new(ErrorKind::Stream, "the peer reset the stream")
+                        }
+                    }));
+                } else if let Some(reported) = reported {
+                    // The response head was already delivered, so the only channel left
+                    // to the caller is the body it is holding. A request body that failed
+                    // after its response began is still the caller's to hear about.
+                    entry.incoming.fail(reported);
                 }
                 // A no-op once the message has ended: what is still queued is the whole
                 // of it, and the caller is entitled to read it after the stream is gone.
@@ -687,6 +710,56 @@ fn dispatch(
     }
 
     Ok(())
+}
+
+/// Recovers the error an outgoing body reported.
+///
+/// The session parks whatever a body handed to [`BodyOutcome::Fail`] and gives it back at
+/// stream close, by value. Everything this crate puts in there is one of its own errors,
+/// so the caller sees the cause they produced rather than a printed rendering of it. A box
+/// from anywhere else — a body source submitted directly against the sans-I/O layer — is
+/// carried as a source instead of being discarded.
+///
+/// [`BodyOutcome::Fail`]: crate::BodyOutcome::Fail
+fn recover(failure: crate::BodyError) -> Error {
+    match failure.downcast::<Error>() {
+        Ok(error) => *error,
+        Err(other) => Error::with_source(
+            ErrorKind::Body,
+            "the outgoing body reported an error",
+            // `BodyError` is only `Send`; the taxonomy's source is `Send + Sync`, so the
+            // rendering is carried rather than the box.
+            other.to_string(),
+        ),
+    }
+}
+
+/// Submits every trailing block an outgoing body left behind.
+///
+/// Deliberately after the send pass. A body announces trailers while it is being
+/// serialised, and they only become legal once the message they follow has gone out —
+/// which is the very call the announcement came from.
+///
+/// Returns whether anything was submitted, since submitting makes the session want to
+/// write again.
+fn submit_trailers(session: &mut Session<Events>, shared: &Shared) -> Result<bool> {
+    let mut submitted = false;
+
+    for (stream, trailers) in shared.take_trailers() {
+        // The stream may have been reset between the announcement and here, in which case
+        // the trailer window closed with it. Checked rather than caught: submitting to a
+        // stream that cannot carry trailers is a caller error, and it would be
+        // indistinguishable from a real one.
+        if !session.trailers_ready(StreamId::new(stream)) {
+            continue;
+        }
+
+        let fields = head::trailer_fields(&trailers)?;
+        session.submit_trailer(StreamId::new(stream), &fields.views())?;
+        submitted = true;
+    }
+
+    Ok(submitted)
 }
 
 /// Writes out everything the session currently has to say.

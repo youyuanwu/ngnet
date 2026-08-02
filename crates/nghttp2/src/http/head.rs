@@ -162,6 +162,27 @@ pub(crate) fn response_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Respo
         .map_err(|_| protocol("the peer sent a response head that could not be assembled"))
 }
 
+/// Encodes a trailing header block for submission.
+///
+/// The same rule as decoding, from the other side: trailers carry ordinary fields only,
+/// and the connection-specific names HTTP/2 forbids are forbidden here too. A caller who
+/// set one is told rather than having it quietly dropped.
+pub(crate) fn trailer_fields(trailers: &http::HeaderMap) -> Result<OwnedHeaders> {
+    let mut headers = OwnedHeaders::default();
+
+    for (name, value) in trailers {
+        let name = name.as_str();
+        if FORBIDDEN.contains(&name) {
+            return Err(protocol(
+                "this field is connection-specific and HTTP/2 forbids it in trailers",
+            ));
+        }
+        headers.push(name, value.as_bytes());
+    }
+
+    Ok(headers)
+}
+
 /// Decodes a received trailing header block.
 ///
 /// Trailers are ordinary fields only: a pseudo-header after a message has begun is

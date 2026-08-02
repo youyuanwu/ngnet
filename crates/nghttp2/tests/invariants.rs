@@ -18,7 +18,10 @@ const UNSAFE_TEST_EXEMPTIONS: &[(&str, &str)] = &[
     ("raw_escape_hatch.rs", "calls a raw binding by design"),
     // Implementing `GlobalAlloc` is unsafe by language rule. This is measurement
     // scaffolding for SC-005, not use of this crate's API.
-    ("zero_alloc.rs", "implements GlobalAlloc to count allocations"),
+    (
+        "zero_alloc.rs",
+        "implements GlobalAlloc to count allocations",
+    ),
 ];
 
 /// Facilities the crate's own source must not reach for.
@@ -65,9 +68,8 @@ fn strip_comments_and_strings(source: &str) -> String {
     let mut i = 0;
 
     while i < bytes.len() {
-        let rest_is = |pat: &str, i: usize| {
-            bytes[i..].iter().copied().take(pat.len()).eq(pat.chars())
-        };
+        let rest_is =
+            |pat: &str, i: usize| bytes[i..].iter().copied().take(pat.len()).eq(pat.chars());
 
         if rest_is("//", i) {
             while i < bytes.len() && bytes[i] != '\n' {
@@ -280,9 +282,18 @@ fn the_comment_stripper_actually_strips() {
         "// std::net in a line comment\n/* std::fs in a block */\nlet s = \"std::thread\";\nlet real = std::process::id();",
     );
 
-    assert!(!stripped.contains("std::net"), "line comments must be stripped");
-    assert!(!stripped.contains("std::fs"), "block comments must be stripped");
-    assert!(!stripped.contains("std::thread"), "string literals must be stripped");
+    assert!(
+        !stripped.contains("std::net"),
+        "line comments must be stripped"
+    );
+    assert!(
+        !stripped.contains("std::fs"),
+        "block comments must be stripped"
+    );
+    assert!(
+        !stripped.contains("std::thread"),
+        "string literals must be stripped"
+    );
     assert!(
         stripped.contains("std::process"),
         "real code must survive stripping, got: {stripped}"
@@ -432,7 +443,10 @@ fn every_module_using_unsafe_is_in_the_pinned_set() {
     };
 
     for file in rust_files(&crate_root().join("src")) {
-        let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        let stem = file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
         if stem == "lib" {
             continue;
         }
@@ -539,4 +553,39 @@ fn the_async_subtree_exists_and_is_scanned() {
         files.iter().any(|f| f.ends_with("transport.rs")),
         "the transport module should be part of the async subtree, found: {files:?}"
     );
+}
+
+#[test]
+fn the_send_path_has_nowhere_to_put_a_second_chunk() {
+    // SC-018, the half that no runtime assertion can cover. The hook a test reads reports
+    // what the bridge *did* hold; this reports what it *could* hold. A container added to
+    // the send path would be free to fill up under exactly the conditions a test is least
+    // likely to reproduce — a fast producer against a blocked window — so the absence of
+    // one is checked here rather than left to review.
+    //
+    // The single retained chunk lives in an `Option`, which cannot hold two by
+    // construction. Anything that can is named below.
+    let path = crate_root()
+        .join("src")
+        .join("http")
+        .join("body")
+        .join("outgoing.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {path:?}: {e}; the send path bridge has moved"));
+    let code = strip_comments_and_strings(&source);
+
+    assert!(
+        code.contains("leftover: Option<"),
+        "the send path no longer holds its one chunk in an Option; this scan is stale",
+    );
+
+    for container in [
+        "Vec<", "VecDeque", "BTreeMap", "HashMap", "BTreeSet", "HashSet", "BytesMut", "Box<[",
+        "; 2]",
+    ] {
+        assert!(
+            !code.contains(container),
+            "the send path gained a `{container}`, which can hold more than one chunk",
+        );
+    }
 }

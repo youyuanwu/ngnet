@@ -53,6 +53,15 @@ impl StreamWaker {
     pub(crate) fn bind(&self, stream: i32) {
         self.stream.store(stream, Ordering::Release);
     }
+
+    /// The stream this waker names, or zero before submission has assigned one.
+    ///
+    /// Read by the outgoing body bridge, which needs to say which stream a trailing block
+    /// belongs to and has no other way to know: the identifier does not exist until after
+    /// the body has been handed to the session.
+    pub(crate) fn stream(&self) -> i32 {
+        self.stream.load(Ordering::Acquire)
+    }
 }
 
 impl Wake for StreamWaker {

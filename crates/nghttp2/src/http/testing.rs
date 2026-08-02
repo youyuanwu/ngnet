@@ -465,6 +465,8 @@ impl http_body::Body for Full {
 #[derive(Debug, Default)]
 struct Script {
     chunks: Mutex<VecDeque<Bytes>>,
+    trailers: Mutex<Option<http::HeaderMap>>,
+    failure: Mutex<Option<&'static str>>,
     finished: Mutex<bool>,
     waker: Mutex<Option<Waker>>,
     consultations: AtomicUsize,
@@ -482,6 +484,18 @@ impl Script {
         }
     }
 }
+
+/// What a [`Scripted`] body reports when told to fail.
+#[derive(Debug)]
+pub struct ScriptError(&'static str);
+
+impl core::fmt::Display for ScriptError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ScriptError {}
 
 /// A body that answers only when told to, and counts how often it is asked.
 ///
@@ -552,16 +566,39 @@ impl ScriptHandle {
     pub fn wake_spuriously(&self) {
         self.script.signal();
     }
+
+    /// Ends the body with a trailing header block, and wakes it.
+    ///
+    /// Delivered after everything already queued, which is the order `http_body` requires
+    /// and the order the wire requires.
+    pub fn finish_with_trailers(&self, trailers: http::HeaderMap) {
+        *self
+            .script
+            .trailers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(trailers);
+        self.finish();
+    }
+
+    /// Makes the body report a failure the next time it is asked, and wakes it.
+    pub fn fail(&self, detail: &'static str) {
+        *self
+            .script
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(detail);
+        self.script.signal();
+    }
 }
 
 impl http_body::Body for Scripted {
     type Data = Bytes;
-    type Error = Infallible;
+    type Error = ScriptError;
 
     fn poll_frame(
         self: core::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<http_body::Frame<Bytes>, Infallible>>> {
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, ScriptError>>> {
         self.script.consultations.fetch_add(1, Ordering::AcqRel);
 
         let next = self
@@ -572,6 +609,26 @@ impl http_body::Body for Scripted {
             .pop_front();
         if let Some(data) = next {
             return Poll::Ready(Some(Ok(http_body::Frame::data(data))));
+        }
+
+        let failure = self
+            .script
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(detail) = failure {
+            return Poll::Ready(Some(Err(ScriptError(detail))));
+        }
+
+        let trailers = self
+            .script
+            .trailers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(trailers) = trailers {
+            return Poll::Ready(Some(Ok(http_body::Frame::trailers(trailers))));
         }
 
         if *self
@@ -631,6 +688,15 @@ pub async fn serve<T: Transport, C>(
         }
         session.recv(&buf, context).expect("receiving");
     }
+}
+
+/// The most chunks any one outgoing body on this connection has held back at once.
+///
+/// The send path retains at most one unconsumed chunk per stream. This is the named hook
+/// that claim is asserted against — a property proven by inspection is a property that
+/// stops being true the first time someone edits the file without reading the comment.
+pub fn buffered_chunks<B>(handle: &super::client::SendRequest<B>) -> usize {
+    handle.buffered_chunks()
 }
 
 /// How many streams a connection is holding wakes for.

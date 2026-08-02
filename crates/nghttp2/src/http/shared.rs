@@ -51,6 +51,18 @@ struct Inner {
     /// Accumulated per stream rather than queued per chunk, so a caller reading a body in
     /// small pieces produces one `WINDOW_UPDATE` per driver pass instead of one per read.
     credits: BTreeMap<i32, usize>,
+    /// Trailing header blocks an outgoing body produced, waiting to be submitted.
+    ///
+    /// Left here rather than submitted on the spot because they are produced from inside
+    /// `Session::send`, where the session cannot be reached — and could not accept them
+    /// anyway until the body that announced them has finished being serialised.
+    trailers: Vec<(i32, http::HeaderMap)>,
+    /// The most octets any one outgoing body has ever held back at once, as chunks.
+    ///
+    /// The send path retains at most one unconsumed chunk per stream, and this is the
+    /// hook that claim is asserted against rather than read off the source. Never reset:
+    /// a high-water mark that could be cleared would not be evidence of anything.
+    buffered_high_water: usize,
     /// Set once the driver is gone, so nothing waits for an answer that cannot come.
     gone: bool,
 }
@@ -132,6 +144,37 @@ impl Shared {
     /// How many streams have consumption waiting to be reported.
     pub(crate) fn credits_len(&self) -> usize {
         self.lock().credits.len()
+    }
+
+    /// Records a trailing header block an outgoing body produced.
+    ///
+    /// Called from inside [`BodySource::fill`](crate::BodySource::fill), which runs
+    /// re-entrantly inside `Session::send`. A leaf lock, taken and released without
+    /// calling anything: the driver is inside the session at this moment and must not be
+    /// made to wait on it.
+    pub(crate) fn stash_trailers(&self, stream: i32, trailers: http::HeaderMap) {
+        self.lock().trailers.push((stream, trailers));
+    }
+
+    /// Takes the trailing blocks to submit, leaving none behind.
+    pub(crate) fn take_trailers(&self) -> Vec<(i32, http::HeaderMap)> {
+        core::mem::take(&mut self.lock().trailers)
+    }
+
+    /// Whether any trailing block is waiting to be submitted.
+    pub(crate) fn trailers_pending(&self) -> bool {
+        !self.lock().trailers.is_empty()
+    }
+
+    /// Notes how many chunks an outgoing body is holding back.
+    pub(crate) fn note_buffered(&self, chunks: usize) {
+        let mut inner = self.lock();
+        inner.buffered_high_water = inner.buffered_high_water.max(chunks);
+    }
+
+    /// The most chunks any outgoing body has held back at once.
+    pub(crate) fn buffered_high_water(&self) -> usize {
+        self.lock().buffered_high_water
     }
 
     /// Records that the driver has stopped, and wakes anything waiting on it.

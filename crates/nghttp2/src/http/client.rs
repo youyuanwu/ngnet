@@ -176,6 +176,15 @@ impl<B> SendRequest<B> {
     pub(crate) fn pending_wakes(&self) -> usize {
         self.shared.ready_len()
     }
+
+    /// The most chunks any one outgoing body has held back at once.
+    ///
+    /// Reachable only through the hidden testing module, for the same reason as
+    /// [`Self::pending_wakes`]: the send path promises to retain at most one unconsumed
+    /// chunk per stream, and a promise that cannot be observed cannot be tested.
+    pub(crate) fn buffered_chunks(&self) -> usize {
+        self.shared.buffered_high_water()
+    }
 }
 
 /// Resolves when a request's response head arrives.
