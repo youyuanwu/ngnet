@@ -373,6 +373,130 @@ impl TransportWrite for DuplexWriter {
     }
 }
 
+/// A transport that works for a while and then does not.
+///
+/// Reads and writes pass through to a [`Duplex`] until the countdown reaches zero, after
+/// which every operation reports the same error. That is what makes "this failure came
+/// from the transport, not from the protocol" assertable: the same exchange either
+/// completes or fails, and which one is the caller's choice.
+#[derive(Debug)]
+pub struct Failing {
+    inner: Duplex,
+    /// Operations left before the failure. Shared so both halves count against one budget.
+    countdown: Arc<AtomicUsize>,
+    /// Whether it is reads or writes that fail.
+    on_read: bool,
+}
+
+/// A transport that fails after `after` operations, and its unbroken peer.
+///
+/// `on_read` chooses the direction that breaks, since a socket may fail either way and the
+/// two reach the driver through different paths.
+pub fn failing(after: usize, on_read: bool) -> (Failing, Duplex) {
+    let (one, two) = duplex(false);
+    (
+        Failing {
+            inner: one,
+            countdown: Arc::new(AtomicUsize::new(after)),
+            on_read,
+        },
+        two,
+    )
+}
+
+/// The reading half of a [`Failing`].
+#[derive(Debug)]
+pub struct FailingReader {
+    inner: DuplexReader,
+    countdown: Arc<AtomicUsize>,
+    armed: bool,
+}
+
+/// The writing half of a [`Failing`].
+#[derive(Debug)]
+pub struct FailingWriter {
+    inner: DuplexWriter,
+    countdown: Arc<AtomicUsize>,
+    armed: bool,
+}
+
+/// Counts one operation down, reporting whether this is the one that fails.
+fn spent(countdown: &AtomicUsize, armed: bool) -> bool {
+    if !armed {
+        return false;
+    }
+    // Saturating, so every operation after the first failure fails too — a transport that
+    // recovered on its own would be a different thing to test.
+    let left = countdown.load(Ordering::Acquire);
+    if left == 0 {
+        return true;
+    }
+    countdown.store(left - 1, Ordering::Release);
+    left == 1
+}
+
+fn broken() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionReset,
+        "the scripted transport failed",
+    )
+}
+
+impl Transport for Failing {
+    type Reader = FailingReader;
+    type Writer = FailingWriter;
+
+    fn split(self) -> (Self::Reader, Self::Writer) {
+        let (reader, writer) = self.inner.split();
+        (
+            FailingReader {
+                inner: reader,
+                countdown: Arc::clone(&self.countdown),
+                armed: self.on_read,
+            },
+            FailingWriter {
+                inner: writer,
+                countdown: self.countdown,
+                armed: !self.on_read,
+            },
+        )
+    }
+}
+
+impl TransportRead for FailingReader {
+    fn read(&mut self, buf: BytesMut) -> impl Future<Output = (io::Result<usize>, BytesMut)> {
+        let failed = spent(&self.countdown, self.armed);
+        let inner = self.inner.read(buf);
+        async move {
+            let (result, buf) = inner.await;
+            if failed {
+                (Err(broken()), buf)
+            } else {
+                (result, buf)
+            }
+        }
+    }
+}
+
+impl TransportWrite for FailingWriter {
+    fn write(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
+        let failed = spent(&self.countdown, self.armed);
+        let inner = self.inner.write(buf);
+        async move {
+            let (result, buf) = inner.await;
+            if failed {
+                (Err(broken()), buf)
+            } else {
+                (result, buf)
+            }
+        }
+    }
+
+    fn writes_borrowed(&self) -> bool {
+        false
+    }
+}
+
 /// Polls `background` alongside `main`, finishing when `main` does.
 ///
 /// Everything an asynchronous connection does needs at least two things running at once —

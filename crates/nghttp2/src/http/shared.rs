@@ -57,6 +57,17 @@ struct Inner {
     /// `Session::send`, where the session cannot be reached — and could not accept them
     /// anyway until the body that announced them has finished being serialised.
     trailers: Vec<(i32, http::HeaderMap)>,
+    /// Streams to reset, with the code to reset them under.
+    ///
+    /// Written by a dropped request or a dropped response body, both of which are on the
+    /// caller's task rather than the driver's, and neither of which can reach the session.
+    resets: Vec<(i32, crate::ErrorCode)>,
+    /// A graceful shutdown the caller asked for and the driver has not yet sent, as the
+    /// last stream to honour and the code to give.
+    shutdown: Option<(i32, crate::ErrorCode)>,
+    /// Set once nothing new may be started: the caller asked to shut down, or the peer
+    /// said it was going away.
+    refusing: bool,
     /// The most octets any one outgoing body has ever held back at once, as chunks.
     ///
     /// The send path retains at most one unconsumed chunk per stream, and this is the
@@ -164,6 +175,66 @@ impl Shared {
     /// Whether any trailing block is waiting to be submitted.
     pub(crate) fn trailers_pending(&self) -> bool {
         !self.lock().trailers.is_empty()
+    }
+
+    /// Asks the driver to reset `stream`.
+    ///
+    /// The session lives in the driver, so a caller dropping a request cannot reset
+    /// anything itself. Leaving a note and waking is the whole of it — and the note has to
+    /// be honoured promptly, because until it is the peer is still sending a body nobody
+    /// will read.
+    pub(crate) fn reset(&self, stream: i32, code: crate::ErrorCode) {
+        if stream <= 0 {
+            return;
+        }
+        self.lock().resets.push((stream, code));
+    }
+
+    /// Takes the streams to reset, leaving none behind.
+    pub(crate) fn take_resets(&self) -> Vec<(i32, crate::ErrorCode)> {
+        core::mem::take(&mut self.lock().resets)
+    }
+
+    /// Whether any stream is waiting to be reset.
+    pub(crate) fn resets_pending(&self) -> bool {
+        !self.lock().resets.is_empty()
+    }
+
+    /// Asks the driver to stop accepting new exchanges, letting current ones finish.
+    ///
+    /// `last_stream` is what the `GOAWAY` will name, and it means the last stream *the
+    /// peer opened* that this end will honour — not the last one this end opened. A client
+    /// that accepts no pushed streams has opened nothing on the peer's behalf, so it says
+    /// zero; naming one of its own requests is rejected outright by libnghttp2, which is
+    /// the protocol saying the same thing.
+    pub(crate) fn request_shutdown(&self, last_stream: i32, code: crate::ErrorCode) {
+        let mut inner = self.lock();
+        inner.refusing = true;
+        inner.shutdown = Some((last_stream, code));
+    }
+
+    /// Takes the shutdown to send, if one was asked for and not yet sent.
+    pub(crate) fn take_shutdown(&self) -> Option<(i32, crate::ErrorCode)> {
+        self.lock().shutdown.take()
+    }
+
+    /// Whether a shutdown is waiting to be sent.
+    pub(crate) fn shutdown_pending(&self) -> bool {
+        self.lock().shutdown.is_some()
+    }
+
+    /// Records that nothing new may be started on this connection.
+    ///
+    /// Set by a caller's shutdown and by a peer's `GOAWAY` alike: from a handle's point of
+    /// view the two are the same fact, and the difference is only in what the exchanges
+    /// already in flight are told.
+    pub(crate) fn set_refusing(&self) {
+        self.lock().refusing = true;
+    }
+
+    /// Whether new exchanges are being refused.
+    pub(crate) fn is_refusing(&self) -> bool {
+        self.lock().refusing
     }
 
     /// Notes how many chunks an outgoing body is holding back.
@@ -279,6 +350,12 @@ struct SlotState {
     error: Option<Error>,
     waker: Option<Waker>,
     settled: bool,
+    /// Filled once the request has been submitted and a stream exists to name.
+    ///
+    /// A response future that is dropped before its answer arrives has to reset that
+    /// stream, and this is the only place it can learn which one — it holds a slot, not a
+    /// connection.
+    stream: i32,
 }
 
 impl Slot {
@@ -320,6 +397,17 @@ impl Slot {
     /// Whether an answer has been delivered.
     pub(crate) fn is_settled(&self) -> bool {
         self.lock().settled
+    }
+
+    /// Names the stream this exchange was given.
+    pub(crate) fn bind(&self, stream: i32) {
+        self.lock().stream = stream;
+    }
+
+    /// The stream still owed an answer, if this exchange has one and is unsettled.
+    pub(crate) fn unsettled_stream(&self) -> Option<i32> {
+        let state = self.lock();
+        (!state.settled && state.stream > 0).then_some(state.stream)
     }
 
     pub(crate) fn poll(
@@ -436,6 +524,12 @@ impl Incoming {
         if let Some(waker) = waker {
             waker.wake();
         }
+    }
+
+    /// Whether the peer finished sending this message, read or not.
+    pub(crate) fn is_finished(&self) -> bool {
+        let state = self.lock();
+        state.finished || state.error.is_some()
     }
 
     /// Whether the message has ended and nothing is left to read.
@@ -581,6 +675,15 @@ impl Registry {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.lock().is_empty()
+    }
+
+    /// The live streams above `limit`, which a `GOAWAY` says were never begun.
+    pub(crate) fn above(&self, limit: i32) -> Vec<i32> {
+        self.lock()
+            .keys()
+            .copied()
+            .filter(|stream| *stream > limit)
+            .collect()
     }
 
     /// Empties the registry, handing back everything that was in it.

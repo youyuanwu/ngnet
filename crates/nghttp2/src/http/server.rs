@@ -40,14 +40,16 @@
 //! channel.
 
 use core::future::Future;
+use std::collections::BTreeMap;
 use std::error::Error as StdError;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use http_body::Body;
 
 use crate::{ErrorCode, Session, StreamId};
 
-use super::body::IncomingBody;
+use super::body::{Direction, IncomingBody};
+use super::connection::Connection;
 use super::driver::{self, DriverGuard, Events, Role, Signals};
 use super::error::Result;
 use super::head;
@@ -68,7 +70,10 @@ use super::transport::Transport;
 ///
 /// Fails if the underlying session cannot be created. Failures afterwards are reported by
 /// the returned future.
-pub fn serve<T, H, F, B>(transport: T, handler: H) -> Result<impl Future<Output = Result<()>>>
+pub fn serve<T, H, F, B>(
+    transport: T,
+    handler: H,
+) -> Result<Connection<impl Future<Output = Result<()>>>>
 where
     T: Transport,
     H: FnMut(http::Request<IncomingBody>) -> F,
@@ -87,11 +92,100 @@ where
         registry: Arc::clone(&registry),
         handler,
         tasks: Tasks::new(Arc::clone(&shared)),
+        losses: BTreeMap::new(),
         body: core::marker::PhantomData,
     };
 
     let guard = DriverGuard::new(Arc::clone(&shared), Arc::clone(&registry), role);
-    Ok(driver::run(transport, session, shared, registry, guard))
+    Ok(Connection::new(driver::run(
+        transport, session, shared, registry, guard,
+    )))
+}
+
+/// Tells a handler that its stream is gone.
+///
+/// Placed in every request's [extensions](http::Extensions), so a handler that wants to
+/// know can ask and one that does not need never mention it.
+///
+/// A handler on a stream the peer reset is not cancelled — this crate does not drop it
+/// part-way, because a dropped future is told nothing and may have cleanup to do. It runs
+/// to completion and its response is discarded. This is how it can stop early instead, and
+/// it is the only signal that works for a request whose body had already ended: reading
+/// the body would report the loss, but a body that is already finished has nothing left to
+/// report.
+///
+/// ```no_run
+/// # use nghttp2::http::{Cancelled, IncomingBody};
+/// # use nghttp2::http::testing::{Empty, http_crate as http};
+/// # async fn handler(request: http::Request<IncomingBody>) -> http::Response<Empty> {
+/// let lost = request.extensions().get::<Cancelled>().cloned();
+/// // ... partway through some long piece of work ...
+/// if lost.is_some_and(|lost| lost.is_cancelled()) {
+///     return http::Response::new(Empty);
+/// }
+/// # http::Response::new(Empty)
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct Cancelled {
+    state: Arc<CancelState>,
+}
+
+#[derive(Debug, Default)]
+struct CancelState {
+    lost: Mutex<(bool, Vec<core::task::Waker>)>,
+}
+
+impl Cancelled {
+    /// Whether the stream this request arrived on has gone.
+    ///
+    /// Once true, always true. A response produced after this is discarded rather than
+    /// sent, so a handler that checks can stop doing work nobody will receive.
+    pub fn is_cancelled(&self) -> bool {
+        self.state.lock().0
+    }
+
+    /// Resolves when the stream this request arrived on goes.
+    ///
+    /// Never resolves for a stream that completes normally, so it belongs in a `select`
+    /// against the handler's real work rather than being awaited on its own.
+    pub async fn cancelled(&self) {
+        core::future::poll_fn(|context| {
+            let mut lost = self.state.lock();
+            if lost.0 {
+                return core::task::Poll::Ready(());
+            }
+            if !lost.1.iter().any(|held| held.will_wake(context.waker())) {
+                lost.1.push(context.waker().clone());
+            }
+            core::task::Poll::Pending
+        })
+        .await;
+    }
+}
+
+impl CancelState {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (bool, Vec<core::task::Waker>)> {
+        self.lost
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Trips the signal, waking everything waiting on it.
+    fn trip(&self) {
+        let waiting = {
+            let mut lost = self.lock();
+            if lost.0 {
+                return;
+            }
+            lost.0 = true;
+            core::mem::take(&mut lost.1)
+        };
+        // Outside the lock: a waker may run arbitrary code, including asking again.
+        for waker in waiting {
+            waker.wake();
+        }
+    }
 }
 
 /// What a server end of a connection does that a client end does not.
@@ -103,6 +197,8 @@ struct ServerRole<H, F, B> {
     registry: Arc<Registry>,
     handler: H,
     tasks: Tasks<F>,
+    /// One signal per running handler, tripped when its stream goes.
+    losses: BTreeMap<i32, Arc<CancelState>>,
     /// Names the response body type, which only appears inside the handler's future.
     body: core::marker::PhantomData<fn() -> B>,
 }
@@ -122,6 +218,9 @@ where
         stream: i32,
         response: http::Response<B>,
     ) -> Result<()> {
+        // The handler has finished, so there is nothing left to tell it.
+        self.losses.remove(&stream);
+
         // The peer may have reset this stream while the handler was running. Submitting
         // anyway is not merely wasted work: libnghttp2 rejects it, and a discarded
         // response is not a reason to fail a connection that is otherwise healthy.
@@ -203,20 +302,37 @@ where
             }
         };
 
-        let request = head
-            .map(|()| IncomingBody::new(stream, Arc::clone(incoming), Arc::clone(&self.shared)));
+        let mut request = head.map(|()| {
+            IncomingBody::new(
+                stream,
+                Direction::Request,
+                Arc::clone(incoming),
+                Arc::clone(&self.shared),
+            )
+        });
+
+        let state = Arc::new(CancelState::default());
+        self.losses.insert(stream, Arc::clone(&state));
+        request.extensions_mut().insert(Cancelled { state });
+
         self.tasks.start(stream, (self.handler)(request));
         Ok(())
     }
 
-    fn closed(&mut self, _stream: i32) {
+    fn closed(&mut self, stream: i32) {
         // Deliberately not dropping the handler. A stream the peer reset still has a
-        // handler that may need to notice, and it notices through the request body it was
-        // given, which the close path fails a moment after this. Its response is discarded
-        // when it eventually offers one.
+        // handler that may need to notice, and dropping a future tells it nothing. It runs
+        // on, learns through the signal tripped here, and its response is discarded when it
+        // eventually offers one.
+        if let Some(state) = self.losses.remove(&stream) {
+            state.trip();
+        }
     }
 
     fn abandon(&mut self) {
+        for (_, state) in core::mem::take(&mut self.losses) {
+            state.trip();
+        }
         self.tasks.abandon_all();
     }
 

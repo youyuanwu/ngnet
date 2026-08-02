@@ -36,6 +36,7 @@
 
 mod body;
 pub mod client;
+mod connection;
 mod driver;
 mod error;
 mod head;
@@ -47,8 +48,9 @@ mod waker;
 
 pub use body::IncomingBody;
 pub use client::{ResponseFuture, SendRequest, handshake};
+pub use connection::Connection;
 pub use error::{Error, ErrorKind, Result};
-pub use server::serve;
+pub use server::{Cancelled, serve};
 pub use transport::{Transport, TransportRead, TransportWrite};
 
 #[doc(hidden)]

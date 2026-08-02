@@ -329,16 +329,29 @@ mod asynchronous {
         let _: Option<&(dyn StdError + 'static)> = StdError::source(error);
         let _: String = error.to_string();
 
+        let _: Option<nghttp2::ErrorCode> = error.reason();
+        let _: bool = error.is_retriable();
+
         match error.kind() {
             ErrorKind::Transport
             | ErrorKind::Connection
             | ErrorKind::Stream
             | ErrorKind::Protocol
             | ErrorKind::Closed
-            | ErrorKind::Body => {}
+            | ErrorKind::Body
+            | ErrorKind::Refused => {}
             // Deliberate: adding a kind must not break a downstream match.
             _ => {}
         }
+    }
+
+    /// The signal a server handler learns cancellation through.
+    pub(super) fn cancelled_surface(lost: &nghttp2::http::Cancelled) {
+        let cloned: nghttp2::http::Cancelled = lost.clone();
+        let _: bool = cloned.is_cancelled();
+        // Held rather than awaited: naming the future is what pins its shape.
+        let waiting = cloned.cancelled();
+        drop(waiting);
     }
 
     /// The client entry point, pinned by naming its shape rather than by calling it.
@@ -355,10 +368,13 @@ mod asynchronous {
         B::Data: Send,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
-        let (requests, connection): (SendRequest<B>, _) = handshake::<T, B>(transport)?;
+        let (requests, connection): (SendRequest<B>, nghttp2::http::Connection<_>) =
+            handshake::<T, B>(transport)?;
         let cloned: SendRequest<B> = requests.clone();
         let _: bool = cloned.is_closed();
+        let _: bool = cloned.is_refusing();
         let _: fn(&SendRequest<B>) -> bool = SendRequest::<B>::is_closed;
+        let _: fn(&SendRequest<B>) = SendRequest::<B>::shutdown;
         let response: ResponseFuture = requests.send_request(
             http::Request::builder()
                 .uri("http://example.test/")
@@ -407,6 +423,7 @@ fn the_asynchronous_surface_is_unchanged() {
     let _: fn(Duplex) -> core::result::Result<(), nghttp2::http::Error> =
         asynchronous::client_surface::<Duplex, Empty>;
     let _: fn(&nghttp2::http::IncomingBody) = asynchronous::incoming_body_surface;
+    let _: fn(&nghttp2::http::Cancelled) = asynchronous::cancelled_surface;
 
     // `serve` is reachable both through the module and at the top of `http`, and both are
     // part of the promise. A `fn` item as the handler and `Ready` as its future keep every

@@ -102,6 +102,8 @@ enum Event {
     },
     /// The peer ended the message.
     End { stream: i32 },
+    /// The peer is going away, and will begin nothing above the stream it named.
+    Goaway { last_stream: i32, code: ErrorCode },
     /// The stream closed.
     Close {
         stream: i32,
@@ -201,6 +203,13 @@ fn observing(builder: SessionBuilder<Events>) -> SessionBuilder<Events> {
             // until both directions have finished, and the message ends first.
             if stream > 0 && frame.is_end_stream() {
                 events.list.push(Event::End { stream });
+            }
+
+            if let Some(goaway) = frame.goaway() {
+                events.list.push(Event::Goaway {
+                    last_stream: goaway.last_stream_id().get(),
+                    code: goaway.code(),
+                });
             }
         })
         .on_data_chunk(|events: &mut Events, stream, chunk: &[u8]| {
@@ -511,6 +520,19 @@ where
                 session.consume(StreamId::new(stream), len)?;
             }
 
+            // A caller that dropped a request or an unread response body has asked for the
+            // stream to stop. Honoured here rather than later: until it is, the peer is
+            // still sending a body nobody will read.
+            for (stream, code) in shared.take_resets() {
+                if session.stream_is_open(StreamId::new(stream)) {
+                    session.reset_stream(StreamId::new(stream), code)?;
+                }
+            }
+
+            if let Some((last_stream, code)) = shared.take_shutdown() {
+                session.shutdown(StreamId::new(last_stream), code)?;
+            }
+
             for stream in shared.take_ready() {
                 match session.resume_body(StreamId::new(stream)) {
                     Ok(()) => {}
@@ -550,7 +572,13 @@ where
                 shared.wake_driver();
             }
 
-            dispatch(&mut session, &mut events, &registry, &mut guard.role)?;
+            dispatch(
+                &mut session,
+                &mut events,
+                &registry,
+                &shared,
+                &mut guard.role,
+            )?;
             flush(&mut session, &mut writer, &mut events).await?;
             // A body announces its trailers while it is being serialised, so they can only
             // be submitted once that pass is over — and then written by a second one.
@@ -559,7 +587,13 @@ where
             }
             // Serialising fires the stream-close handler, so what it observed is
             // dispatched too rather than waiting for the next pass.
-            dispatch(&mut session, &mut events, &registry, &mut guard.role)?;
+            dispatch(
+                &mut session,
+                &mut events,
+                &registry,
+                &shared,
+                &mut guard.role,
+            )?;
 
             if lock(&intake).finished && lock(&inbox).is_empty() {
                 if let Some(failure) = lock(&intake).failure.take() {
@@ -594,6 +628,8 @@ where
                 let idle = !signals.busy()
                     && shared.ready_len() == 0
                     && shared.credits_len() == 0
+                    && !shared.resets_pending()
+                    && !shared.shutdown_pending()
                     && !shared.trailers_pending()
                     && lock(&inbox).is_empty()
                     && !lock(&intake).finished
@@ -665,6 +701,7 @@ fn dispatch<R: Role>(
     session: &mut Session<Events>,
     events: &mut Events,
     registry: &Registry,
+    shared: &Shared,
     role: &mut R,
 ) -> Result<()> {
     for event in core::mem::take(&mut events.list) {
@@ -716,6 +753,27 @@ fn dispatch<R: Role>(
                 }
             }
 
+            Event::Goaway { last_stream, code } => {
+                // Nothing new may be started, whatever the code says. A `GOAWAY` carrying
+                // NO_ERROR is an orderly wind-down and one carrying anything else is a
+                // fault, but neither leaves room for another request.
+                shared.set_refusing();
+
+                // Everything above the stream the peer named was never begun, which is the
+                // one failure a caller may retry without knowing anything else about the
+                // request.
+                for stream in registry.above(last_stream) {
+                    let Some(entry) = registry.remove(stream) else {
+                        continue;
+                    };
+                    role.closed(stream);
+                    if let Some(slot) = &entry.slot {
+                        slot.fail(Error::refused().because(code));
+                    }
+                    entry.incoming.fail(Error::refused().because(code));
+                }
+            }
+
             Event::Close {
                 stream,
                 code,
@@ -736,7 +794,7 @@ fn dispatch<R: Role>(
                                 "the stream closed before a response head arrived",
                             )
                         } else {
-                            Error::new(ErrorKind::Stream, "the peer reset the stream")
+                            Error::new(ErrorKind::Stream, "the peer reset the stream").because(code)
                         }
                     }));
                 } else if let Some(reported) = reported {

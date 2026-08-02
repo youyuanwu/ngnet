@@ -33,7 +33,8 @@ use http_body::Body;
 
 use std::sync::Weak;
 
-use super::body::IncomingBody;
+use super::body::{Direction, IncomingBody};
+use super::connection::Connection;
 use super::driver::{self, DriverGuard, Events, Role, Signals};
 use super::error::{Error, ErrorKind, Result};
 use super::head;
@@ -53,7 +54,9 @@ use crate::{ErrorCode, Session, StreamId};
 /// # Errors
 ///
 /// Fails only if the underlying session cannot be created.
-pub fn handshake<T, B>(transport: T) -> Result<(SendRequest<B>, impl Future<Output = Result<()>>)>
+pub fn handshake<T, B>(
+    transport: T,
+) -> Result<(SendRequest<B>, Connection<impl Future<Output = Result<()>>>)>
 where
     T: Transport,
     B: Body + Send + 'static,
@@ -78,7 +81,13 @@ where
         },
     );
 
-    let connection = driver::run(transport, session, Arc::clone(&shared), registry, guard);
+    let connection = Connection::new(driver::run(
+        transport,
+        session,
+        Arc::clone(&shared),
+        registry,
+        guard,
+    ));
 
     Ok((
         SendRequest {
@@ -138,6 +147,9 @@ where
             stream
         };
 
+        // Named now, so a response future dropped before its answer arrives knows which
+        // stream to stop.
+        slot.bind(stream.get());
         self.registry
             .insert(stream.get(), Some(Arc::clone(slot)), incoming, liveness);
         Ok(())
@@ -176,7 +188,12 @@ where
 
         match head::response_head(fields) {
             Ok(head) => slot.complete(head.map(|()| {
-                IncomingBody::new(stream, Arc::clone(incoming), Arc::clone(&self.shared))
+                IncomingBody::new(
+                    stream,
+                    Direction::Response,
+                    Arc::clone(incoming),
+                    Arc::clone(&self.shared),
+                )
             })),
             Err(error) => {
                 slot.fail(error);
@@ -267,7 +284,14 @@ impl<B> SendRequest<B> {
 
         if self.shared.is_gone() {
             slot.fail(Error::closed());
-            return ResponseFuture { slot };
+            return ResponseFuture { slot, shared: None };
+        }
+
+        // Refused rather than closed: the connection is still carrying its earlier
+        // exchanges, and this one was never begun — which is what makes it safe to retry.
+        if self.shared.is_refusing() {
+            slot.fail(Error::refused());
+            return ResponseFuture { slot, shared: None };
         }
 
         self.queue.push(Command::SendRequest {
@@ -286,7 +310,10 @@ impl<B> SendRequest<B> {
             }
         }
 
-        ResponseFuture { slot }
+        ResponseFuture {
+            slot,
+            shared: Some(Arc::clone(&self.shared)),
+        }
     }
 
     /// Whether the connection has stopped.
@@ -295,6 +322,32 @@ impl<B> SendRequest<B> {
     /// to retire a handle, not to decide whether a request will succeed.
     pub fn is_closed(&self) -> bool {
         self.shared.is_gone()
+    }
+
+    /// Whether new requests are being refused.
+    ///
+    /// True once this end has asked to [shut down](Self::shutdown), or the peer has said
+    /// it is going away. Exchanges already in flight are unaffected; only new ones are
+    /// turned away, and they are turned away as [retriable](Error::is_retriable).
+    pub fn is_refusing(&self) -> bool {
+        self.shared.is_refusing()
+    }
+
+    /// Winds the connection down, letting exchanges already in flight finish.
+    ///
+    /// Tells the peer this end is going away and stops accepting new requests: anything
+    /// submitted afterwards fails as [`ErrorKind::Refused`], which a caller may retry on
+    /// another connection. Requests already sent run to completion, and the driver
+    /// finishes when they do.
+    ///
+    /// Idempotent, and safe to call from any task. It does not wait — the connection ends
+    /// when its driver does.
+    pub fn shutdown(&self) {
+        // Zero, because a `GOAWAY` names the last stream *the peer* opened, and a client
+        // that accepts no pushed streams has honoured none. Its own requests are unaffected
+        // — they are the ones that get to finish.
+        self.shared.request_shutdown(0, crate::ErrorCode::NO_ERROR);
+        self.shared.wake_driver();
     }
 
     /// How many streams are waiting to be resumed.
@@ -317,9 +370,24 @@ impl<B> SendRequest<B> {
 }
 
 /// Resolves when a request's response head arrives.
+///
+/// Dropping one before it resolves cancels that exchange: the peer observes a stream reset
+/// and stops working on it. A request that was never submitted — because the connection had
+/// already gone — has no stream to reset and simply disappears.
 #[derive(Debug)]
 pub struct ResponseFuture {
     slot: Arc<Slot>,
+    shared: Option<Arc<Shared>>,
+}
+
+impl Drop for ResponseFuture {
+    fn drop(&mut self) {
+        let (Some(shared), Some(stream)) = (&self.shared, self.slot.unsettled_stream()) else {
+            return;
+        };
+        shared.reset(stream, crate::ErrorCode::CANCEL);
+        shared.wake_driver();
+    }
 }
 
 impl Future for ResponseFuture {

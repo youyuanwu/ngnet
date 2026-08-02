@@ -30,6 +30,13 @@ pub enum ErrorKind {
     Closed,
     /// A caller-supplied message body reported an error.
     Body,
+    /// The peer went away before it began this exchange, so nothing was attempted.
+    ///
+    /// The one failure here that is safe to retry without knowing anything else about the
+    /// request: a peer that names a last stream in its `GOAWAY` is stating that everything
+    /// above it was never looked at, so a retry on a fresh connection cannot duplicate a
+    /// side effect. See [`Error::is_retriable`].
+    Refused,
 }
 
 impl ErrorKind {
@@ -41,6 +48,7 @@ impl ErrorKind {
             Self::Protocol => "protocol",
             Self::Closed => "closed",
             Self::Body => "body",
+            Self::Refused => "refused",
         }
     }
 }
@@ -50,6 +58,8 @@ impl ErrorKind {
 pub struct Error {
     kind: ErrorKind,
     detail: &'static str,
+    /// The peer's own reason, for failures the peer named one for.
+    reason: Option<crate::ErrorCode>,
     source: Option<Box<dyn StdError + Send + Sync>>,
 }
 
@@ -58,6 +68,7 @@ impl Error {
         Self {
             kind,
             detail,
+            reason: None,
             source: None,
         }
     }
@@ -70,8 +81,15 @@ impl Error {
         Self {
             kind,
             detail,
+            reason: None,
             source: Some(source.into()),
         }
+    }
+
+    /// Records the code the peer gave for this failure.
+    pub(crate) const fn because(mut self, reason: crate::ErrorCode) -> Self {
+        self.reason = Some(reason);
+        self
     }
 
     /// The connection is gone, so this request will never be answered.
@@ -94,11 +112,42 @@ impl Error {
     pub const fn is_closed(&self) -> bool {
         matches!(self.kind, ErrorKind::Closed)
     }
+
+    /// The code the peer gave, for a failure the peer named a reason for.
+    ///
+    /// Present on a stream the peer reset and on a connection the peer closed with
+    /// `GOAWAY`; absent for anything this end decided. That distinction is the point —
+    /// it is how a caller tells "the peer refused this" from "we could not send it".
+    pub const fn reason(&self) -> Option<crate::ErrorCode> {
+        self.reason
+    }
+
+    /// Whether retrying this request on a fresh connection is safe.
+    ///
+    /// True only for [`ErrorKind::Refused`], which means the peer stated it never began
+    /// this exchange. Deliberately narrow: any other failure may have been delivered and
+    /// acted on before it failed, and this crate cannot know whether the request was
+    /// idempotent.
+    pub const fn is_retriable(&self) -> bool {
+        matches!(self.kind, ErrorKind::Refused)
+    }
+
+    /// The connection is going away, and this exchange was never begun.
+    pub(crate) const fn refused() -> Self {
+        Self::new(
+            ErrorKind::Refused,
+            "the peer went away before it began this exchange",
+        )
+    }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.kind.describe(), self.detail)
+        write!(f, "{}: {}", self.kind.describe(), self.detail)?;
+        if let Some(reason) = self.reason {
+            write!(f, " ({reason})")?;
+        }
+        Ok(())
     }
 }
 

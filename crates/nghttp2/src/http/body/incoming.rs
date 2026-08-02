@@ -30,24 +30,51 @@ use http_body::{Body, Frame, SizeHint};
 use super::super::error::Error;
 use super::super::shared::{Incoming, Shared};
 
+/// Which message this body belongs to, which decides what dropping it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Direction {
+    /// A response a client is receiving.
+    ///
+    /// Dropping it unread says the caller has stopped caring, and the only way to stop the
+    /// peer sending the rest is to reset the stream.
+    Response,
+    /// A request a server is receiving.
+    ///
+    /// Dropping it unread says nothing of the sort. A handler that ignores a request body
+    /// is entitled to answer anyway, and resetting would destroy the response it is about
+    /// to send.
+    Request,
+}
+
 /// The body of a received message.
 ///
 /// Yields data frames in the order they arrived, then a trailers frame if the peer sent
 /// one. Reading it is what gives the peer room to send more.
 ///
 /// Dropping it discards whatever has not been read and returns that capacity to the peer,
-/// so an unwanted body never becomes a stalled connection.
+/// so an unwanted body never becomes a stalled connection. For a **response** that has not
+/// finished arriving, dropping also resets the stream: returning the window would
+/// otherwise invite the peer to send the rest of something nobody will read. A **request**
+/// body on a server is not reset, because a handler that ignores the body still has a
+/// response to give.
 #[derive(Debug)]
 pub struct IncomingBody {
     stream: i32,
+    direction: Direction,
     incoming: Arc<Incoming>,
     shared: Arc<Shared>,
 }
 
 impl IncomingBody {
-    pub(crate) const fn new(stream: i32, incoming: Arc<Incoming>, shared: Arc<Shared>) -> Self {
+    pub(crate) const fn new(
+        stream: i32,
+        direction: Direction,
+        incoming: Arc<Incoming>,
+        shared: Arc<Shared>,
+    ) -> Self {
         Self {
             stream,
+            direction,
             incoming,
             shared,
         }
@@ -101,7 +128,16 @@ impl Body for IncomingBody {
 
 impl Drop for IncomingBody {
     fn drop(&mut self) {
+        let complete = self.incoming.is_finished();
         let unread = self.incoming.abandon();
         self.credit(unread);
+
+        // Only a response, and only one still arriving. A stream that already ended has
+        // nothing left to stop, and resetting it would tell the peer something went wrong
+        // when nothing did.
+        if self.direction == Direction::Response && !complete {
+            self.shared.reset(self.stream, crate::ErrorCode::CANCEL);
+            self.shared.wake_driver();
+        }
     }
 }
