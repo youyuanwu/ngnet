@@ -307,11 +307,24 @@ where
                 return Ok(());
             }
 
+            // Read before the park rather than inside it: `&Session` is not `Send`, and a
+            // shared borrow captured by the closure would be held across the `await`,
+            // making the whole driver non-`Send` and defeating the auto-trait inference
+            // the transport traits are shaped around. A snapshot is enough — nothing can
+            // make the session want to write again except a command, a resume or received
+            // octets, and the predicate already watches all three.
+            let wants_write = session.want_write();
+
             core::future::poll_fn(|_cx| {
+                // `wants_write` is redundant today — every path above flushes before
+                // reaching here — but not structurally so: a later phase that touches the
+                // session after the flush would leave octets queued behind a park that no
+                // wake is coming for.
                 let idle = queue.is_empty()
                     && shared.ready_len() == 0
                     && lock(&inbox).is_empty()
                     && !lock(&intake).finished
+                    && !wants_write
                     && !(handles.strong_count() == 0 && registry.is_empty());
                 if idle { Poll::Pending } else { Poll::Ready(()) }
             })

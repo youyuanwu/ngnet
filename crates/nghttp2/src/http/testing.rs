@@ -81,18 +81,33 @@ struct Pipe {
 }
 
 impl Pipe {
-    fn put(&mut self, data: &[u8]) {
+    /// Appends `data`, handing back whoever was waiting for it.
+    ///
+    /// The waker is returned rather than invoked, so the caller can release the pipe's
+    /// lock before waking. Waking under a lock is the shape a deadlock takes when a woken
+    /// task reaches straight back for the same lock, and scaffolding that models a
+    /// transport should not be the one place that rule is broken.
+    #[must_use]
+    fn put(&mut self, data: &[u8]) -> Option<Waker> {
         self.bytes.extend(data.iter().copied());
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
-        }
+        self.waker.take()
     }
 
-    fn close(&mut self) {
+    /// Marks the end of the stream, handing back whoever was waiting.
+    #[must_use]
+    fn close(&mut self) -> Option<Waker> {
         self.closed = true;
-        if let Some(waker) = self.waker.take() {
-            waker.wake();
-        }
+        self.waker.take()
+    }
+}
+
+/// Runs a pipe operation and wakes the waiter, if any, outside the pipe's lock.
+fn notifying(pipe: &Mutex<Pipe>, act: impl FnOnce(&mut Pipe) -> Option<Waker>) {
+    let waker = act(&mut pipe
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner));
+    if let Some(waker) = waker {
+        waker.wake();
     }
 }
 
@@ -153,7 +168,7 @@ impl Duplex {
 
     /// Signals end of stream to the peer.
     pub fn close(&self) {
-        self.outgoing.lock().expect("outgoing pipe").close();
+        notifying(&self.outgoing, Pipe::close);
     }
 }
 
@@ -256,21 +271,21 @@ impl Drop for DuplexWriter {
     /// Closing on drop is what lets a test model a peer hanging up, and is what a real
     /// socket does.
     fn drop(&mut self) {
-        self.outgoing.lock().expect("outgoing pipe").close();
+        notifying(&self.outgoing, Pipe::close);
     }
 }
 
 impl TransportWrite for DuplexWriter {
     fn write(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
         *self.writes.lock().expect("write count") += 1;
-        self.outgoing.lock().expect("outgoing pipe").put(&buf);
+        notifying(&self.outgoing, |pipe| pipe.put(&buf));
         let written = buf.len();
         core::future::ready((Ok(written), buf))
     }
 
     fn write_borrowed(&mut self, data: &[u8]) -> impl Future<Output = io::Result<usize>> {
         *self.writes.lock().expect("write count") += 1;
-        self.outgoing.lock().expect("outgoing pipe").put(data);
+        notifying(&self.outgoing, |pipe| pipe.put(data));
         core::future::ready(Ok(data.len()))
     }
 
@@ -355,7 +370,11 @@ impl http_body::Body for Full {
         mut self: core::pin::Pin<&mut Self>,
         _cx: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Bytes>, Infallible>>> {
-        Poll::Ready(self.data.take().map(|data| Ok(http_body::Frame::data(data))))
+        Poll::Ready(
+            self.data
+                .take()
+                .map(|data| Ok(http_body::Frame::data(data))),
+        )
     }
 
     fn is_end_stream(&self) -> bool {

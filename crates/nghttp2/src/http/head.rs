@@ -161,3 +161,128 @@ pub(crate) fn response_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Respo
         .body(())
         .map_err(|_| protocol("the peer sent a response head that could not be assembled"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A received header block, as `response_head` takes it.
+    type Block = Vec<(Vec<u8>, Vec<u8>)>;
+
+    fn fields(pairs: &[(&str, &str)]) -> Block {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
+            .collect()
+    }
+
+    /// Peer input reaches this function unvalidated by anything of ours, so every
+    /// malformed shape has to produce an error rather than a panic.
+    #[test]
+    fn malformed_response_heads_are_rejected_rather_than_panicking() {
+        let cases: &[(&str, Block)] = &[
+            (
+                "no status at all",
+                fields(&[("content-type", "text/plain")]),
+            ),
+            (
+                "a second status",
+                fields(&[(":status", "200"), (":status", "204")]),
+            ),
+            (
+                "a pseudo-header that is not :status",
+                fields(&[(":status", "200"), (":method", "GET")]),
+            ),
+            (
+                "a field before :status",
+                fields(&[("content-type", "text/plain"), (":status", "200")]),
+            ),
+            (
+                "a status that is not a number",
+                fields(&[(":status", "two hundred")]),
+            ),
+            ("a status out of range", fields(&[(":status", "9999")])),
+            (
+                "a field name with a space in it",
+                fields(&[(":status", "200"), ("bad name", "value")]),
+            ),
+            (
+                "a field value with a newline in it",
+                fields(&[(":status", "200"), ("x-note", "one\ntwo")]),
+            ),
+            (
+                "an empty field name",
+                fields(&[(":status", "200"), ("", "value")]),
+            ),
+        ];
+
+        for (description, block) in cases {
+            let outcome = response_head(block);
+            assert!(
+                outcome.is_err(),
+                "a response head with {description} was accepted",
+            );
+            assert_eq!(
+                outcome.unwrap_err().kind(),
+                ErrorKind::Protocol,
+                "a response head with {description} reported the wrong kind",
+            );
+        }
+    }
+
+    #[test]
+    fn a_well_formed_response_head_is_assembled() {
+        let head = response_head(&fields(&[
+            (":status", "204"),
+            ("x-first", "one"),
+            ("x-second", "two"),
+        ]))
+        .expect("a well-formed head");
+
+        assert_eq!(head.status(), http::StatusCode::NO_CONTENT);
+        assert_eq!(head.headers().get("x-first").unwrap(), "one");
+        assert_eq!(head.headers().get("x-second").unwrap(), "two");
+    }
+
+    #[test]
+    fn a_request_head_leads_with_its_pseudo_headers() {
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("http://example.test/path?query=1")
+            .header("x-note", "value")
+            .body(())
+            .expect("a request");
+        let (parts, ()) = request.into_parts();
+
+        let headers = request_headers(&parts).expect("a valid head");
+        let names: Vec<String> = headers
+            .fields
+            .iter()
+            .map(|(name, _)| String::from_utf8_lossy(name).into_owned())
+            .collect();
+
+        assert_eq!(
+            names,
+            [":method", ":scheme", ":authority", ":path", "x-note"]
+        );
+        assert_eq!(headers.fields[3].1, b"/path?query=1");
+    }
+
+    #[test]
+    fn a_host_field_stands_in_for_a_missing_authority() {
+        let request = http::Request::builder()
+            .uri("/relative")
+            .header("host", "example.test")
+            .body(())
+            .expect("a request");
+        let (parts, ()) = request.into_parts();
+
+        let headers = request_headers(&parts).expect("a valid head");
+        assert_eq!(headers.fields[2].1, b"example.test");
+        // Carried once, as `:authority`, so the two cannot disagree on the wire.
+        assert!(
+            headers.fields.iter().all(|(name, _)| name != b"host"),
+            "the host field was carried twice",
+        );
+    }
+}

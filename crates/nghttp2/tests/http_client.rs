@@ -393,3 +393,64 @@ fn the_borrowed_write_path_carries_an_exchange_too() {
         Some(&b"zero copy"[..]),
     );
 }
+
+#[test]
+fn a_body_frame_larger_than_one_data_frame_arrives_whole() {
+    // The session hands a body a bounded buffer, and an `http_body` frame is whatever size
+    // its producer chose; the two do not line up. Without a cursor over the remainder,
+    // everything past the first buffer's worth would simply be dropped — silently, and
+    // only for large payloads.
+    let payload: Vec<u8> = (0..70_000u32).map(|index| (index % 251) as u8).collect();
+
+    let (client_side, server_side) = duplex(false);
+    let (requests, connection) =
+        nghttp2::http::handshake::<_, Full>(client_side).expect("handshake");
+
+    let mut peer = Peer::default();
+    let response = requests.send_request(
+        http::Request::builder()
+            .method(http::Method::POST)
+            .uri("http://example.test/large")
+            .body(Full::new(payload.clone()))
+            .expect("building a request"),
+    );
+
+    let exchange = async {
+        let response = response.await.expect("a response");
+        // The head may arrive before the upload finishes, which is the point of the
+        // streaming design — so the body still needs passes to drain.
+        for _ in 0..64 {
+            yield_now().await;
+        }
+        drop(requests);
+        response
+    };
+
+    let response = block_on(alongside(
+        alongside(exchange, connection),
+        serve(server_side, peer_session(), &mut peer, answer_plainly),
+    ));
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        peer.bodies.get(&1).map(Vec::len),
+        Some(payload.len()),
+        "every octet of a multi-frame body reached the peer",
+    );
+    assert_eq!(peer.bodies.get(&1), Some(&payload));
+}
+
+/// Yields once, so the driver gets a full poll before the test looks again.
+async fn yield_now() {
+    let mut yielded = false;
+    core::future::poll_fn(move |cx| {
+        if yielded {
+            core::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
+        }
+    })
+    .await;
+}
