@@ -186,7 +186,7 @@ impl<C> SessionBuilder<C> {
             bodies: BodyRegistry::default(),
             pending: PendingErrors::default(),
             responded: ResponseGuard::default(),
-            frames: FrameProgress::default(),
+            frames: FrameProgress::new(self.role == Role::Server),
             _context: PhantomData,
         };
 
@@ -354,7 +354,13 @@ impl<C> Session<C> {
                 consumed as i32,
             ));
         }
-        Ok(consumed as usize)
+
+        // Frame boundaries are counted over exactly the octets libnghttp2 accepted, which
+        // is what keeps `mid_frame` in step with the session even when it stops short of
+        // the whole buffer.
+        let consumed = consumed as usize;
+        self.frames.advance(&input[..consumed]);
+        Ok(consumed)
     }
 
     /// Runs one call into libnghttp2 with the caller's context reachable from callbacks.
@@ -378,7 +384,6 @@ impl<C> Session<C> {
             bodies: &mut self.bodies,
             pending: &mut self.pending,
             responded: &mut self.responded,
-            frames: &mut self.frames,
         };
 
         // Restores the session's user data however this scope is left, so a panic
@@ -756,15 +761,16 @@ impl<C> Session<C> {
 
     /// Whether the session is part-way through receiving a frame.
     ///
-    /// True once a frame header has been parsed and until that frame is complete. A
-    /// transport reporting end-of-file while this holds means the peer truncated a frame
-    /// rather than closing cleanly, which is a connection error rather than an orderly
-    /// shutdown.
+    /// True once any part of a frame has arrived and the frame is not yet whole — its
+    /// nine-octet header included. A transport reporting end-of-file while this holds
+    /// means the peer truncated a frame rather than closing cleanly, which is a
+    /// connection error rather than an orderly shutdown.
     ///
-    /// The nine-octet frame header itself is not covered: libnghttp2 reports nothing
-    /// until a header is complete, so a connection cut part-way through one is
-    /// indistinguishable from a clean close. This reports truncation of a frame *body*,
-    /// which is the case worth distinguishing and the only one observable.
+    /// This is counted from the octets handed to [`Session::recv`] rather than inferred
+    /// from libnghttp2's callbacks, because not every frame that begins produces a
+    /// frame-received callback — a valid `PRIORITY` frame does not, nor does a discarded
+    /// payload — and a tracker built on that pairing would stick, turning a later clean
+    /// close into a reported truncation.
     pub const fn mid_frame(&self) -> bool {
         self.frames.in_frame()
     }
@@ -893,10 +899,6 @@ impl Callbacks {
             sys::nghttp2_session_callbacks_set_on_stream_close_callback(
                 self.raw,
                 Some(callbacks::on_stream_close::<C>),
-            );
-            sys::nghttp2_session_callbacks_set_on_begin_frame_callback(
-                self.raw,
-                Some(callbacks::on_begin_frame::<C>),
             );
         }
     }

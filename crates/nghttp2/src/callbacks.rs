@@ -26,7 +26,7 @@ use nghttp2_sys as sys;
 use crate::body::{BodyError, BodyOutcome};
 use crate::error::ErrorCode;
 use crate::handlers::{HeaderAction, Handlers};
-use crate::state::{BodyEntry, BodyRegistry, FrameProgress, PendingErrors, ResponseGuard};
+use crate::state::{BodyEntry, BodyRegistry, PendingErrors, ResponseGuard};
 use crate::stream::{FrameInfo, Goaway, HeaderCategory, StreamId};
 
 /// Everything a trampoline may touch during one FFI call.
@@ -39,7 +39,6 @@ pub(crate) struct Bridge<'a, C> {
     pub(crate) bodies: &'a mut BodyRegistry,
     pub(crate) pending: &'a mut PendingErrors,
     pub(crate) responded: &'a mut ResponseGuard,
-    pub(crate) frames: &'a mut FrameProgress,
 }
 
 /// Recovers the bridge a callback was handed.
@@ -106,24 +105,6 @@ unsafe fn frame_info(frame: *const sys::nghttp2_frame) -> FrameInfo {
     };
 
     FrameInfo::with_details(hd, category, goaway)
-}
-
-/// Records that a frame header has been parsed, so a truncated frame body is detectable.
-///
-/// libnghttp2 offers no query for "part-way through a frame", so it is synthesised here:
-/// this fires once a frame header is complete, and `on_frame_recv` fires once the frame
-/// is. Between the two, the session holds an incomplete frame. Truncation *within* the
-/// nine-octet header is not observable this way, and is documented as such.
-pub(crate) unsafe extern "C" fn on_begin_frame<C>(
-    _session: *mut sys::nghttp2_session,
-    _hd: *const sys::nghttp2_frame_hd,
-    user_data: *mut c_void,
-) -> i32 {
-    // SAFETY: `user_data` is whatever `with_context` installed, or null.
-    if let Some(bridge) = unsafe { bridge::<C>(user_data) } {
-        bridge.frames.begin();
-    }
-    0
 }
 
 pub(crate) unsafe extern "C" fn on_begin_headers<C>(
@@ -221,11 +202,6 @@ pub(crate) unsafe extern "C" fn on_frame_recv<C>(
     let Some(bridge) = (unsafe { bridge::<C>(user_data) }) else {
         return 0;
     };
-
-    // The frame is complete, whether or not the caller wants to hear about it — so this
-    // must happen before the early return below, or a session with no frame handler would
-    // look permanently mid-frame.
-    bridge.frames.end();
 
     let Some(handler) = bridge.handlers.frame_recv.as_mut() else {
         return 0;

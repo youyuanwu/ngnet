@@ -401,11 +401,25 @@ fn a_request_reaches_the_handlers_intact() {
 #[derive(Debug, Default)]
 struct Categories {
     blocks: Vec<(i32, Option<nghttp2::HeaderCategory>)>,
+    begun: Vec<Option<nghttp2::HeaderCategory>>,
+    per_field: Vec<Option<nghttp2::HeaderCategory>>,
     goaway: Vec<(i32, u32)>,
 }
 
 fn categorising(builder: SessionBuilder<Categories>) -> SessionBuilder<Categories> {
-    builder.on_frame(|seen: &mut Categories, info: FrameInfo| {
+    builder
+        // All three header-phase callbacks were changed to carry the category, so all
+        // three are exercised: a fix applied to only one of them would pass a test that
+        // watched only `on_frame`.
+        .on_begin_headers(|seen: &mut Categories, info: FrameInfo| {
+            seen.begun.push(info.category());
+            HeaderAction::Continue
+        })
+        .on_header(|seen: &mut Categories, info: FrameInfo, _name: &[u8], _value: &[u8]| {
+            seen.per_field.push(info.category());
+            HeaderAction::Continue
+        })
+        .on_frame(|seen: &mut Categories, info: FrameInfo| {
         if info.kind() == FrameType::HEADERS {
             seen.blocks.push((info.stream_id().get(), info.category()));
         }
@@ -507,6 +521,31 @@ fn a_trailing_header_block_is_distinguishable_from_the_one_that_opened_the_messa
         seen_client.blocks[1].1.unwrap().is_trailing(),
         "the trailing block is"
     );
+
+    // The same distinction must be available in the header-phase callbacks, which is
+    // where an async layer decides whether a field belongs to the message head or its
+    // trailers — by the time the frame callback fires, the fields have already been
+    // dispatched.
+    assert_eq!(
+        seen_client.begun,
+        vec![
+            Some(nghttp2::HeaderCategory::Response),
+            Some(nghttp2::HeaderCategory::Trailing)
+        ],
+        "the begin-headers callback must carry the category too"
+    );
+    assert!(
+        seen_client
+            .per_field
+            .contains(&Some(nghttp2::HeaderCategory::Trailing)),
+        "fields of a trailing block must be identifiable as such while they arrive"
+    );
+    assert!(
+        seen_client
+            .per_field
+            .contains(&Some(nghttp2::HeaderCategory::Response)),
+        "fields of the opening block must be identifiable as such"
+    );
 }
 
 #[test]
@@ -537,41 +576,118 @@ fn a_received_goaway_reports_the_last_stream_the_peer_processed() {
 }
 
 #[test]
-fn a_truncated_frame_body_is_distinguishable_from_a_clean_close() {
-    // FR-036. Feeding a frame header without its body leaves the session mid-frame, which
-    // is what lets a transport EOF there be reported as truncation rather than an orderly
-    // shutdown. Truncation inside the nine-octet header is not observable this way, and
-    // the second half of this test pins that limit so it cannot be claimed by accident.
+fn a_truncated_frame_is_distinguishable_from_a_clean_close_at_every_boundary() {
+    // FR-036. The interesting property is not that one hand-picked split is detected, but
+    // that the answer is right at *every* offset in a real byte stream — including inside
+    // a frame header, which the callback-based approach this replaced could not see at
+    // all. So the stream is replayed one octet at a time and the tracker is checked after
+    // each, against boundaries computed independently by walking the frames here.
+    let mut client = SessionBuilder::<()>::client().build().unwrap();
+    let stream = client
+        .submit_request(&[
+            nghttp2::Header::new(":method", "GET"),
+            nghttp2::Header::new(":scheme", "http"),
+            nghttp2::Header::new(":authority", "example.test"),
+            nghttp2::Header::new(":path", "/"),
+        ])
+        .unwrap();
+    let _ = stream;
+    let wire = drain(&mut client, &mut ());
+
+    // Independently derive, for each prefix length, whether it ends on a frame boundary.
+    // This walks the same structure the implementation does but is written separately, so
+    // agreement is evidence rather than tautology.
+    let mut boundary = vec![false; wire.len() + 1];
+    let mut at = CLIENT_MAGIC.len();
+    boundary[at] = true;
+    while at + 9 <= wire.len() {
+        let len = u32::from_be_bytes([0, wire[at], wire[at + 1], wire[at + 2]]) as usize;
+        at += 9 + len;
+        if at <= wire.len() {
+            boundary[at] = true;
+        }
+    }
+
+    let mut server = SessionBuilder::<Observed>::server().build().unwrap();
+    let mut observed = Observed::default();
+
+    assert!(
+        !server.mid_frame(),
+        "a session that has received nothing is not mid-frame"
+    );
+
+    for (index, octet) in wire.iter().enumerate() {
+        server.recv(&[*octet], &mut observed).unwrap();
+        let fed = index + 1;
+
+        // The preface is not a frame, so anything inside it counts as between frames.
+        let expected = fed > CLIENT_MAGIC.len() && !boundary[fed];
+        assert_eq!(
+            server.mid_frame(),
+            expected,
+            "after {fed} of {} octets the tracker disagreed about being mid-frame",
+            wire.len()
+        );
+    }
+
+    assert!(
+        !server.mid_frame(),
+        "a complete stream ends on a frame boundary"
+    );
+}
+
+#[test]
+fn a_frame_split_across_reads_is_tracked_across_the_gap() {
+    // The case the byte counter exists for: a frame that spans two `recv` calls. A
+    // transport reporting end-of-file in the gap has truncated the connection, and this
+    // is what lets that be said with confidence rather than guessed.
     let mut server = SessionBuilder::<Observed>::server().build().unwrap();
     let mut observed = Observed::default();
     handshake(&mut server, &mut observed);
 
-    assert!(
-        !server.mid_frame(),
-        "a session between frames is not mid-frame"
-    );
+    assert!(!server.mid_frame(), "between frames after the handshake");
 
-    // A SETTINGS frame header announcing 6 octets of payload, with none supplied.
+    // A SETTINGS frame header announcing six octets, delivered without them.
     let header = [0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
     server.recv(&header, &mut observed).unwrap();
-    assert!(
-        server.mid_frame(),
-        "a header without its payload leaves the session part-way through a frame"
-    );
+    assert!(server.mid_frame(), "a header without its payload is mid-frame");
 
-    // Completing the frame clears it again.
-    let payload = [0x00, 0x03, 0x00, 0x00, 0x00, 0x64];
-    server.recv(&payload, &mut observed).unwrap();
-    assert!(
-        !server.mid_frame(),
-        "completing the frame ends the partial state"
-    );
+    // Part of the payload: still mid-frame.
+    server.recv(&[0x00, 0x03, 0x00], &mut observed).unwrap();
+    assert!(server.mid_frame(), "a partial payload is still mid-frame");
 
-    // The documented limit: a truncated frame *header* reports nothing, because nothing
-    // fires until a header is whole.
+    // The rest completes it.
+    server.recv(&[0x00, 0x00, 0x64], &mut observed).unwrap();
+    assert!(!server.mid_frame(), "completing the frame ends the state");
+
+    // And truncation inside a frame *header* is now detectable too, which the callback
+    // pairing this replaced could not see.
     server.recv(&header[..4], &mut observed).unwrap();
     assert!(
+        server.mid_frame(),
+        "a partial frame header is part-way through a frame"
+    );
+}
+
+#[test]
+fn a_priority_frame_does_not_strand_the_partial_frame_state() {
+    // The specific defect that made a callback-paired implementation unsound: libnghttp2
+    // completes a valid PRIORITY frame without ever invoking the frame-received callback,
+    // so a tracker keyed on that pairing stays stuck mid-frame and reports a later clean
+    // close as a truncation. Counting octets is immune, and this pins that.
+    let mut server = SessionBuilder::<Observed>::server().build().unwrap();
+    let mut observed = Observed::default();
+    handshake(&mut server, &mut observed);
+
+    // PRIORITY: five octets of payload on stream 1, depending on stream 0 with weight 16.
+    let priority = [
+        0x00, 0x00, 0x05, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x0f,
+    ];
+    server.recv(&priority, &mut observed).unwrap();
+
+    assert!(
         !server.mid_frame(),
-        "truncation inside a frame header is not observable, as documented"
+        "a complete PRIORITY frame must leave no partial-frame state behind, \
+         however libnghttp2 chooses to report it"
     );
 }

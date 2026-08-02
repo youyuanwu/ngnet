@@ -83,7 +83,8 @@ fn open_enumerations_stay_open(
         | Setting::InitialWindowSize(_)
         | Setting::MaxFrameSize(_)
         | Setting::MaxHeaderListSize(_)
-        | Setting::EnableConnectProtocol(_) => {}
+        | Setting::EnableConnectProtocol(_)
+        | Setting::NoRfc7540Priorities(_) => {}
         _ => {}
     }
 }
@@ -173,9 +174,32 @@ fn goaway_surface(goaway: Goaway) {
 
 /// Header fields for outgoing messages.
 fn header_surface() {
-    let _: Header<'_> = Header::new("name", "value");
+    let plain: Header<'_> = Header::new("name", "value");
     let _: Header<'_> = Header::from_bytes(b"name", b"value");
-    let _: Header<'_> = Header::new("authorization", "secret").sensitive();
+    let sensitive: Header<'_> = Header::new("authorization", "secret").sensitive();
+
+    let _: &[u8] = plain.name();
+    let _: &[u8] = plain.value();
+    let _: bool = plain.is_sensitive();
+    let _: bool = sensitive.is_sensitive();
+}
+
+/// Settings, including the accessors that translate them for the wire.
+fn setting_surface() {
+    let settings = [
+        Setting::HeaderTableSize(4096),
+        Setting::EnablePush(false),
+        Setting::MaxConcurrentStreams(100),
+        Setting::InitialWindowSize(65535),
+        Setting::MaxFrameSize(16384),
+        Setting::MaxHeaderListSize(8192),
+        Setting::EnableConnectProtocol(false),
+        Setting::NoRfc7540Priorities(true),
+    ];
+    for setting in settings {
+        let _: i32 = setting.id();
+        let _: u32 = setting.value();
+    }
 }
 
 /// Outgoing bodies: the trait, its outcomes, and the in-memory implementation.
@@ -255,6 +279,7 @@ fn the_sans_io_surface_is_unchanged() {
 
     error_code_surface();
     header_surface();
+    setting_surface();
     body_surface();
     raw_surface();
     error_surface(&Error::from_native("nghttp2_session_send", -901));
