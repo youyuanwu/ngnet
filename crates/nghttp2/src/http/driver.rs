@@ -618,7 +618,17 @@ fn dispatch(
                             ErrorKind::Protocol,
                             "the peer sent a response head this crate could not accept",
                         ));
+                        // No body was handed out, so nothing will ever read or drop one —
+                        // and anything already queued would hold connection-level window
+                        // shut for the rest of the connection's life. Abandoning here is
+                        // what returns it, and marks the stream so later arrivals are
+                        // credited on the spot rather than accumulating behind a reader
+                        // that does not exist.
+                        let unread = incoming.abandon();
                         session.reset_stream(StreamId::new(stream), ErrorCode::PROTOCOL_ERROR)?;
+                        if unread > 0 {
+                            session.consume(StreamId::new(stream), unread)?;
+                        }
                     }
                 }
             }

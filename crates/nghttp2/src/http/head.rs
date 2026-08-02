@@ -267,6 +267,51 @@ mod tests {
         assert_eq!(head.headers().get("x-second").unwrap(), "two");
     }
 
+    /// Trailers reach this function straight off the wire, so the same rule applies as to
+    /// response heads: every malformed shape must produce an error rather than a panic.
+    #[test]
+    fn malformed_trailers_are_rejected_rather_than_panicking() {
+        let cases: &[(&str, Block)] = &[
+            (
+                "a pseudo-header, which no trailing block may carry",
+                fields(&[(":status", "200")]),
+            ),
+            ("a name with a space in it", fields(&[("bad name", "one")])),
+            ("an empty name", fields(&[("", "one")])),
+            (
+                "a value with a newline in it",
+                fields(&[("x-note", "one\ntwo")]),
+            ),
+        ];
+
+        for (description, block) in cases {
+            let outcome = trailers(block);
+            assert!(
+                outcome.is_err(),
+                "a trailing block with {description} was accepted",
+            );
+            assert_eq!(
+                outcome.unwrap_err().kind(),
+                ErrorKind::Protocol,
+                "a trailing block with {description} reported the wrong kind",
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_trailer_keeps_every_value() {
+        let map = trailers(&fields(&[
+            ("x-note", "one"),
+            ("x-checksum", "deadbeef"),
+            ("x-note", "two"),
+        ]))
+        .expect("a well-formed trailing block");
+
+        let notes: Vec<&[u8]> = map.get_all("x-note").iter().map(|v| v.as_bytes()).collect();
+        assert_eq!(notes, [b"one".as_slice(), b"two".as_slice()]);
+        assert_eq!(map.get("x-checksum").unwrap(), "deadbeef");
+    }
+
     #[test]
     fn a_request_head_leads_with_its_pseudo_headers() {
         let request = http::Request::builder()

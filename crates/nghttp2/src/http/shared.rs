@@ -537,3 +537,86 @@ impl Registry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A waker that records nothing. The accounting below is what is under test, not the
+    /// notification.
+    fn nowhere() -> Waker {
+        struct Silent;
+        impl std::task::Wake for Silent {
+            fn wake(self: Arc<Self>) {}
+        }
+        Waker::from(Arc::new(Silent))
+    }
+
+    fn taken(incoming: &Incoming) -> Option<usize> {
+        match incoming.poll_frame(&nowhere()) {
+            Poll::Ready(Some(Ok(frame))) => frame.data_ref().map(bytes::Bytes::len),
+            _ => None,
+        }
+    }
+
+    /// Every received octet must be accounted for exactly once: once by being read, or
+    /// once by being abandoned, never both and never neither. Getting this wrong does not
+    /// corrupt anything — it quietly throttles the connection, and the symptom shows up
+    /// far from the cause, which is why it is pinned here rather than left to inference.
+    #[test]
+    fn octets_read_are_not_also_octets_abandoned() {
+        let incoming = Incoming::default();
+        assert_eq!(incoming.push(Bytes::from_static(b"first")), 0);
+        assert_eq!(incoming.push(Bytes::from_static(b"second")), 0);
+
+        assert_eq!(taken(&incoming), Some(5));
+        // The five already handed over are the caller's to credit; only the six left are
+        // the abandoning body's.
+        assert_eq!(incoming.abandon(), 6);
+    }
+
+    #[test]
+    fn everything_read_leaves_nothing_to_abandon() {
+        let incoming = Incoming::default();
+        assert_eq!(incoming.push(Bytes::from_static(b"payload")), 0);
+        assert_eq!(taken(&incoming), Some(7));
+        assert_eq!(incoming.abandon(), 0);
+    }
+
+    #[test]
+    fn arrivals_after_a_body_is_dropped_are_credited_at_once() {
+        let incoming = Incoming::default();
+        assert_eq!(incoming.abandon(), 0);
+        // Nothing will ever read this, so the driver is told to hand the window straight
+        // back rather than let it accumulate behind a reader that does not exist.
+        assert_eq!(incoming.push(Bytes::from_static(b"unwanted")), 8);
+    }
+
+    #[test]
+    fn a_finished_message_is_not_retroactively_failed() {
+        let incoming = Incoming::default();
+        incoming.push(Bytes::from_static(b"body"));
+        incoming.finish();
+        incoming.fail(truncated());
+
+        assert_eq!(taken(&incoming), Some(4));
+        assert!(matches!(incoming.poll_frame(&nowhere()), Poll::Ready(None)));
+        assert!(incoming.is_end_stream());
+    }
+
+    #[test]
+    fn trailers_are_delivered_after_the_payload_that_precedes_them() {
+        let incoming = Incoming::default();
+        incoming.push(Bytes::from_static(b"body"));
+        incoming.set_trailers(http::HeaderMap::new());
+        incoming.finish();
+
+        assert_eq!(taken(&incoming), Some(4));
+        let trailing = incoming.poll_frame(&nowhere());
+        assert!(
+            matches!(&trailing, Poll::Ready(Some(Ok(frame))) if frame.trailers_ref().is_some()),
+            "trailers overtook the payload they follow",
+        );
+        assert!(matches!(incoming.poll_frame(&nowhere()), Poll::Ready(None)));
+    }
+}

@@ -401,11 +401,10 @@ fn an_unread_body_stalls_the_peer_and_resumes_once_it_is_read() {
         }),
     ));
 
-    assert!(
-        stalled <= DEFAULT_WINDOW,
-        "the peer sent {stalled} octets into a {DEFAULT_WINDOW}-octet window",
+    assert_eq!(
+        stalled, DEFAULT_WINDOW,
+        "the peer should have sent exactly its window and then stopped",
     );
-    assert!(stalled > 0, "the peer sent nothing at all");
     assert_eq!(received, expected, "reading did not let the rest through");
 }
 
@@ -413,9 +412,16 @@ fn an_unread_body_stalls_the_peer_and_resumes_once_it_is_read() {
 fn an_unread_body_does_not_hold_up_another_stream() {
     // Spec SC-031. Flow control is per stream as well as per connection, so one caller
     // ignoring its body must not become every other caller's problem.
-    let ignored = payload(20_000);
-    let wanted = payload(4_000);
-    let answers = Answers::one("/ignored", ignored).and("/wanted", wanted.clone());
+    //
+    // The two payloads together come to within a few kilobytes of the connection's whole
+    // receive window, so the wanted stream finishes with almost nothing to spare. Sized
+    // that way on purpose: a comfortable margin would pass whether or not the per-stream
+    // accounting was right.
+    let ignored = payload(40_000);
+    let wanted = payload(20_000);
+    assert!(ignored.len() + wanted.len() < DEFAULT_WINDOW);
+    let answers = Answers::one("/ignored", ignored.clone()).and("/wanted", wanted.clone());
+    let sent = Arc::clone(&answers.sent);
 
     let (client_side, server_side) = duplex(false);
     let (requests, connection) =
@@ -444,6 +450,69 @@ fn an_unread_body_does_not_hold_up_another_stream() {
     ));
 
     assert_eq!(received, wanted);
+    assert_eq!(
+        sent.load(Ordering::Acquire),
+        ignored.len() + wanted.len(),
+        "the neglected stream never received its payload, so nothing was neglected",
+    );
+}
+
+#[test]
+fn dropping_an_unread_body_returns_its_window() {
+    // The other half of backpressure. An unread body holds connection-level capacity, and
+    // a caller who gives up on one has no way to return it by hand — so dropping must do
+    // it. Without this a connection would throttle itself a little further with every
+    // abandoned response, and the symptom would appear long after the cause.
+    let abandoned = payload(DEFAULT_WINDOW);
+    let wanted = payload(30_000);
+    let answers = Answers::one("/abandoned", abandoned).and("/wanted", wanted.clone());
+    let sent = Arc::clone(&answers.sent);
+
+    let (client_side, server_side) = duplex(false);
+    let (requests, connection) =
+        nghttp2::http::handshake::<_, Empty>(client_side).expect("handshake");
+
+    let mut peer = Peer::default();
+    let first = requests.send_request(request("/abandoned"));
+
+    let exchange = async {
+        let body = first.await.expect("a response").into_body();
+
+        // Let the peer fill the connection window with a body nobody wants.
+        for _ in 0..64 {
+            yield_now().await;
+        }
+        let held = sent.load(Ordering::Acquire);
+
+        drop(body);
+
+        // Only now is a second exchange asked for, so nothing but the drop can have made
+        // room for it.
+        let mut second = requests
+            .send_request(request("/wanted"))
+            .await
+            .expect("a response")
+            .into_body();
+        let (received, _) = drain(&mut second, None).await;
+        drop(requests);
+        (held, received)
+    };
+
+    let (held, received) = block_on(alongside(
+        alongside(exchange, connection),
+        serve(server_side, peer_session(), &mut peer, |session, peer| {
+            answers.step(session, peer);
+        }),
+    ));
+
+    assert_eq!(
+        held, DEFAULT_WINDOW,
+        "the abandoned body did not fill the window, so nothing had to be returned",
+    );
+    assert_eq!(
+        received, wanted,
+        "a body dropped unread did not hand its window back",
+    );
 }
 
 #[test]
