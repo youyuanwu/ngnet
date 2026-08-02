@@ -296,6 +296,20 @@ async fn the_same_exchange_runs_over_a_completion_shaped_transport() {
 // A transport that cannot move between threads
 // ---------------------------------------------------------------------------
 
+/// Compiles only while `T` is *not* `Send`.
+///
+/// Two blanket impls overlap for anything that *is* `Send`, so naming the method becomes
+/// ambiguous exactly then. Written out because this workspace takes no dependency on
+/// `static_assertions`, and asserted at all because the obvious alternative — "it was
+/// driven on a `LocalSet`" — proves nothing: `spawn_local` accepts `Send` futures too, so a
+/// connection that had quietly become `Send` would run there just as happily.
+trait AmbiguousIfSend<A> {}
+
+impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+
+fn assert_not_send<T: AmbiguousIfSend<A> + ?Sized, A>(_value: &T) {}
+
 /// A transport built on `Rc`, as the thread-per-core runtimes are.
 ///
 /// Nothing in the transport traits requires [`Send`], precisely so that runtimes like this
@@ -363,6 +377,17 @@ async fn a_transport_that_cannot_move_between_threads_compiles_and_runs() {
             inner: to_server,
             peer: to_client,
         };
+
+        // The guarantee itself, checked by the compiler rather than implied by how the
+        // test happens to run it. If a `Send` bound ever appeared in the transport traits,
+        // this connection would become `Send` and the call below would stop compiling.
+        let (_probe, probing) = nghttp2::http::handshake::<_, Full>(ThreadBound {
+            inner: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            peer: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        })
+        .expect("handshake");
+        assert_not_send(&probing);
+        drop(probing);
 
         let local = tokio::task::LocalSet::new();
         local
