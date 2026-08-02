@@ -691,3 +691,75 @@ fn a_priority_frame_does_not_strand_the_partial_frame_state() {
          however libnghttp2 chooses to report it"
     );
 }
+
+#[test]
+fn a_request_trailer_block_is_categorised_on_the_server_too() {
+    // FR-030 on the other role. The client-side test proves response trailers; this
+    // proves request trailers, because a regression that preserved one and broke the
+    // other would otherwise pass. Both directions matter: a server reading trailers is
+    // exactly as common as a client reading them.
+    let mut client = SessionBuilder::<()>::client().build().unwrap();
+    let mut server = categorising(SessionBuilder::<Categories>::server())
+        .build()
+        .unwrap();
+    let mut seen = Categories::default();
+
+    let stream = client
+        .submit_request_with_body(
+            &[
+                nghttp2::Header::new(":method", "POST"),
+                nghttp2::Header::new(":scheme", "http"),
+                nghttp2::Header::new(":authority", "example.test"),
+                nghttp2::Header::new(":path", "/upload"),
+            ],
+            TrailingBody { sent: false },
+        )
+        .unwrap();
+
+    // Drain until the body has ended and the trailer window has opened.
+    for _ in 0..16 {
+        let out = drain(&mut client, &mut ());
+        if !out.is_empty() {
+            server.recv(&out, &mut seen).unwrap();
+        }
+        if client.trailers_ready(stream) {
+            break;
+        }
+    }
+
+    client
+        .submit_trailer(stream, &[nghttp2::Header::new("checksum", "def456")])
+        .unwrap();
+    let out = drain(&mut client, &mut ());
+    server.recv(&out, &mut seen).unwrap();
+
+    let categories: Vec<_> = seen.blocks.iter().map(|(_, cat)| *cat).collect();
+    assert_eq!(
+        categories,
+        vec![
+            Some(nghttp2::HeaderCategory::Request),
+            Some(nghttp2::HeaderCategory::Trailing)
+        ],
+        "the server must distinguish the block that opened the request from the one \
+         trailing it"
+    );
+
+    assert_eq!(
+        seen.begun,
+        vec![
+            Some(nghttp2::HeaderCategory::Request),
+            Some(nghttp2::HeaderCategory::Trailing)
+        ],
+        "the begin-headers callback must carry the category on the server role too"
+    );
+    assert!(
+        seen.per_field
+            .contains(&Some(nghttp2::HeaderCategory::Trailing)),
+        "fields of a request's trailing block must be identifiable while they arrive"
+    );
+    assert!(
+        seen.per_field
+            .contains(&Some(nghttp2::HeaderCategory::Request)),
+        "fields of the opening request block must be identifiable"
+    );
+}
