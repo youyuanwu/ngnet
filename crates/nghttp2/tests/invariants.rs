@@ -113,9 +113,13 @@ fn strip_comments_and_strings(source: &str) -> String {
 ///
 /// That subtree is the one part of the crate permitted I/O-adjacent facilities and the
 /// `async` keyword; everything else is the sans-I/O core and is held to the original rule.
+///
+/// The match is on the exact location, `src/http/`, not on any path component that
+/// happens to be named `http`. A component-wise match would silently exempt a future core
+/// module at, say, `src/protocol/http/`, turning these scans into a partial no-op for
+/// exactly the code they exist to police.
 fn is_async_subtree(path: &Path) -> bool {
-    path.components()
-        .any(|part| part.as_os_str() == "http")
+    path.starts_with(crate_root().join("src").join("http"))
 }
 
 #[test]
@@ -182,13 +186,28 @@ fn the_facility_scan_would_still_catch_the_core() {
         "the scan must still detect async in a core module"
     );
 
-    // And the exclusion must be narrow: only the async subtree, not anything merely
-    // sharing a prefix or sitting beside it.
-    assert!(is_async_subtree(Path::new("src/http/transport.rs")));
-    assert!(is_async_subtree(Path::new("src/http/mod.rs")));
-    assert!(!is_async_subtree(Path::new("src/session.rs")));
-    assert!(!is_async_subtree(Path::new("src/header.rs")));
-    assert!(!is_async_subtree(Path::new("src/lib.rs")));
+    // And the exclusion must be narrow: the async subtree at its exact location, and
+    // nothing else. In particular a core module nested under a directory that happens to
+    // be named `http` must still be scanned — a component-wise match would exempt it, and
+    // the resulting hole would be invisible.
+    let src = crate_root().join("src");
+    assert!(is_async_subtree(&src.join("http/transport.rs")));
+    assert!(is_async_subtree(&src.join("http/mod.rs")));
+    assert!(!is_async_subtree(&src.join("session.rs")));
+    assert!(!is_async_subtree(&src.join("header.rs")));
+    assert!(!is_async_subtree(&src.join("lib.rs")));
+    assert!(
+        !is_async_subtree(&src.join("protocol/http/probe.rs")),
+        "a core module merely nested under a directory named `http` must still be scanned"
+    );
+    assert!(
+        !is_async_subtree(&src.join("codec/http/mod.rs")),
+        "the exemption is a location, not a name"
+    );
+    assert!(
+        !is_async_subtree(&src.join("http_helpers.rs")),
+        "a sibling sharing a prefix is not part of the subtree"
+    );
 }
 
 #[test]

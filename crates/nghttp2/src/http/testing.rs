@@ -123,14 +123,43 @@ pub fn duplex(borrowed_writes: bool) -> (Duplex, Duplex) {
 }
 
 impl Duplex {
-    /// How many writes this half has issued, for the per-pass write-count assertions.
+    /// How many writes this half has issued.
     pub fn writes(&self) -> usize {
         *self.writes.lock().expect("write count")
+    }
+
+    /// A handle that keeps observing the write count after the transport is split.
+    ///
+    /// [`Transport::split`] consumes the transport, so a test driving a connection can no
+    /// longer reach it — but the per-pass write counts are exactly what the later phases
+    /// must assert. Taking a handle first is how that count stays observable.
+    pub fn write_counter(&self) -> WriteCounter {
+        WriteCounter {
+            writes: Arc::clone(&self.writes),
+        }
     }
 
     /// Signals end of stream to the peer.
     pub fn close(&self) {
         self.outgoing.lock().expect("outgoing pipe").close();
+    }
+}
+
+/// Observes how many writes a transport has issued, across a split.
+#[derive(Debug, Clone)]
+pub struct WriteCounter {
+    writes: Arc<Mutex<usize>>,
+}
+
+impl WriteCounter {
+    /// Writes issued so far.
+    pub fn get(&self) -> usize {
+        *self.writes.lock().expect("write count")
+    }
+
+    /// Resets the count, so a test can measure one driver pass at a time.
+    pub fn reset(&self) {
+        *self.writes.lock().expect("write count") = 0;
     }
 }
 
@@ -201,6 +230,13 @@ impl TransportRead for DuplexReader {
             buf.extend_from_slice(&chunk);
             (Ok(take), buf)
         }
+    }
+}
+
+impl DuplexWriter {
+    /// Writes issued by this half.
+    pub fn writes(&self) -> usize {
+        *self.writes.lock().expect("write count")
     }
 }
 

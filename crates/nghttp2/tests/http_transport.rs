@@ -216,3 +216,68 @@ fn a_closed_duplex_reports_end_of_stream() {
         );
     });
 }
+
+#[test]
+fn write_counts_stay_observable_across_a_split() {
+    // Splitting consumes the transport, so a test that drives a connection can no longer
+    // reach it — yet the per-pass write counts are precisely what the later phases must
+    // assert. Taking a counter handle first is how that stays possible, and this pins it
+    // before anything depends on it.
+    let (client, server) = duplex(false);
+    let counter = client.write_counter();
+    let (_reader, mut writer) = client.split();
+    let (mut server_reader, _server_writer) = server.split();
+
+    assert_eq!(counter.get(), 0, "nothing written yet");
+
+    block_on(async {
+        let (result, _buf) = writer.write(Bytes::from_static(b"one")).await;
+        result.unwrap();
+        let (result, _buf) = writer.write(Bytes::from_static(b"two")).await;
+        result.unwrap();
+
+        let (read, buf) = server_reader.read(BytesMut::with_capacity(16)).await;
+        assert_eq!(read.unwrap(), 6);
+        assert_eq!(&buf[..], b"onetwo");
+    });
+
+    assert_eq!(counter.get(), 2, "two writes should have been counted");
+    assert_eq!(
+        writer.writes(),
+        counter.get(),
+        "the writer and the handle should agree"
+    );
+
+    counter.reset();
+    assert_eq!(counter.get(), 0, "resetting lets a single pass be measured");
+}
+
+#[test]
+fn a_borrowed_write_duplex_takes_the_zero_copy_path_and_still_counts() {
+    // The other of the two shapes the in-memory transport can take. Both are used by the
+    // later drain-strategy assertions, so both need coverage here rather than one being
+    // assumed to work because the other does.
+    let (client, server) = duplex(true);
+    let counter = client.write_counter();
+    let (_reader, mut writer) = client.split();
+    let (mut server_reader, _server_writer) = server.split();
+
+    assert!(
+        writer.writes_borrowed(),
+        "this shape advertises the zero-copy write path"
+    );
+
+    block_on(async {
+        writer.write_borrowed(b"borrowed").await.unwrap();
+
+        let (read, buf) = server_reader.read(BytesMut::with_capacity(16)).await;
+        assert_eq!(read.unwrap(), b"borrowed".len());
+        assert_eq!(&buf[..], b"borrowed");
+    });
+
+    assert_eq!(
+        counter.get(),
+        1,
+        "a borrowed write is still a write, and must be counted as one"
+    );
+}
