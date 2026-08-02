@@ -49,6 +49,7 @@ use http_body::Body;
 use crate::{ErrorCode, Session, StreamId};
 
 use super::body::{Direction, IncomingBody};
+use super::config::Config;
 use super::connection::Connection;
 use super::driver::{self, DriverGuard, Events, Role, Signals};
 use super::error::Result;
@@ -82,7 +83,35 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
-    let session = driver::server_session()?;
+    serve_with(transport, handler, Config::default())
+}
+
+/// Serves requests over `transport` with an explicit [`Config`].
+///
+/// Identical to [`serve`] but for the limits advertised to the peer and enforced locally.
+/// The concurrency limit in particular is the ceiling on how many handler futures one peer
+/// can have running at once — including handlers retained after their stream was reset —
+/// so it is a real bound on this connection's memory, not merely advice to the peer. See
+/// [`Config`] for the defaults and why they are conservative.
+///
+/// # Errors
+///
+/// Fails if the underlying session cannot be created. Failures afterwards are reported by
+/// the returned future.
+pub fn serve_with<T, H, F, B>(
+    transport: T,
+    handler: H,
+    config: Config,
+) -> Result<Connection<impl Future<Output = Result<()>>>>
+where
+    T: Transport,
+    H: FnMut(http::Request<IncomingBody>) -> F,
+    F: Future<Output = http::Response<B>>,
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    let session = driver::server_session(&config)?;
 
     let shared = Arc::new(Shared::default());
     let registry = Arc::new(Registry::default());
@@ -93,6 +122,8 @@ where
         handler,
         tasks: Tasks::new(Arc::clone(&shared)),
         losses: BTreeMap::new(),
+        max_concurrent_streams: config.concurrency(),
+        woken: Vec::new(),
         body: core::marker::PhantomData,
     };
 
@@ -199,6 +230,11 @@ struct ServerRole<H, F, B> {
     tasks: Tasks<F>,
     /// One signal per running handler, tripped when its stream goes.
     losses: BTreeMap<i32, Arc<CancelState>>,
+    /// The ceiling on concurrently running handlers, from [`Config`].
+    max_concurrent_streams: u32,
+    /// Scratch buffer of woken streams, reused across passes so draining the ready set
+    /// costs no allocation on the steady-state path — mirrors the body path's discipline.
+    woken: Vec<i32>,
     /// Names the response body type, which only appears inside the handler's future.
     body: core::marker::PhantomData<fn() -> B>,
 }
@@ -275,8 +311,14 @@ where
     fn advance(&mut self, session: &mut Session<Events>) -> Result<()> {
         // Only the handlers that were woken, which is the whole point of giving each its
         // own waker: a connection carrying a hundred streams polls one future when one of
-        // them becomes ready, not a hundred.
-        for stream in self.tasks.woken() {
+        // them becomes ready, not a hundred. The woken set is drained into a reused scratch
+        // buffer, and iterated by index so a handler that finishes can be polled and
+        // responded to without holding a borrow of that buffer across the call.
+        self.tasks.take_woken_into(&mut self.woken);
+        let mut index = 0;
+        while index < self.woken.len() {
+            let stream = self.woken[index];
+            index += 1;
             if let Some(response) = self.tasks.poll(stream) {
                 self.respond(session, stream, response)?;
             }
@@ -291,6 +333,18 @@ where
         fields: &[(Vec<u8>, Vec<u8>)],
         incoming: &Arc<Incoming>,
     ) -> Result<()> {
+        // libnghttp2 enforces the advertised `MAX_CONCURRENT_STREAMS` against the streams
+        // it still counts as open, and drops a reset stream from that count. This crate
+        // deliberately keeps a handler running after its stream is reset, so the number of
+        // handler futures alive here can exceed what libnghttp2 is counting. Enforcing the
+        // cap against the running handlers — retained ones included — makes it a real
+        // structural bound on this connection's memory rather than only advice to the peer.
+        if self.tasks.len() >= self.max_concurrent_streams as usize {
+            incoming.abandon();
+            session.reset_stream(StreamId::new(stream), ErrorCode::REFUSED_STREAM)?;
+            return Ok(());
+        }
+
         let head = match head::request_head(fields) {
             Ok(head) => head,
             Err(_error) => {

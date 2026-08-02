@@ -9,10 +9,15 @@
 //!
 //! tokio is readiness-based, so nothing here needs to own a buffer while an operation is in
 //! flight. Reads take the buffer, fill it and hand it straight back, with no copy. Writes
-//! override [`TransportWrite::write_borrowed`] and advertise it, so the connection hands
-//! over the session's own output blocks directly instead of gathering them into an owned
-//! buffer first — which is the one cost the completion-shaped traits would otherwise impose
-//! on a runtime that does not need them.
+//! elect [`TransportWrite::write_borrowed`], handing the session's own output blocks over
+//! directly instead of gathering them into an owned buffer first — the one cost the
+//! completion-shaped traits would otherwise impose on a runtime that does not need them.
+//!
+//! Because the `AsyncWrite` bound also admits buffering wrappers, whose `write` only fills a
+//! buffer, [`TransportWrite::commit`] flushes: without it a `BufWriter` or `BufStream` would
+//! strand the request and the driver would park on a response the peer never got.
+
+use core::future::Future;
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -99,13 +104,22 @@ where
         (result, buf)
     }
 
-    async fn write_borrowed(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.half.write(data).await
+    fn write_borrowed<'w>(
+        &'w mut self,
+        data: &'w [u8],
+    ) -> Option<impl Future<Output = std::io::Result<usize>> + 'w> {
+        // tokio never needs to own the octets, so the session's blocks are handed over as
+        // they are produced rather than gathered into one owned buffer first — the zero-copy
+        // path, elected by returning the write itself rather than by any separate flag.
+        Some(self.half.write(data))
     }
 
-    fn writes_borrowed(&self) -> bool {
-        // tokio never needs to own the octets, so the connection is told to hand over the
-        // session's blocks as they are produced rather than gathering them first.
-        true
+    async fn commit(&mut self) -> std::io::Result<()> {
+        // The bound is `AsyncWrite` alone, which admits buffering wrappers (`BufWriter`,
+        // `BufStream`): their `write` only fills a buffer, so without this the driver would
+        // park on a response to a request still sitting unflushed. Flushing here is the
+        // driver's promise made good — a raw socket's flush is a no-op, so the honest cases
+        // pay nothing.
+        self.half.flush().await
     }
 }

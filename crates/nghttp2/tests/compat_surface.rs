@@ -299,9 +299,21 @@ mod asynchronous {
         bytes_crate as bytes, http_body_crate as http_body, http_crate as http,
     };
     use nghttp2::http::{
-        Error, ErrorKind, IncomingBody, ResponseFuture, SendRequest, Transport, TransportRead,
-        TransportWrite, handshake,
+        Config, Error, ErrorKind, IncomingBody, ResponseFuture, SendRequest, Transport,
+        TransportRead, TransportWrite, handshake, handshake_with,
     };
+
+    /// The connection configuration, pinned as a `Copy` builder with conservative
+    /// defaults and one setter per advertised limit.
+    pub(super) fn config_surface() {
+        let _: Config = Config::default();
+        let configured: Config = Config::default()
+            .max_concurrent_streams(64)
+            .max_header_list_size(32 * 1024);
+        // `Copy`, so a caller can keep one and hand copies to several connections.
+        let _: Config = configured;
+        let _: Config = configured;
+    }
 
     /// The receiving body, pinned as an `http_body::Body` over the ecosystem's types.
     ///
@@ -385,6 +397,29 @@ mod asynchronous {
         Ok(())
     }
 
+    /// The explicit-config client entry point.
+    ///
+    /// Additive over [`client_surface`]: it takes a [`Config`] by value and returns the
+    /// same pair, so a caller that never wanted to configure anything keeps using
+    /// `handshake` unchanged.
+    pub(super) fn client_with_config_surface<T, B>(
+        transport: T,
+        config: Config,
+    ) -> core::result::Result<(), Error>
+    where
+        T: Transport,
+        T::Reader: TransportRead,
+        T::Writer: TransportWrite,
+        B: http_body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let (requests, connection): (SendRequest<B>, nghttp2::http::Connection<_>) =
+            handshake_with::<T, B>(transport, config)?;
+        drop((requests, connection));
+        Ok(())
+    }
+
     /// The server entry point, pinned the same way as the client's.
     ///
     /// A handler is an ordinary `FnMut` returning an ordinary future; nothing here is a
@@ -408,6 +443,27 @@ mod asynchronous {
         Ok(())
     }
 
+    /// The explicit-config server entry point, additive over [`server_surface`].
+    pub(super) fn server_with_config_surface<T, H, F, B>(
+        transport: T,
+        handler: H,
+        config: Config,
+    ) -> core::result::Result<(), Error>
+    where
+        T: Transport,
+        T::Reader: TransportRead,
+        T::Writer: TransportWrite,
+        H: FnMut(http::Request<IncomingBody>) -> F,
+        F: core::future::Future<Output = http::Response<B>>,
+        B: http_body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let connection = nghttp2::http::serve_with(transport, handler, config)?;
+        drop(connection);
+        Ok(())
+    }
+
     /// The ready-made tokio transport, when the feature that provides it is on.
     ///
     /// Feature-gated surface is still surface: a caller who enabled it is entitled to the
@@ -421,8 +477,31 @@ mod asynchronous {
 
         let carried: TokioIo<T> = TokioIo::new(stream);
         let (reader, writer): (TokioReader<T>, TokioWriter<T>) = Transport::split(carried);
-        let _: fn(&TokioWriter<T>) -> bool = TransportWrite::writes_borrowed;
+        write_half_surface::<TokioWriter<T>>();
         drop((reader, writer));
+    }
+
+    /// The writing half's contract, pinned by the shape of its two overridable points.
+    ///
+    /// The borrowed fast path is a *single* override: `write_borrowed` returns an
+    /// `Option` of a future, so the decision (`Some`/`None`) and the write are one method —
+    /// a separate boolean flag would be a different, breakable, surface. `commit` returns a
+    /// future of `()`. Both are pinned as signatures rather than fn pointers because a
+    /// return-position `impl Future` has no nameable type.
+    pub(super) fn write_half_surface<W: TransportWrite>() {
+        fn borrowed_is_one_optional_future<W: TransportWrite>(writer: &mut W, data: &[u8]) {
+            fn assert_optional_future<F: core::future::Future<Output = std::io::Result<usize>>>(
+                _: Option<F>,
+            ) {
+            }
+            assert_optional_future(writer.write_borrowed(data));
+        }
+        fn commit_returns_a_result_future<W: TransportWrite>(writer: &mut W) {
+            fn assert_future<F: core::future::Future<Output = std::io::Result<()>>>(_: F) {}
+            assert_future(writer.commit());
+        }
+        let _ = borrowed_is_one_optional_future::<W>;
+        let _ = commit_returns_a_result_future::<W>;
     }
 
     /// Never called. Its only job is to give the fixture above a `B` to hand over.
@@ -441,6 +520,12 @@ fn the_asynchronous_surface_is_unchanged() {
         asynchronous::client_surface::<Duplex, Empty>;
     let _: fn(&nghttp2::http::IncomingBody) = asynchronous::incoming_body_surface;
     let _: fn(&nghttp2::http::Cancelled) = asynchronous::cancelled_surface;
+    // The writing half's two overridable points, pinned generically so the shape holds for
+    // every transport, not only the ready-made tokio one.
+    asynchronous::write_half_surface::<nghttp2::http::testing::DuplexWriter>();
+    let _: fn() = asynchronous::config_surface;
+    let _: fn(Duplex, nghttp2::http::Config) -> core::result::Result<(), nghttp2::http::Error> =
+        asynchronous::client_with_config_surface::<Duplex, Empty>;
     #[cfg(feature = "tokio")]
     {
         let _: fn(tokio::net::TcpStream) = asynchronous::tokio_transport_surface::<_>;
@@ -464,6 +549,14 @@ fn the_asynchronous_surface_is_unchanged() {
     // call above: `serve` must stay usable from a function generic over all four.
     let (generic, _peer) = nghttp2::http::testing::duplex(false);
     asynchronous::server_surface(generic, answer).expect("serving");
+    let (configured, _peer) = nghttp2::http::testing::duplex(false);
+    asynchronous::server_with_config_surface(configured, answer, nghttp2::http::Config::default())
+        .expect("serving");
+    let (top_level, _peer) = nghttp2::http::testing::duplex(false);
+    drop(
+        nghttp2::http::serve_with(top_level, answer, nghttp2::http::Config::default())
+            .expect("serving"),
+    );
     let _: fn(nghttp2::http::testing::http_crate::Response<nghttp2::http::IncomingBody>) =
         asynchronous::response_surface;
 

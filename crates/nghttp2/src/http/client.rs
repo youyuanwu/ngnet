@@ -34,6 +34,7 @@ use http_body::Body;
 use std::sync::Weak;
 
 use super::body::{Direction, IncomingBody};
+use super::config::Config;
 use super::connection::Connection;
 use super::driver::{self, DriverGuard, Events, Role, Signals};
 use super::error::{Error, ErrorKind, Result};
@@ -63,7 +64,28 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
-    let session = driver::client_session()?;
+    handshake_with(transport, Config::default())
+}
+
+/// Starts a client connection over `transport` with an explicit [`Config`].
+///
+/// Identical to [`handshake`] but for the limits advertised to the peer; see [`Config`]
+/// for what those bound and why the defaults are conservative.
+///
+/// # Errors
+///
+/// Fails only if the underlying session cannot be created.
+pub fn handshake_with<T, B>(
+    transport: T,
+    config: Config,
+) -> Result<(SendRequest<B>, Connection<impl Future<Output = Result<()>>>)>
+where
+    T: Transport,
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    let session = driver::client_session(&config)?;
 
     let shared = Arc::new(Shared::default());
     let queue = Arc::new(Queue::<B>::default());
@@ -197,14 +219,29 @@ where
         };
 
         match head::response_head(fields) {
-            Ok(head) => slot.complete(head.map(|()| {
-                IncomingBody::new(
-                    stream,
-                    Direction::Response,
-                    Arc::clone(incoming),
-                    Arc::clone(&self.shared),
-                )
-            })),
+            Ok(head) => {
+                // An informational `1xx` head is not the answer — it precedes the real
+                // response. libnghttp2 surfaces `103 Early Hints` / `100 Continue` to this
+                // callback before the final head arrives and before it marks the stream as
+                // expecting a final response, so settling the future on the first head
+                // would resolve it with a provisional status and discard the actual `200`
+                // that follows. Ignored here, leaving the slot unsettled for the final
+                // head; the stream stays open and `IncomingBody` is not handed out for
+                // something that carries no body. A stream that only ever carries `1xx`
+                // and then ends leaves the slot unsettled, which the stream-close path
+                // then fails rather than hanging.
+                if head.status().is_informational() {
+                    return Ok(());
+                }
+                slot.complete(head.map(|()| {
+                    IncomingBody::new(
+                        stream,
+                        Direction::Response,
+                        Arc::clone(incoming),
+                        Arc::clone(&self.shared),
+                    )
+                }));
+            }
             Err(error) => {
                 slot.fail(error);
                 incoming.fail(Error::new(
@@ -227,6 +264,27 @@ where
     }
 
     fn closed(&mut self, _stream: i32) {}
+
+    fn trailers(
+        &mut self,
+        session: &mut Session<Events>,
+        stream: i32,
+        fields: &[(Vec<u8>, Vec<u8>)],
+        incoming: &Arc<Incoming>,
+    ) -> Result<()> {
+        // libnghttp2 categorises the final response that follows a `1xx` as an ordinary
+        // trailing header block, indistinguishable at the frame level from genuine
+        // trailers on an answered stream. The slot disambiguates them: a slot that is not
+        // yet settled has seen only `1xx` heads, so this block is the awaited final
+        // response head rather than trailers. Once the slot is settled a further block is
+        // real trailers and is delivered as such.
+        if let Some(slot) = self.registry.slot(stream) {
+            if !slot.is_settled() {
+                return self.head(session, stream, fields, incoming);
+            }
+        }
+        driver::deliver_trailers(session, stream, fields, incoming)
+    }
 
     fn started(&self, stream: i32) -> bool {
         // A client opens odd-numbered streams; even ones can only have come from a push,

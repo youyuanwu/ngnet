@@ -9,7 +9,7 @@
 //! between threads still compiles and runs — the thread-per-core case the traits exist to
 //! serve.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -546,6 +546,115 @@ async fn four_streams_share_one_real_connection() {
             assert_eq!(
                 seen.get(&format!("/stream-{index}")).map(Vec::as_slice),
                 Some(format!("payload {index}").as_bytes()),
+            );
+        }
+    })
+    .await
+    .expect("the exchanges stalled");
+}
+
+// ---------------------------------------------------------------------------
+// One handle, shared across tasks
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_client_handle_serves_many_tasks() {
+    // SF-6. The `SendRequest` handle is `Clone` and `Send` on purpose, so a request may be
+    // issued from a task that is not the one driving the connection. Nothing proved that
+    // until here: the other multi-stream test submits every request from the single task
+    // it also drives the connection on, and the `Send` check elsewhere is only a type
+    // assertion. This spawns the driver on its own task, clones the handle into several
+    // more, and has each issue a distinct request concurrently — the realistic failure is
+    // a silent hang, which the surrounding timeout is here to catch.
+    tokio::time::timeout(PATIENCE, async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binding");
+        let addr = listener.local_addr().expect("an address");
+
+        // The set of paths the one server connection saw. That every stream lands in this
+        // one connection's record is what proves they shared the single connection.
+        let seen: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
+        let recorder = Arc::clone(&seen);
+
+        let serving = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accepting");
+            server::serve(
+                TokioIo::new(stream),
+                move |request: http::Request<IncomingBody>| {
+                    let recorder = Arc::clone(&recorder);
+                    async move {
+                        let path = request.uri().path().to_owned();
+                        let body = drain(request.into_body()).await.unwrap_or_default();
+                        recorder.lock().expect("record").insert(path.clone());
+                        http::Response::builder()
+                            .status(http::StatusCode::OK)
+                            .header("x-path", path)
+                            .body(Full::new(body))
+                            .expect("a well-formed response")
+                    }
+                },
+            )
+            .expect("serving")
+            .await
+        });
+
+        let stream = TcpStream::connect(addr).await.expect("connecting");
+        let (requests, connection) =
+            nghttp2::http::handshake::<_, Full>(TokioIo::new(stream)).expect("handshake");
+
+        // The driver is a task of its own; every request below is issued from a different
+        // one, through a clone of the handle.
+        let driving = tokio::spawn(connection);
+
+        const TASKS: usize = 6;
+        let mut tasks = Vec::new();
+        for index in 0..TASKS {
+            let handle = requests.clone();
+            tasks.push(tokio::spawn(async move {
+                let path = format!("/task-{index}");
+                let payload = format!("payload {index}");
+                let response = handle
+                    .send_request(
+                        http::Request::builder()
+                            .method(http::Method::POST)
+                            .uri(format!("http://example.test{path}"))
+                            .body(Full::new(payload.clone()))
+                            .expect("a request"),
+                    )
+                    .await
+                    .expect("a response");
+                assert_eq!(response.status(), http::StatusCode::OK);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("x-path")
+                        .map(|value| value.as_bytes()),
+                    Some(path.as_bytes()),
+                    "a task received a response meant for another",
+                );
+                let body = drain(response.into_body()).await.expect("a body");
+                assert_eq!(body, payload.as_bytes(), "the echoed body did not match");
+            }));
+        }
+
+        // The connection winds down once the last handle is gone: this one, and the clones
+        // the tasks drop as they finish.
+        drop(requests);
+        for task in tasks {
+            task.await.expect("a task");
+        }
+
+        driving
+            .await
+            .expect("the driver task")
+            .expect("the connection");
+        serving.await.expect("the server task").expect("the server");
+
+        let seen = seen.lock().expect("record");
+        assert_eq!(seen.len(), TASKS, "the peer did not see every stream");
+        for index in 0..TASKS {
+            assert!(
+                seen.contains(&format!("/task-{index}")),
+                "the peer never saw stream /task-{index}",
             );
         }
     })

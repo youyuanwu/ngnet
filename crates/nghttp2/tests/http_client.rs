@@ -7,12 +7,14 @@
 #![cfg(feature = "http")]
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nghttp2::http::testing::{
     self, Empty, Full, alongside, block_on, duplex, http_crate as http, serve,
 };
 use nghttp2::{
-    BodyOutcome, BodySource, FrameType, Header, HeaderAction, HeaderCategory, Session,
+    BodyOutcome, BodySource, ErrorCode, FrameType, Header, HeaderAction, HeaderCategory, Session,
     SessionBuilder, StreamId,
 };
 
@@ -223,6 +225,138 @@ fn the_response_head_arrives_before_the_exchange_ends() {
     ));
 
     assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+}
+
+#[test]
+fn an_informational_head_does_not_settle_the_future_as_final() {
+    // A hostile or ordinary peer sends `103 Early Hints` before the real `200`. libnghttp2
+    // surfaces the `1xx` head to the client before it marks the stream as expecting a
+    // final response, so a client that settled on the first head would resolve with `103`
+    // and discard the `200` that follows. The future must resolve with `200`.
+    let (client_side, server_side) = duplex(false);
+    let (requests, connection) =
+        nghttp2::http::handshake::<_, Empty>(client_side).expect("handshake");
+
+    let mut peer = Peer::default();
+    let response = requests.send_request(request("/hinted"));
+
+    // Counts the informational heads actually put on the wire, so a future resolving with
+    // `200` means the `1xx` was sent and ignored — not that the peer never sent one.
+    let hints = Arc::new(AtomicUsize::new(0));
+    let hints_sent = Arc::clone(&hints);
+
+    // The `1xx` and the final head cannot be submitted in one pass: libnghttp2 rejects a
+    // second HEADERS on a stream whose first is not yet serialised. So the `103` goes out
+    // on the pass a request arrives, and the `200` on the next — which is also the order a
+    // real server produces them.
+    let mut phase: BTreeMap<i32, u8> = BTreeMap::new();
+    let interim_then_final = move |session: &mut Session<Peer>, peer: &mut Peer| {
+        for stream in core::mem::take(&mut peer.pending) {
+            phase.entry(stream).or_insert(0);
+        }
+        for (&stream, step) in &mut phase {
+            match *step {
+                0 => {
+                    session
+                        .submit_informational(
+                            StreamId::new(stream),
+                            &[Header::new(":status", "103"), Header::new("link", "</a>")],
+                        )
+                        .expect("submitting 103");
+                    hints_sent.fetch_add(1, Ordering::AcqRel);
+                    *step = 1;
+                }
+                1 => {
+                    session
+                        .submit_response(
+                            StreamId::new(stream),
+                            &[Header::new(":status", "200"), Header::new("x-final", "yes")],
+                        )
+                        .expect("submitting 200");
+                    *step = 2;
+                }
+                _ => {}
+            }
+        }
+    };
+
+    let response = block_on(alongside(
+        alongside(async { response.await.expect("a response") }, connection),
+        serve(server_side, peer_session(), &mut peer, interim_then_final),
+    ));
+
+    assert_eq!(
+        response.status(),
+        http::StatusCode::OK,
+        "the future settled on an informational head instead of the final response",
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-final")
+            .map(http::HeaderValue::as_bytes),
+        Some(b"yes".as_slice()),
+        "the resolved head is not the final one",
+    );
+    assert!(
+        hints.load(Ordering::Acquire) >= 1,
+        "the peer never actually sent an informational head, so nothing was ignored",
+    );
+}
+
+#[test]
+fn a_stream_carrying_only_an_informational_head_fails_rather_than_hangs() {
+    // The other side of ignoring `1xx`: if a stream only ever carries an informational
+    // head and then ends, the future must resolve — with an error — rather than wait for a
+    // final response that will never come.
+    let (client_side, server_side) = duplex(false);
+    let (requests, connection) =
+        nghttp2::http::handshake::<_, Empty>(client_side).expect("handshake");
+
+    let mut peer = Peer::default();
+    let response = requests.send_request(request("/hint-only"));
+
+    let mut phase: BTreeMap<i32, u8> = BTreeMap::new();
+    let interim_then_reset = move |session: &mut Session<Peer>, peer: &mut Peer| {
+        for stream in core::mem::take(&mut peer.pending) {
+            phase.entry(stream).or_insert(0);
+        }
+        for (&stream, step) in &mut phase {
+            match *step {
+                0 => {
+                    session
+                        .submit_informational(
+                            StreamId::new(stream),
+                            &[Header::new(":status", "100")],
+                        )
+                        .expect("submitting 100");
+                    *step = 1;
+                }
+                // On the pass after the `100` is serialised, end the stream without a final
+                // response. Resetting on the next pass rather than the same one is what
+                // lets the informational head reach the client first.
+                1 => {
+                    session
+                        .reset_stream(StreamId::new(stream), ErrorCode::INTERNAL_ERROR)
+                        .expect("resetting");
+                    *step = 2;
+                }
+                _ => {}
+            }
+        }
+    };
+
+    let outcome = block_on(alongside(
+        alongside(response, connection),
+        serve(server_side, peer_session(), &mut peer, interim_then_reset),
+    ));
+
+    let error = outcome.expect_err("a stream that never sent a final response must fail");
+    assert_eq!(
+        error.kind(),
+        nghttp2::http::ErrorKind::Stream,
+        "an informational-only stream ended with the wrong error: {error}",
+    );
 }
 
 #[test]

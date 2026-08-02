@@ -48,6 +48,16 @@ pub(crate) struct Shared {
     /// from its own thread after the work they describe has already been driven.
     pool_size: AtomicUsize,
     pool_high_water: AtomicUsize,
+    /// The most chunks any one outgoing body has ever held back at once.
+    ///
+    /// Outside the `Inner` mutex for the same reason as the pool gauges above: it is
+    /// bumped on the body hand-off hot path — every chunk of every upload — yet its only
+    /// reader is a test, on another thread, after the driving is done. Taking the crate's
+    /// central lock there purely to update a test-only high-water mark would put avoidable
+    /// contention on the hottest lock; a relaxed `fetch_max` keeps the mark monotone
+    /// without a lock and orders nothing, which is all this needs. Never reset: a
+    /// high-water mark that could be cleared would not be evidence of anything.
+    buffered_high_water: AtomicUsize,
 }
 
 #[derive(Debug, Default)]
@@ -88,12 +98,6 @@ struct Inner {
     /// Set once nothing new may be started: the caller asked to shut down, or the peer
     /// said it was going away.
     refusing: bool,
-    /// The most octets any one outgoing body has ever held back at once, as chunks.
-    ///
-    /// The send path retains at most one unconsumed chunk per stream, and this is the
-    /// hook that claim is asserted against rather than read off the source. Never reset:
-    /// a high-water mark that could be cleared would not be evidence of anything.
-    buffered_high_water: usize,
     /// Set once the driver is gone, so nothing waits for an answer that cannot come.
     gone: bool,
 }
@@ -268,14 +272,19 @@ impl Shared {
     }
 
     /// Notes how many chunks an outgoing body is holding back.
+    ///
+    /// Relaxed `fetch_max` on an atomic outside `Inner`, not a lock on it: this is the
+    /// body hand-off hot path, taken once per outgoing chunk, and taking the central lock
+    /// here purely to update a test-only mark would contend the hottest lock under
+    /// sustained uploads. Follows the pool gauge's precedent — see the field.
     pub(crate) fn note_buffered(&self, chunks: usize) {
-        let mut inner = self.lock();
-        inner.buffered_high_water = inner.buffered_high_water.max(chunks);
+        self.buffered_high_water
+            .fetch_max(chunks, Ordering::Relaxed);
     }
 
     /// The most chunks any outgoing body has held back at once.
     pub(crate) fn buffered_high_water(&self) -> usize {
-        self.lock().buffered_high_water
+        self.buffered_high_water.load(Ordering::Relaxed)
     }
 
     /// Records the read-buffer pool's current size, tracking its high-water mark too.

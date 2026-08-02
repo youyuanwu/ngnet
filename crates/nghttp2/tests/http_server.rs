@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nghttp2::http::testing::{
-    Empty, Full, alongside, block_on, duplex, http_crate as http, serve as drive_peer,
+    Empty, Full, alongside, block_on, duplex, http_crate as http, scripted, serve as drive_peer,
 };
 use nghttp2::http::{IncomingBody, server};
 use nghttp2::{
@@ -37,6 +37,11 @@ struct Peer {
     opening: BTreeMap<i32, Vec<(String, String)>>,
     /// Response payload, by stream.
     bodies: BTreeMap<i32, Vec<u8>>,
+    /// Trailing header blocks received, by stream.
+    trailers: BTreeMap<i32, Vec<(String, String)>>,
+    /// Streams whose trailers arrived only after some data had, the ordering the wire
+    /// requires.
+    trailers_after_data: std::collections::BTreeSet<i32>,
     /// Streams that closed, with the code they closed under.
     closed: BTreeMap<i32, u32>,
 }
@@ -102,7 +107,22 @@ fn peer_session() -> Session<Peer> {
         .on_frame(|peer: &mut Peer, frame| {
             if frame.kind() == FrameType::HEADERS && frame.is_end_headers() {
                 if let Some(fields) = peer.opening.remove(&frame.stream_id().get()) {
-                    peer.heads.insert(frame.stream_id().get(), fields);
+                    let stream = frame.stream_id().get();
+                    if frame.is_trailers() {
+                        // Witnessed before the block is stored, so "trailers followed data"
+                        // is read off what had already arrived rather than off arrival
+                        // order alone.
+                        if peer
+                            .bodies
+                            .get(&stream)
+                            .is_some_and(|body| !body.is_empty())
+                        {
+                            peer.trailers_after_data.insert(stream);
+                        }
+                        peer.trailers.insert(stream, fields);
+                    } else {
+                        peer.heads.insert(stream, fields);
+                    }
                 }
             }
         })
@@ -565,6 +585,226 @@ fn a_reset_stream_discards_its_response_without_failing_the_connection() {
         *noticed.lock().expect("record"),
         Some(true),
         "the handler could not tell its stream had gone",
+    );
+}
+
+#[test]
+fn a_retained_handler_still_counts_against_the_concurrency_cap() {
+    // SF-3 / TO-4. The concurrency cap must be a structural bound on handler futures, not
+    // only advice the peer may ignore. libnghttp2 drops a reset stream from the count it
+    // enforces, but this crate deliberately keeps that stream's handler running — so the
+    // cap has to be re-enforced here against the running handlers. With a cap of one, a
+    // peer that resets its first stream and opens a second must be refused, because the
+    // retained handler still holds the only slot.
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&invocations);
+
+    let (server_side, client_side) = duplex(false);
+    let config = nghttp2::http::Config::default().max_concurrent_streams(1);
+    let connection = server::serve_with(
+        server_side,
+        move |_request: http::Request<IncomingBody>| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                // Never finishes: a handler that outlives the reset of its stream, still
+                // occupying its slot against the cap.
+                core::future::pending::<()>().await;
+                #[allow(unreachable_code)]
+                http::Response::builder()
+                    .status(200)
+                    .body(Empty)
+                    .expect("a response")
+            }
+        },
+        config,
+    )
+    .expect("serving");
+
+    let mut peer = Peer::default();
+    peer.outgoing.push(("GET", "/first".to_owned(), None));
+
+    let driving = async {
+        for _ in 0..128 {
+            yield_now().await;
+        }
+    };
+
+    // Sequenced on the observed handler count, not a pass tally: the reset must follow the
+    // first handler actually starting. The reset and the second request go out together —
+    // they name different streams, so the reset cannot cancel the second request's headers
+    // — and the reset's own output keeps the peer's send loop running long enough to
+    // serialise that second request.
+    let observed = Arc::clone(&invocations);
+    let mut done = false;
+    let step = move |session: &mut Session<Peer>, peer: &mut Peer| {
+        ask(session, peer);
+        if !done && observed.load(Ordering::SeqCst) >= 1 {
+            session
+                .reset_stream(StreamId::new(1), ErrorCode::CANCEL)
+                .expect("resetting");
+            peer.outgoing.push(("GET", "/second".to_owned(), None));
+            done = true;
+        }
+    };
+
+    block_on(alongside(
+        alongside(driving, connection),
+        drive_peer(client_side, peer_session(), &mut peer, step),
+    ));
+
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "the capped second request started a handler, so a retained handler did not hold its slot",
+    );
+    assert_eq!(
+        peer.closed.get(&3).copied(),
+        Some(ErrorCode::REFUSED_STREAM.get()),
+        "the capped stream was not refused with REFUSED_STREAM",
+    );
+    assert_eq!(
+        peer.heads.get(&3),
+        None,
+        "a refused stream still received a response head",
+    );
+}
+
+#[test]
+fn a_handler_sends_trailers_after_its_body() {
+    // SF-7. Server response bodies are inserted with `slot: None`, so a client-side test
+    // proves nothing about them. A handler that sends data and then trailers must reach
+    // the peer as exactly that: the data first, the trailing block after it, in the order
+    // the wire requires. `trailers_after_data` records that ordering as it was observed,
+    // not merely that both arrived.
+    let expected = payload(4_000);
+    let answer = expected.clone();
+
+    let (body, handle) = scripted();
+    handle.send(answer);
+    let mut sent = http::HeaderMap::new();
+    sent.insert("x-trailer", http::HeaderValue::from_static("checksum"));
+    handle.finish_with_trailers(sent);
+
+    let body_slot = Arc::new(Mutex::new(Some(body)));
+    let taker = Arc::clone(&body_slot);
+    let (server_side, client_side) = duplex(false);
+    let connection = server::serve(server_side, move |_request: http::Request<IncomingBody>| {
+        let taker = Arc::clone(&taker);
+        async move {
+            let body = taker.lock().expect("body").take().expect("one request");
+            http::Response::builder()
+                .status(200)
+                .body(body)
+                .expect("a response")
+        }
+    })
+    .expect("serving");
+
+    let mut peer = Peer::default();
+    peer.outgoing.push(("GET", "/report".to_owned(), None));
+
+    let driving = async {
+        for _ in 0..64 {
+            yield_now().await;
+        }
+    };
+
+    block_on(alongside(
+        alongside(driving, connection),
+        drive_peer(client_side, peer_session(), &mut peer, ask),
+    ));
+
+    assert_eq!(peer.head(1, ":status"), Some("200"));
+    assert_eq!(
+        peer.bodies.get(&1),
+        Some(&expected),
+        "the handler's body did not arrive intact",
+    );
+    assert_eq!(
+        peer.trailers
+            .get(&1)
+            .and_then(|fields| fields.iter().find(|(name, _)| name == "x-trailer"))
+            .map(|(_, value)| value.as_str()),
+        Some("checksum"),
+        "the handler's trailers did not arrive",
+    );
+    assert!(
+        peer.trailers_after_data.contains(&1),
+        "the trailers did not follow the data on the wire",
+    );
+}
+
+#[test]
+fn a_failed_response_body_resets_only_its_own_stream() {
+    // SF-7. `fail_stream` early-returns for a server stream because it has no slot, so a
+    // handler whose body fails part-way exercises code no client-side test can. The peer
+    // must see that one stream reset, while a second request on the same connection still
+    // completes and the connection itself reports no error.
+    let (doomed_body, doomed) = scripted();
+    doomed.send(payload(2_000));
+    doomed.fail("the body gave out");
+    let (fine_body, fine) = scripted();
+    fine.finish();
+
+    let mut bodies = BTreeMap::new();
+    bodies.insert("/doomed".to_owned(), doomed_body);
+    bodies.insert("/fine".to_owned(), fine_body);
+    let bodies = Arc::new(Mutex::new(bodies));
+    let taker = Arc::clone(&bodies);
+
+    let (server_side, client_side) = duplex(false);
+    let connection = server::serve(server_side, move |request: http::Request<IncomingBody>| {
+        let taker = Arc::clone(&taker);
+        let path = request.uri().path().to_owned();
+        async move {
+            let body = taker
+                .lock()
+                .expect("body")
+                .remove(&path)
+                .expect("a scripted body for the path");
+            http::Response::builder()
+                .status(200)
+                .body(body)
+                .expect("a response")
+        }
+    })
+    .expect("serving");
+
+    let failed = Arc::new(Mutex::new(None));
+    let sink = Arc::clone(&failed);
+    let connection = async move {
+        *sink.lock().expect("outcome") = Some(connection.await.is_err());
+    };
+
+    let mut peer = Peer::default();
+    peer.outgoing.push(("GET", "/doomed".to_owned(), None));
+    peer.outgoing.push(("GET", "/fine".to_owned(), None));
+
+    let driving = async {
+        for _ in 0..64 {
+            yield_now().await;
+        }
+    };
+
+    block_on(alongside(
+        alongside(driving, connection),
+        drive_peer(client_side, peer_session(), &mut peer, ask),
+    ));
+
+    let doomed_close = peer.closed.get(&1).copied();
+    assert!(
+        doomed_close.is_some_and(|code| code != ErrorCode::NO_ERROR.get()),
+        "the failed stream did not reset with an error (closed under {doomed_close:?})",
+    );
+    assert_eq!(
+        peer.head(3, ":status"),
+        Some("200"),
+        "the healthy stream did not complete alongside the failed one",
+    );
+    assert_ne!(
+        *failed.lock().expect("outcome"),
+        Some(true),
+        "one failed response body failed the whole connection",
     );
 }
 

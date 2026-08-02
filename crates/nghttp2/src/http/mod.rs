@@ -85,22 +85,31 @@
 //! IOCP) needs and a readiness API (tokio, `futures-io`) satisfies with no copy.
 //!
 //! One decision is the writer's, and it is not free either way.
-//! [`TransportWrite::writes_borrowed`] chooses how the session is drained. Returning
-//! `false` — the default — has the driver coalesce a whole pass into one owned buffer and
-//! issue a single [`write`](TransportWrite::write); that is one syscall per pass but
-//! allocates and copies every outgoing octet, every pass. Overriding
-//! [`write_borrowed`](TransportWrite::write_borrowed) and returning `true` hands each of
-//! the session's own blocks over directly: a few small writes per pass, but **zero**
-//! allocation and zero copy, which is the only path on which steady-state allocation
-//! reaches zero. The two are genuinely exclusive — the session invalidates each block when
-//! the next is requested, so blocks cannot be gathered without copying them. A
-//! readiness-based transport should override and return `true`, which is why
-//! [`TokioIo`](transport::TokioIo) does. A completion API maps onto the owned methods with
-//! no adapter code to speak of — its `read`/`write` already take and return the buffer —
-//! as `crates/nghttp2-tests/tests/http_compio.rs` demonstrates against a real one.
+//! [`TransportWrite::write_borrowed`] chooses how the session is drained, and it is a single
+//! override point on purpose: returning `None` — the default — has the driver coalesce a
+//! whole pass into one owned buffer and issue a single [`write`](TransportWrite::write),
+//! which is one syscall per pass but allocates and copies every outgoing octet, every pass.
+//! Returning `Some(future)` hands each of the session's own blocks over directly: a few
+//! small writes per pass, but **zero** allocation and zero copy, which is the only path on
+//! which steady-state allocation reaches zero. Because the same method carries both the
+//! choice and the write, an adapter cannot advertise the fast path without providing it, nor
+//! provide it without the driver taking it. The two are genuinely exclusive — the session
+//! invalidates each block when the next is requested, so blocks cannot be gathered without
+//! copying them. A readiness-based transport overrides it, which is why the `TokioIo`
+//! adapter behind the `tokio` feature does; a completion API leaves it at its default and
+//! maps onto the owned methods with no adapter code to speak of — its `read`/`write` already
+//! take and return the buffer — as `crates/nghttp2-tests/tests/http_compio.rs` demonstrates
+//! against a real one.
+//!
+//! The other obligation is [`TransportWrite::commit`]: the driver calls it after draining a
+//! pass and before it waits on the peer, so a transport that buffers its writes — a
+//! `BufWriter`, a `BufStream` — must flush there. A transport whose writes are already
+//! peer-visible leaves it at its no-op default. Omitting it for a buffering transport is a
+//! silent hang, which is exactly what the driver's flush point exists to rule out.
 
 mod body;
 pub mod client;
+mod config;
 mod connection;
 mod driver;
 mod error;
@@ -112,10 +121,11 @@ pub mod transport;
 mod waker;
 
 pub use body::IncomingBody;
-pub use client::{ResponseFuture, SendRequest, handshake};
+pub use client::{ResponseFuture, SendRequest, handshake, handshake_with};
+pub use config::Config;
 pub use connection::Connection;
 pub use error::{Error, ErrorKind, Result};
-pub use server::{Cancelled, serve};
+pub use server::{Cancelled, serve, serve_with};
 pub use transport::{Transport, TransportRead, TransportWrite};
 
 #[doc(hidden)]

@@ -362,14 +362,20 @@ impl TransportWrite for DuplexWriter {
         core::future::ready((Ok(written), buf))
     }
 
-    fn write_borrowed(&mut self, data: &[u8]) -> impl Future<Output = io::Result<usize>> {
+    fn write_borrowed<'w>(
+        &'w mut self,
+        data: &'w [u8],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        // Which shape this duplex takes is fixed at construction: only the borrowed variant
+        // elects the zero-copy path, the owned one declines it and is coalesced through
+        // `write`. Returning the write here — rather than a separate flag — is the whole
+        // decision.
+        if !self.borrowed_writes {
+            return None;
+        }
         *self.writes.lock().expect("write count") += 1;
         notifying(&self.outgoing, |pipe| pipe.put(data));
-        core::future::ready(Ok(data.len()))
-    }
-
-    fn writes_borrowed(&self) -> bool {
-        self.borrowed_writes
+        Some(core::future::ready(Ok(data.len())))
     }
 }
 
@@ -491,9 +497,79 @@ impl TransportWrite for FailingWriter {
             }
         }
     }
+}
 
-    fn writes_borrowed(&self) -> bool {
-        false
+/// A transport whose writes are invisible to the peer until [`TransportWrite::commit`].
+///
+/// This is the shape of a `tokio::io::BufWriter`/`BufStream`: `write` only fills a
+/// user-space buffer, and the octets reach the peer solely when that buffer is flushed.
+/// It exists to pin the driver's flush contract — that the driver commits produced octets
+/// before it ever awaits the peer. Drop the driver's [`TransportWrite::commit`] call and
+/// an exchange over this transport hangs, because the request never leaves the buffer.
+///
+/// The reading half and the peer are an ordinary [`Duplex`]; only the writing half buffers.
+#[derive(Debug)]
+pub struct Buffering {
+    inner: Duplex,
+}
+
+/// A [`Buffering`] transport and its ordinary [`Duplex`] peer.
+pub fn buffering() -> (Buffering, Duplex) {
+    let (one, two) = duplex(false);
+    (Buffering { inner: one }, two)
+}
+
+/// The writing half of a [`Buffering`] transport.
+#[derive(Debug)]
+pub struct BufferingWriter {
+    inner: DuplexWriter,
+    /// Octets written but not yet flushed to the peer — the user-space buffer a
+    /// `BufWriter` would keep.
+    buffer: Vec<u8>,
+}
+
+impl Transport for Buffering {
+    type Reader = DuplexReader;
+    type Writer = BufferingWriter;
+
+    fn split(self) -> (Self::Reader, Self::Writer) {
+        let (reader, writer) = self.inner.split();
+        (
+            reader,
+            BufferingWriter {
+                inner: writer,
+                buffer: Vec::new(),
+            },
+        )
+    }
+}
+
+impl BufferingWriter {
+    /// How many octets are buffered but not yet flushed to the peer.
+    pub fn buffered(&self) -> usize {
+        self.buffer.len()
+    }
+}
+
+impl TransportWrite for BufferingWriter {
+    fn write(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
+        // Buffered, not sent: the octets stay here until `commit`, exactly as a buffering
+        // wrapper's `write` fills its buffer without touching the socket.
+        self.buffer.extend_from_slice(&buf);
+        let written = buf.len();
+        core::future::ready((Ok(written), buf))
+    }
+
+    // `write_borrowed` is deliberately left at its default: this transport exercises the
+    // owned/coalesced path, and the point it makes is about `commit`, not about borrowing.
+
+    async fn commit(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let data = core::mem::take(&mut self.buffer);
+        let (result, _buf) = self.inner.write(Bytes::from(data)).await;
+        result.map(|_| ())
     }
 }
 
@@ -526,7 +602,8 @@ pub async fn alongside<M: Future, B: Future>(main: M, background: B) -> M::Outpu
 /// replenishes windows automatically, so a successful call is proof that this one does
 /// not — asserted against a real session rather than read off a constant.
 pub fn client_session_has_manual_flow_control() -> bool {
-    let mut session = super::driver::client_session().expect("building a client session");
+    let mut session = super::driver::client_session(&super::config::Config::default())
+        .expect("building a client session");
     session.consume(crate::StreamId::new(1), 0).is_ok()
 }
 

@@ -23,7 +23,7 @@
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Wake, Waker};
 
@@ -32,7 +32,7 @@ use super::shared::Shared;
 /// The streams whose handlers have been woken.
 #[derive(Debug, Default)]
 pub(crate) struct Ready {
-    inner: Mutex<BTreeSet<i32>>,
+    inner: Mutex<HashSet<i32>>,
 }
 
 impl Ready {
@@ -40,8 +40,16 @@ impl Ready {
         self.lock().insert(stream);
     }
 
-    fn take(&self) -> Vec<i32> {
-        core::mem::take(&mut *self.lock()).into_iter().collect()
+    /// Moves the woken streams into `out`, leaving the set empty.
+    ///
+    /// Takes a caller-owned scratch buffer rather than returning a fresh `Vec`, the same
+    /// discipline the body path's [`Shared::take_ready_into`](super::shared::Shared::take_ready_into)
+    /// follows: [`HashSet::drain`] keeps the set's capacity and clearing `out` keeps the
+    /// vector's, so a steady state waking the same handlers every pass allocates in
+    /// neither. That is the property the server allocation harness pins.
+    fn take_into(&self, out: &mut Vec<i32>) {
+        out.clear();
+        out.extend(self.lock().drain());
     }
 
     fn is_empty(&self) -> bool {
@@ -52,7 +60,7 @@ impl Ready {
         self.lock().remove(&stream);
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<i32>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<i32>> {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -148,9 +156,18 @@ impl<F> Tasks<F> {
         self.ready.mark(stream);
     }
 
-    /// The streams whose handlers should be polled, leaving the set empty.
-    pub(crate) fn woken(&self) -> Vec<i32> {
-        self.ready.take()
+    /// Moves the streams whose handlers should be polled into `out`, leaving the set
+    /// empty. Reuses `out` across passes; see [`Ready::take_into`].
+    pub(crate) fn take_woken_into(&self, out: &mut Vec<i32>) {
+        self.ready.take_into(out);
+    }
+
+    /// How many handlers are currently running.
+    ///
+    /// Includes handlers retained after their stream was reset — the cap on concurrent
+    /// handlers is enforced against this, so a retained handler still occupies a slot.
+    pub(crate) fn len(&self) -> usize {
+        self.running.len()
     }
 
     /// Forgets a handler without running it to completion.

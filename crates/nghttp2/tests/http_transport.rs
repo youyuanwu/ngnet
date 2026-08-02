@@ -6,7 +6,8 @@
 //!
 //! * a completion-based transport can be written without mentioning the borrowed-write
 //!   path at all;
-//! * a readiness-based one can override it, and say so;
+//! * a readiness-based one can elect it through the single override that carries both the
+//!   choice and the write;
 //! * neither is required to be `Send`, because the flagship completion runtimes are
 //!   thread-per-core and build their I/O on `Rc`. A `Send` bound in the traits would
 //!   exclude exactly the runtimes the abstraction exists to serve.
@@ -21,6 +22,7 @@ use nghttp2::http::testing::{block_on, duplex};
 use nghttp2::http::{Transport, TransportRead, TransportWrite};
 
 use bytes::{Bytes, BytesMut};
+use core::future::Future;
 
 /// A completion-based transport: owns its buffers, ignores the borrowed-write path.
 ///
@@ -106,13 +108,14 @@ impl TransportWrite for ReadinessHalf {
         (Ok(written), buf)
     }
 
-    async fn write_borrowed(&mut self, data: &[u8]) -> io::Result<usize> {
+    fn write_borrowed<'w>(
+        &'w mut self,
+        data: &'w [u8],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        // The single override: returning `Some` both elects the zero-copy path and is how
+        // it writes. There is no separate flag that could disagree with it.
         *self.borrowed.borrow_mut() += 1;
-        Ok(data.len())
-    }
-
-    fn writes_borrowed(&self) -> bool {
-        true
+        Some(core::future::ready(Ok(data.len())))
     }
 }
 
@@ -131,27 +134,29 @@ fn a_completion_transport_needs_no_borrowed_write_path() {
     assert_eq!(read.unwrap(), b"from the peer".len());
     assert_eq!(&buf[..], b"from the peer");
 
-    let written = block_on(writer.write_borrowed(b"to the peer")).unwrap();
-    assert_eq!(written, b"to the peer".len());
-    assert_eq!(writer.written, b"to the peer");
-
     assert!(
-        !writer.writes_borrowed(),
-        "a transport that has not overridden the borrowed path must not claim it"
+        writer.write_borrowed(b"to the peer").is_none(),
+        "a transport that has not overridden the borrowed path must decline it, so the \
+         driver coalesces and writes owned"
     );
+
+    let (written, _buf) = block_on(writer.write(Bytes::from_static(b"to the peer")));
+    assert_eq!(written.unwrap(), b"to the peer".len());
+    assert_eq!(writer.written, b"to the peer");
 }
 
 #[test]
 fn a_readiness_transport_can_take_the_zero_copy_path() {
     let (_reader, mut writer) = Readiness.split();
 
+    let write = writer.write_borrowed(b"borrowed");
     assert!(
-        writer.writes_borrowed(),
-        "a transport that overrides the borrowed path should say so, since that is how \
-         the connection chooses between coalescing and zero-copy"
+        write.is_some(),
+        "a transport that overrides the borrowed path offers it, which is how the \
+         connection chooses zero-copy over coalescing"
     );
 
-    let written = block_on(writer.write_borrowed(b"borrowed")).unwrap();
+    let written = block_on(write.expect("the borrowed path")).unwrap();
     assert_eq!(written, b"borrowed".len());
     assert_eq!(
         *writer.borrowed.borrow(),
@@ -262,13 +267,14 @@ fn a_borrowed_write_duplex_takes_the_zero_copy_path_and_still_counts() {
     let (_reader, mut writer) = client.split();
     let (mut server_reader, _server_writer) = server.split();
 
+    let write = writer.write_borrowed(b"borrowed");
     assert!(
-        writer.writes_borrowed(),
-        "this shape advertises the zero-copy write path"
+        write.is_some(),
+        "this shape offers the zero-copy write path"
     );
 
     block_on(async {
-        writer.write_borrowed(b"borrowed").await.unwrap();
+        write.expect("the borrowed path").await.unwrap();
 
         let (read, buf) = server_reader.read(BytesMut::with_capacity(16)).await;
         assert_eq!(read.unwrap(), b"borrowed".len());

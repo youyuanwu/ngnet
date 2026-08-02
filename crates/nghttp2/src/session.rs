@@ -1,19 +1,19 @@
 //! HTTP/2 sessions: construction, teardown, and the outbound half of the sans-I/O loop.
 
-use std::sync::Arc;
 use core::fmt;
 use core::marker::PhantomData;
+use std::sync::Arc;
 
 use nghttp2_sys as sys;
 
 use crate::alloc_state::{AllocState, mem_for};
+use crate::body::{BodyError, BodySource};
 use crate::callbacks::{self, Bridge};
 use crate::error::{Error, ErrorCode, ErrorKind, Result};
-use crate::handlers::{HeaderAction, Handlers};
+use crate::handlers::{Handlers, HeaderAction};
 use crate::header::{self, Header};
 use crate::options::Options;
 use crate::settings::Setting;
-use crate::body::{BodyError, BodySource};
 use crate::state::{BodyEntry, BodyRegistry, FrameProgress, PendingErrors, ResponseGuard};
 use crate::stream::{FrameInfo, StreamId};
 
@@ -393,10 +393,7 @@ impl<C> Session<C> {
         // SAFETY: `raw` is live, and `bridge` outlives the call below because it is a
         // local of this frame and `call` returns before it is dropped.
         unsafe {
-            sys::nghttp2_session_set_user_data(
-                raw,
-                (&raw mut bridge).cast::<core::ffi::c_void>(),
-            );
+            sys::nghttp2_session_set_user_data(raw, (&raw mut bridge).cast::<core::ffi::c_void>());
         }
 
         call(raw)
@@ -481,6 +478,39 @@ impl<C> Session<C> {
         Ok(())
     }
 
+    /// Submits a non-final informational (`1xx`) response on an open stream.
+    ///
+    /// Hidden test scaffolding, not part of the promised surface: it exists so a peer in
+    /// this crate's own tests can reproduce a server that sends `103 Early Hints` or
+    /// `100 Continue` ahead of the real response, which the safe surface otherwise offers
+    /// no way to do. Unlike [`submit_response`](Self::submit_response) it carries no
+    /// end-of-stream, so the stream stays open for the final HEADERS that must follow —
+    /// which is exactly the sequence libnghttp2 requires for an informational response.
+    #[doc(hidden)]
+    pub fn submit_informational(&mut self, stream: StreamId, headers: &[Header<'_>]) -> Result<()> {
+        let nva = header::to_nv_vec(headers)?;
+
+        // SAFETY: `self.raw` is live and `nva` is valid for its length; libnghttp2 copies
+        // the contents. `NGHTTP2_FLAG_NONE` (no END_STREAM) is what makes this a non-final
+        // response. A null priority spec and null stream user data are both accepted.
+        let rc = unsafe {
+            sys::nghttp2_submit_headers(
+                self.raw,
+                sys::NGHTTP2_FLAG_NONE as u8,
+                stream.get(),
+                core::ptr::null(),
+                nva.as_ptr(),
+                nva.len(),
+                core::ptr::null_mut(),
+            )
+        };
+
+        if rc < 0 {
+            return Err(Error::from_native("nghttp2_submit_headers", rc));
+        }
+        Ok(())
+    }
+
     /// Whether `stream` is currently open on this session.
     ///
     /// A server needs this before answering: a peer may reset or close a stream while its
@@ -527,9 +557,8 @@ impl<C> Session<C> {
 
         // SAFETY: `self.raw` is live and `nva` is valid for its length; libnghttp2 copies
         // the contents.
-        let rc = unsafe {
-            sys::nghttp2_submit_trailer(self.raw, stream.get(), nva.as_ptr(), nva.len())
-        };
+        let rc =
+            unsafe { sys::nghttp2_submit_trailer(self.raw, stream.get(), nva.as_ptr(), nva.len()) };
 
         if rc != 0 {
             return Err(Error::from_native("nghttp2_submit_trailer", rc));
@@ -961,8 +990,14 @@ mod tests {
         let mut session = SessionBuilder::<()>::server().build().unwrap();
         let wire = drain(&mut session);
 
-        assert!(!wire.is_empty(), "a server must still announce its SETTINGS");
-        assert!(!wire.starts_with(CLIENT_MAGIC), "only clients send the preface");
+        assert!(
+            !wire.is_empty(),
+            "a server must still announce its SETTINGS"
+        );
+        assert!(
+            !wire.starts_with(CLIENT_MAGIC),
+            "only clients send the preface"
+        );
         assert_eq!(wire[3], sys::NGHTTP2_SETTINGS as u8);
     }
 
@@ -1077,7 +1112,10 @@ mod tests {
             "an explicit preference must win over the default, got {entries:?}"
         );
         assert_eq!(
-            entries.iter().filter(|(id, _)| *id == ENABLE_PUSH_ID).count(),
+            entries
+                .iter()
+                .filter(|(id, _)| *id == ENABLE_PUSH_ID)
+                .count(),
             1,
             "the default must not be injected alongside an explicit value"
         );
@@ -1142,7 +1180,10 @@ mod tests {
         let entries = settings_entries(&drain(&mut session), true);
 
         assert_eq!(
-            entries.iter().filter(|(id, _)| *id == ENABLE_PUSH_ID).count(),
+            entries
+                .iter()
+                .filter(|(id, _)| *id == ENABLE_PUSH_ID)
+                .count(),
             2,
             "the caller's entries should pass through untouched, got {entries:?}"
         );
@@ -1164,7 +1205,10 @@ mod tests {
         let mut session = SessionBuilder::<()>::client().build().unwrap();
 
         assert!(session.want_write(), "the preface and SETTINGS are pending");
-        assert!(session.want_read(), "a fresh session expects the peer's SETTINGS");
+        assert!(
+            session.want_read(),
+            "a fresh session expects the peer's SETTINGS"
+        );
         assert!(!session.is_finished());
 
         let _ = drain(&mut session);

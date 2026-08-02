@@ -39,11 +39,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use bytes::BytesMut;
 use http_body::Body;
 
+use crate::settings::Setting;
 use crate::{
     ErrorCode, FrameType, HeaderAction, HeaderCategory, Session, SessionBuilder, StreamId,
 };
 
 use super::body::outgoing::Outgoing;
+use super::config::Config;
 use super::error::{Error, ErrorKind, Result};
 use super::head;
 use super::shared;
@@ -152,13 +154,24 @@ fn resolve(events: &mut Events, buffer: &bytes::Bytes, from: usize) {
 ///
 /// Kept separate from [`run`] so the flow-control choice above can be asserted against a
 /// real session rather than read off a constant.
-pub(crate) fn client_session() -> crate::Result<Session<Events>> {
-    observing(SessionBuilder::<Events>::client()).build()
+pub(crate) fn client_session(config: &Config) -> crate::Result<Session<Events>> {
+    configured(observing(SessionBuilder::<Events>::client()), config).build()
 }
 
 /// Builds the session a server connection runs on.
-pub(crate) fn server_session() -> crate::Result<Session<Events>> {
-    observing(SessionBuilder::<Events>::server()).build()
+pub(crate) fn server_session(config: &Config) -> crate::Result<Session<Events>> {
+    configured(observing(SessionBuilder::<Events>::server()), config).build()
+}
+
+/// Advertises this crate's connection limits in the initial `SETTINGS` frame.
+///
+/// libnghttp2's own defaults for these two are effectively unlimited, so without this a
+/// peer could open unbounded streams and force unbounded header copies; see [`Config`] for
+/// why the built-in values are what they are.
+fn configured(builder: SessionBuilder<Events>, config: &Config) -> SessionBuilder<Events> {
+    builder
+        .setting(Setting::MaxConcurrentStreams(config.concurrency()))
+        .setting(Setting::MaxHeaderListSize(config.header_list_size()))
 }
 
 /// Wires the handlers that record what arrived.
@@ -268,6 +281,22 @@ pub(crate) trait Role {
         fields: &[(Vec<u8>, Vec<u8>)],
         incoming: &Arc<Incoming>,
     ) -> Result<()>;
+
+    /// A header block that libnghttp2 categorised as trailers arrived on `stream`.
+    ///
+    /// The default is to attach them to the message being received, which is what a
+    /// server does with a request's trailers. The client overrides this: libnghttp2
+    /// reports the final response that follows a `1xx` under the same category as genuine
+    /// trailers, so that end has to disambiguate the two.
+    fn trailers(
+        &mut self,
+        session: &mut Session<Events>,
+        stream: i32,
+        fields: &[(Vec<u8>, Vec<u8>)],
+        incoming: &Arc<Incoming>,
+    ) -> Result<()> {
+        deliver_trailers(session, stream, fields, incoming)
+    }
 
     /// `stream` has closed, and is about to leave the registry.
     fn closed(&mut self, stream: i32);
@@ -529,6 +558,13 @@ where
 
             let buf = buffers.take();
 
+            // The transport appends into the buffer's spare capacity, so its length before
+            // the read is where the fresh octets begin. The returned count is only an EOF
+            // indicator (see `TransportRead::read`); the octets themselves are read off the
+            // buffer by how much it grew. This asserts the two agree so an adapter that
+            // reads but forgets to append cannot pass silently in debug builds.
+            let filled = buf.len();
+
             let (result, buf) = reader.read(buf).await;
             match result {
                 Ok(0) => {
@@ -536,7 +572,13 @@ where
                     shared.wake_driver();
                     return;
                 }
-                Ok(_) => {
+                Ok(count) => {
+                    debug_assert_eq!(
+                        buf.len(),
+                        filled + count,
+                        "a transport read must append its reported octets, growing the buffer by \
+                         exactly that many",
+                    );
                     lock(&inbox).push_back(buf);
                     shared.wake_driver();
                 }
@@ -653,6 +695,14 @@ where
                 &mut guard.role,
             )?;
 
+            // Everything this pass produced has been written; commit it to the peer-visible
+            // stream before the pass can end in a park or a return. A buffering transport
+            // holds octets until this call, so skipping it before awaiting the peer — or
+            // before finishing — would strand the request behind a buffer and hang the
+            // connection. The honest cases (a raw socket, the in-memory duplex) flush
+            // nothing here.
+            writer.commit().await?;
+
             if lock(&intake).finished && lock(&inbox).is_empty() {
                 if let Some(failure) = lock(&intake).failure.take() {
                     return Err(Error::from(failure));
@@ -754,6 +804,26 @@ where
     (source, waker)
 }
 
+/// Attaches a received trailer block to the message it belongs to.
+///
+/// The default handling of trailers, shared by the `Role` trait's default `trailers` and
+/// the client's fallback once it has ruled out a post-`1xx` final response.
+pub(super) fn deliver_trailers(
+    session: &mut Session<Events>,
+    stream: i32,
+    fields: &[(Vec<u8>, Vec<u8>)],
+    incoming: &Arc<Incoming>,
+) -> Result<()> {
+    match head::trailers(fields) {
+        Ok(trailers) => incoming.set_trailers(trailers),
+        Err(error) => {
+            incoming.fail(error);
+            session.reset_stream(StreamId::new(stream), ErrorCode::PROTOCOL_ERROR)?;
+        }
+    }
+    Ok(())
+}
+
 /// Acts on everything the handlers observed, in the order they observed it.
 fn dispatch<R: Role>(
     session: &mut Session<Events>,
@@ -783,13 +853,7 @@ fn dispatch<R: Role>(
                 let Some(incoming) = registry.incoming(stream) else {
                     continue;
                 };
-                match head::trailers(&fields) {
-                    Ok(trailers) => incoming.set_trailers(trailers),
-                    Err(error) => {
-                        incoming.fail(error);
-                        session.reset_stream(StreamId::new(stream), ErrorCode::PROTOCOL_ERROR)?;
-                    }
-                }
+                role.trailers(session, stream, &fields, &incoming)?;
             }
 
             Event::Data { stream, data, .. } => {
@@ -963,35 +1027,53 @@ fn fail_stream(registry: &Registry, stream: i32, error: Error) {
 
 /// Writes out everything the session currently has to say.
 ///
-/// Which of the two strategies runs is the transport's choice, because they cannot be
-/// combined: the session invalidates each block when the next is asked for, so blocks can
-/// only be gathered into one write by copying them.
+/// Which of the two strategies runs is the transport's choice, expressed once through
+/// [`TransportWrite::write_borrowed`]: it returns `Some` to take each block borrowed and
+/// uncopied, or `None` to have them coalesced into one owned write. The two cannot be
+/// combined — the session invalidates each block when the next is asked for, so blocks can
+/// only be gathered into one write by copying them — so the choice is read from the first
+/// block and held for the rest of the pass.
+///
+/// This does not commit the octets to the peer; [`TransportWrite::commit`] does, and the
+/// caller runs it once the pass is fully drained.
 async fn flush<W: TransportWrite>(
     session: &mut Session<Events>,
     writer: &mut W,
     events: &mut Events,
 ) -> Result<()> {
-    if writer.writes_borrowed() {
-        while let Some(block) = session.send(events)? {
-            let mut offset = 0;
-            while offset < block.len() {
-                let written = writer.write_borrowed(&block[offset..]).await?;
-                if written == 0 {
-                    return Err(Error::new(
-                        ErrorKind::Transport,
-                        "the transport accepted no octets and reported no error",
-                    ));
+    // Empty until the owned path is taken, and never touched on the borrowed one, so the
+    // borrowed path keeps its zero-allocation promise: `BytesMut::new` does not allocate.
+    let mut out = BytesMut::new();
+    let mut coalescing = false;
+    while let Some(block) = session.send(events)? {
+        if coalescing {
+            out.extend_from_slice(block);
+            continue;
+        }
+        let mut offset = 0;
+        while offset < block.len() {
+            match writer.write_borrowed(&block[offset..]) {
+                Some(write) => {
+                    let written = write.await?;
+                    if written == 0 {
+                        return Err(Error::new(
+                            ErrorKind::Transport,
+                            "the transport accepted no octets and reported no error",
+                        ));
+                    }
+                    offset += written;
                 }
-                offset += written;
+                // The transport does not lend the fast path; from here on the pass is
+                // coalesced into one owned write, this block included.
+                None => break,
             }
         }
-        return Ok(());
+        if offset < block.len() {
+            coalescing = true;
+            out.extend_from_slice(&block[offset..]);
+        }
     }
 
-    let mut out = BytesMut::new();
-    while let Some(block) = session.send(events)? {
-        out.extend_from_slice(block);
-    }
     let mut pending = out.freeze();
     while !pending.is_empty() {
         let (result, returned) = writer.write(pending).await;
@@ -1005,4 +1087,86 @@ async fn flush<W: TransportWrite>(
         pending = returned.slice(written..);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CLIENT_MAGIC: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    const MAX_CONCURRENT_STREAMS_ID: u16 = 0x03;
+    const MAX_HEADER_LIST_SIZE_ID: u16 = 0x06;
+
+    fn drain(session: &mut Session<Events>) -> Vec<u8> {
+        let mut events = Events::default();
+        let mut wire = Vec::new();
+        while let Some(block) = session.send(&mut events).expect("send failed") {
+            wire.extend_from_slice(block);
+        }
+        wire
+    }
+
+    /// Parses the SETTINGS payload following an optional preface into (id, value) pairs.
+    fn settings_entries(wire: &[u8], skip_preface: bool) -> Vec<(u16, u32)> {
+        let start = if skip_preface { CLIENT_MAGIC.len() } else { 0 } + 9;
+        wire[start..]
+            .chunks_exact(6)
+            .map(|c| {
+                (
+                    u16::from_be_bytes([c[0], c[1]]),
+                    u32::from_be_bytes([c[2], c[3], c[4], c[5]]),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_client_advertises_its_concurrency_and_header_limits() {
+        let config = Config::default();
+        let mut session = client_session(&config).unwrap();
+        let entries = settings_entries(&drain(&mut session), true);
+
+        assert!(
+            entries.contains(&(MAX_CONCURRENT_STREAMS_ID, config.concurrency())),
+            "the initial SETTINGS must carry the concurrency cap, got {entries:?}"
+        );
+        assert!(
+            entries.contains(&(MAX_HEADER_LIST_SIZE_ID, config.header_list_size())),
+            "the initial SETTINGS must carry the header-list limit, got {entries:?}"
+        );
+    }
+
+    #[test]
+    fn a_server_advertises_its_concurrency_and_header_limits() {
+        let config = Config::default();
+        let mut session = server_session(&config).unwrap();
+        let entries = settings_entries(&drain(&mut session), false);
+
+        assert!(
+            entries.contains(&(MAX_CONCURRENT_STREAMS_ID, config.concurrency())),
+            "the initial SETTINGS must carry the concurrency cap, got {entries:?}"
+        );
+        assert!(
+            entries.contains(&(MAX_HEADER_LIST_SIZE_ID, config.header_list_size())),
+            "the initial SETTINGS must carry the header-list limit, got {entries:?}"
+        );
+    }
+
+    #[test]
+    fn a_caller_can_override_the_advertised_limits() {
+        let config = Config::default()
+            .max_concurrent_streams(7)
+            .max_header_list_size(9000);
+        let mut session = client_session(&config).unwrap();
+        let entries = settings_entries(&drain(&mut session), true);
+
+        assert!(
+            entries.contains(&(MAX_CONCURRENT_STREAMS_ID, 7)),
+            "an overridden concurrency cap must be the one advertised, got {entries:?}"
+        );
+        assert!(
+            entries.contains(&(MAX_HEADER_LIST_SIZE_ID, 9000)),
+            "an overridden header-list limit must be the one advertised, got {entries:?}"
+        );
+    }
 }

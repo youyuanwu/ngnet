@@ -30,7 +30,7 @@
 //! allocator — so what it counts is precisely this crate's own Rust allocations, which is
 //! exactly the attribution SC-017 asks for.
 //!
-//! # Deferred from Phase 8: is `writes_borrowed() == true` right for `TokioWriter`?
+//! # Deferred from Phase 8: is the borrowed path right for `TokioWriter`?
 //!
 //! Measured here, per steady-state pass of a client upload, for each write shape. The
 //! `>0` / `0` allocation columns and the `1` write column are asserted by the tests named
@@ -40,10 +40,10 @@
 //! held constant) rather than those incidental numbers, which move with the window size and
 //! `bytes`' growth policy.
 //!
-//! | shape (`writes_borrowed`) | heap allocations / pass | transport writes / pass | pinned by |
-//! |---------------------------|-------------------------|-------------------------|-----------|
-//! | `true`  (borrowed)        | `0`                     | one per block (4 here)  | `steady_state_send_allocates_nothing_on_the_borrowed_path`, `the_borrowed_write_path_writes_each_block_separately` |
-//! | `false` (owned)           | `>0`, constant (4 here) | `1` (all blocks coalesced) | `the_owned_write_path_coalesces_a_pass_into_one_write`, `the_owned_write_path_allocates_on_every_pass` |
+//! | shape (`write_borrowed`) | heap allocations / pass | transport writes / pass | pinned by |
+//! |--------------------------|-------------------------|-------------------------|-----------|
+//! | `Some` (borrowed)        | `0`                     | one per block (4 here)  | `steady_state_send_allocates_nothing_on_the_borrowed_path`, `the_borrowed_write_path_writes_each_block_separately` |
+//! | `None` (owned)           | `>0`, constant (4 here) | `1` (all blocks coalesced) | `the_owned_write_path_coalesces_a_pass_into_one_write`, `the_owned_write_path_allocates_on_every_pass` |
 //!
 //! The borrowed shape trades a handful of small writes for zero allocation and zero copy;
 //! the owned shape buys a single write per pass by allocating a coalescing buffer and
@@ -53,8 +53,8 @@
 //! — steady-state zero allocation — is reachable *only* on the borrowed path, which
 //! `the_owned_write_path_allocates_on_every_pass` pins by showing the same traffic costs an
 //! allocation every pass on the owned shape and none on the borrowed one. The measurement
-//! therefore does not contradict the tokio default; it endorses it.
-//! `TokioWriter::writes_borrowed()` should stay `true`.
+//! therefore does not contradict the tokio default; it endorses it: `TokioWriter` should go
+//! on returning `Some` from `write_borrowed`.
 #![cfg(feature = "http")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -259,13 +259,18 @@ impl TransportWrite for RecWriter {
         (Ok(written), buf)
     }
 
-    async fn write_borrowed(&mut self, data: &[u8]) -> io::Result<usize> {
+    fn write_borrowed<'w>(
+        &'w mut self,
+        data: &'w [u8],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        // The single override decides the drain strategy: `Some` elects the zero-copy
+        // borrowed path, `None` leaves the owned coalescing one. Which shape this writer is
+        // was fixed when it was built.
+        if !self.borrowed {
+            return None;
+        }
         self.record(data);
-        Ok(data.len())
-    }
-
-    fn writes_borrowed(&self) -> bool {
-        self.borrowed
+        Some(core::future::ready(Ok(data.len())))
     }
 }
 
@@ -627,6 +632,130 @@ fn the_owned_write_path_allocates_on_every_pass() {
         borrowed.allocations.iter().all(|&count| count == 0),
         "the borrowed path carries the same traffic for no allocation, saw {:?}",
         borrowed.allocations,
+    );
+}
+
+// ----- the server handler path: waking parked handlers allocates nothing -----
+//
+// SF-4. The server drains the set of woken handlers into a scratch buffer every pass, the
+// same discipline the body path follows. This proves it: several handlers are started and
+// parked, then woken repeatedly without any new stream, and the driver's drain-and-poll
+// pass is measured to allocate nothing once the connection has warmed up.
+
+/// A handler that never finishes, publishing the waker it was last polled with so the
+/// harness can wake it again without opening a new stream.
+struct Park {
+    slot: WakerSlot,
+}
+
+/// The cell a parked handler publishes its waker into, shared with the harness.
+type WakerSlot = Rc<RefCell<Option<Waker>>>;
+
+impl Future for Park {
+    type Output = http::Response<Empty>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Cloning an `Arc`-backed waker is a refcount bump, not an allocation, so
+        // republishing it every poll costs nothing the measured window would see.
+        *self.slot.borrow_mut() = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+fn peer_client_session() -> Session<()> {
+    SessionBuilder::<()>::client()
+        .build()
+        .expect("peer client session")
+}
+
+/// Feeds the server's octets to the peer and posts the peer's octets back. The peer never
+/// answers anything — it only opens streams — so all that travels back is protocol
+/// bookkeeping.
+fn pump_client(peer: &mut Session<()>, to_server: &Wire, from_server: &Wire) {
+    let input: Vec<u8> = from_server.borrow_mut().buf.drain(..).collect();
+    if !input.is_empty() {
+        peer.recv(&input, &mut ()).expect("peer recv");
+    }
+    let mut out = to_server.borrow_mut();
+    while let Some(block) = peer.send(&mut ()).expect("peer send") {
+        out.buf.extend(block.iter().copied());
+    }
+}
+
+fn run_handlers() -> Vec<usize> {
+    const HANDLERS: usize = 4;
+
+    let to_server = wire(1 << 20);
+    let from_server = wire(1 << 20);
+    let transport = Recording {
+        inbound: Rc::clone(&to_server),
+        outbound: Rc::clone(&from_server),
+        borrowed: true,
+        meter: Rc::new(RefCell::new(Meter::default())),
+    };
+
+    let wakers: Rc<RefCell<Vec<WakerSlot>>> = Rc::new(RefCell::new(Vec::new()));
+    let published = Rc::clone(&wakers);
+    let connection = nghttp2::http::server::serve(
+        transport,
+        move |_request: http::Request<nghttp2::http::IncomingBody>| {
+            let slot = Rc::new(RefCell::new(None));
+            published.borrow_mut().push(Rc::clone(&slot));
+            Park { slot }
+        },
+    )
+    .expect("serve");
+
+    let mut peer = peer_client_session();
+    for _ in 0..HANDLERS {
+        peer.submit_request(&[
+            Header::new(":method", "GET"),
+            Header::new(":scheme", "http"),
+            Header::new(":authority", "example.test"),
+            Header::new(":path", "/"),
+        ])
+        .expect("submit request");
+    }
+
+    let flag = Arc::new(Flag(std::sync::atomic::AtomicBool::new(false)));
+    let waker = Waker::from(Arc::clone(&flag));
+    let mut connection = core::pin::pin!(connection);
+
+    for _ in 0..WARMUP {
+        pump_client(&mut peer, &to_server, &from_server);
+        let _ = step(connection.as_mut(), &waker);
+    }
+
+    assert_eq!(
+        wakers.borrow().len(),
+        HANDLERS,
+        "every request should have started a handler that parked",
+    );
+
+    let mut per_pass = Vec::with_capacity(MEASURE);
+    for _ in 0..MEASURE {
+        // Woken outside the window: the marking's own cost is not what this measures, only
+        // the driver's drain of the woken set and the poll of each parked handler.
+        for slot in wakers.borrow().iter() {
+            if let Some(waker) = slot.borrow().as_ref() {
+                waker.wake_by_ref();
+            }
+        }
+        arm();
+        let _ = step(connection.as_mut(), &waker);
+        per_pass.push(disarm());
+    }
+    per_pass
+}
+
+#[test]
+fn waking_parked_handlers_allocates_nothing() {
+    let per_pass = run_handlers();
+
+    assert!(
+        per_pass.iter().all(|&count| count == 0),
+        "draining and polling several woken handlers must allocate nothing in steady state, \
+         saw {per_pass:?}",
     );
 }
 

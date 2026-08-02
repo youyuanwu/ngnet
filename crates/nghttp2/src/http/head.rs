@@ -201,6 +201,7 @@ pub(crate) fn request_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Reques
     let mut scheme = None;
     let mut authority = None;
     let mut path = None;
+    let mut host = None;
     let mut seen_field = false;
 
     for (name, value) in fields {
@@ -237,6 +238,19 @@ pub(crate) fn request_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Reques
         }
 
         seen_field = true;
+        // A regular `host` field says the same thing as `:authority`, and the layer below
+        // does nothing to keep the two honest: libnghttp2 validates each independently and
+        // requires only that *one* be present, comparing neither, so both reach here and
+        // can disagree. Authority is a trust-boundary input — routing, tenant checks,
+        // absolute-URL and cache-key generation all read it — so a `host` that contradicts
+        // `:authority` is a smuggling attempt and the request is refused. A `host` that
+        // agrees is dropped as redundant rather than delivered beside the authority it
+        // merely repeats; the outbound encoder drops `host` for exactly this reason (see
+        // `request_headers`). The comparison happens once `:authority` is known, below.
+        if name.eq_ignore_ascii_case(b"host") {
+            host = Some(value.clone());
+            continue;
+        }
         let name = http::HeaderName::from_bytes(name)
             .map_err(|_| protocol("the peer sent a malformed field name"))?;
         let value = http::HeaderValue::from_bytes(value)
@@ -247,6 +261,13 @@ pub(crate) fn request_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Reques
     let method = method.ok_or_else(|| protocol("a request must carry :method"))?;
     let path = path.ok_or_else(|| protocol("a request must carry :path"))?;
     let authority = authority.ok_or_else(|| protocol("a request must carry :authority"))?;
+    if let Some(host) = &host {
+        if host != &authority {
+            return Err(protocol(
+                "the peer sent a host field that disagrees with :authority",
+            ));
+        }
+    }
     // Cleartext only, so a missing scheme has exactly one sensible reading — but a scheme
     // that says otherwise is the peer telling us something this crate cannot honour.
     let scheme = scheme.unwrap_or_else(|| b"http".to_vec());
@@ -613,6 +634,51 @@ mod tests {
         ]))
         .expect("a well-formed head");
         assert_eq!(head.uri().scheme_str(), Some("http"));
+    }
+
+    #[test]
+    fn a_host_field_disagreeing_with_authority_is_refused() {
+        // The smuggling shape: `:authority` names one host and a regular `host` names
+        // another. libnghttp2 delivers both without comparing them, so refusing the
+        // disagreement is this layer's job — otherwise `request.uri().authority()` and
+        // `request.headers()["host"]` would each name a different origin and an attacker
+        // could target whichever a downstream layer happened to trust.
+        let outcome = request_head(&fields(&[
+            (":method", "GET"),
+            (":scheme", "http"),
+            (":authority", "victim.example"),
+            (":path", "/"),
+            ("host", "attacker.example"),
+        ]));
+        assert!(
+            outcome.is_err(),
+            "a host disagreeing with :authority was accepted",
+        );
+        assert_eq!(outcome.unwrap_err().kind(), ErrorKind::Protocol);
+    }
+
+    #[test]
+    fn a_host_field_agreeing_with_authority_is_dropped_not_delivered() {
+        // An agreeing `host` is not a disagreement to refuse, but it is still redundant
+        // with the authority the URI already carries, so it is dropped rather than handed
+        // to a handler beside a value it merely repeats.
+        let head = request_head(&fields(&[
+            (":method", "GET"),
+            (":scheme", "http"),
+            (":authority", "example.test"),
+            (":path", "/"),
+            ("host", "example.test"),
+        ]))
+        .expect("an agreeing host is well-formed");
+
+        assert_eq!(
+            head.uri().authority().map(http::uri::Authority::as_str),
+            Some("example.test"),
+        );
+        assert!(
+            head.headers().get(http::header::HOST).is_none(),
+            "a host field redundant with :authority was delivered to the handler",
+        );
     }
 
     #[test]
