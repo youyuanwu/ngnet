@@ -408,6 +408,23 @@ mod asynchronous {
         Ok(())
     }
 
+    /// The ready-made tokio transport, when the feature that provides it is on.
+    ///
+    /// Feature-gated surface is still surface: a caller who enabled it is entitled to the
+    /// same promise as one who did not.
+    #[cfg(feature = "tokio")]
+    pub(super) fn tokio_transport_surface<T>(stream: T)
+    where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite,
+    {
+        use nghttp2::http::transport::{TokioIo, TokioReader, TokioWriter};
+
+        let carried: TokioIo<T> = TokioIo::new(stream);
+        let (reader, writer): (TokioReader<T>, TokioWriter<T>) = Transport::split(carried);
+        let _: fn(&TokioWriter<T>) -> bool = TransportWrite::writes_borrowed;
+        drop((reader, writer));
+    }
+
     /// Never called. Its only job is to give the fixture above a `B` to hand over.
     fn unreachable_body<B>() -> B {
         unreachable!("the client surface fixture is never executed")
@@ -424,6 +441,10 @@ fn the_asynchronous_surface_is_unchanged() {
         asynchronous::client_surface::<Duplex, Empty>;
     let _: fn(&nghttp2::http::IncomingBody) = asynchronous::incoming_body_surface;
     let _: fn(&nghttp2::http::Cancelled) = asynchronous::cancelled_surface;
+    #[cfg(feature = "tokio")]
+    {
+        let _: fn(tokio::net::TcpStream) = asynchronous::tokio_transport_surface::<_>;
+    }
 
     // `serve` is reachable both through the module and at the top of `http`, and both are
     // part of the promise. A `fn` item as the handler and `Ready` as its future keep every

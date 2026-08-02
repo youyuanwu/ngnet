@@ -40,6 +40,12 @@ use core::future::Future;
 
 use bytes::{Bytes, BytesMut};
 
+#[cfg(feature = "tokio")]
+mod tokio;
+
+#[cfg(feature = "tokio")]
+pub use tokio::{TokioIo, TokioReader, TokioWriter};
+
 /// A connected byte stream, divisible into independent halves.
 pub trait Transport {
     /// The reading half.

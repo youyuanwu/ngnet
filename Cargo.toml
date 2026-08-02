@@ -14,6 +14,16 @@ rust-version = "1.85"
 [workspace.dependencies]
 bindgen = "0.72"
 bytes = "1"
+# `polling` rather than the default `io-uring`: what is being proven is that the transport
+# traits fit a completion API, and the epoll-backed driver presents the same completion
+# shape while running anywhere. Environments with io_uring can swap the feature.
+compio = { version = "0.19", default-features = false, features = [
+    "bytes",
+    "io",
+    "net",
+    "polling",
+    "runtime",
+] }
 cmake = "0.1"
 http = "1"
 http-body = "1"

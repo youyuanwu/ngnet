@@ -549,9 +549,17 @@ fn the_async_subtree_exists_and_is_scanned() {
         !files.is_empty(),
         "no files found in the async subtree; the path filter has gone stale"
     );
+    // Named by module rather than by file, since a module grows into a directory the
+    // moment it gains a submodule — as `transport` did when it acquired the tokio one.
     assert!(
-        files.iter().any(|f| f.ends_with("transport.rs")),
+        files
+            .iter()
+            .any(|f| f.ends_with("transport.rs") || f.ends_with("transport/mod.rs")),
         "the transport module should be part of the async subtree, found: {files:?}"
+    );
+    assert!(
+        files.iter().any(|f| f.ends_with("driver.rs")),
+        "the driver should be part of the async subtree, found: {files:?}"
     );
 }
 
