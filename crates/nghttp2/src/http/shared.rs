@@ -16,7 +16,8 @@
 //! `Session::send` — so waking must never need a lock the driver is already holding.
 //! Waking the driver itself is done *after* releasing the lock, for the same reason.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Poll, Waker};
 
@@ -34,6 +35,19 @@ use super::error::{Error, ErrorKind, Result};
 #[derive(Debug, Default)]
 pub(crate) struct Shared {
     inner: Mutex<Inner>,
+    /// The read-buffer pool's current size, and the largest it has ever reached.
+    ///
+    /// Kept here purely so a test can watch the pool settle: the pool itself is a local of
+    /// the driver future and reaches nothing else, so without a gauge the claim that it
+    /// stabilises could only be argued, not observed. Deliberately *outside* the `Inner`
+    /// mutex: the driver updates these on the buffer hot path — every `Buffers::take` and
+    /// every `Buffers::sweep` — and that path has no other reason to touch `Inner`. Taking
+    /// the crate's central lock there, purely for test observability, would add contention
+    /// on the hottest lock to production builds. A relaxed atomic store is enough: nothing
+    /// in the driver reads these back, so they order nothing, and the test reads them only
+    /// from its own thread after the work they describe has already been driven.
+    pool_size: AtomicUsize,
+    pool_high_water: AtomicUsize,
 }
 
 #[derive(Debug, Default)]
@@ -41,8 +55,11 @@ struct Inner {
     /// Streams whose bodies have announced they are ready to be asked again.
     ///
     /// A set rather than a queue: a stream woken five times before the driver next runs
-    /// still needs resuming exactly once.
-    ready: BTreeSet<i32>,
+    /// still needs resuming exactly once. A `HashSet` rather than a `BTreeSet` because the
+    /// driver empties it every pass with [`HashSet::drain`], which keeps the table's
+    /// capacity — so a stream resumed on every pass reuses the same slot rather than
+    /// allocating one afresh, which is what the steady-state allocation harness pins.
+    ready: HashSet<i32>,
     /// The driver task's waker, replaced whenever the runtime hands over a different one.
     driver: Option<Waker>,
     /// Receive-window capacity the application has finished with, by stream, waiting to
@@ -50,7 +67,10 @@ struct Inner {
     ///
     /// Accumulated per stream rather than queued per chunk, so a caller reading a body in
     /// small pieces produces one `WINDOW_UPDATE` per driver pass instead of one per read.
-    credits: BTreeMap<i32, usize>,
+    /// A `HashMap` rather than a `BTreeMap` for the same reason as `ready`: draining it
+    /// keeps its capacity, so a stream credited every pass reuses its entry rather than
+    /// churning a fresh tree node each time.
+    credits: HashMap<i32, usize>,
     /// Trailing header blocks an outgoing body produced, waiting to be submitted.
     ///
     /// Left here rather than submitted on the spot because they are produced from inside
@@ -121,10 +141,15 @@ impl Shared {
         true
     }
 
-    /// Takes the streams to resume, leaving the set empty.
-    pub(crate) fn take_ready(&self) -> Vec<i32> {
-        let mut inner = self.lock();
-        core::mem::take(&mut inner.ready).into_iter().collect()
+    /// Moves the streams to resume into `out`, leaving the set empty.
+    ///
+    /// Takes a caller-owned scratch buffer rather than returning a fresh `Vec` so the
+    /// driver can reuse one across passes: [`HashSet::drain`] keeps the set's capacity and
+    /// clearing `out` keeps the vector's, so a steady state resuming the same streams every
+    /// pass allocates in neither. That is the property the allocation harness pins.
+    pub(crate) fn take_ready_into(&self, out: &mut Vec<i32>) {
+        out.clear();
+        out.extend(self.lock().ready.drain());
     }
 
     /// How many streams are waiting to be resumed.
@@ -146,10 +171,12 @@ impl Shared {
         *self.lock().credits.entry(stream).or_default() += len;
     }
 
-    /// Takes the consumption to report, leaving nothing behind.
-    pub(crate) fn take_credits(&self) -> Vec<(i32, usize)> {
-        let mut inner = self.lock();
-        core::mem::take(&mut inner.credits).into_iter().collect()
+    /// Moves the consumption to report into `out`, leaving nothing behind.
+    ///
+    /// Reuses `out` across passes for the same reason as [`Self::take_ready_into`].
+    pub(crate) fn take_credits_into(&self, out: &mut Vec<(i32, usize)>) {
+        out.clear();
+        out.extend(self.lock().credits.drain());
     }
 
     /// How many streams have consumption waiting to be reported.
@@ -190,9 +217,12 @@ impl Shared {
         self.lock().resets.push((stream, code));
     }
 
-    /// Takes the streams to reset, leaving none behind.
-    pub(crate) fn take_resets(&self) -> Vec<(i32, crate::ErrorCode)> {
-        core::mem::take(&mut self.lock().resets)
+    /// Moves the streams to reset into `out`, leaving none behind.
+    ///
+    /// Reuses `out` across passes for the same reason as [`Self::take_ready_into`].
+    pub(crate) fn take_resets_into(&self, out: &mut Vec<(i32, crate::ErrorCode)>) {
+        out.clear();
+        out.append(&mut self.lock().resets);
     }
 
     /// Whether any stream is waiting to be reset.
@@ -246,6 +276,27 @@ impl Shared {
     /// The most chunks any outgoing body has held back at once.
     pub(crate) fn buffered_high_water(&self) -> usize {
         self.lock().buffered_high_water
+    }
+
+    /// Records the read-buffer pool's current size, tracking its high-water mark too.
+    ///
+    /// Relaxed throughout: this is called on the buffer hot path and its only reader is a
+    /// test, on another thread, after the driving is done — so it synchronises nothing and
+    /// needs no ordering. `fetch_max` keeps the high-water mark monotone without a lock or a
+    /// read-modify-write loop.
+    pub(crate) fn note_pool_size(&self, size: usize) {
+        self.pool_size.store(size, Ordering::Relaxed);
+        self.pool_high_water.fetch_max(size, Ordering::Relaxed);
+    }
+
+    /// The read-buffer pool's current size.
+    pub(crate) fn pool_size(&self) -> usize {
+        self.pool_size.load(Ordering::Relaxed)
+    }
+
+    /// The largest the read-buffer pool has ever grown.
+    pub(crate) fn pool_high_water(&self) -> usize {
+        self.pool_high_water.load(Ordering::Relaxed)
     }
 
     /// Records that the driver has stopped, and wakes anything waiting on it.

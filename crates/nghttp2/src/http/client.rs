@@ -383,6 +383,20 @@ impl<B> SendRequest<B> {
     pub(crate) fn buffered_chunks(&self) -> usize {
         self.shared.buffered_high_water()
     }
+
+    /// The read-buffer pool's current size, and the largest it has ever reached.
+    ///
+    /// Reachable only through the hidden testing module. The pool is a local of the driver
+    /// future and reaches nothing else, so the promise that it settles to a fixed size and
+    /// stops growing can only be tested through a gauge the driver keeps for the purpose.
+    pub(crate) fn pool_size(&self) -> usize {
+        self.shared.pool_size()
+    }
+
+    /// See [`Self::pool_size`].
+    pub(crate) fn pool_high_water(&self) -> usize {
+        self.shared.pool_high_water()
+    }
 }
 
 /// Resolves when a request's response head arrives.

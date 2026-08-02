@@ -831,6 +831,20 @@ pub fn pending_wakes<B>(handle: &super::client::SendRequest<B>) -> usize {
     handle.pending_wakes()
 }
 
+/// The read-buffer pool's current size, and the largest it has ever reached.
+///
+/// The pool lives inside the driver future and reaches nothing else, so its settling to a
+/// fixed size is a claim that can only be observed through a gauge — these two hand that
+/// gauge to a test without widening the public surface.
+pub fn pool_size<B>(handle: &super::client::SendRequest<B>) -> usize {
+    handle.pool_size()
+}
+
+/// See [`pool_size`].
+pub fn pool_high_water<B>(handle: &super::client::SendRequest<B>) -> usize {
+    handle.pool_high_water()
+}
+
 impl ScriptHandle {
     /// A clone of the waker the body was last handed, if it is parked.
     ///

@@ -22,6 +22,15 @@ const UNSAFE_TEST_EXEMPTIONS: &[(&str, &str)] = &[
         "zero_alloc.rs",
         "implements GlobalAlloc to count allocations",
     ),
+    // Counting a future's allocations needs the counter to follow the poll across
+    // suspension points, so this harness installs its own GlobalAlloc — unsafe by language
+    // rule — just as `zero_alloc.rs` does for the sans-I/O path. It exercises SC-017 and
+    // SC-019 through the safe async API; the unsafe is measurement scaffolding, not use of
+    // the API.
+    (
+        "http_zero_alloc.rs",
+        "implements GlobalAlloc to count a future's allocations",
+    ),
 ];
 
 /// Facilities the crate's own source must not reach for.

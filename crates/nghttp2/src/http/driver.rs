@@ -396,6 +396,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 struct Buffers {
     pool: Mutex<Vec<BytesMut>>,
     holding: Mutex<Vec<bytes::Bytes>>,
+    /// Where the pool's size is reported, so a test can watch it settle. Nothing in the
+    /// driver reads it back.
+    gauge: Arc<Shared>,
 }
 
 /// How many spare read buffers to keep. One per outstanding read, plus room for a buffer
@@ -405,19 +408,39 @@ const POOL_LIMIT: usize = READ_AHEAD + 2;
 /// How many buffers to keep watching for reuse before giving up on them.
 const HOLDING_LIMIT: usize = 16;
 
+/// A read buffer whose shared representation has already been forced.
+///
+/// A `BytesMut` is first backed by a plain allocation; the first time a `Bytes` derived
+/// from it is cloned or sliced, it promotes to a reference-counted representation, and that
+/// promotion allocates. Forcing it once here — `split_off(0)` yields the whole buffer in
+/// the shared representation — means every later slice only bumps a refcount, and because
+/// reclaiming the buffer keeps that representation, the cost is paid once for the buffer's
+/// whole life rather than once per reuse. Without it, handing a streamed body's chunks to
+/// the caller as owned `Bytes` would allocate on every driver pass, which the steady-state
+/// allocation harness exists to forbid.
+fn new_read_buffer() -> BytesMut {
+    let mut buf = BytesMut::with_capacity(READ_BUFFER);
+    buf.split_off(0)
+}
+
 impl Buffers {
-    fn new() -> Self {
+    fn new(gauge: Arc<Shared>) -> Self {
         Self {
             pool: Mutex::new(Vec::new()),
             holding: Mutex::new(Vec::new()),
+            gauge,
         }
     }
 
     /// A buffer to read into: a recycled one if any is free, otherwise a fresh one.
     fn take(&self) -> BytesMut {
-        let mut buf = lock(&self.pool)
-            .pop()
-            .unwrap_or_else(|| BytesMut::with_capacity(READ_BUFFER));
+        let (buf, size) = {
+            let mut pool = lock(&self.pool);
+            let buf = pool.pop();
+            (buf, pool.len())
+        };
+        self.gauge.note_pool_size(size);
+        let mut buf = buf.unwrap_or_else(new_read_buffer);
         buf.clear();
         buf
     }
@@ -429,25 +452,43 @@ impl Buffers {
     }
 
     fn sweep(&self) {
-        let waiting: Vec<bytes::Bytes> = core::mem::take(&mut *lock(&self.holding));
-        let mut still = Vec::with_capacity(waiting.len());
+        let mut holding = lock(&self.holding);
+        let mut pool = lock(&self.pool);
 
-        for buffer in waiting {
+        // Partitioned in place rather than into a fresh vector: this runs on every pass,
+        // often several times, so a scratch allocation here would be a per-pass cost on
+        // the steady-state path the whole design is trying to keep free of them. Each
+        // buffer is lifted out against an empty `Bytes` placeholder — which owns nothing
+        // and allocates nothing — reclaimed if its last view has been dropped, and kept
+        // by compacting it toward the front otherwise.
+        let mut kept = 0;
+        for index in 0..holding.len() {
+            let buffer = core::mem::replace(&mut holding[index], bytes::Bytes::new());
             match buffer.try_into_mut() {
                 Ok(mut buf) => {
-                    let mut pool = lock(&self.pool);
                     if pool.len() < POOL_LIMIT {
                         buf.clear();
                         pool.push(buf);
                     }
                 }
-                Err(buffer) => still.push(buffer),
+                Err(buffer) => {
+                    holding[kept] = buffer;
+                    kept += 1;
+                }
             }
         }
+        holding.truncate(kept);
 
-        // Oldest first, so what is dropped is what has been held longest.
-        let excess = still.len().saturating_sub(HOLDING_LIMIT);
-        *lock(&self.holding) = still.split_off(excess);
+        let size = pool.len();
+        drop(pool);
+        self.gauge.note_pool_size(size);
+
+        // Oldest first, so what is dropped is what has been held longest. `drain` keeps the
+        // vector's capacity, so bounding the set costs no allocation either.
+        let excess = holding.len().saturating_sub(HOLDING_LIMIT);
+        if excess > 0 {
+            holding.drain(..excess);
+        }
     }
 }
 
@@ -470,7 +511,7 @@ where
     // and defeat the auto-trait inference the transport traits are shaped around. The
     // locks are never contended — the halves are polled one at a time on one task.
     let inbox = Mutex::new(VecDeque::<BytesMut>::new());
-    let buffers = Buffers::new();
+    let buffers = Buffers::new(Arc::clone(&shared));
     let intake = Mutex::new(Intake::default());
 
     let reading = async {
@@ -515,6 +556,12 @@ where
 
     let driving = async {
         let mut events = Events::default();
+        // Reused across passes so draining the command sets costs no allocation on the
+        // steady-state path — the shared collections keep their capacity when drained, and
+        // so do these. The steady-state allocation harness is what holds this to account.
+        let mut credited: Vec<(i32, usize)> = Vec::new();
+        let mut to_reset: Vec<(i32, crate::ErrorCode)> = Vec::new();
+        let mut to_resume: Vec<i32> = Vec::new();
 
         loop {
             buffers.sweep();
@@ -524,16 +571,18 @@ where
             // Hand back the window the application has finished with. Done before
             // anything else touches the session, so the `WINDOW_UPDATE` this queues goes
             // out in the same pass rather than waiting for the next wake.
-            for (stream, len) in shared.take_credits() {
-                session.consume(StreamId::new(stream), len)?;
+            shared.take_credits_into(&mut credited);
+            for (stream, len) in &credited {
+                session.consume(StreamId::new(*stream), *len)?;
             }
 
             // A caller that dropped a request or an unread response body has asked for the
             // stream to stop. Honoured here rather than later: until it is, the peer is
             // still sending a body nobody will read.
-            for (stream, code) in shared.take_resets() {
-                if session.stream_is_open(StreamId::new(stream)) {
-                    session.reset_stream(StreamId::new(stream), code)?;
+            shared.take_resets_into(&mut to_reset);
+            for (stream, code) in &to_reset {
+                if session.stream_is_open(StreamId::new(*stream)) {
+                    session.reset_stream(StreamId::new(*stream), *code)?;
                 }
             }
 
@@ -541,8 +590,9 @@ where
                 session.shutdown(StreamId::new(last_stream), code)?;
             }
 
-            for stream in shared.take_ready() {
-                match session.resume_body(StreamId::new(stream)) {
+            shared.take_ready_into(&mut to_resume);
+            for stream in &to_resume {
+                match session.resume_body(StreamId::new(*stream)) {
                     Ok(()) => {}
                     // A readiness note that arrived after its stream closed, or after the
                     // body already finished. Benign, and swallowed only here: the same
@@ -712,7 +762,7 @@ fn dispatch<R: Role>(
     shared: &Shared,
     role: &mut R,
 ) -> Result<()> {
-    for event in core::mem::take(&mut events.list) {
+    for event in events.list.drain(..) {
         match event {
             Event::Head { stream, fields } => {
                 // A client made this stream and registered it at submission; a server
