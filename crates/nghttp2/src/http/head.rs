@@ -162,6 +162,121 @@ pub(crate) fn response_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Respo
         .map_err(|_| protocol("the peer sent a response head that could not be assembled"))
 }
 
+/// Encodes a response head as an HTTP/2 header set.
+///
+/// A response carries exactly one pseudo-header, `:status`, and it must come first.
+pub(crate) fn response_headers(parts: &http::response::Parts) -> Result<OwnedHeaders> {
+    let mut headers = OwnedHeaders::default();
+    headers.push(":status", parts.status.as_str());
+
+    for (name, value) in &parts.headers {
+        let name = name.as_str();
+        if FORBIDDEN.contains(&name) {
+            return Err(protocol(
+                "this field is connection-specific and HTTP/2 forbids it",
+            ));
+        }
+        headers.push(name, value.as_bytes());
+    }
+
+    header::validate(&headers.views()).map_err(|error| {
+        Error::with_source(
+            ErrorKind::Protocol,
+            "the response head is not a valid HTTP/2 header set",
+            error,
+        )
+    })?;
+    Ok(headers)
+}
+
+/// Decodes a received request header block.
+///
+/// HTTP/2 splits the request line across four pseudo-headers; `http::Request` has a method
+/// and a URI. Reassembling the URI from `:scheme`, `:authority` and `:path` is what this
+/// does, and rejecting a head that cannot make one is the other half of it — a request
+/// missing a pseudo-header is malformed, not merely inconvenient.
+pub(crate) fn request_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Request<()>> {
+    let mut builder = http::Request::builder();
+    let mut method = None;
+    let mut scheme = None;
+    let mut authority = None;
+    let mut path = None;
+    let mut seen_field = false;
+
+    for (name, value) in fields {
+        if name.first() == Some(&b':') {
+            if seen_field {
+                return Err(protocol(
+                    "a request must send its pseudo-headers before any other field",
+                ));
+            }
+            let slot = match name.as_slice() {
+                b":method" => &mut method,
+                b":scheme" => &mut scheme,
+                b":authority" => &mut authority,
+                b":path" => &mut path,
+                b":protocol" => {
+                    return Err(protocol(
+                        "extended CONNECT is not supported: this crate speaks h2c \
+                         request/response only",
+                    ));
+                }
+                _ => {
+                    return Err(protocol(
+                        "the peer sent a pseudo-header HTTP/2 does not define",
+                    ));
+                }
+            };
+            if slot.is_some() {
+                return Err(protocol(
+                    "a request carries each pseudo-header at most once",
+                ));
+            }
+            *slot = Some(value.clone());
+            continue;
+        }
+
+        seen_field = true;
+        let name = http::HeaderName::from_bytes(name)
+            .map_err(|_| protocol("the peer sent a malformed field name"))?;
+        let value = http::HeaderValue::from_bytes(value)
+            .map_err(|_| protocol("the peer sent a malformed field value"))?;
+        builder = builder.header(name, value);
+    }
+
+    let method = method.ok_or_else(|| protocol("a request must carry :method"))?;
+    let path = path.ok_or_else(|| protocol("a request must carry :path"))?;
+    let authority = authority.ok_or_else(|| protocol("a request must carry :authority"))?;
+    // Cleartext only, so a missing scheme has exactly one sensible reading — but a scheme
+    // that says otherwise is the peer telling us something this crate cannot honour.
+    let scheme = scheme.unwrap_or_else(|| b"http".to_vec());
+    if scheme != b"http" {
+        return Err(protocol("this crate speaks cleartext HTTP/2 only"));
+    }
+
+    let method = http::Method::from_bytes(&method)
+        .map_err(|_| protocol("the peer sent a method that is not a token"))?;
+    if method == http::Method::CONNECT {
+        return Err(protocol(
+            "CONNECT is not supported: this crate speaks h2c request/response only",
+        ));
+    }
+
+    let mut uri = Vec::with_capacity(scheme.len() + authority.len() + path.len() + 3);
+    uri.extend_from_slice(&scheme);
+    uri.extend_from_slice(b"://");
+    uri.extend_from_slice(&authority);
+    uri.extend_from_slice(&path);
+    let uri = http::Uri::try_from(uri.as_slice())
+        .map_err(|_| protocol("the peer sent a request target that is not a URI"))?;
+
+    builder
+        .method(method)
+        .uri(uri)
+        .body(())
+        .map_err(|_| protocol("the peer sent a request head that could not be assembled"))
+}
+
 /// Encodes a trailing header block for submission.
 ///
 /// The same rule as decoding, from the other side: trailers carry ordinary fields only,

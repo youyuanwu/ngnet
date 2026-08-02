@@ -369,6 +369,29 @@ mod asynchronous {
         Ok(())
     }
 
+    /// The server entry point, pinned the same way as the client's.
+    ///
+    /// A handler is an ordinary `FnMut` returning an ordinary future; nothing here is a
+    /// trait this crate defines, which is the promise being pinned.
+    pub(super) fn server_surface<T, H, F, B>(
+        transport: T,
+        handler: H,
+    ) -> core::result::Result<(), Error>
+    where
+        T: Transport,
+        T::Reader: TransportRead,
+        T::Writer: TransportWrite,
+        H: FnMut(http::Request<IncomingBody>) -> F,
+        F: core::future::Future<Output = http::Response<B>>,
+        B: http_body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let connection = nghttp2::http::server::serve(transport, handler)?;
+        drop(connection);
+        Ok(())
+    }
+
     /// Never called. Its only job is to give the fixture above a `B` to hand over.
     fn unreachable_body<B>() -> B {
         unreachable!("the client surface fixture is never executed")
@@ -384,6 +407,25 @@ fn the_asynchronous_surface_is_unchanged() {
     let _: fn(Duplex) -> core::result::Result<(), nghttp2::http::Error> =
         asynchronous::client_surface::<Duplex, Empty>;
     let _: fn(&nghttp2::http::IncomingBody) = asynchronous::incoming_body_surface;
+
+    // `serve` is reachable both through the module and at the top of `http`, and both are
+    // part of the promise. A `fn` item as the handler and `Ready` as its future keep every
+    // type here nameable, which a closure would not.
+    type Answer = core::future::Ready<nghttp2::http::testing::http_crate::Response<Empty>>;
+    fn answer(
+        _: nghttp2::http::testing::http_crate::Request<nghttp2::http::IncomingBody>,
+    ) -> Answer {
+        core::future::ready(nghttp2::http::testing::http_crate::Response::new(Empty))
+    }
+    let (direct, _peer) = nghttp2::http::testing::duplex(false);
+    drop(nghttp2::http::serve(direct, answer).expect("serving"));
+    let (qualified, _peer) = nghttp2::http::testing::duplex(false);
+    drop(nghttp2::http::server::serve(qualified, answer).expect("serving"));
+
+    // And the generic shape a caller writes against, pinned separately from the concrete
+    // call above: `serve` must stay usable from a function generic over all four.
+    let (generic, _peer) = nghttp2::http::testing::duplex(false);
+    asynchronous::server_surface(generic, answer).expect("serving");
     let _: fn(nghttp2::http::testing::http_crate::Response<nghttp2::http::IncomingBody>) =
         asynchronous::response_surface;
 

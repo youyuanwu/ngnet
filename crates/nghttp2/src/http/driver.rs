@@ -34,7 +34,7 @@ use core::future::Future;
 use core::task::Poll;
 use std::collections::VecDeque;
 use std::error::Error as StdError;
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::BytesMut;
 use http_body::Body;
@@ -43,12 +43,11 @@ use crate::{
     ErrorCode, FrameType, HeaderAction, HeaderCategory, Session, SessionBuilder, StreamId,
 };
 
-use super::body::IncomingBody;
 use super::body::outgoing::Outgoing;
 use super::error::{Error, ErrorKind, Result};
 use super::head;
 use super::shared;
-use super::shared::{Command, HandleToken, Incoming, Queue, Registry, Shared, Slot};
+use super::shared::{Incoming, Registry, Shared};
 use super::transport::{Transport, TransportRead, TransportWrite};
 use super::waker::StreamWaker;
 
@@ -70,7 +69,7 @@ const READ_BUFFER: usize = 16 * 1024;
 const READ_AHEAD: usize = 2;
 
 /// A header block as it arrives: names and values, in order, uninterpreted.
-type Fields = Vec<(Vec<u8>, Vec<u8>)>;
+pub(crate) type Fields = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// Where a delivered chunk lies inside the buffer `Session::recv` was handed.
 #[derive(Debug, Clone, Copy)]
@@ -152,13 +151,29 @@ fn resolve(events: &mut Events, buffer: &bytes::Bytes, from: usize) {
 /// Kept separate from [`run`] so the flow-control choice above can be asserted against a
 /// real session rather than read off a constant.
 pub(crate) fn client_session() -> crate::Result<Session<Events>> {
-    SessionBuilder::<Events>::client()
+    observing(SessionBuilder::<Events>::client()).build()
+}
+
+/// Builds the session a server connection runs on.
+pub(crate) fn server_session() -> crate::Result<Session<Events>> {
+    observing(SessionBuilder::<Events>::server()).build()
+}
+
+/// Wires the handlers that record what arrived.
+///
+/// The same at both ends: what a header block *means* is the role's business, and is
+/// decided when the recorded events are dispatched. Splitting the wiring by role would
+/// mean maintaining the aliasing rules and the ordering rules twice for no difference.
+fn observing(builder: SessionBuilder<Events>) -> SessionBuilder<Events> {
+    builder
         .on_begin_headers(|events: &mut Events, frame| {
-            // Responses and trailers both open a block that has to be collected; which
-            // one it was is read off the frame again when the block completes.
+            // Requests, responses and trailers all open a block that has to be collected;
+            // which one it was is read off the frame again when the block completes. A
+            // client never receives a request and a server never receives a response, so
+            // accepting all three costs nothing and keeps this end-agnostic.
             let opens_a_block = matches!(
                 frame.category(),
-                Some(HeaderCategory::Response | HeaderCategory::Trailing)
+                Some(HeaderCategory::Request | HeaderCategory::Response | HeaderCategory::Trailing)
             );
             if opens_a_block {
                 events.open.insert(frame.stream_id().get(), Vec::new());
@@ -219,7 +234,78 @@ pub(crate) fn client_session() -> crate::Result<Session<Events>> {
             });
         })
         .manual_flow_control(MANUAL_FLOW_CONTROL)
-        .build()
+}
+
+/// What a connection does that depends on which end of it this is.
+///
+/// Everything else about a driver pass — reading, feeding, flushing, crediting, parking —
+/// is the same at both ends, and duplicating it would mean maintaining the park predicate
+/// and the buffer discipline twice. What genuinely differs is small: where work comes from
+/// (a handle's queue, or a handler that has finished), what a completed header block
+/// means (an answer arriving, or a request to serve), and when there is nothing left.
+pub(crate) trait Role {
+    /// Runs whatever is waiting that is not I/O. Called at the top of every pass, before
+    /// anything received is fed in.
+    fn advance(&mut self, session: &mut Session<Events>) -> Result<()>;
+
+    /// A complete header block arrived on `stream`.
+    ///
+    /// `incoming` is where that message's payload will be delivered; the role decides who
+    /// reads it.
+    fn head(
+        &mut self,
+        session: &mut Session<Events>,
+        stream: i32,
+        fields: &[(Vec<u8>, Vec<u8>)],
+        incoming: &Arc<Incoming>,
+    ) -> Result<()>;
+
+    /// `stream` has closed, and is about to leave the registry.
+    fn closed(&mut self, stream: i32);
+
+    /// Fails everything still waiting, because the driver is going away.
+    fn abandon(&mut self);
+
+    /// A handle to this role's "is there anything to do?" state.
+    ///
+    /// Taken once and consulted from inside the park predicate, which is held across an
+    /// `await`: borrowing the role itself there would make the whole driver non-`Send` and
+    /// defeat the auto-trait inference the transport traits are shaped around. It has to
+    /// be *live* rather than a snapshot — a value read before the park would still say
+    /// "nothing to do" after the wake that had something to do, and the connection would
+    /// sleep through it.
+    fn signals(&self) -> Signals;
+}
+
+/// A role's readiness, consultable without borrowing the role.
+///
+/// The closures capture the role's own shared state, so every call sees the present
+/// moment.
+pub(crate) struct Signals {
+    busy: Box<dyn Fn() -> bool + Send + Sync>,
+    done: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl Signals {
+    pub(crate) fn new(
+        busy: impl Fn() -> bool + Send + Sync + 'static,
+        done: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            busy: Box::new(busy),
+            done: Box::new(done),
+        }
+    }
+
+    /// Whether something is waiting that parking would sit on top of.
+    fn busy(&self) -> bool {
+        (self.busy)()
+    }
+
+    /// Whether nothing further can arrive, so the connection may end.
+    fn done(&self) -> bool {
+        (self.done)()
+    }
 }
 
 /// Fails everything still waiting when the driver goes away.
@@ -228,39 +314,37 @@ pub(crate) fn client_session() -> crate::Result<Session<Events>> {
 /// stores its arguments in the future the moment it is called. A driver that is dropped
 /// without ever being polled therefore still runs this, which is what makes "dropping the
 /// connection resolves every pending request" true rather than nearly true.
-pub(crate) struct DriverGuard<B> {
+///
+/// It owns the role for the same reason: whatever the role is holding — queued commands, a
+/// handler part-way through — is exactly what has to be given up when the driver does.
+pub(crate) struct DriverGuard<R: Role> {
     shared: Arc<Shared>,
-    queue: Arc<Queue<B>>,
     registry: Arc<Registry>,
+    role: R,
 }
 
-impl<B> DriverGuard<B> {
-    pub(crate) const fn new(
-        shared: Arc<Shared>,
-        queue: Arc<Queue<B>>,
-        registry: Arc<Registry>,
-    ) -> Self {
+impl<R: Role> DriverGuard<R> {
+    pub(crate) const fn new(shared: Arc<Shared>, registry: Arc<Registry>, role: R) -> Self {
         Self {
             shared,
-            queue,
             registry,
+            role,
         }
     }
 }
 
-impl<B> Drop for DriverGuard<B> {
+impl<R: Role> Drop for DriverGuard<R> {
     fn drop(&mut self) {
         // Marked gone first, so a handle racing this sees a closed connection rather than
         // enqueueing a command nothing will ever drain.
         self.shared.set_gone();
         for entry in self.registry.take_all() {
-            entry.slot.fail(Error::closed());
+            if let Some(slot) = &entry.slot {
+                slot.fail(Error::closed());
+            }
             entry.incoming.fail(Error::closed());
         }
-        for command in self.queue.drain() {
-            let Command::SendRequest { slot, .. } = command;
-            slot.fail(Error::closed());
-        }
+        self.role.abandon();
     }
 }
 
@@ -351,20 +435,16 @@ impl Buffers {
 }
 
 /// Runs the connection until the peer goes away or nothing is left to do.
-pub(crate) async fn run<T, B>(
+pub(crate) async fn run<T, R>(
     transport: T,
     mut session: Session<Events>,
     shared: Arc<Shared>,
-    queue: Arc<Queue<B>>,
     registry: Arc<Registry>,
-    handles: Weak<HandleToken>,
-    guard: DriverGuard<B>,
+    mut guard: DriverGuard<R>,
 ) -> Result<()>
 where
     T: Transport,
-    B: Body + Send + 'static,
-    B::Data: Send,
-    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    R: Role,
 {
     let (mut reader, mut writer) = transport.split();
 
@@ -414,18 +494,15 @@ where
         }
     };
 
+    let signals = guard.role.signals();
+
     let driving = async {
         let mut events = Events::default();
 
         loop {
             buffers.sweep();
 
-            for command in queue.drain() {
-                let Command::SendRequest { request, slot } = command;
-                if let Err(error) = submit(&mut session, &shared, &registry, request, &slot) {
-                    slot.fail(error);
-                }
-            }
+            guard.role.advance(&mut session)?;
 
             // Hand back the window the application has finished with. Done before
             // anything else touches the session, so the `WINDOW_UPDATE` this queues goes
@@ -473,7 +550,7 @@ where
                 shared.wake_driver();
             }
 
-            dispatch(&mut session, &mut events, &registry, &shared)?;
+            dispatch(&mut session, &mut events, &registry, &mut guard.role)?;
             flush(&mut session, &mut writer, &mut events).await?;
             // A body announces its trailers while it is being serialised, so they can only
             // be submitted once that pass is over — and then written by a second one.
@@ -482,7 +559,7 @@ where
             }
             // Serialising fires the stream-close handler, so what it observed is
             // dispatched too rather than waiting for the next pass.
-            dispatch(&mut session, &mut events, &registry, &shared)?;
+            dispatch(&mut session, &mut events, &registry, &mut guard.role)?;
 
             if lock(&intake).finished && lock(&inbox).is_empty() {
                 if let Some(failure) = lock(&intake).failure.take() {
@@ -497,7 +574,7 @@ where
                 return Ok(());
             }
 
-            if handles.strong_count() == 0 && registry.is_empty() && !session.want_write() {
+            if signals.done() && registry.is_empty() && !session.want_write() {
                 return Ok(());
             }
 
@@ -514,14 +591,14 @@ where
                 // reaching here — but not structurally so: a later phase that touches the
                 // session after the flush would leave octets queued behind a park that no
                 // wake is coming for.
-                let idle = queue.is_empty()
+                let idle = !signals.busy()
                     && shared.ready_len() == 0
                     && shared.credits_len() == 0
                     && !shared.trailers_pending()
                     && lock(&inbox).is_empty()
                     && !lock(&intake).finished
                     && !wants_write
-                    && !(handles.strong_count() == 0 && registry.is_empty());
+                    && !(signals.done() && registry.is_empty());
                 if idle { Poll::Pending } else { Poll::Ready(()) }
             })
             .await;
@@ -561,87 +638,50 @@ where
     .await
 }
 
-/// Submits one request, linking its stream to the slot that will answer it.
-fn submit<B>(
-    session: &mut Session<Events>,
+/// Wraps a caller's body for the session, with the waker that will resume it.
+///
+/// Both ends of a connection send bodies and both need the same three things tied
+/// together: the bridge, a waker naming the stream, and a liveness token that retires
+/// every waker when the stream goes. The identifier does not exist until submission
+/// returns one, so the caller binds it — see [`StreamWaker`] for why the cycle is cut that
+/// way rather than avoided.
+pub(crate) fn outgoing_body<B>(
     shared: &Arc<Shared>,
-    registry: &Registry,
-    request: http::Request<B>,
-    slot: &Arc<Slot>,
-) -> Result<()>
+    liveness: std::sync::Weak<()>,
+    body: B,
+) -> (Outgoing<B>, Arc<StreamWaker>)
 where
     B: Body + Send + 'static,
     B::Data: Send,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
-    let (parts, body) = request.into_parts();
-    let headers = head::request_headers(&parts)?;
-    let views = headers.views();
-
-    // Dropped when the stream leaves the registry, at which point every waker that names
-    // this stream stops being able to enqueue anything.
-    let liveness = Arc::new(());
-    // Created with the stream rather than with the response head, so payload that arrives
-    // before anything has looked for it still has somewhere to go.
-    let incoming = Arc::new(Incoming::default());
-
-    let stream = if body.is_end_stream() {
-        session.submit_request(&views)?
-    } else {
-        let waker = Arc::new(StreamWaker::new(
-            Arc::clone(shared),
-            Arc::downgrade(&liveness),
-        ));
-        let outgoing = Outgoing::new(body, Arc::clone(&waker), Arc::clone(shared));
-        let stream = session.submit_request_with_body(&views, outgoing)?;
-        // The identifier only exists now. Nothing can have consulted the body yet — that
-        // happens inside `Session::send` — so no wake can have been lost.
-        waker.bind(stream.get());
-        stream
-    };
-
-    registry.insert(stream.get(), Arc::clone(slot), incoming, liveness);
-    Ok(())
+    let waker = Arc::new(StreamWaker::new(Arc::clone(shared), liveness));
+    let source = Outgoing::new(body, Arc::clone(&waker), Arc::clone(shared));
+    (source, waker)
 }
 
 /// Acts on everything the handlers observed, in the order they observed it.
-fn dispatch(
+fn dispatch<R: Role>(
     session: &mut Session<Events>,
     events: &mut Events,
     registry: &Registry,
-    shared: &Arc<Shared>,
+    role: &mut R,
 ) -> Result<()> {
     for event in core::mem::take(&mut events.list) {
         match event {
             Event::Head { stream, fields } => {
-                let (Some(slot), Some(incoming)) =
-                    (registry.slot(stream), registry.incoming(stream))
-                else {
-                    continue;
-                };
-                match head::response_head(&fields) {
-                    Ok(head) => slot.complete(head.map(|()| {
-                        IncomingBody::new(stream, Arc::clone(&incoming), Arc::clone(shared))
-                    })),
-                    Err(error) => {
-                        slot.fail(error);
-                        incoming.fail(Error::new(
-                            ErrorKind::Protocol,
-                            "the peer sent a response head this crate could not accept",
-                        ));
-                        // No body was handed out, so nothing will ever read or drop one —
-                        // and anything already queued would hold connection-level window
-                        // shut for the rest of the connection's life. Abandoning here is
-                        // what returns it, and marks the stream so later arrivals are
-                        // credited on the spot rather than accumulating behind a reader
-                        // that does not exist.
-                        let unread = incoming.abandon();
-                        session.reset_stream(StreamId::new(stream), ErrorCode::PROTOCOL_ERROR)?;
-                        if unread > 0 {
-                            session.consume(StreamId::new(stream), unread)?;
-                        }
+                // A client made this stream and registered it at submission; a server
+                // learns of it here. Either way its payload needs somewhere to go before
+                // the role decides who reads it.
+                let incoming = match registry.incoming(stream) {
+                    Some(incoming) => incoming,
+                    None => {
+                        let incoming = Arc::new(Incoming::default());
+                        registry.insert(stream, None, Arc::clone(&incoming), Arc::new(()));
+                        incoming
                     }
-                }
+                };
+                role.head(session, stream, &fields, &incoming)?;
             }
 
             Event::Trailers { stream, fields } => {
@@ -684,9 +724,12 @@ fn dispatch(
                 let Some(entry) = registry.remove(stream) else {
                     continue;
                 };
+                role.closed(stream);
+
                 let reported = failure.map(recover);
-                if !entry.slot.is_settled() {
-                    entry.slot.fail(reported.unwrap_or_else(|| {
+                let unanswered = entry.slot.as_ref().filter(|slot| !slot.is_settled());
+                if let Some(slot) = unanswered {
+                    slot.fail(reported.unwrap_or_else(|| {
                         if code == ErrorCode::NO_ERROR {
                             Error::new(
                                 ErrorKind::Stream,

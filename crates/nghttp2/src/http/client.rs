@@ -31,11 +31,15 @@ use std::sync::Arc;
 
 use http_body::Body;
 
+use std::sync::Weak;
+
 use super::body::IncomingBody;
-use super::driver::{self, DriverGuard};
-use super::error::{Error, Result};
-use super::shared::{Command, HandleToken, Queue, Registry, Shared, Slot};
+use super::driver::{self, DriverGuard, Events, Role, Signals};
+use super::error::{Error, ErrorKind, Result};
+use super::head;
+use super::shared::{Command, HandleToken, Incoming, Queue, Registry, Shared, Slot};
 use super::transport::Transport;
+use crate::{ErrorCode, Session, StreamId};
 
 /// Starts a client connection over `transport`.
 ///
@@ -65,19 +69,16 @@ where
 
     let guard = DriverGuard::new(
         Arc::clone(&shared),
-        Arc::clone(&queue),
         Arc::clone(&registry),
+        ClientRole {
+            shared: Arc::clone(&shared),
+            queue: Arc::clone(&queue),
+            registry: Arc::clone(&registry),
+            handles: Arc::downgrade(&token),
+        },
     );
 
-    let connection = driver::run(
-        transport,
-        session,
-        Arc::clone(&shared),
-        Arc::clone(&queue),
-        Arc::clone(&registry),
-        Arc::downgrade(&token),
-        guard,
-    );
+    let connection = driver::run(transport, session, Arc::clone(&shared), registry, guard);
 
     Ok((
         SendRequest {
@@ -87,6 +88,134 @@ where
         },
         connection,
     ))
+}
+
+/// What a client end of a connection does that a server end does not.
+///
+/// Requests arrive from handles rather than from the wire, and a completed header block is
+/// an answer rather than a job.
+struct ClientRole<B> {
+    shared: Arc<Shared>,
+    queue: Arc<Queue<B>>,
+    registry: Arc<Registry>,
+    /// Weak, so the last handle going away is what tells the driver no more can come.
+    handles: Weak<HandleToken>,
+}
+
+impl<B> ClientRole<B>
+where
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    /// Submits one request, linking its stream to the slot that will answer it.
+    fn submit(
+        &self,
+        session: &mut Session<Events>,
+        request: http::Request<B>,
+        slot: &Arc<Slot>,
+    ) -> Result<()> {
+        let (parts, body) = request.into_parts();
+        let headers = head::request_headers(&parts)?;
+        let views = headers.views();
+
+        // Dropped when the stream leaves the registry, at which point every waker that
+        // names this stream stops being able to enqueue anything.
+        let liveness = Arc::new(());
+        // Created with the stream rather than with the response head, so payload that
+        // arrives before anything has looked for it still has somewhere to go.
+        let incoming = Arc::new(Incoming::default());
+
+        let stream = if body.is_end_stream() {
+            session.submit_request(&views)?
+        } else {
+            let (source, waker) =
+                driver::outgoing_body(&self.shared, Arc::downgrade(&liveness), body);
+            let stream = session.submit_request_with_body(&views, source)?;
+            // The identifier only exists now. Nothing can have consulted the body yet —
+            // that happens inside `Session::send` — so no wake can have been lost.
+            waker.bind(stream.get());
+            stream
+        };
+
+        self.registry
+            .insert(stream.get(), Some(Arc::clone(slot)), incoming, liveness);
+        Ok(())
+    }
+}
+
+impl<B> Role for ClientRole<B>
+where
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    fn advance(&mut self, session: &mut Session<Events>) -> Result<()> {
+        for command in self.queue.drain() {
+            let Command::SendRequest { request, slot } = command;
+            // A request this crate will not send is that request's failure, not the
+            // connection's: the handle that made it hears about it and every other
+            // exchange carries on.
+            if let Err(error) = self.submit(session, request, &slot) {
+                slot.fail(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn head(
+        &mut self,
+        session: &mut Session<Events>,
+        stream: i32,
+        fields: &[(Vec<u8>, Vec<u8>)],
+        incoming: &Arc<Incoming>,
+    ) -> Result<()> {
+        let Some(slot) = self.registry.slot(stream) else {
+            return Ok(());
+        };
+
+        match head::response_head(fields) {
+            Ok(head) => slot.complete(head.map(|()| {
+                IncomingBody::new(stream, Arc::clone(incoming), Arc::clone(&self.shared))
+            })),
+            Err(error) => {
+                slot.fail(error);
+                incoming.fail(Error::new(
+                    ErrorKind::Protocol,
+                    "the peer sent a response head this crate could not accept",
+                ));
+                // No body was handed out, so nothing will ever read or drop one — and
+                // anything already queued would hold the connection-level window shut for
+                // the rest of the connection's life. Abandoning here is what returns it,
+                // and marks the stream so later arrivals are credited on the spot rather
+                // than accumulating behind a reader that does not exist.
+                let unread = incoming.abandon();
+                session.reset_stream(StreamId::new(stream), ErrorCode::PROTOCOL_ERROR)?;
+                if unread > 0 {
+                    session.consume(StreamId::new(stream), unread)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn closed(&mut self, _stream: i32) {}
+
+    fn signals(&self) -> Signals {
+        let queue = Arc::clone(&self.queue);
+        let handles = self.handles.clone();
+        Signals::new(
+            move || !queue.is_empty(),
+            move || handles.strong_count() == 0,
+        )
+    }
+
+    fn abandon(&mut self) {
+        for command in self.queue.drain() {
+            let Command::SendRequest { slot, .. } = command;
+            slot.fail(Error::closed());
+        }
+    }
 }
 
 /// Makes requests on a connection.

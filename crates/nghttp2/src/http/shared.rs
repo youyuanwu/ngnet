@@ -504,8 +504,11 @@ pub(crate) fn truncated() -> Error {
 /// What the driver knows about one live stream.
 #[derive(Debug)]
 pub(crate) struct Entry {
-    /// Where this exchange's answer goes.
-    pub(crate) slot: Arc<Slot>,
+    /// Where this exchange's answer goes, for a client.
+    ///
+    /// A server has no response future to settle — its answer goes out on the wire, not
+    /// back to a caller — so there is deliberately nothing here for it to fill.
+    pub(crate) slot: Option<Arc<Slot>>,
     /// Where this exchange's received payload goes.
     ///
     /// Created with the stream rather than with the response head, so a peer that sends
@@ -513,9 +516,10 @@ pub(crate) struct Entry {
     pub(crate) incoming: Arc<Incoming>,
     /// Proof that the stream is still live.
     ///
-    /// Held here and nowhere else, so removing the entry is what makes every waker that
-    /// ever named this stream inert. Never read — its existence is the whole signal.
-    _liveness: Arc<()>,
+    /// The only strong handle, so removing the entry is what makes every waker that ever
+    /// named this stream inert. Read only to hand out [`Weak`] copies of it — its
+    /// existence, not its contents, is the signal.
+    liveness: Arc<()>,
 }
 
 /// The streams currently in flight.
@@ -532,7 +536,7 @@ impl Registry {
     pub(crate) fn insert(
         &self,
         stream: i32,
-        slot: Arc<Slot>,
+        slot: Option<Arc<Slot>>,
         incoming: Arc<Incoming>,
         liveness: Arc<()>,
     ) {
@@ -541,16 +545,16 @@ impl Registry {
             Entry {
                 slot,
                 incoming,
-                _liveness: liveness,
+                liveness,
             },
         );
     }
 
-    /// The slot for a live stream.
+    /// The slot for a live stream, if this end of the connection has one.
     pub(crate) fn slot(&self, stream: i32) -> Option<Arc<Slot>> {
         self.lock()
             .get(&stream)
-            .map(|entry| Arc::clone(&entry.slot))
+            .and_then(|entry| entry.slot.clone())
     }
 
     /// The receive queue for a live stream.
@@ -558,6 +562,16 @@ impl Registry {
         self.lock()
             .get(&stream)
             .map(|entry| Arc::clone(&entry.incoming))
+    }
+
+    /// A handle that stops resolving once `stream` leaves the registry.
+    ///
+    /// What a waker for this stream is gated on. Handed out rather than created afresh,
+    /// so every waker naming a stream is retired by the one act of removing it.
+    pub(crate) fn liveness(&self, stream: i32) -> Option<Weak<()>> {
+        self.lock()
+            .get(&stream)
+            .map(|entry| Arc::downgrade(&entry.liveness))
     }
 
     /// Forgets a stream, retiring every waker that named it.

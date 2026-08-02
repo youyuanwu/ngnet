@@ -9,10 +9,21 @@
 //!
 //! # Shape
 //!
-//! A connection is two objects. [`handshake`] hands back a cloneable handle for
-//! making requests and a driver future that moves octets. Nothing happens until the
-//! driver is polled, and where it is polled is entirely the caller's business — this
-//! crate spawns nothing and takes no executor, spawner or timer.
+//! A client connection is two objects. [`handshake`] hands back a cloneable handle for
+//! making requests and a driver future that moves octets. A server connection is one:
+//! [`serve`] takes a handler and hands back the driver. Nothing happens until the driver
+//! is polled, and where it is polled is entirely the caller's business — this crate spawns
+//! nothing and takes no executor, spawner or timer.
+//!
+//! Both ends share one driver. What differs between them is small and named: where work
+//! comes from, what a completed header block means, and when there is nothing left. Reads,
+//! writes, flow control, buffer reuse and the park predicate are the same code at both
+//! ends rather than the same idea written twice.
+//!
+//! Server handlers run concurrently without being spawned: they are futures the driver
+//! holds, each woken by a waker naming its own stream. A handler that *blocks* rather than
+//! returning `Pending` stalls its whole connection, since there is no other thread for the
+//! connection to be on — see [`server`] for what to do about that.
 //!
 //! # What must be `Send`
 //!
@@ -28,13 +39,16 @@ pub mod client;
 mod driver;
 mod error;
 mod head;
+pub mod server;
 mod shared;
+mod tasks;
 pub mod transport;
 mod waker;
 
 pub use body::IncomingBody;
 pub use client::{ResponseFuture, SendRequest, handshake};
 pub use error::{Error, ErrorKind, Result};
+pub use server::serve;
 pub use transport::{Transport, TransportRead, TransportWrite};
 
 #[doc(hidden)]
