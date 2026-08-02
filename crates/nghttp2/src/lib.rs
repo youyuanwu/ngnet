@@ -79,6 +79,7 @@
 //! # }
 //! ```
 //!
+#![cfg_attr(feature = "http", doc = include_str!("http/doc_async_example.md"))]
 //! # Compile-time guarantees
 //!
 //! Several of this crate's safety properties are enforced by the type system rather than
@@ -216,6 +217,7 @@
 //! );
 //! ```
 //!
+#![cfg_attr(feature = "http", doc = include_str!("http/doc_driver_guarantee.md"))]
 //! # Escape hatch
 //!
 //! Capabilities this crate does not yet wrap remain reachable through [`raw`], so a

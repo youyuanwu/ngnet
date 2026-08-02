@@ -246,6 +246,80 @@ fn no_async_facility_escapes_the_subtree() {
     );
 }
 
+#[test]
+fn an_included_doc_cannot_smuggle_async_past_the_scan() {
+    // SC-027, continued. `no_async_facility_escapes_the_subtree` reads `.rs` files, so a
+    // doc body pulled in with `include_str!` is code the scan never sees — and a doctest
+    // in one is compiled and run like any other. The async example the crate root shows is
+    // exactly such a body, which is why it lives at `src/http/doc_async_example.md`.
+    //
+    // Requiring every included doc to sit inside the subtree keeps that a rule rather than
+    // a happy accident: async may appear in an included doc precisely because the file
+    // holding it is part of the subtree that is allowed async in the first place.
+    let mut offences = Vec::new();
+    let subtree = crate_root().join("src").join("http");
+
+    for file in rust_files(&crate_root().join("src")) {
+        let source = std::fs::read_to_string(&file).expect("reading");
+        for target in included_docs(&source) {
+            let resolved = file
+                .parent()
+                .expect("a source file has a parent")
+                .join(&target);
+            if !resolved.starts_with(&subtree) {
+                offences.push(format!("{}: includes {target}", file.display()));
+            }
+        }
+    }
+
+    assert!(
+        offences.is_empty(),
+        "an included doc body must live under src/http/, where async is permitted and \
+         where the async scan's exemption is deliberate:\n{}",
+        offences.join("\n")
+    );
+}
+
+/// The paths every `include_str!` in `source` names, in order.
+///
+/// Deliberately naive — it matches the literal spelling rather than parsing Rust — because
+/// the invariant it serves is about a form the crate actually uses. A cleverer spelling
+/// that evaded it would evade the scanner it protects too, and the test below pins the
+/// extraction so a change in that form is noticed rather than silently tolerated.
+fn included_docs(source: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = source;
+
+    while let Some(at) = rest.find("include_str!") {
+        rest = &rest[at + "include_str!".len()..];
+        let opened = rest.find('"');
+        let Some(opened) = opened else { break };
+        let after = &rest[opened + 1..];
+        match after.find('"') {
+            Some(closed) => {
+                found.push(after[..closed].to_string());
+                rest = &after[closed + 1..];
+            }
+            None => break,
+        }
+    }
+
+    found
+}
+
+#[test]
+fn included_docs_are_found_wherever_they_are_spelled() {
+    assert_eq!(
+        included_docs(r#"#![doc = include_str!("http/doc_async_example.md")]"#),
+        vec!["http/doc_async_example.md".to_string()],
+    );
+    assert_eq!(
+        included_docs("include_str!( \"a.md\" ) and include_str!(\"b.md\")"),
+        vec!["a.md".to_string(), "b.md".to_string()],
+    );
+    assert!(included_docs("no includes here").is_empty());
+}
+
 /// Whether `code` uses `unsafe` as a keyword rather than merely containing the letters.
 ///
 /// A substring search is not enough: an identifier such as `uses_unsafe` contains the
