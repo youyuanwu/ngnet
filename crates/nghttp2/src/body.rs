@@ -13,7 +13,11 @@ use core::error::Error as StdError;
 pub type BodyError = Box<dyn StdError + Send>;
 
 /// What a body source did with the buffer it was given.
+///
+/// Marked non-exhaustive: matching on it must include a wildcard arm, so that a future
+/// variant is not a breaking change for callers.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum BodyOutcome {
     /// Wrote this many octets; more will follow.
     Wrote(usize),
@@ -27,6 +31,21 @@ pub enum BodyOutcome {
     /// Returning this keeps the stream open, after which
     /// [`Session::submit_trailer`](crate::Session::submit_trailer) becomes legal.
     EofWithTrailers(usize),
+    /// Nothing is available yet. Suspend this stream and ask again only once
+    /// [`Session::resume_body`](crate::Session::resume_body) is called for it.
+    ///
+    /// This is the outcome an asynchronous body needs, and the only correct way to say
+    /// "not yet". Returning [`BodyOutcome::Wrote`] with zero octets says something quite
+    /// different: it emits an empty `DATA` frame and reschedules the stream immediately,
+    /// so a source that is repeatedly not ready will spin, filling the connection with
+    /// empty frames.
+    ///
+    /// **The stream stalls until it is resumed.** Nothing else will wake it — not another
+    /// stream's traffic, not a `SETTINGS` exchange, not flow-control capacity arriving.
+    /// A caller that defers without arranging for `resume_body` to be called has stalled
+    /// that stream permanently, and the peer will simply wait. Only this stream is
+    /// affected; the rest of the connection continues.
+    Defer,
     /// Abandon the message. The stream is reset and the error is reported to the
     /// stream-close handler.
     Fail(BodyError),
@@ -40,7 +59,8 @@ pub trait BodySource: Send {
     /// Writes up to `buf.len()` octets of body into `buf`.
     ///
     /// Returning [`BodyOutcome::Wrote`] with zero octets is permitted but will simply be
-    /// asked again; prefer [`BodyOutcome::Eof`] when there is nothing left.
+    /// asked again; prefer [`BodyOutcome::Eof`] when there is nothing left, or
+    /// [`BodyOutcome::Defer`] when there is nothing left *yet*.
     ///
     /// The reported count must not exceed `buf.len()`. A larger one is treated as a body
     /// failure and terminates the stream rather than being forwarded, since acting on it

@@ -652,3 +652,135 @@ fn trailers_are_rejected_without_an_open_trailer_window() {
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
     assert!(error.to_string().contains("EofWithTrailers"));
 }
+
+/// A body that has nothing to give until it is told otherwise.
+///
+/// Counts how often it is consulted, which is what makes the deferral assertions exact:
+/// the point of deferring is not merely that no data is produced, but that the source is
+/// left alone until it is resumed.
+struct DeferringBody {
+    ready: Arc<AtomicUsize>,
+    payload: &'static [u8],
+    sent: usize,
+    fills: Arc<AtomicUsize>,
+}
+
+impl BodySource for DeferringBody {
+    fn fill(&mut self, buf: &mut [u8]) -> BodyOutcome {
+        self.fills.fetch_add(1, AtomicOrdering::SeqCst);
+
+        if self.ready.load(AtomicOrdering::SeqCst) == 0 {
+            return BodyOutcome::Defer;
+        }
+        if self.sent == self.payload.len() {
+            return BodyOutcome::Eof(0);
+        }
+
+        let take = (self.payload.len() - self.sent).min(buf.len());
+        buf[..take].copy_from_slice(&self.payload[self.sent..self.sent + take]);
+        self.sent += take;
+        BodyOutcome::Eof(take)
+    }
+}
+
+#[test]
+fn a_deferred_body_stalls_its_stream_without_emitting_or_being_asked_again() {
+    // FR-029, and the precursor to SC-008. Three properties matter and each is asserted
+    // separately, because an implementation could satisfy any one of them while failing
+    // the others: no DATA frames are produced, the source is not consulted again, and the
+    // stream still completes once resumed.
+    let ready = Arc::new(AtomicUsize::new(0));
+    let fills = Arc::new(AtomicUsize::new(0));
+
+    let mut client = SessionBuilder::<()>::client().build().unwrap();
+    let stream = client
+        .submit_request_with_body(
+            &[
+                Header::new(":method", "POST"),
+                Header::new(":scheme", "http"),
+                Header::new(":authority", "example.test"),
+                Header::new(":path", "/deferred"),
+            ],
+            DeferringBody {
+                ready: Arc::clone(&ready),
+                payload: b"eventually",
+                sent: 0,
+                fills: Arc::clone(&fills),
+            },
+        )
+        .expect("submitting the request");
+
+    // First drain: headers go out, the body defers.
+    let wire = drain(&mut client, &mut ());
+    let after_first = fills.load(AtomicOrdering::SeqCst);
+    assert_eq!(
+        after_first, 1,
+        "the body should have been consulted exactly once before deferring"
+    );
+    assert!(
+        !parse_frames(&wire).iter().any(|(kind, _, _)| *kind == 0),
+        "a deferred body must emit no DATA frames, not even empty ones"
+    );
+
+    // Further passes must not touch the body at all. This is the property that separates
+    // deferral from returning `Wrote(0)`, which would emit an empty DATA frame and
+    // reschedule the stream on every pass.
+    for _ in 0..8 {
+        let idle = drain(&mut client, &mut ());
+        assert!(
+            parse_frames(&idle).iter().all(|(kind, _, _)| *kind != 0),
+            "a deferred stream must stay silent across repeated sends"
+        );
+    }
+    assert_eq!(
+        fills.load(AtomicOrdering::SeqCst),
+        after_first,
+        "a deferred body must not be consulted again until its stream is resumed"
+    );
+
+    // Resuming puts the DATA item back on the queue, and only then is the body asked.
+    ready.store(1, AtomicOrdering::SeqCst);
+    client.resume_body(stream).expect("resuming the stream");
+
+    let wire = drain(&mut client, &mut ());
+    assert!(
+        fills.load(AtomicOrdering::SeqCst) > after_first,
+        "resuming should let the body be consulted again"
+    );
+    let data: Vec<_> = parse_frames(&wire)
+        .into_iter()
+        .filter(|(kind, _, _)| *kind == 0)
+        .collect();
+    assert!(!data.is_empty(), "the resumed body should produce DATA");
+    assert!(
+        data.iter().any(|(_, flags, _)| flags & 0x01 != 0),
+        "the resumed body should end its stream"
+    );
+}
+
+#[test]
+fn resuming_a_stream_with_nothing_deferred_is_reported_as_invalid_input() {
+    // The stale-notification case. An asynchronous body may signal readiness just as its
+    // stream is reset, so callers need this to be a typed, benign outcome rather than a
+    // fault they cannot distinguish.
+    let mut client = SessionBuilder::<()>::client().build().unwrap();
+
+    let error = client
+        .resume_body(StreamId::new(99))
+        .expect_err("no such stream");
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+
+    let stream = client
+        .submit_request(&[
+            Header::new(":method", "GET"),
+            Header::new(":scheme", "http"),
+            Header::new(":authority", "example.test"),
+            Header::new(":path", "/"),
+        ])
+        .expect("submitting");
+
+    // The stream exists but nothing is deferred on it, which libnghttp2 reports the same
+    // way — so callers cannot tell the two apart, and must not need to.
+    let error = client.resume_body(stream).expect_err("nothing deferred");
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+}

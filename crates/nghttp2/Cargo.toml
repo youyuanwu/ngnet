@@ -7,6 +7,25 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-# Exactly one runtime dependency. SC-021 fails the build if this grows.
+[features]
+# The async `http` layer is the headline API, so it is on by default. Disabling it
+# returns the crate to a sans-I/O state machine with exactly one dependency.
+default = ["http"]
+http = ["dep:bytes", "dep:http", "dep:http-body"]
+# A ready-made transport for tokio. Off by default: a caller on another runtime should not
+# pay for this one, and writing a transport for an unsupported runtime is a small job.
+tokio = ["http", "dep:tokio"]
+
+# Exactly one *non-optional* dependency. A test fails the build if that grows, and
+# requires every optional one to be reachable only through a declared feature.
 [dependencies]
 nghttp2-sys.workspace = true
+
+bytes = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[[example]]
+name = "h2c_async_server"
+required-features = ["tokio"]

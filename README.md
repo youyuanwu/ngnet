@@ -3,11 +3,14 @@
 Rust bindings for [nghttp2](https://nghttp2.org), targeting cleartext HTTP/2
 (**h2c**).
 
+Design notes, the invariants the test suite pins, and the tracked backlog live in
+[`docs/`](docs/).
+
 ## Crates
 
 | Crate | Description |
 | --- | --- |
-| [`nghttp2`](crates/nghttp2) | Safe, sans-I/O API. Drives a client or server connection; the caller owns the transport. |
+| [`nghttp2`](crates/nghttp2) | Safe, sans-I/O API driving a client or server connection, the caller owning the transport — plus an optional asynchronous `http`/`http-body` client and server built on it (default `http` feature). |
 | [`nghttp2-sys`](crates/nghttp2-sys) | Raw FFI bindings. Builds libnghttp2 from source and generates bindings with `bindgen`. |
 | [`nghttp2-tests`](crates/nghttp2-tests) | Not published. Drives `nghttp2` over a real async transport, so the wrapper needs no runtime dependency of its own. |
 
@@ -71,6 +74,51 @@ knowledge, so it can be driven with `curl`:
 cargo run -p nghttp2 --example h2c_server
 curl --http2-prior-knowledge -i http://127.0.0.1:8080/hello
 curl --http2-prior-knowledge -i --data 'ping' http://127.0.0.1:8080/echo
+```
+
+## Asynchronous HTTP/2
+
+The default `http` feature adds an asynchronous client and server over the same core,
+speaking in [`http`](https://docs.rs/http), [`http-body`](https://docs.rs/http-body) and
+[`bytes`](https://docs.rs/bytes) types. It owns no runtime either: `handshake` and `serve`
+hand back a *driver* future, and where that future runs — spawned, joined, or polled
+alongside other work — is the caller's choice. Nothing is sent until it is polled, so the
+driver is `#[must_use]`; dropping it fails every exchange it was carrying.
+
+```rust
+use bytes::Bytes;
+use http_body_util::Empty; // any `http_body::Body` will do
+use nghttp2::http::{handshake, transport::TokioIo};
+
+let stream = tokio::net::TcpStream::connect("127.0.0.1:8080").await?;
+let (requests, connection) = handshake::<_, Empty<Bytes>>(TokioIo::new(stream))?;
+
+// The driver runs wherever the caller's runtime puts work; the handle only enqueues.
+tokio::spawn(connection);
+
+let response = requests
+    .send_request(http::Request::get("http://127.0.0.1:8080/hello").body(Empty::new())?)
+    .await?;
+assert_eq!(response.status(), 200);
+// `response.into_body()` is an `http_body::Body`, delivering data then trailers as they
+// arrive — the head is readable here, before the body has finished.
+```
+
+The `TokioIo` transport comes from the optional, off-by-default `tokio` feature. On any
+other runtime, implementing the three transport traits is a twenty-line job — the
+completion-based runtimes (`io_uring`, IOCP) the traits were shaped for included. A
+runnable server is in
+[`examples/h2c_async_server.rs`](crates/nghttp2/examples/h2c_async_server.rs), answering
+the same `curl --http2-prior-knowledge` as the blocking one.
+
+### When to disable the feature
+
+`http` is additive but not free: it pulls in `http`, `http-body` and `bytes`. Turn it off
+with `default-features = false` when you already have your own HTTP types, or want the
+crate at its smallest — one dependency, no async, and the sans-I/O API above unchanged.
+
+```toml
+nghttp2 = { version = "*", default-features = false }
 ```
 
 ## Dependencies

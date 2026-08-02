@@ -79,6 +79,7 @@
 //! # }
 //! ```
 //!
+#![cfg_attr(feature = "http", doc = include_str!("http/doc_async_example.md"))]
 //! # Compile-time guarantees
 //!
 //! Several of this crate's safety properties are enforced by the type system rather than
@@ -216,6 +217,7 @@
 //! );
 //! ```
 //!
+#![cfg_attr(feature = "http", doc = include_str!("http/doc_driver_guarantee.md"))]
 //! # Escape hatch
 //!
 //! Capabilities this crate does not yet wrap remain reachable through [`raw`], so a
@@ -231,6 +233,9 @@
 #[path = "alloc.rs"]
 mod alloc_state;
 mod body;
+#[cfg(feature = "http")]
+pub mod http;
+
 #[allow(unsafe_code)]
 mod callbacks;
 #[allow(unsafe_code)]
@@ -253,7 +258,7 @@ pub use handlers::HeaderAction;
 pub use header::Header;
 pub use session::{Session, SessionBuilder};
 pub use settings::Setting;
-pub use stream::{FrameInfo, FrameType, StreamId};
+pub use stream::{FrameInfo, FrameType, Goaway, HeaderCategory, StreamId};
 
 /// The raw, unsafe FFI bindings this crate is built on.
 ///

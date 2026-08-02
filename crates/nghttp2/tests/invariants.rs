@@ -18,7 +18,19 @@ const UNSAFE_TEST_EXEMPTIONS: &[(&str, &str)] = &[
     ("raw_escape_hatch.rs", "calls a raw binding by design"),
     // Implementing `GlobalAlloc` is unsafe by language rule. This is measurement
     // scaffolding for SC-005, not use of this crate's API.
-    ("zero_alloc.rs", "implements GlobalAlloc to count allocations"),
+    (
+        "zero_alloc.rs",
+        "implements GlobalAlloc to count allocations",
+    ),
+    // Counting a future's allocations needs the counter to follow the poll across
+    // suspension points, so this harness installs its own GlobalAlloc — unsafe by language
+    // rule — just as `zero_alloc.rs` does for the sans-I/O path. It exercises SC-017 and
+    // SC-019 through the safe async API; the unsafe is measurement scaffolding, not use of
+    // the API.
+    (
+        "http_zero_alloc.rs",
+        "implements GlobalAlloc to count a future's allocations",
+    ),
 ];
 
 /// Facilities the crate's own source must not reach for.
@@ -65,9 +77,8 @@ fn strip_comments_and_strings(source: &str) -> String {
     let mut i = 0;
 
     while i < bytes.len() {
-        let rest_is = |pat: &str, i: usize| {
-            bytes[i..].iter().copied().take(pat.len()).eq(pat.chars())
-        };
+        let rest_is =
+            |pat: &str, i: usize| bytes[i..].iter().copied().take(pat.len()).eq(pat.chars());
 
         if rest_is("//", i) {
             while i < bytes.len() && bytes[i] != '\n' {
@@ -109,13 +120,38 @@ fn strip_comments_and_strings(source: &str) -> String {
     out
 }
 
+/// Whether a source file belongs to the feature-gated async subtree.
+///
+/// That subtree is the one part of the crate permitted I/O-adjacent facilities and the
+/// `async` keyword; everything else is the sans-I/O core and is held to the original rule.
+///
+/// The match is on the exact location, `src/http/`, not on any path component that
+/// happens to be named `http`. A component-wise match would silently exempt a future core
+/// module at, say, `src/protocol/http/`, turning these scans into a partial no-op for
+/// exactly the code they exist to police.
+fn is_async_subtree(path: &Path) -> bool {
+    path.starts_with(crate_root().join("src").join("http"))
+}
+
 #[test]
-fn the_crate_reaches_for_no_io_threading_or_time_facility() {
-    // SC-021. Together with the interop tests, which complete a whole exchange without a
-    // socket, this is what establishes FR-007.
+fn the_sans_io_core_reaches_for_no_io_threading_or_time_facility() {
+    // SC-021 and SC-027. Together with the interop tests, which complete a whole exchange
+    // without a socket, this is what establishes FR-007.
+    //
+    // The async subtree is excluded, because an async transport layer must name the very
+    // facilities the core forbids. What is *not* relaxed is the core itself: the scan
+    // still runs over every other file, and the companion test below proves it would
+    // still fail for them.
     let src = crate_root().join("src");
-    let files = rust_files(&src);
+    let files: Vec<PathBuf> = rust_files(&src)
+        .into_iter()
+        .filter(|path| !is_async_subtree(path))
+        .collect();
     assert!(!files.is_empty(), "no source files found under {src:?}");
+    assert!(
+        files.iter().any(|f| f.ends_with("session.rs")),
+        "the scan must still cover the core; it no longer does"
+    );
 
     let mut offences = Vec::new();
 
@@ -138,9 +174,150 @@ fn the_crate_reaches_for_no_io_threading_or_time_facility() {
 
     assert!(
         offences.is_empty(),
-        "the crate must not reach for I/O, threading or time facilities:\n{}",
+        "the sans-I/O core must not reach for I/O, threading or time facilities:\n{}",
         offences.join("\n")
     );
+}
+
+#[test]
+fn the_facility_scan_would_still_catch_the_core() {
+    // The re-scoping above is only honest if the scan still fails for the code it was
+    // written to protect. Excluding a subtree by path is exactly the kind of change that
+    // can quietly turn a test into a no-op, so the detector is exercised directly on
+    // samples standing in for core modules.
+    let core_sample = "use std::net::TcpStream;";
+    assert!(
+        FORBIDDEN
+            .iter()
+            .any(|facility| strip_comments_and_strings(core_sample).contains(facility)),
+        "the scan must still detect a socket in a core module"
+    );
+    assert!(
+        uses_keyword(&strip_comments_and_strings("async fn drive() {}"), "async"),
+        "the scan must still detect async in a core module"
+    );
+
+    // And the exclusion must be narrow: the async subtree at its exact location, and
+    // nothing else. In particular a core module nested under a directory that happens to
+    // be named `http` must still be scanned — a component-wise match would exempt it, and
+    // the resulting hole would be invisible.
+    let src = crate_root().join("src");
+    assert!(is_async_subtree(&src.join("http/transport.rs")));
+    assert!(is_async_subtree(&src.join("http/mod.rs")));
+    assert!(!is_async_subtree(&src.join("session.rs")));
+    assert!(!is_async_subtree(&src.join("header.rs")));
+    assert!(!is_async_subtree(&src.join("lib.rs")));
+    assert!(
+        !is_async_subtree(&src.join("protocol/http/probe.rs")),
+        "a core module merely nested under a directory named `http` must still be scanned"
+    );
+    assert!(
+        !is_async_subtree(&src.join("codec/http/mod.rs")),
+        "the exemption is a location, not a name"
+    );
+    assert!(
+        !is_async_subtree(&src.join("http_helpers.rs")),
+        "a sibling sharing a prefix is not part of the subtree"
+    );
+}
+
+#[test]
+fn no_async_facility_escapes_the_subtree() {
+    // SC-027. The counterpart to the exclusion: async code is permitted in `src/http/`
+    // and nowhere else, so containment is structural rather than a matter of habit.
+    let mut offences = Vec::new();
+
+    for file in rust_files(&crate_root().join("src")) {
+        if is_async_subtree(&file) {
+            continue;
+        }
+        let code = strip_comments_and_strings(&std::fs::read_to_string(&file).expect("reading"));
+        for keyword in ["async", "await"] {
+            if uses_keyword(&code, keyword) {
+                offences.push(format!("{}: {keyword}", file.display()));
+            }
+        }
+    }
+
+    assert!(
+        offences.is_empty(),
+        "async facilities must stay inside the http subtree:\n{}",
+        offences.join("\n")
+    );
+}
+
+#[test]
+fn an_included_doc_cannot_smuggle_async_past_the_scan() {
+    // SC-027, continued. `no_async_facility_escapes_the_subtree` reads `.rs` files, so a
+    // doc body pulled in with `include_str!` is code the scan never sees — and a doctest
+    // in one is compiled and run like any other. The async example the crate root shows is
+    // exactly such a body, which is why it lives at `src/http/doc_async_example.md`.
+    //
+    // Requiring every included doc to sit inside the subtree keeps that a rule rather than
+    // a happy accident: async may appear in an included doc precisely because the file
+    // holding it is part of the subtree that is allowed async in the first place.
+    let mut offences = Vec::new();
+    let subtree = crate_root().join("src").join("http");
+
+    for file in rust_files(&crate_root().join("src")) {
+        let source = std::fs::read_to_string(&file).expect("reading");
+        for target in included_docs(&source) {
+            let resolved = file
+                .parent()
+                .expect("a source file has a parent")
+                .join(&target);
+            if !resolved.starts_with(&subtree) {
+                offences.push(format!("{}: includes {target}", file.display()));
+            }
+        }
+    }
+
+    assert!(
+        offences.is_empty(),
+        "an included doc body must live under src/http/, where async is permitted and \
+         where the async scan's exemption is deliberate:\n{}",
+        offences.join("\n")
+    );
+}
+
+/// The paths every `include_str!` in `source` names, in order.
+///
+/// Deliberately naive — it matches the literal spelling rather than parsing Rust — because
+/// the invariant it serves is about a form the crate actually uses. A cleverer spelling
+/// that evaded it would evade the scanner it protects too, and the test below pins the
+/// extraction so a change in that form is noticed rather than silently tolerated.
+fn included_docs(source: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = source;
+
+    while let Some(at) = rest.find("include_str!") {
+        rest = &rest[at + "include_str!".len()..];
+        let opened = rest.find('"');
+        let Some(opened) = opened else { break };
+        let after = &rest[opened + 1..];
+        match after.find('"') {
+            Some(closed) => {
+                found.push(after[..closed].to_string());
+                rest = &after[closed + 1..];
+            }
+            None => break,
+        }
+    }
+
+    found
+}
+
+#[test]
+fn included_docs_are_found_wherever_they_are_spelled() {
+    assert_eq!(
+        included_docs(r#"#![doc = include_str!("http/doc_async_example.md")]"#),
+        vec!["http/doc_async_example.md".to_string()],
+    );
+    assert_eq!(
+        included_docs("include_str!( \"a.md\" ) and include_str!(\"b.md\")"),
+        vec!["a.md".to_string(), "b.md".to_string()],
+    );
+    assert!(included_docs("no includes here").is_empty());
 }
 
 /// Whether `code` uses `unsafe` as a keyword rather than merely containing the letters.
@@ -188,9 +365,18 @@ fn the_comment_stripper_actually_strips() {
         "// std::net in a line comment\n/* std::fs in a block */\nlet s = \"std::thread\";\nlet real = std::process::id();",
     );
 
-    assert!(!stripped.contains("std::net"), "line comments must be stripped");
-    assert!(!stripped.contains("std::fs"), "block comments must be stripped");
-    assert!(!stripped.contains("std::thread"), "string literals must be stripped");
+    assert!(
+        !stripped.contains("std::net"),
+        "line comments must be stripped"
+    );
+    assert!(
+        !stripped.contains("std::fs"),
+        "block comments must be stripped"
+    );
+    assert!(
+        !stripped.contains("std::thread"),
+        "string literals must be stripped"
+    );
     assert!(
         stripped.contains("std::process"),
         "real code must survive stripping, got: {stripped}"
@@ -198,13 +384,14 @@ fn the_comment_stripper_actually_strips() {
 }
 
 #[test]
-fn the_crate_declares_exactly_one_runtime_dependency() {
-    // SC-021. A second runtime dependency would need justifying against the crate's
-    // promise to be a thin, self-contained layer over the raw bindings.
+fn the_crate_declares_exactly_one_non_optional_dependency() {
+    // SC-020. The property worth protecting is that a default sans-I/O build pulls in
+    // nothing but the raw bindings. Optional dependencies do not compromise that — they
+    // are absent unless a feature asks for them — so they are permitted, but only if a
+    // feature actually gates them. An optional dependency named by no feature would be
+    // dead weight nobody can enable, and an ungated one would not be optional at all.
     let manifest = std::fs::read_to_string(crate_root().join("Cargo.toml")).expect("manifest");
 
-    // Sections are delimited by a bracket at the start of a line, so inline arrays such
-    // as `features = [...]` do not truncate the section.
     let dependencies: Vec<&str> = manifest
         .split("[dependencies]")
         .nth(1)
@@ -217,16 +404,42 @@ fn the_crate_declares_exactly_one_runtime_dependency() {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect();
 
+    let (optional, required): (Vec<&str>, Vec<&str>) = dependencies
+        .iter()
+        .partition(|line| line.contains("optional = true"));
+
     assert_eq!(
-        dependencies.len(),
+        required.len(),
         1,
-        "expected exactly one runtime dependency, found: {dependencies:?}"
+        "expected exactly one non-optional dependency, found: {required:?}"
     );
     assert!(
-        dependencies[0].starts_with("nghttp2-sys"),
-        "the single dependency should be the raw bindings, found: {}",
-        dependencies[0]
+        required[0].starts_with("nghttp2-sys"),
+        "the single required dependency should be the raw bindings, found: {}",
+        required[0]
     );
+
+    // Every optional dependency must be reachable through a declared feature.
+    let features = manifest
+        .split("[features]")
+        .nth(1)
+        .expect("no [features] section")
+        .split("\n[")
+        .next()
+        .expect("features section");
+
+    for line in optional {
+        let name = line
+            .split(['=', ' '])
+            .next()
+            .expect("dependency name")
+            .trim();
+        assert!(
+            features.contains(&format!("dep:{name}")),
+            "optional dependency `{name}` is not enabled by any feature; either gate it \
+             or drop it"
+        );
+    }
 }
 
 #[test]
@@ -313,7 +526,10 @@ fn every_module_using_unsafe_is_in_the_pinned_set() {
     };
 
     for file in rust_files(&crate_root().join("src")) {
-        let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        let stem = file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
         if stem == "lib" {
             continue;
         }
@@ -372,6 +588,95 @@ fn every_unsafe_exemption_is_still_earned() {
         assert!(
             uses_unsafe_keyword(&code),
             "{name} no longer uses unsafe ({reason}); drop its exemption"
+        );
+    }
+}
+
+#[test]
+fn the_async_subtree_contains_no_unsafe_at_all() {
+    // SC-021. The sans-I/O core confines `unsafe` to the modules that wrap the raw
+    // bindings; the async layer is held to a stricter rule, because it wraps the safe API
+    // rather than the bindings and has no reason to reach past it. Needing `unsafe` here
+    // would mean the safe layer is missing something — which is a signal worth failing a
+    // build for, rather than a licence to write it.
+    let mut offenders = Vec::new();
+
+    for file in rust_files(&crate_root().join("src")) {
+        if !is_async_subtree(&file) {
+            continue;
+        }
+        let code = strip_comments_and_strings(&std::fs::read_to_string(&file).expect("reading"));
+        if uses_unsafe_keyword(&code) {
+            offenders.push(file.display().to_string());
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "the async layer must need no `unsafe`; if one of these genuinely does, the safe \
+         layer is missing a capability and that is what should change:\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn the_async_subtree_exists_and_is_scanned() {
+    // Guards every assertion above that filters on the subtree: if the directory moved or
+    // were renamed, those tests would pass by scanning nothing at all.
+    let files: Vec<_> = rust_files(&crate_root().join("src"))
+        .into_iter()
+        .filter(|path| is_async_subtree(path))
+        .collect();
+
+    assert!(
+        !files.is_empty(),
+        "no files found in the async subtree; the path filter has gone stale"
+    );
+    // Named by module rather than by file, since a module grows into a directory the
+    // moment it gains a submodule — as `transport` did when it acquired the tokio one.
+    assert!(
+        files
+            .iter()
+            .any(|f| f.ends_with("transport.rs") || f.ends_with("transport/mod.rs")),
+        "the transport module should be part of the async subtree, found: {files:?}"
+    );
+    assert!(
+        files.iter().any(|f| f.ends_with("driver.rs")),
+        "the driver should be part of the async subtree, found: {files:?}"
+    );
+}
+
+#[test]
+fn the_send_path_has_nowhere_to_put_a_second_chunk() {
+    // SC-018, the half that no runtime assertion can cover. The hook a test reads reports
+    // what the bridge *did* hold; this reports what it *could* hold. A container added to
+    // the send path would be free to fill up under exactly the conditions a test is least
+    // likely to reproduce — a fast producer against a blocked window — so the absence of
+    // one is checked here rather than left to review.
+    //
+    // The single retained chunk lives in an `Option`, which cannot hold two by
+    // construction. Anything that can is named below.
+    let path = crate_root()
+        .join("src")
+        .join("http")
+        .join("body")
+        .join("outgoing.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {path:?}: {e}; the send path bridge has moved"));
+    let code = strip_comments_and_strings(&source);
+
+    assert!(
+        code.contains("leftover: Option<"),
+        "the send path no longer holds its one chunk in an Option; this scan is stale",
+    );
+
+    for container in [
+        "Vec<", "VecDeque", "BTreeMap", "HashMap", "BTreeSet", "HashSet", "BytesMut", "Box<[",
+        "; 2]",
+    ] {
+        assert!(
+            !code.contains(container),
+            "the send path gained a `{container}`, which can hold more than one chunk",
         );
     }
 }

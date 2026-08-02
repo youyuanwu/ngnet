@@ -519,3 +519,54 @@ fn a_request_submitted_after_the_peer_goes_away_is_never_transmitted() {
     );
     let _ = drain(&mut client, &mut ());
 }
+
+#[test]
+fn stream_liveness_is_reportable_before_answering() {
+    // FR-031. A server must be able to ask whether a stream is still there before it
+    // submits a response, because a peer may abandon a stream while a handler is still
+    // running and submitting for a dead stream is rejected rather than ignored.
+    let mut client = SessionBuilder::<()>::client().build().unwrap();
+    let mut server = recording().build().unwrap();
+    let mut seen = Seen::default();
+
+    // The connection stream is never a message stream, whatever else is true.
+    assert!(
+        !server.stream_is_open(StreamId::CONNECTION),
+        "stream zero is the connection, never an open stream"
+    );
+    assert!(
+        !server.stream_is_open(StreamId::new(1)),
+        "a stream that has never existed is not open"
+    );
+
+    let stream = client.submit_request(&request_headers()).unwrap();
+    let wire = drain(&mut client, &mut ());
+    server.recv(&wire, &mut seen).unwrap();
+
+    assert!(
+        server.stream_is_open(stream),
+        "the stream carrying an arrived request is open"
+    );
+
+    // The peer abandons it.
+    client
+        .reset_stream(stream, ErrorCode::CANCEL)
+        .expect("resetting");
+    let wire = drain(&mut client, &mut ());
+    server.recv(&wire, &mut seen).unwrap();
+
+    assert!(
+        !server.stream_is_open(stream),
+        "a stream the peer reset is no longer open"
+    );
+
+    // And the consequence the predicate exists to let a caller avoid.
+    let error = server
+        .submit_response_with_body(
+            stream,
+            &[Header::new(":status", "200")],
+            nghttp2::BytesBody::new(b"too late".to_vec()),
+        )
+        .expect_err("answering an abandoned stream must be rejected");
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+}

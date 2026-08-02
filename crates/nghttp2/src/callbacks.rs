@@ -23,11 +23,11 @@ use core::ffi::c_void;
 
 use nghttp2_sys as sys;
 
-use crate::body::{BodyOutcome, BodyError};
+use crate::body::{BodyError, BodyOutcome};
 use crate::error::ErrorCode;
 use crate::handlers::{HeaderAction, Handlers};
 use crate::state::{BodyEntry, BodyRegistry, PendingErrors, ResponseGuard};
-use crate::stream::{FrameInfo, StreamId};
+use crate::stream::{FrameInfo, Goaway, HeaderCategory, StreamId};
 
 /// Everything a trampoline may touch during one FFI call.
 ///
@@ -73,6 +73,40 @@ const fn header_action_code(action: HeaderAction) -> i32 {
     }
 }
 
+/// Reads the type-specific detail this crate exposes out of a frame.
+///
+/// # Safety
+///
+/// `frame` must point at a live `nghttp2_frame`. Which union member is readable is
+/// decided by the frame header's type, which is why every read below is gated on it.
+unsafe fn frame_info(frame: *const sys::nghttp2_frame) -> FrameInfo {
+    // SAFETY: the caller guarantees `frame` is live, and `hd` is the common prefix of the
+    // union, readable whatever the frame type.
+    let hd = unsafe { &(*frame).hd };
+    let kind = crate::stream::FrameType::new(hd.type_);
+
+    let category = if kind == crate::stream::FrameType::HEADERS {
+        // SAFETY: the header says this is a HEADERS frame, so `headers` is the live
+        // member.
+        HeaderCategory::from_native(unsafe { (*frame).headers.cat })
+    } else {
+        None
+    };
+
+    let goaway = if kind == crate::stream::FrameType::GOAWAY {
+        // SAFETY: as above, for the `goaway` member.
+        let raw = unsafe { &(*frame).goaway };
+        Some(Goaway::new(
+            StreamId::new(raw.last_stream_id),
+            ErrorCode::new(raw.error_code),
+        ))
+    } else {
+        None
+    };
+
+    FrameInfo::with_details(hd, category, goaway)
+}
+
 pub(crate) unsafe extern "C" fn on_begin_headers<C>(
     _session: *mut sys::nghttp2_session,
     frame: *const sys::nghttp2_frame,
@@ -88,7 +122,7 @@ pub(crate) unsafe extern "C" fn on_begin_headers<C>(
 
     // SAFETY: libnghttp2 always passes a valid frame pointer to this callback, and the
     // frame lives at least for the duration of the call.
-    let info = FrameInfo::from_header(unsafe { &(*frame).hd });
+    let info = unsafe { frame_info(frame) };
 
     // Server push is out of scope. Sessions advertise ENABLE_PUSH = 0, but a peer that
     // ignores that must still not reach a caller's handler.
@@ -118,7 +152,7 @@ pub(crate) unsafe extern "C" fn on_header<C>(
     };
 
     // SAFETY: libnghttp2 always passes a valid frame pointer to this callback.
-    let info = FrameInfo::from_header(unsafe { &(*frame).hd });
+    let info = unsafe { frame_info(frame) };
     if info.kind() == crate::stream::FrameType::PUSH_PROMISE {
         return 0;
     }
@@ -168,12 +202,13 @@ pub(crate) unsafe extern "C" fn on_frame_recv<C>(
     let Some(bridge) = (unsafe { bridge::<C>(user_data) }) else {
         return 0;
     };
+
     let Some(handler) = bridge.handlers.frame_recv.as_mut() else {
         return 0;
     };
 
     // SAFETY: libnghttp2 always passes a valid frame pointer to this callback.
-    let info = FrameInfo::from_header(unsafe { &(*frame).hd });
+    let info = unsafe { frame_info(frame) };
     if info.kind() == crate::stream::FrameType::PUSH_PROMISE {
         return 0;
     }
@@ -297,6 +332,10 @@ pub(crate) unsafe extern "C" fn read_body<C>(
             // Resets this stream rather than failing the connection.
             sys::NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE as sys::nghttp2_ssize
         }
+        // libnghttp2 lifts the DATA item out of the outbound queue and marks the stream
+        // user-deferred. Nothing will consult this source again until
+        // `nghttp2_session_resume_data` puts the item back.
+        BodyOutcome::Defer => sys::NGHTTP2_ERR_DEFERRED as sys::nghttp2_ssize,
     }
 }
 

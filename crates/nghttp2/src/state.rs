@@ -161,3 +161,134 @@ impl ResponseGuard {
         self.responded.remove(&stream);
     }
 }
+
+/// Tracks whether the session is part-way through a frame, by counting bytes.
+///
+/// # Why this is not driven by callbacks
+///
+/// libnghttp2 offers a callback that fires once a frame header has been parsed, and it is
+/// tempting to pair that with the frame-received callback and call the gap "mid-frame".
+/// That pairing does not hold. A valid `PRIORITY` frame completes through
+/// `session_inbound_frame_reset` without ever reaching the frame-received callback
+/// (`deps/nghttp2/lib/nghttp2_session.c:6218`), as do the paths that discard an ignored
+/// payload (`:6523`). Any of those would leave such a tracker stuck mid-frame, and a
+/// later clean close would then be misreported as a truncated one — the precise error
+/// this exists to avoid making.
+///
+/// So the frame boundaries are counted here instead. After the connection preface, an
+/// HTTP/2 connection is nothing but a sequence of frames, each a nine-octet header whose
+/// last three octets carry the payload length. Walking that structure needs no cooperation
+/// from libnghttp2 and cannot be wrong-footed by which callbacks it chooses to invoke:
+/// the arithmetic is over the same bytes the caller already handed us.
+///
+/// This also detects truncation *inside* a frame header, which the callback approach
+/// could not see at all.
+#[derive(Debug)]
+pub(crate) struct FrameProgress {
+    state: Framing,
+    /// Header octets seen so far, retained across reads because a header may be split and
+    /// its last three octets carry the payload length.
+    pending: [u8; FRAME_HEADER],
+}
+
+#[derive(Debug)]
+enum Framing {
+    /// Awaiting the remainder of the client connection preface. Server sessions only.
+    Preface(usize),
+    /// Between frames, or part-way through a frame header: how many of the nine octets
+    /// have arrived.
+    Header(usize),
+    /// Inside a frame payload: how many octets are still to come.
+    Payload(usize),
+}
+
+/// The nine-octet frame header every HTTP/2 frame begins with.
+const FRAME_HEADER: usize = 9;
+
+/// The client connection preface, which a server receives before any frame.
+const CLIENT_PREFACE: usize = 24;
+
+impl FrameProgress {
+    /// A tracker for a session in the given role.
+    ///
+    /// Only a server receives the client connection preface, so only a server has to skip
+    /// it before frames begin.
+    pub(crate) const fn new(expects_preface: bool) -> Self {
+        Self {
+            state: if expects_preface {
+                Framing::Preface(CLIENT_PREFACE)
+            } else {
+                Framing::Header(0)
+            },
+            pending: [0; FRAME_HEADER],
+        }
+    }
+
+    /// Accounts for bytes handed to the session, advancing through frame boundaries.
+    pub(crate) fn advance(&mut self, mut input: &[u8]) {
+        while !input.is_empty() {
+            match self.state {
+                Framing::Preface(remaining) => {
+                    let taken = remaining.min(input.len());
+                    input = &input[taken..];
+                    self.state = if taken == remaining {
+                        Framing::Header(0)
+                    } else {
+                        Framing::Preface(remaining - taken)
+                    };
+                }
+                Framing::Header(have) => {
+                    let want = FRAME_HEADER - have;
+                    let taken = want.min(input.len());
+
+                    if taken < want {
+                        // A header split across reads. Only the length matters, and it is
+                        // in the first three octets, so a partial header is remembered by
+                        // its length alone — but the octets themselves must be retained
+                        // to read that length once it is complete.
+                        self.pending[have..have + taken].copy_from_slice(&input[..taken]);
+                        self.state = Framing::Header(have + taken);
+                        return;
+                    }
+
+                    self.pending[have..FRAME_HEADER].copy_from_slice(&input[..taken]);
+                    input = &input[taken..];
+
+                    let length = u32::from_be_bytes([
+                        0,
+                        self.pending[0],
+                        self.pending[1],
+                        self.pending[2],
+                    ]) as usize;
+
+                    self.state = if length == 0 {
+                        Framing::Header(0)
+                    } else {
+                        Framing::Payload(length)
+                    };
+                }
+                Framing::Payload(remaining) => {
+                    let taken = remaining.min(input.len());
+                    input = &input[taken..];
+                    self.state = if taken == remaining {
+                        Framing::Header(0)
+                    } else {
+                        Framing::Payload(remaining - taken)
+                    };
+                }
+            }
+        }
+    }
+
+    /// Whether a frame is currently incomplete.
+    ///
+    /// False between frames and while the preface is still arriving; true once any part
+    /// of a frame has arrived and the frame is not yet whole, header included.
+    pub(crate) const fn in_frame(&self) -> bool {
+        match self.state {
+            Framing::Preface(_) => false,
+            Framing::Header(have) => have > 0,
+            Framing::Payload(_) => true,
+        }
+    }
+}
