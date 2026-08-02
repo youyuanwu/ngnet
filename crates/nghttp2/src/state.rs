@@ -161,3 +161,35 @@ impl ResponseGuard {
         self.responded.remove(&stream);
     }
 }
+
+/// Tracks whether the session is part-way through a frame.
+///
+/// libnghttp2 exposes no query for this, so it is synthesised from the two callbacks that
+/// bracket a frame: one fires once a frame header has been parsed, the other once the
+/// whole frame has. Between them the session holds an incomplete frame, and an
+/// end-of-file there means the peer truncated it rather than closing cleanly.
+///
+/// The nine-octet frame header itself is not covered: nothing fires until it is complete,
+/// so a connection cut mid-header is indistinguishable from a clean close. That limit is
+/// inherent to the callbacks available and is documented on the public accessor.
+#[derive(Debug, Default)]
+pub(crate) struct FrameProgress {
+    in_frame: bool,
+}
+
+impl FrameProgress {
+    /// A frame header has been parsed; its body is now arriving.
+    pub(crate) fn begin(&mut self) {
+        self.in_frame = true;
+    }
+
+    /// A frame has been fully received.
+    pub(crate) fn end(&mut self) {
+        self.in_frame = false;
+    }
+
+    /// Whether a frame is currently incomplete.
+    pub(crate) const fn in_frame(&self) -> bool {
+        self.in_frame
+    }
+}

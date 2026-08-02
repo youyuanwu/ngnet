@@ -253,7 +253,7 @@ pub use handlers::HeaderAction;
 pub use header::Header;
 pub use session::{Session, SessionBuilder};
 pub use settings::Setting;
-pub use stream::{FrameInfo, FrameType, StreamId};
+pub use stream::{FrameInfo, FrameType, Goaway, HeaderCategory, StreamId};
 
 /// The raw, unsafe FFI bindings this crate is built on.
 ///

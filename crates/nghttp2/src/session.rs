@@ -14,7 +14,7 @@ use crate::header::{self, Header};
 use crate::options::Options;
 use crate::settings::Setting;
 use crate::body::{BodyError, BodySource};
-use crate::state::{BodyEntry, BodyRegistry, PendingErrors, ResponseGuard};
+use crate::state::{BodyEntry, BodyRegistry, FrameProgress, PendingErrors, ResponseGuard};
 use crate::stream::{FrameInfo, StreamId};
 
 /// Which side of the connection a session drives.
@@ -186,6 +186,7 @@ impl<C> SessionBuilder<C> {
             bodies: BodyRegistry::default(),
             pending: PendingErrors::default(),
             responded: ResponseGuard::default(),
+            frames: FrameProgress::default(),
             _context: PhantomData,
         };
 
@@ -250,6 +251,7 @@ pub struct Session<C> {
     bodies: BodyRegistry,
     pending: PendingErrors,
     responded: ResponseGuard,
+    frames: FrameProgress,
     _context: PhantomData<fn(&mut C)>,
 }
 
@@ -376,6 +378,7 @@ impl<C> Session<C> {
             bodies: &mut self.bodies,
             pending: &mut self.pending,
             responded: &mut self.responded,
+            frames: &mut self.frames,
         };
 
         // Restores the session's user data however this scope is left, so a panic
@@ -440,7 +443,7 @@ impl<C> Session<C> {
         // accepts a response for an unopened stream and silently drops the frame without
         // ever closing a stream, so claiming one here would leave an entry that nothing
         // releases — poisoning a later, genuine stream that reused the identifier.
-        let track = self.stream_exists(stream);
+        let track = self.stream_is_open(stream);
 
         if track && !self.responded.claim(stream) {
             return Err(Error::new(
@@ -475,12 +478,19 @@ impl<C> Session<C> {
 
     /// Whether `stream` is currently open on this session.
     ///
+    /// A server needs this before answering: a peer may reset or close a stream while its
+    /// handler is still running, and submitting a response for a stream that is gone is
+    /// rejected rather than silently dropped.
+    ///
     /// Uses the half-closed predicate, which returns -1 exactly when no such stream
     /// exists and 0 or 1 otherwise. A window-size query would be the obvious probe but is
     /// wrong: a stream's local window legitimately goes negative when the local initial
     /// window size is reduced while data is in flight, so a negative result there does
     /// not mean the stream is absent.
-    fn stream_exists(&self, stream: StreamId) -> bool {
+    ///
+    /// The connection stream is never open in this sense, so stream zero is always
+    /// `false`.
+    pub fn stream_is_open(&self, stream: StreamId) -> bool {
         if stream.is_connection() {
             return false;
         }
@@ -576,7 +586,7 @@ impl<C> Session<C> {
         // identifier would replace the entry while the queued item still pointed at it.
         // Rejecting here is what keeps that address valid for exactly as long as C holds
         // it.
-        if !self.stream_exists(stream) {
+        if !self.stream_is_open(stream) {
             return Err(Error::new(
                 "nghttp2_submit_response2",
                 ErrorKind::InvalidInput,
@@ -721,6 +731,44 @@ impl<C> Session<C> {
         Ok(())
     }
 
+    /// Resumes a stream whose body previously returned [`BodyOutcome::Defer`](crate::BodyOutcome::Defer).
+    ///
+    /// Puts the deferred `DATA` frame back on the outbound queue, after which the next
+    /// [`Session::send`] may consult that body again. Until this is called, a deferred
+    /// stream is inert: nothing else will ask its body for data.
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] when there is nothing to resume — the stream
+    /// has closed, never existed, or has no deferred data. That is routinely benign
+    /// rather than a fault: an asynchronous body may signal readiness just as its stream
+    /// is being reset, so a caller draining readiness notifications should treat this
+    /// outcome as a stale notification and carry on. Allocation failure surfaces
+    /// separately as [`ErrorKind::Exhausted`], and is not benign.
+    pub fn resume_body(&mut self, stream: StreamId) -> Result<()> {
+        // SAFETY: `self.raw` is live; the call only inspects and requeues session state
+        // and accepts any stream identifier.
+        let rc = unsafe { sys::nghttp2_session_resume_data(self.raw, stream.get()) };
+
+        if rc != 0 {
+            return Err(Error::from_native("nghttp2_session_resume_data", rc));
+        }
+        Ok(())
+    }
+
+    /// Whether the session is part-way through receiving a frame.
+    ///
+    /// True once a frame header has been parsed and until that frame is complete. A
+    /// transport reporting end-of-file while this holds means the peer truncated a frame
+    /// rather than closing cleanly, which is a connection error rather than an orderly
+    /// shutdown.
+    ///
+    /// The nine-octet frame header itself is not covered: libnghttp2 reports nothing
+    /// until a header is complete, so a connection cut part-way through one is
+    /// indistinguishable from a clean close. This reports truncation of a frame *body*,
+    /// which is the case worth distinguishing and the only one observable.
+    pub const fn mid_frame(&self) -> bool {
+        self.frames.in_frame()
+    }
+
     /// Whether the session still wants to read from the peer.
     pub fn want_read(&self) -> bool {
         // SAFETY: `self.raw` is live; this only inspects session state.
@@ -845,6 +893,10 @@ impl Callbacks {
             sys::nghttp2_session_callbacks_set_on_stream_close_callback(
                 self.raw,
                 Some(callbacks::on_stream_close::<C>),
+            );
+            sys::nghttp2_session_callbacks_set_on_begin_frame_callback(
+                self.raw,
+                Some(callbacks::on_begin_frame::<C>),
             );
         }
     }

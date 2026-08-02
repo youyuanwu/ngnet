@@ -396,3 +396,182 @@ fn a_request_reaches_the_handlers_intact() {
         "headers should arrive in order with names and values intact"
     );
 }
+
+/// Records the category of every header block a peer receives, in arrival order.
+#[derive(Debug, Default)]
+struct Categories {
+    blocks: Vec<(i32, Option<nghttp2::HeaderCategory>)>,
+    goaway: Vec<(i32, u32)>,
+}
+
+fn categorising(builder: SessionBuilder<Categories>) -> SessionBuilder<Categories> {
+    builder.on_frame(|seen: &mut Categories, info: FrameInfo| {
+        if info.kind() == FrameType::HEADERS {
+            seen.blocks.push((info.stream_id().get(), info.category()));
+        }
+        if let Some(goaway) = info.goaway() {
+            seen.goaway
+                .push((goaway.last_stream_id().get(), goaway.code().get()));
+        }
+    })
+}
+
+/// A body that emits one chunk and then announces trailers.
+struct TrailingBody {
+    sent: bool,
+}
+
+impl nghttp2::BodySource for TrailingBody {
+    fn fill(&mut self, buf: &mut [u8]) -> nghttp2::BodyOutcome {
+        if self.sent {
+            return nghttp2::BodyOutcome::EofWithTrailers(0);
+        }
+        let body = b"payload";
+        buf[..body.len()].copy_from_slice(body);
+        self.sent = true;
+        nghttp2::BodyOutcome::Wrote(body.len())
+    }
+}
+
+#[test]
+fn a_trailing_header_block_is_distinguishable_from_the_one_that_opened_the_message() {
+    // FR-030. HTTP/2 carries both in a HEADERS frame, so without the category a trailing
+    // block is indistinguishable from a second set of response headers — and an async
+    // layer would deliver trailers as headers.
+    let mut client = categorising(SessionBuilder::<Categories>::client())
+        .build()
+        .unwrap();
+    let mut server = categorising(SessionBuilder::<Categories>::server())
+        .build()
+        .unwrap();
+    let (mut seen_client, mut seen_server) = (Categories::default(), Categories::default());
+
+    let stream = client
+        .submit_request(&[
+            nghttp2::Header::new(":method", "GET"),
+            nghttp2::Header::new(":scheme", "http"),
+            nghttp2::Header::new(":authority", "example.test"),
+            nghttp2::Header::new(":path", "/trailers"),
+        ])
+        .unwrap();
+
+    let wire = drain(&mut client, &mut seen_client);
+    server.recv(&wire, &mut seen_server).unwrap();
+
+    server
+        .submit_response_with_body(
+            stream,
+            &[nghttp2::Header::new(":status", "200")],
+            TrailingBody { sent: false },
+        )
+        .unwrap();
+
+    // Drain until the trailer window opens, then send the trailing block.
+    for _ in 0..16 {
+        let out = drain(&mut server, &mut seen_server);
+        if !out.is_empty() {
+            client.recv(&out, &mut seen_client).unwrap();
+        }
+        if server.trailers_ready(stream) {
+            break;
+        }
+    }
+    server
+        .submit_trailer(stream, &[nghttp2::Header::new("checksum", "abc123")])
+        .unwrap();
+    let out = drain(&mut server, &mut seen_server);
+    client.recv(&out, &mut seen_client).unwrap();
+
+    // The server saw the request that opened the stream.
+    assert_eq!(
+        seen_server.blocks,
+        vec![(stream.get(), Some(nghttp2::HeaderCategory::Request))],
+        "a request block should be categorised as opening a request"
+    );
+
+    // The client saw the response, then the trailers — same frame type, different roles.
+    let categories: Vec<_> = seen_client.blocks.iter().map(|(_, cat)| *cat).collect();
+    assert_eq!(
+        categories,
+        vec![
+            Some(nghttp2::HeaderCategory::Response),
+            Some(nghttp2::HeaderCategory::Trailing)
+        ],
+        "the opening block and the trailing block must be distinguishable"
+    );
+    assert!(
+        !seen_client.blocks[0].1.unwrap().is_trailing(),
+        "the response block is not trailers"
+    );
+    assert!(
+        seen_client.blocks[1].1.unwrap().is_trailing(),
+        "the trailing block is"
+    );
+}
+
+#[test]
+fn a_received_goaway_reports_the_last_stream_the_peer_processed() {
+    // FR-035. Without this the async layer cannot tell a caller which requests were
+    // abandoned and are therefore safe to retry, and it may not reach past the safe
+    // surface to find out.
+    let mut client = categorising(SessionBuilder::<Categories>::client())
+        .build()
+        .unwrap();
+    let mut server = SessionBuilder::<()>::server().build().unwrap();
+    let mut seen = Categories::default();
+
+    let wire = drain(&mut client, &mut seen);
+    server.recv(&wire, &mut ()).unwrap();
+
+    server
+        .shutdown(StreamId::new(7), nghttp2::ErrorCode::ENHANCE_YOUR_CALM)
+        .unwrap();
+    let out = drain(&mut server, &mut ());
+    client.recv(&out, &mut seen).unwrap();
+
+    assert_eq!(
+        seen.goaway,
+        vec![(7, nghttp2::ErrorCode::ENHANCE_YOUR_CALM.get())],
+        "the peer's last processed stream and reason should both survive"
+    );
+}
+
+#[test]
+fn a_truncated_frame_body_is_distinguishable_from_a_clean_close() {
+    // FR-036. Feeding a frame header without its body leaves the session mid-frame, which
+    // is what lets a transport EOF there be reported as truncation rather than an orderly
+    // shutdown. Truncation inside the nine-octet header is not observable this way, and
+    // the second half of this test pins that limit so it cannot be claimed by accident.
+    let mut server = SessionBuilder::<Observed>::server().build().unwrap();
+    let mut observed = Observed::default();
+    handshake(&mut server, &mut observed);
+
+    assert!(
+        !server.mid_frame(),
+        "a session between frames is not mid-frame"
+    );
+
+    // A SETTINGS frame header announcing 6 octets of payload, with none supplied.
+    let header = [0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
+    server.recv(&header, &mut observed).unwrap();
+    assert!(
+        server.mid_frame(),
+        "a header without its payload leaves the session part-way through a frame"
+    );
+
+    // Completing the frame clears it again.
+    let payload = [0x00, 0x03, 0x00, 0x00, 0x00, 0x64];
+    server.recv(&payload, &mut observed).unwrap();
+    assert!(
+        !server.mid_frame(),
+        "completing the frame ends the partial state"
+    );
+
+    // The documented limit: a truncated frame *header* reports nothing, because nothing
+    // fires until a header is whole.
+    server.recv(&header[..4], &mut observed).unwrap();
+    assert!(
+        !server.mid_frame(),
+        "truncation inside a frame header is not observable, as documented"
+    );
+}

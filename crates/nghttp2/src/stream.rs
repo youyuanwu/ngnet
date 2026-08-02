@@ -67,6 +67,78 @@ impl FrameType {
     pub const fn get(self) -> u8 {
         self.0
     }
+
+    pub(crate) const fn new(kind: u8) -> Self {
+        Self(kind)
+    }
+}
+
+/// What role a received header block plays in its message.
+///
+/// HTTP/2 uses one frame type for every header block, so the block that opens a message
+/// and the block that trails it are distinguished only by this category. Without it a
+/// trailing block is indistinguishable from a second set of response headers.
+///
+/// Marked non-exhaustive: the protocol's category list is libnghttp2's, not this crate's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum HeaderCategory {
+    /// Opens a request.
+    Request,
+    /// Opens a response.
+    Response,
+    /// Opens a pushed response. Server push is out of scope for this crate.
+    PushResponse,
+    /// A block that is neither of the above — on a stream that already carries a message,
+    /// this is a trailing header block.
+    Trailing,
+}
+
+impl HeaderCategory {
+    pub(crate) fn from_native(cat: sys::nghttp2_headers_category) -> Option<Self> {
+        match cat {
+            sys::NGHTTP2_HCAT_REQUEST => Some(Self::Request),
+            sys::NGHTTP2_HCAT_RESPONSE => Some(Self::Response),
+            sys::NGHTTP2_HCAT_PUSH_RESPONSE => Some(Self::PushResponse),
+            sys::NGHTTP2_HCAT_HEADERS => Some(Self::Trailing),
+            _ => None,
+        }
+    }
+
+    /// Whether this block trails a message rather than opening one.
+    pub const fn is_trailing(self) -> bool {
+        matches!(self, Self::Trailing)
+    }
+}
+
+/// The payload of a received `GOAWAY` frame.
+///
+/// A peer sends this to say it is shutting the connection down and how much of what it
+/// received it actually processed. Streams above [`Self::last_stream_id`] were not
+/// processed and may safely be retried on another connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Goaway {
+    last_stream_id: StreamId,
+    code: crate::error::ErrorCode,
+}
+
+impl Goaway {
+    pub(crate) const fn new(last_stream_id: StreamId, code: crate::error::ErrorCode) -> Self {
+        Self {
+            last_stream_id,
+            code,
+        }
+    }
+
+    /// The highest stream the peer processed. Anything above this was abandoned.
+    pub const fn last_stream_id(self) -> StreamId {
+        self.last_stream_id
+    }
+
+    /// Why the peer is going away.
+    pub const fn code(self) -> crate::error::ErrorCode {
+        self.code
+    }
 }
 
 /// What a handler was told about the frame that triggered it.
@@ -79,6 +151,8 @@ pub struct FrameInfo {
     kind: FrameType,
     flags: u8,
     payload_len: usize,
+    category: Option<HeaderCategory>,
+    goaway: Option<Goaway>,
 }
 
 impl FrameInfo {
@@ -88,7 +162,44 @@ impl FrameInfo {
             kind: FrameType(hd.type_),
             flags: hd.flags,
             payload_len: hd.length,
+            category: None,
+            goaway: None,
         }
+    }
+
+    /// Builds a view that also carries the type-specific detail this crate exposes.
+    ///
+    /// The union reads that produce `category` and `goaway` are deliberately left to
+    /// `callbacks`, which is already permitted `unsafe`; this keeps the frame types free
+    /// of it rather than widening the crate's confinement to reach one union member.
+    pub(crate) fn with_details(
+        hd: &sys::nghttp2_frame_hd,
+        category: Option<HeaderCategory>,
+        goaway: Option<Goaway>,
+    ) -> Self {
+        Self {
+            category,
+            goaway,
+            ..Self::from_header(hd)
+        }
+    }
+
+    /// What role this header block plays, for frames that carry one.
+    ///
+    /// `None` for every frame type other than `HEADERS`, and for a category this crate
+    /// does not recognise.
+    pub const fn category(self) -> Option<HeaderCategory> {
+        self.category
+    }
+
+    /// Whether this frame is a trailing header block.
+    pub const fn is_trailers(self) -> bool {
+        matches!(self.category, Some(HeaderCategory::Trailing))
+    }
+
+    /// The `GOAWAY` payload, for frames that carry one.
+    pub const fn goaway(self) -> Option<Goaway> {
+        self.goaway
     }
 
     /// The stream this frame belongs to.
