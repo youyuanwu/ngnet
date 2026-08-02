@@ -262,12 +262,34 @@ pub(crate) fn request_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Reques
         ));
     }
 
-    let mut uri = Vec::with_capacity(scheme.len() + authority.len() + path.len() + 3);
-    uri.extend_from_slice(&scheme);
-    uri.extend_from_slice(b"://");
-    uri.extend_from_slice(&authority);
-    uri.extend_from_slice(&path);
-    let uri = http::Uri::try_from(uri.as_slice())
+    // Assembled from validated components rather than by joining text. Concatenating
+    // `scheme://authority` and `path` would let an authority containing a slash claim part
+    // of the path — `evil.test/admin` with a path of `/x` reads back as authority
+    // `evil.test` and path `/admin/x` — which is a routing decision made by the peer
+    // rather than by the server. RFC 9113 §8.3.1 forbids that shape; parsing each piece on
+    // its own is what enforces it.
+    let authority = http::uri::Authority::try_from(authority.as_slice())
+        .map_err(|_| protocol("the peer sent an :authority that is not a valid authority"))?;
+    if authority.as_str().contains('@') {
+        return Err(protocol("RFC 9113 §8.3.1 forbids userinfo in :authority"));
+    }
+
+    let path_and_query = http::uri::PathAndQuery::try_from(path.as_slice())
+        .map_err(|_| protocol("the peer sent a :path that is not a valid request target"))?;
+    // The asterisk form is legal, but only for OPTIONS, and this crate does not serve it.
+    // Accepting it elsewhere would hand a handler a path it cannot route on.
+    if path_and_query.path() == "*" {
+        return Err(protocol(
+            "the asterisk request target is not supported: this crate speaks h2c \
+             request/response only",
+        ));
+    }
+
+    let uri = http::Uri::builder()
+        .scheme(scheme.as_slice())
+        .authority(authority)
+        .path_and_query(path_and_query)
+        .build()
         .map_err(|_| protocol("the peer sent a request target that is not a URI"))?;
 
     builder
@@ -431,6 +453,200 @@ mod tests {
                 ErrorKind::Protocol,
                 "a trailing block with {description} reported the wrong kind",
             );
+        }
+    }
+
+    /// A request head is peer input reaching a routing decision, so every malformed shape
+    /// must produce an error rather than a panic — and, more importantly, rather than a
+    /// *plausible* request that says something the peer did not.
+    #[test]
+    fn malformed_request_heads_are_rejected_rather_than_panicking() {
+        let base = [
+            (":method", "GET"),
+            (":scheme", "http"),
+            (":authority", "example.test"),
+            (":path", "/"),
+        ];
+        let with = |name: &str, value: &str| -> Block {
+            let mut pairs: Vec<(&str, &str)> = base.to_vec();
+            for pair in &mut pairs {
+                if pair.0 == name {
+                    pair.1 = value;
+                }
+            }
+            fields(&pairs)
+        };
+        let without = |name: &str| -> Block {
+            fields(
+                &base
+                    .iter()
+                    .copied()
+                    .filter(|(field, _)| *field != name)
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let cases: &[(&str, Block)] = &[
+            ("no method", without(":method")),
+            ("no path", without(":path")),
+            ("no authority", without(":authority")),
+            // The attack this shape carries: an authority that swallows part of the path
+            // makes the peer, not the server, decide what was requested.
+            (
+                "an authority containing a path",
+                with(":authority", "example.test/admin"),
+            ),
+            (
+                "userinfo in the authority",
+                with(":authority", "user@example.test"),
+            ),
+            ("an empty authority", with(":authority", "")),
+            ("an empty path", with(":path", "")),
+            (
+                "a path that is not a request target",
+                with(":path", "no-slash"),
+            ),
+            ("the asterisk target", with(":path", "*")),
+            (
+                "a scheme this crate does not speak",
+                with(":scheme", "https"),
+            ),
+            ("a method that is not a token", with(":method", "GE T")),
+            ("CONNECT", with(":method", "CONNECT")),
+            (
+                "a duplicate pseudo-header",
+                fields(&[
+                    (":method", "GET"),
+                    (":method", "POST"),
+                    (":scheme", "http"),
+                    (":authority", "example.test"),
+                    (":path", "/"),
+                ]),
+            ),
+            (
+                "a pseudo-header after a regular field",
+                fields(&[
+                    (":method", "GET"),
+                    (":scheme", "http"),
+                    (":authority", "example.test"),
+                    ("x-note", "one"),
+                    (":path", "/"),
+                ]),
+            ),
+            (
+                "a pseudo-header HTTP/2 does not define",
+                fields(&[
+                    (":method", "GET"),
+                    (":scheme", "http"),
+                    (":authority", "example.test"),
+                    (":path", "/"),
+                    (":invented", "value"),
+                ]),
+            ),
+            (
+                "extended CONNECT",
+                fields(&[
+                    (":method", "GET"),
+                    (":scheme", "http"),
+                    (":authority", "example.test"),
+                    (":path", "/"),
+                    (":protocol", "websocket"),
+                ]),
+            ),
+            (
+                "a field name with a space in it",
+                fields(&[
+                    (":method", "GET"),
+                    (":scheme", "http"),
+                    (":authority", "example.test"),
+                    (":path", "/"),
+                    ("bad name", "value"),
+                ]),
+            ),
+        ];
+
+        for (description, block) in cases {
+            let outcome = request_head(block);
+            assert!(
+                outcome.is_err(),
+                "a request head with {description} was accepted",
+            );
+            assert_eq!(
+                outcome.unwrap_err().kind(),
+                ErrorKind::Protocol,
+                "a request head with {description} reported the wrong kind",
+            );
+        }
+    }
+
+    #[test]
+    fn a_well_formed_request_head_is_reassembled() {
+        let head = request_head(&fields(&[
+            (":method", "POST"),
+            (":scheme", "http"),
+            (":authority", "example.test:8080"),
+            (":path", "/things/7?q=1"),
+            ("x-note", "one"),
+        ]))
+        .expect("a well-formed head");
+
+        assert_eq!(head.method(), http::Method::POST);
+        assert_eq!(head.uri().scheme_str(), Some("http"));
+        assert_eq!(
+            head.uri().authority().map(http::uri::Authority::as_str),
+            Some("example.test:8080"),
+        );
+        assert_eq!(head.uri().path(), "/things/7");
+        assert_eq!(head.uri().query(), Some("q=1"));
+        assert_eq!(head.headers().get("x-note").unwrap(), "one");
+        // The pseudo-headers are the request line, not fields, and must not appear twice.
+        assert!(head.headers().get(":method").is_none());
+    }
+
+    #[test]
+    fn a_request_head_may_omit_its_scheme() {
+        // Cleartext only, so a missing scheme has exactly one reading.
+        let head = request_head(&fields(&[
+            (":method", "GET"),
+            (":authority", "example.test"),
+            (":path", "/"),
+        ]))
+        .expect("a well-formed head");
+        assert_eq!(head.uri().scheme_str(), Some("http"));
+    }
+
+    #[test]
+    fn a_response_head_leads_with_its_status() {
+        let response = http::Response::builder()
+            .status(http::StatusCode::CREATED)
+            .header("x-note", "one")
+            .body(())
+            .expect("a response");
+        let (parts, ()) = response.into_parts();
+
+        let headers = response_headers(&parts).expect("a valid head");
+        let names: Vec<String> = headers
+            .fields
+            .iter()
+            .map(|(name, _)| String::from_utf8_lossy(name).into_owned())
+            .collect();
+
+        assert_eq!(names, [":status", "x-note"]);
+        assert_eq!(headers.fields[0].1, b"201");
+    }
+
+    #[test]
+    fn a_connection_specific_response_field_is_rejected() {
+        for name in ["connection", "transfer-encoding", "keep-alive", "upgrade"] {
+            let response = http::Response::builder()
+                .header(name, "whatever")
+                .body(())
+                .expect("a response");
+            let (parts, ()) = response.into_parts();
+
+            let outcome = response_headers(&parts);
+            assert!(outcome.is_err(), "a `{name}` response field was accepted");
+            assert_eq!(outcome.unwrap_err().kind(), ErrorKind::Protocol);
         }
     }
 

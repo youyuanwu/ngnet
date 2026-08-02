@@ -326,19 +326,28 @@ fn a_handler_sends_a_response_body() {
 #[test]
 fn a_slow_handler_delays_no_other_stream() {
     // Spec SC-006. The whole point of holding handlers as futures rather than running them
-    // in turn: one that is not ready must cost the others nothing. Asserted by ordering —
-    // the second request is answered while the first is still pending, which a server that
-    // ran handlers to completion in arrival order could not do.
+    // in turn: one that is not ready must cost the others nothing.
+    //
+    // Asserted by ordering, not by outcome. A server that ran handlers to completion in
+    // arrival order would still answer both eventually — what it could not do is answer
+    // the second *before* the first was released, which is what the log below records.
     let gate = Arc::new(Gate::default());
     let opened = Arc::clone(&gate);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&log);
+    let observer = Arc::clone(&log);
 
     let (server_side, client_side) = duplex(false);
     let connection = server::serve(server_side, move |request: http::Request<IncomingBody>| {
         let gate = Arc::clone(&gate);
+        let recorder = Arc::clone(&recorder);
         let slow = request.uri().path() == "/slow";
         async move {
             if slow {
                 gate.wait().await;
+                recorder.lock().expect("log").push("slow answered");
+            } else {
+                recorder.lock().expect("log").push("quick answered");
             }
             http::Response::builder()
                 .status(200)
@@ -357,7 +366,7 @@ fn a_slow_handler_delays_no_other_stream() {
         for _ in 0..32 {
             yield_now().await;
         }
-        // The quick one must already be answered, with the slow one still held.
+        observer.lock().expect("log").push("released");
         opened.open();
         for _ in 0..32 {
             yield_now().await;
@@ -370,33 +379,33 @@ fn a_slow_handler_delays_no_other_stream() {
     ));
 
     assert_eq!(
-        peer.head(3, "x-path"),
-        Some("/quick"),
+        *log.lock().expect("log"),
+        ["quick answered", "released", "slow answered"],
         "the quick request waited behind the slow one",
     );
+    assert_eq!(peer.head(3, "x-path"), Some("/quick"));
     assert_eq!(peer.head(1, "x-path"), Some("/slow"));
 }
 
 #[test]
-fn a_handler_is_polled_only_when_its_own_stream_wakes() {
-    // The other half of the concurrency claim. Handlers each hold their own waker, so a
-    // connection carrying several streams polls one future when one of them becomes
-    // ready — not all of them every time anything happens.
+fn a_parked_handler_is_not_polled_by_another_streams_traffic() {
+    // The other half of the concurrency claim, and the reason each handler carries its own
+    // waker. A connection carrying several streams must poll one future when one of them
+    // becomes ready — not every future every time anything happens.
+    //
+    // The gate counts its own polls, so a re-poll is visible. Other streams run throughout,
+    // so "it was not polled" means something: without per-handler wakers, every response
+    // that went out on those streams would have polled this one too.
     let gate = Arc::new(Gate::default());
-    let opened = Arc::clone(&gate);
-    let polls = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&polls);
+    let watcher = Arc::clone(&gate);
 
     let (server_side, client_side) = duplex(false);
     let connection = server::serve(server_side, move |request: http::Request<IncomingBody>| {
         let gate = Arc::clone(&gate);
-        let counter = Arc::clone(&counter);
         let watched = request.uri().path() == "/watched";
         async move {
             if watched {
-                counter.fetch_add(1, Ordering::AcqRel);
                 gate.wait().await;
-                counter.fetch_add(1, Ordering::AcqRel);
             }
             http::Response::builder()
                 .status(200)
@@ -413,34 +422,50 @@ fn a_handler_is_polled_only_when_its_own_stream_wakes() {
         for _ in 0..8 {
             yield_now().await;
         }
-        let parked = polls.load(Ordering::Acquire);
+        let parked = watcher.polls();
 
-        // Plenty more traffic on another stream, none of it this handler's business.
-        for _ in 0..24 {
+        for _ in 0..40 {
             yield_now().await;
         }
-        let after = polls.load(Ordering::Acquire);
+        let after = watcher.polls();
 
-        opened.open();
+        watcher.open();
         for _ in 0..16 {
             yield_now().await;
         }
-        (parked, after, polls.load(Ordering::Acquire))
+        (parked, after, watcher.polls())
     };
 
-    let ((parked, after, finally), ()) = block_on(alongside(
-        alongside(async { (driving.await, ()) }, connection),
-        drive_peer(client_side, peer_session(), &mut peer, |session, peer| {
-            ask(session, peer);
-        }),
+    // Six more requests, answered while the watched handler sits parked.
+    let mut passes = 0;
+    let busywork = move |session: &mut Session<Peer>, peer: &mut Peer| {
+        passes += 1;
+        if (2..8).contains(&passes) {
+            peer.outgoing
+                .push(("GET", format!("/other/{passes}"), None));
+        }
+        ask(session, peer);
+    };
+
+    let (parked, after, finally) = block_on(alongside(
+        alongside(driving, connection),
+        drive_peer(client_side, peer_session(), &mut peer, busywork),
     ));
 
     assert_eq!(parked, 1, "the handler did not park where expected");
     assert_eq!(
         after, parked,
-        "a parked handler was polled again with nothing to wake it",
+        "a parked handler was polled again by another stream's traffic",
     );
-    assert_eq!(finally, 2, "the handler was never resumed");
+    assert_eq!(
+        finally, 2,
+        "the handler was never resumed, or was resumed twice"
+    );
+    assert!(
+        peer.heads.len() > 4,
+        "not enough other streams completed for the claim to mean anything: {:?}",
+        peer.heads.keys().collect::<Vec<_>>(),
+    );
 }
 
 #[test]
@@ -544,9 +569,13 @@ fn a_reset_stream_discards_its_response_without_failing_the_connection() {
 }
 
 /// A future that resolves only when opened, so a handler can be held at a known point.
+///
+/// Counts how often it is polled, which is what makes "a parked handler is not polled
+/// again" observable: counting around the `await` would only ever see the two ends of it.
 #[derive(Debug, Default)]
 struct Gate {
     state: Mutex<(bool, Option<core::task::Waker>)>,
+    polls: AtomicUsize,
 }
 
 impl Gate {
@@ -561,8 +590,13 @@ impl Gate {
         }
     }
 
+    fn polls(&self) -> usize {
+        self.polls.load(Ordering::Acquire)
+    }
+
     async fn wait(&self) {
         core::future::poll_fn(|cx| {
+            self.polls.fetch_add(1, Ordering::AcqRel);
             let mut state = self.state.lock().expect("gate");
             if state.0 {
                 core::task::Poll::Ready(())
