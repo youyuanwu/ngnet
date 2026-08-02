@@ -13,7 +13,10 @@ rust-version = "1.85"
 # Paths are relative to this file, not to the crate that uses them.
 [workspace.dependencies]
 bindgen = "0.72"
+bytes = "1"
 cmake = "0.1"
+http = "1"
+http-body = "1"
 nghttp2 = { path = "crates/nghttp2" }
 nghttp2-sys = { path = "crates/nghttp2-sys" }
 tokio = { version = "1", features = [

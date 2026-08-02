@@ -231,6 +231,13 @@
 #[path = "alloc.rs"]
 mod alloc_state;
 mod body;
+/// The asynchronous `http` integration layer.
+///
+/// Present when the default `http` feature is enabled. It contains no `unsafe` and is the
+/// only part of the crate permitted async facilities.
+#[cfg(feature = "http")]
+pub mod http;
+
 #[allow(unsafe_code)]
 mod callbacks;
 #[allow(unsafe_code)]
