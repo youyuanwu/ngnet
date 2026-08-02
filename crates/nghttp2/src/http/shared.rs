@@ -356,6 +356,11 @@ struct SlotState {
     /// stream, and this is the only place it can learn which one — it holds a slot, not a
     /// connection.
     stream: i32,
+    /// Set when the caller dropped the response future before a stream existed.
+    ///
+    /// A request nobody is waiting for should not be sent at all. Once it *has* been sent
+    /// the only remedy is a reset, but before then it can simply be dropped.
+    abandoned: bool,
 }
 
 impl Slot {
@@ -399,15 +404,32 @@ impl Slot {
         self.lock().settled
     }
 
-    /// Names the stream this exchange was given.
-    pub(crate) fn bind(&self, stream: i32) {
-        self.lock().stream = stream;
+    /// Names the stream this exchange was given, reporting whether it is already unwanted.
+    ///
+    /// The answer has to come back under the same lock the caller's drop takes, or a
+    /// cancellation landing between submitting and naming would be lost — the drop would
+    /// see no stream and the submission would see no cancellation.
+    pub(crate) fn bind(&self, stream: i32) -> bool {
+        let mut state = self.lock();
+        state.stream = stream;
+        state.abandoned
     }
 
-    /// The stream still owed an answer, if this exchange has one and is unsettled.
-    pub(crate) fn unsettled_stream(&self) -> Option<i32> {
-        let state = self.lock();
-        (!state.settled && state.stream > 0).then_some(state.stream)
+    /// Gives up on this exchange, reporting the stream to reset if there is one.
+    ///
+    /// `None` means nothing was sent, and the record left behind stops it being sent.
+    pub(crate) fn cancel(&self) -> Option<i32> {
+        let mut state = self.lock();
+        if state.settled {
+            return None;
+        }
+        state.abandoned = true;
+        (state.stream > 0).then_some(state.stream)
+    }
+
+    /// Whether the caller gave up before this exchange was sent.
+    pub(crate) fn is_abandoned(&self) -> bool {
+        self.lock().abandoned
     }
 
     pub(crate) fn poll(

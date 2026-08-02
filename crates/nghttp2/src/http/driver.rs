@@ -272,6 +272,14 @@ pub(crate) trait Role {
     /// `stream` has closed, and is about to leave the registry.
     fn closed(&mut self, stream: i32);
 
+    /// Whether this end opened `stream`.
+    ///
+    /// A `GOAWAY` names the last stream *its sender* acted on, so what it abandons is the
+    /// work the receiver started — a client's requests, or a server's pushes. A server
+    /// reading a client's ordinary `GOAWAY(0)` must not read it as "discard every request
+    /// in flight", which is what a role-agnostic reading would say.
+    fn started(&self, stream: i32) -> bool;
+
     /// Fails everything still waiting, because the driver is going away.
     fn abandon(&mut self);
 
@@ -759,10 +767,17 @@ fn dispatch<R: Role>(
                 // fault, but neither leaves room for another request.
                 shared.set_refusing();
 
-                // Everything above the stream the peer named was never begun, which is the
-                // one failure a caller may retry without knowing anything else about the
-                // request.
-                for stream in registry.above(last_stream) {
+                // Everything *this end started* above the stream the peer named was never
+                // begun, which is the one failure a caller may retry without knowing
+                // anything else about the request. Streams the peer started are its own
+                // business and are unaffected: a server told its client is going away still
+                // owes that client the responses it is working on.
+                let abandoned: Vec<i32> = registry
+                    .above(last_stream)
+                    .into_iter()
+                    .filter(|stream| role.started(*stream))
+                    .collect();
+                for stream in abandoned {
                     let Some(entry) = registry.remove(stream) else {
                         continue;
                     };

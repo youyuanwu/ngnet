@@ -433,12 +433,20 @@ fn a_peer_reset_carries_the_peers_reason() {
 fn a_transport_failure_is_identifiable_as_one() {
     // Spec SC-026. A caller deciding whether to reconnect needs to know the socket broke
     // rather than the peer having said something invalid.
-    for on_read in [true, false] {
-        let (client_side, server_side) = failing(2, on_read);
+    // The budget differs by direction because the two are not symmetric: a client
+    // coalesces its preface, settings and first request into a single write, so a second
+    // write only ever happens if there is something further to send. Two reads, one write.
+    for (on_read, after) in [(true, 2), (false, 1)] {
+        let direction = if on_read { "reading" } else { "writing" };
+        let (client_side, server_side) = failing(after, on_read);
         let (requests, connection) =
             nghttp2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
         let mut peer = Peer::default();
+        // The *connection* is what reports a broken transport. The request future only
+        // ever learns that its connection went away, which is true of every failure and so
+        // distinguishes nothing — asserting there would have been an assertion about
+        // nothing at all.
         let exchange = async {
             let outcome = requests.send_request(request("/doomed")).await;
             drop(requests);
@@ -446,16 +454,20 @@ fn a_transport_failure_is_identifiable_as_one() {
         };
 
         let outcome = block_on(alongside(
-            alongside(exchange, connection),
+            alongside(connection, exchange),
             drive_peer(server_side, peer_session(), &mut peer, answer_plainly),
         ));
 
         let error = outcome.expect_err("a transport that broke");
-        let direction = if on_read { "reading" } else { "writing" };
-        assert!(
-            matches!(error.kind(), ErrorKind::Transport | ErrorKind::Closed),
-            "a broken transport reported {:?} while {direction}",
+        assert_eq!(
             error.kind(),
+            ErrorKind::Transport,
+            "a transport that broke while {direction} reported something else: {error}",
+        );
+        let cause = std::error::Error::source(&error).expect("the underlying failure");
+        assert!(
+            cause.to_string().contains("scripted transport"),
+            "the transport's own error was lost while {direction}: {cause}",
         );
     }
 }
@@ -518,8 +530,9 @@ fn a_handler_learns_its_stream_was_lost_even_with_no_body_to_read() {
         let counter = Arc::clone(&counter);
         let lost = request.extensions().get::<Cancelled>().cloned();
         async move {
+            // Awaited rather than checked first: the reset may already have arrived in the
+            // same read as the request, and either way the handler learns.
             let lost = lost.expect("every request carries the signal");
-            assert!(!lost.is_cancelled(), "cancelled before anything happened");
             lost.cancelled().await;
             counter.fetch_add(1, Ordering::AcqRel);
             http::Response::builder()
@@ -539,15 +552,24 @@ fn a_handler_learns_its_stream_was_lost_even_with_no_body_to_read() {
         }
     };
 
-    let mut passes = 0;
+    // Reset once the request has actually gone out, rather than after a fixed number of
+    // passes: the peer harness steps until it has nothing more to send, so passes are not
+    // exchanges and counting them is how this test would come to pass by accident.
+    let mut sent = false;
+    let mut reset = false;
     let step = move |session: &mut Session<ClientPeer>, peer: &mut ClientPeer| {
-        ask(session, peer);
-        passes += 1;
-        if passes == 3 {
+        // On the pass *after* the request went out, not the same one: a reset submitted
+        // alongside the headers cancels them before they are ever serialised, and the
+        // server would never see the request at all.
+        if sent && !reset {
+            reset = true;
             session
                 .reset_stream(StreamId::new(1), ErrorCode::CANCEL)
                 .expect("resetting");
         }
+        let had_work = !peer.outgoing.is_empty();
+        ask(session, peer);
+        sent |= had_work;
     };
 
     block_on(alongside(
@@ -563,6 +585,128 @@ fn a_handler_learns_its_stream_was_lost_even_with_no_body_to_read() {
     assert!(
         !client.heads.contains_key(&1),
         "a response was sent on a stream the peer had reset",
+    );
+}
+
+#[test]
+fn a_request_dropped_before_it_is_sent_never_reaches_the_peer() {
+    // A response future dropped before the driver has run has no stream to reset, and
+    // sending the request only to take it back would be work the peer has to do for
+    // nothing. It is simply never sent.
+    let (client_side, server_side) = duplex(false);
+    let (requests, connection) =
+        nghttp2::http::handshake::<_, Empty>(client_side).expect("handshake");
+
+    let mut peer = Peer::default();
+
+    let exchange = async {
+        // Dropped before anything is polled, so the driver has not seen it.
+        drop(requests.send_request(request("/never-sent")));
+        let kept = requests.send_request(request("/sent"));
+        kept.await.expect("a response");
+        drop(requests);
+    };
+
+    block_on(alongside(
+        alongside(exchange, connection),
+        drive_peer(server_side, peer_session(), &mut peer, answer_plainly),
+    ));
+
+    assert_eq!(
+        peer.paths.values().cloned().collect::<Vec<_>>(),
+        ["/sent"],
+        "a request nobody was waiting for was sent anyway",
+    );
+}
+
+#[test]
+fn a_client_going_away_does_not_discard_the_responses_a_server_owes_it() {
+    // A `GOAWAY` names the last stream *its sender* acted on, so what it abandons is the
+    // work the receiver started. A client's ordinary wind-down names zero, and a server
+    // reading that as "discard everything in flight" would drop responses its peer is
+    // still waiting for — including for this crate talking to itself.
+    let (server_side, client_side) = duplex(false);
+    let connection = server::serve(server_side, |request: http::Request<IncomingBody>| {
+        let lost = request.extensions().get::<Cancelled>().cloned();
+        async move {
+            assert!(
+                !lost.expect("the signal").is_cancelled(),
+                "a client's wind-down cancelled a handler that was still wanted",
+            );
+            http::Response::builder()
+                .status(200)
+                .header("x-answered", "yes")
+                .body(Empty)
+                .expect("a response")
+        }
+    })
+    .expect("serving");
+
+    let mut client = ClientPeer::default();
+    client.outgoing.push("/in-flight".to_owned());
+
+    let driving = async {
+        for _ in 0..32 {
+            yield_now().await;
+        }
+    };
+
+    // Says it is going away the moment the request is out, naming stream zero as a client
+    // that accepts no pushes must.
+    let mut sent = false;
+    let mut gone = false;
+    let step = move |session: &mut Session<ClientPeer>, peer: &mut ClientPeer| {
+        if sent && !gone {
+            gone = true;
+            session
+                .shutdown(StreamId::new(0), ErrorCode::NO_ERROR)
+                .expect("going away");
+        }
+        let had_work = !peer.outgoing.is_empty();
+        ask(session, peer);
+        sent |= had_work;
+    };
+
+    block_on(alongside(
+        alongside(driving, connection),
+        drive_peer(client_side, client_peer_session(), &mut client, step),
+    ));
+
+    assert_eq!(
+        client.status(1),
+        Some("200"),
+        "the server discarded a response its client was still waiting for",
+    );
+    assert_eq!(client.head(1, "x-answered"), Some("yes"));
+}
+
+#[test]
+fn shutting_down_twice_is_no_worse_than_once() {
+    // Documented as idempotent, so it has to be.
+    let (client_side, server_side) = duplex(false);
+    let (requests, connection) =
+        nghttp2::http::handshake::<_, Empty>(client_side).expect("handshake");
+
+    let mut peer = Peer::default();
+
+    let exchange = async {
+        let first = requests.send_request(request("/in-flight"));
+        requests.shutdown();
+        requests.shutdown();
+        requests.shutdown();
+        let answered = first.await;
+        drop(requests);
+        answered
+    };
+
+    let answered = block_on(alongside(
+        alongside(exchange, connection),
+        drive_peer(server_side, peer_session(), &mut peer, answer_plainly),
+    ));
+
+    assert_eq!(
+        answered.expect("the in-flight request").status(),
+        http::StatusCode::OK,
     );
 }
 

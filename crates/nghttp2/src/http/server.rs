@@ -329,6 +329,13 @@ where
         }
     }
 
+    fn started(&self, stream: i32) -> bool {
+        // A server opens only pushed streams, which are even — and this crate pushes
+        // nothing, so it starts nothing. A client's `GOAWAY` therefore abandons none of the
+        // requests being served, which is the whole point of asking.
+        stream % 2 == 0
+    }
+
     fn abandon(&mut self) {
         for (_, state) in core::mem::take(&mut self.losses) {
             state.trip();

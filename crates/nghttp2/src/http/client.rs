@@ -148,10 +148,14 @@ where
         };
 
         // Named now, so a response future dropped before its answer arrives knows which
-        // stream to stop.
-        slot.bind(stream.get());
+        // stream to stop — and if it was dropped while this call was in flight, that is
+        // what `bind` reports, since the drop could not have seen a stream to name.
+        let unwanted = slot.bind(stream.get());
         self.registry
             .insert(stream.get(), Some(Arc::clone(slot)), incoming, liveness);
+        if unwanted {
+            session.reset_stream(stream, crate::ErrorCode::CANCEL)?;
+        }
         Ok(())
     }
 }
@@ -165,6 +169,12 @@ where
     fn advance(&mut self, session: &mut Session<Events>) -> Result<()> {
         for command in self.queue.drain() {
             let Command::SendRequest { request, slot } = command;
+            // Dropped before it was ever sent, so there is nothing to send and nothing to
+            // reset. Cheaper than submitting and immediately taking it back, and the peer
+            // never sees a request nobody wanted.
+            if slot.is_abandoned() {
+                continue;
+            }
             // A request this crate will not send is that request's failure, not the
             // connection's: the handle that made it hears about it and every other
             // exchange carries on.
@@ -217,6 +227,12 @@ where
     }
 
     fn closed(&mut self, _stream: i32) {}
+
+    fn started(&self, stream: i32) -> bool {
+        // A client opens odd-numbered streams; even ones can only have come from a push,
+        // which this crate does not accept.
+        stream % 2 == 1
+    }
 
     fn signals(&self) -> Signals {
         let queue = Arc::clone(&self.queue);
@@ -382,10 +398,15 @@ pub struct ResponseFuture {
 
 impl Drop for ResponseFuture {
     fn drop(&mut self) {
-        let (Some(shared), Some(stream)) = (&self.shared, self.slot.unsettled_stream()) else {
+        let Some(shared) = &self.shared else {
             return;
         };
-        shared.reset(stream, crate::ErrorCode::CANCEL);
+        // A request that has already been sent can only be taken back with a reset. One
+        // that has not is simply never sent — which `cancel` records, under the same lock
+        // the driver binds the stream with, so the two cannot pass each other.
+        if let Some(stream) = self.slot.cancel() {
+            shared.reset(stream, crate::ErrorCode::CANCEL);
+        }
         shared.wake_driver();
     }
 }
