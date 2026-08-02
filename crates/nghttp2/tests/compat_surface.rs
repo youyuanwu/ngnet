@@ -295,11 +295,32 @@ fn the_sans_io_surface_is_unchanged() {
 mod asynchronous {
     use std::error::Error as StdError;
 
-    use nghttp2::http::testing::{http_body_crate as http_body, http_crate as http};
-    use nghttp2::http::{
-        Error, ErrorKind, ResponseFuture, SendRequest, Transport, TransportRead, TransportWrite,
-        handshake,
+    use nghttp2::http::testing::{
+        bytes_crate as bytes, http_body_crate as http_body, http_crate as http,
     };
+    use nghttp2::http::{
+        Error, ErrorKind, IncomingBody, ResponseFuture, SendRequest, Transport, TransportRead,
+        TransportWrite, handshake,
+    };
+
+    /// The receiving body, pinned as an `http_body::Body` over the ecosystem's types.
+    ///
+    /// The associated types are the whole contract here: a caller writing a generic
+    /// function over `Body<Data = Bytes>` must keep compiling, and so must one that
+    /// matches on this crate's error.
+    pub(super) fn incoming_body_surface(body: &IncomingBody) {
+        fn assert_body<B: http_body::Body<Data = bytes::Bytes, Error = Error>>(_body: &B) {}
+        assert_body(body);
+        let _: bool = http_body::Body::is_end_stream(body);
+        let _: http_body::SizeHint = http_body::Body::size_hint(body);
+    }
+
+    /// The receiving body is what a response carries, and it is not `()`.
+    pub(super) fn response_surface(response: http::Response<IncomingBody>) {
+        let _: http::StatusCode = response.status();
+        let (parts, body): (http::response::Parts, IncomingBody) = response.into_parts();
+        drop((parts, body));
+    }
 
     /// The error taxonomy, left open so it can grow without breaking a caller's match.
     pub(super) fn error_surface(error: &Error) {
@@ -362,6 +383,9 @@ fn the_asynchronous_surface_is_unchanged() {
     let _: fn(&nghttp2::http::Error) = asynchronous::error_surface;
     let _: fn(Duplex) -> core::result::Result<(), nghttp2::http::Error> =
         asynchronous::client_surface::<Duplex, Empty>;
+    let _: fn(&nghttp2::http::IncomingBody) = asynchronous::incoming_body_surface;
+    let _: fn(nghttp2::http::testing::http_crate::Response<nghttp2::http::IncomingBody>) =
+        asynchronous::response_surface;
 
     // The ecosystem types are part of the promise too: a caller hands over an
     // `http::Request` and gets back an `http::Response`, not a bespoke type.

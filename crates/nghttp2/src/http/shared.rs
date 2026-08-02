@@ -16,11 +16,14 @@
 //! `Session::send` — so waking must never need a lock the driver is already holding.
 //! Waking the driver itself is done *after* releasing the lock, for the same reason.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
-use std::task::Waker;
+use std::task::{Poll, Waker};
 
-use super::error::Error;
+use bytes::Bytes;
+use http_body::Frame;
+
+use super::error::{Error, ErrorKind, Result};
 
 /// The de-duplicating ready set, the driver's waker, and the connection's liveness.
 ///
@@ -42,6 +45,12 @@ struct Inner {
     ready: BTreeSet<i32>,
     /// The driver task's waker, replaced whenever the runtime hands over a different one.
     driver: Option<Waker>,
+    /// Receive-window capacity the application has finished with, by stream, waiting to
+    /// be handed back to the peer.
+    ///
+    /// Accumulated per stream rather than queued per chunk, so a caller reading a body in
+    /// small pieces produces one `WINDOW_UPDATE` per driver pass instead of one per read.
+    credits: BTreeMap<i32, usize>,
     /// Set once the driver is gone, so nothing waits for an answer that cannot come.
     gone: bool,
 }
@@ -98,6 +107,31 @@ impl Shared {
     /// How many streams are waiting to be resumed.
     pub(crate) fn ready_len(&self) -> usize {
         self.lock().ready.len()
+    }
+
+    /// Notes that `len` octets received on `stream` have been consumed by the application.
+    ///
+    /// Reporting consumption is what re-opens the receive window, so this is the whole of
+    /// the crate's backpressure: a body nobody reads produces no credit, the window
+    /// closes, and the peer stops. The driver hands the total to the session on its next
+    /// pass — nothing here touches the session, which lives in the driver and is not
+    /// shareable.
+    pub(crate) fn credit(&self, stream: i32, len: usize) {
+        if len == 0 {
+            return;
+        }
+        *self.lock().credits.entry(stream).or_default() += len;
+    }
+
+    /// Takes the consumption to report, leaving nothing behind.
+    pub(crate) fn take_credits(&self) -> Vec<(i32, usize)> {
+        let mut inner = self.lock();
+        core::mem::take(&mut inner.credits).into_iter().collect()
+    }
+
+    /// How many streams have consumption waiting to be reported.
+    pub(crate) fn credits_len(&self) -> usize {
+        self.lock().credits.len()
     }
 
     /// Records that the driver has stopped, and wakes anything waiting on it.
@@ -198,7 +232,7 @@ pub(crate) struct Slot {
 
 #[derive(Debug, Default)]
 struct SlotState {
-    head: Option<http::Response<()>>,
+    head: Option<http::Response<super::body::IncomingBody>>,
     error: Option<Error>,
     waker: Option<Waker>,
     settled: bool,
@@ -206,7 +240,7 @@ struct SlotState {
 
 impl Slot {
     /// Delivers a response head.
-    pub(crate) fn complete(&self, head: http::Response<()>) {
+    pub(crate) fn complete(&self, head: http::Response<super::body::IncomingBody>) {
         let waker = {
             let mut state = self.lock();
             if state.settled {
@@ -248,19 +282,19 @@ impl Slot {
     pub(crate) fn poll(
         &self,
         waker: &Waker,
-    ) -> core::task::Poll<super::error::Result<http::Response<()>>> {
+    ) -> Poll<Result<http::Response<super::body::IncomingBody>>> {
         let mut state = self.lock();
         if let Some(head) = state.head.take() {
-            return core::task::Poll::Ready(Ok(head));
+            return Poll::Ready(Ok(head));
         }
         if let Some(error) = state.error.take() {
-            return core::task::Poll::Ready(Err(error));
+            return Poll::Ready(Err(error));
         }
         match &state.waker {
             Some(current) if current.will_wake(waker) => {}
             _ => state.waker = Some(waker.clone()),
         }
-        core::task::Poll::Pending
+        Poll::Pending
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, SlotState> {
@@ -270,11 +304,170 @@ impl Slot {
     }
 }
 
+/// What one stream has received, waiting for its body to be read.
+///
+/// The driver fills it as frames arrive; [`IncomingBody`](super::body::IncomingBody)
+/// empties it. Nothing here credits the peer — that is the body's doing, and only when the
+/// application has actually taken a chunk, which is what makes the window track
+/// consumption rather than arrival.
+#[derive(Debug, Default)]
+pub(crate) struct Incoming {
+    state: Mutex<IncomingState>,
+}
+
+#[derive(Debug, Default)]
+struct IncomingState {
+    /// Payload as delivered, each chunk a refcounted view of a driver read buffer.
+    chunks: VecDeque<Bytes>,
+    /// Octets sitting in `chunks`, so a body that is dropped can return the window in one
+    /// call rather than by walking what it never read.
+    queued: usize,
+    trailers: Option<http::HeaderMap>,
+    /// The peer ended the message.
+    finished: bool,
+    error: Option<Error>,
+    waker: Option<Waker>,
+    /// The receiving body was dropped, so nothing will ever read what arrives next.
+    abandoned: bool,
+}
+
+impl Incoming {
+    /// Queues a received chunk, waking whoever is reading.
+    ///
+    /// Returns octets the driver should hand straight back to the peer — non-zero only
+    /// when the body has been dropped, in which case holding the window shut for a chunk
+    /// nobody will read would stall the whole connection.
+    pub(crate) fn push(&self, chunk: Bytes) -> usize {
+        let waker = {
+            let mut state = self.lock();
+            if state.abandoned {
+                return chunk.len();
+            }
+            state.queued += chunk.len();
+            state.chunks.push_back(chunk);
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        0
+    }
+
+    /// Records a trailing header block.
+    pub(crate) fn set_trailers(&self, trailers: http::HeaderMap) {
+        let waker = {
+            let mut state = self.lock();
+            state.trailers = Some(trailers);
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Marks the end of the message.
+    pub(crate) fn finish(&self) {
+        let waker = {
+            let mut state = self.lock();
+            state.finished = true;
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Reports a failure, unless the message already ended.
+    ///
+    /// A stream that closed after its body was complete has nothing to report: the octets
+    /// still queued are the whole message and the caller is entitled to read them.
+    pub(crate) fn fail(&self, error: Error) {
+        let waker = {
+            let mut state = self.lock();
+            if state.finished || state.error.is_some() {
+                return;
+            }
+            state.error = Some(error);
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Whether the message has ended and nothing is left to read.
+    pub(crate) fn is_end_stream(&self) -> bool {
+        let state = self.lock();
+        state.finished
+            && state.chunks.is_empty()
+            && state.trailers.is_none()
+            && state.error.is_none()
+    }
+
+    /// Takes the next frame, or registers `waker` to be told when there is one.
+    pub(crate) fn poll_frame(&self, waker: &Waker) -> Poll<Option<Result<Frame<Bytes>>>> {
+        let mut state = self.lock();
+
+        if let Some(chunk) = state.chunks.pop_front() {
+            state.queued -= chunk.len();
+            return Poll::Ready(Some(Ok(Frame::data(chunk))));
+        }
+        if let Some(error) = state.error.take() {
+            return Poll::Ready(Some(Err(error)));
+        }
+        // Trailers last: they close the message, and anything still queued precedes them.
+        if let Some(trailers) = state.trailers.take() {
+            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+        }
+        if state.finished {
+            return Poll::Ready(None);
+        }
+
+        match &state.waker {
+            Some(current) if current.will_wake(waker) => {}
+            _ => state.waker = Some(waker.clone()),
+        }
+        Poll::Pending
+    }
+
+    /// Gives up on anything unread, reporting how much window it holds.
+    ///
+    /// Called when the receiving body is dropped. The octets it never read still count
+    /// against the connection's receive window, so they have to be handed back or the
+    /// connection would slowly throttle itself to a halt.
+    pub(crate) fn abandon(&self) -> usize {
+        let mut state = self.lock();
+        state.abandoned = true;
+        state.chunks.clear();
+        state.trailers = None;
+        core::mem::take(&mut state.queued)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, IncomingState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// The failure a stream that closed without ending its message reports.
+pub(crate) fn truncated() -> Error {
+    Error::new(
+        ErrorKind::Stream,
+        "the stream closed before the message body ended",
+    )
+}
+
 /// What the driver knows about one live stream.
 #[derive(Debug)]
 pub(crate) struct Entry {
     /// Where this exchange's answer goes.
     pub(crate) slot: Arc<Slot>,
+    /// Where this exchange's received payload goes.
+    ///
+    /// Created with the stream rather than with the response head, so a peer that sends
+    /// payload before anything has looked for it still has somewhere to put it.
+    pub(crate) incoming: Arc<Incoming>,
     /// Proof that the stream is still live.
     ///
     /// Held here and nowhere else, so removing the entry is what makes every waker that
@@ -293,11 +486,18 @@ pub(crate) struct Registry {
 }
 
 impl Registry {
-    pub(crate) fn insert(&self, stream: i32, slot: Arc<Slot>, liveness: Arc<()>) {
+    pub(crate) fn insert(
+        &self,
+        stream: i32,
+        slot: Arc<Slot>,
+        incoming: Arc<Incoming>,
+        liveness: Arc<()>,
+    ) {
         self.lock().insert(
             stream,
             Entry {
                 slot,
+                incoming,
                 _liveness: liveness,
             },
         );
@@ -308,6 +508,13 @@ impl Registry {
         self.lock()
             .get(&stream)
             .map(|entry| Arc::clone(&entry.slot))
+    }
+
+    /// The receive queue for a live stream.
+    pub(crate) fn incoming(&self, stream: i32) -> Option<Arc<Incoming>> {
+        self.lock()
+            .get(&stream)
+            .map(|entry| Arc::clone(&entry.incoming))
     }
 
     /// Forgets a stream, retiring every waker that named it.

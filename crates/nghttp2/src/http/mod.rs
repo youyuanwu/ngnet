@@ -23,15 +23,16 @@
 //! Outgoing bodies are the exception. They are stored inside the session, which may be
 //! moved between threads, so they inherit the sans-I/O core's `Send + 'static` bound.
 
+mod body;
 pub mod client;
 mod driver;
 mod error;
 mod head;
-mod outgoing;
 mod shared;
 pub mod transport;
 mod waker;
 
+pub use body::IncomingBody;
 pub use client::{ResponseFuture, SendRequest, handshake};
 pub use error::{Error, ErrorKind, Result};
 pub use transport::{Transport, TransportRead, TransportWrite};

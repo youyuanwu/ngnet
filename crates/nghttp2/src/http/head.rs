@@ -162,6 +162,29 @@ pub(crate) fn response_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Respo
         .map_err(|_| protocol("the peer sent a response head that could not be assembled"))
 }
 
+/// Decodes a received trailing header block.
+///
+/// Trailers are ordinary fields only: a pseudo-header after a message has begun is
+/// malformed, and RFC 9113 §8.1 says so explicitly.
+pub(crate) fn trailers(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::HeaderMap> {
+    let mut map = http::HeaderMap::with_capacity(fields.len());
+
+    for (name, value) in fields {
+        if name.first() == Some(&b':') {
+            return Err(protocol(
+                "a trailing header block carries no pseudo-headers",
+            ));
+        }
+        let name = http::HeaderName::from_bytes(name)
+            .map_err(|_| protocol("the peer sent a malformed trailer name"))?;
+        let value = http::HeaderValue::from_bytes(value)
+            .map_err(|_| protocol("the peer sent a malformed trailer value"))?;
+        map.append(name, value);
+    }
+
+    Ok(map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

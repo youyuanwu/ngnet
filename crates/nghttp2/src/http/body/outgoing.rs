@@ -19,7 +19,7 @@ use http_body::Body;
 
 use crate::{BodyOutcome, BodySource};
 
-use super::error::{Error, ErrorKind};
+use super::super::error::{Error, ErrorKind};
 
 /// Presents an [`http_body::Body`] to the session.
 pub(crate) struct Outgoing<B: Body> {

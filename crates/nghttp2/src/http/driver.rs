@@ -44,10 +44,12 @@ use crate::{
     ErrorCode, FrameType, HeaderAction, HeaderCategory, Session, SessionBuilder, StreamId,
 };
 
+use super::body::IncomingBody;
+use super::body::outgoing::Outgoing;
 use super::error::{Error, ErrorKind, Result};
 use super::head;
-use super::outgoing::Outgoing;
-use super::shared::{Command, HandleToken, Queue, Registry, Shared, Slot};
+use super::shared;
+use super::shared::{Command, HandleToken, Incoming, Queue, Registry, Shared, Slot};
 use super::transport::{Transport, TransportRead, TransportWrite};
 use super::waker::StreamWaker;
 
@@ -71,6 +73,41 @@ const READ_AHEAD: usize = 2;
 /// A header block as it arrives: names and values, in order, uninterpreted.
 type Fields = Vec<(Vec<u8>, Vec<u8>)>;
 
+/// Where a delivered chunk lies inside the buffer `Session::recv` was handed.
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    offset: usize,
+    len: usize,
+}
+
+/// One thing the handlers observed.
+///
+/// A single ordered list rather than a bucket per kind, because the order *is* the
+/// message. Payload dispatched before its head would have nowhere to go, and payload
+/// dispatched after the end of the message would arrive after the caller had been told
+/// there was none.
+#[derive(Debug)]
+enum Event {
+    /// A response head completed.
+    Head { stream: i32, fields: Fields },
+    /// A trailing header block completed.
+    Trailers { stream: i32, fields: Fields },
+    /// Payload arrived.
+    ///
+    /// Recorded as an extent of the buffer being read from, and resolved into a
+    /// refcounted view of that same buffer once the call returns: the handler is handed
+    /// the chunk but not the buffer it lies in, so it cannot take the view itself.
+    Data {
+        stream: i32,
+        span: Option<Span>,
+        data: bytes::Bytes,
+    },
+    /// The peer ended the message.
+    End { stream: i32 },
+    /// The stream closed.
+    Close { stream: i32, code: ErrorCode },
+}
+
 /// What the session's handlers observed, accumulated for the driver to act on.
 ///
 /// Handlers run inside `Session::send` and `Session::recv` and are handed only this, so
@@ -81,12 +118,29 @@ type Fields = Vec<(Vec<u8>, Vec<u8>)>;
 pub(crate) struct Events {
     /// Header blocks still arriving, by stream.
     open: std::collections::BTreeMap<i32, Fields>,
-    /// Header blocks that completed.
-    heads: Vec<(i32, Fields)>,
-    /// Received payload, by stream, awaiting a window credit.
-    data: Vec<(i32, usize)>,
-    /// Streams that closed, with the code they closed under.
-    closes: Vec<(i32, ErrorCode)>,
+    /// What happened, in the order it happened.
+    list: Vec<Event>,
+    /// The address range of the buffer currently being read from.
+    ///
+    /// Plain addresses rather than a borrow, because this outlives any one call and a
+    /// lifetime here would infect the session's type. Nothing is ever dereferenced
+    /// through them — they are only compared, to learn where a chunk sits.
+    base: usize,
+    limit: usize,
+}
+
+/// Turns the extents recorded during one `recv` into refcounted views of its buffer.
+///
+/// This is the zero-copy step: `Bytes::slice` over the very buffer the octets were read
+/// into, so a chunk the caller keeps is the same memory rather than a copy of it.
+fn resolve(events: &mut Events, buffer: &bytes::Bytes, from: usize) {
+    for event in &mut events.list[from..] {
+        if let Event::Data { span, data, .. } = event {
+            if let Some(span) = span.take() {
+                *data = buffer.slice(span.offset..span.offset + span.len);
+            }
+        }
+    }
 }
 
 /// Builds the session a client connection runs on.
@@ -95,9 +149,14 @@ pub(crate) struct Events {
 /// real session rather than read off a constant.
 pub(crate) fn client_session() -> crate::Result<Session<Events>> {
     SessionBuilder::<Events>::client()
-        .manual_flow_control(MANUAL_FLOW_CONTROL)
         .on_begin_headers(|events: &mut Events, frame| {
-            if frame.category() == Some(HeaderCategory::Response) {
+            // Responses and trailers both open a block that has to be collected; which
+            // one it was is read off the frame again when the block completes.
+            let opens_a_block = matches!(
+                frame.category(),
+                Some(HeaderCategory::Response | HeaderCategory::Trailing)
+            );
+            if opens_a_block {
                 events.open.insert(frame.stream_id().get(), Vec::new());
             }
             HeaderAction::Continue
@@ -109,19 +168,52 @@ pub(crate) fn client_session() -> crate::Result<Session<Events>> {
             HeaderAction::Continue
         })
         .on_frame(|events: &mut Events, frame| {
+            let stream = frame.stream_id().get();
             if frame.kind() == FrameType::HEADERS && frame.is_end_headers() {
-                if let Some(fields) = events.open.remove(&frame.stream_id().get()) {
-                    events.heads.push((frame.stream_id().get(), fields));
+                if let Some(fields) = events.open.remove(&stream) {
+                    events.list.push(if frame.is_trailers() {
+                        Event::Trailers { stream, fields }
+                    } else {
+                        Event::Head { stream, fields }
+                    });
                 }
+            }
+            // Recorded from the flag rather than from stream closure: a stream stays open
+            // until both directions have finished, and the message ends first.
+            if stream > 0 && frame.is_end_stream() {
+                events.list.push(Event::End { stream });
             }
         })
         .on_data_chunk(|events: &mut Events, stream, chunk: &[u8]| {
-            events.data.push((stream.get(), chunk.len()));
+            let address = chunk.as_ptr() as usize;
+            // Chunks are delivered as views of the buffer handed to `recv`. Checked
+            // rather than assumed: a chunk from anywhere else is still correct data and
+            // is copied, so an implementation detail changing underneath costs a copy
+            // instead of producing wrong bytes.
+            let aliases = address >= events.base
+                && address.saturating_add(chunk.len()) <= events.limit
+                && !chunk.is_empty();
+            events.list.push(Event::Data {
+                stream: stream.get(),
+                span: aliases.then(|| Span {
+                    offset: address - events.base,
+                    len: chunk.len(),
+                }),
+                data: if aliases {
+                    bytes::Bytes::new()
+                } else {
+                    bytes::Bytes::copy_from_slice(chunk)
+                },
+            });
         })
         .on_stream_close(|events: &mut Events, stream, code, _failure| {
             events.open.remove(&stream.get());
-            events.closes.push((stream.get(), code));
+            events.list.push(Event::Close {
+                stream: stream.get(),
+                code,
+            });
         })
+        .manual_flow_control(MANUAL_FLOW_CONTROL)
         .build()
 }
 
@@ -158,6 +250,7 @@ impl<B> Drop for DriverGuard<B> {
         self.shared.set_gone();
         for entry in self.registry.take_all() {
             entry.slot.fail(Error::closed());
+            entry.incoming.fail(Error::closed());
         }
         for command in self.queue.drain() {
             let Command::SendRequest { slot, .. } = command;
@@ -178,6 +271,78 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Read buffers waiting to go back to the pool, and the pool itself.
+///
+/// # The reuse rule
+///
+/// Received payload is handed to callers as refcounted views of the buffer it was read
+/// into, so a buffer must not be read into again while any of those views is still alive
+/// — doing so would rewrite octets a caller is holding. A buffer therefore goes to
+/// `holding` after it is fed, and moves to `pool` only once every view derived from it
+/// has been dropped, which [`bytes::Bytes::try_into_mut`] reports by succeeding.
+///
+/// Nothing is leaked when a caller keeps a chunk forever: the memory is retained by the
+/// chunk regardless, and the entry here is a pointer's worth of bookkeeping that
+/// `HOLDING_LIMIT` bounds. A buffer dropped from `holding` is simply not reused; it is
+/// freed when its last chunk is.
+struct Buffers {
+    pool: Mutex<Vec<BytesMut>>,
+    holding: Mutex<Vec<bytes::Bytes>>,
+}
+
+/// How many spare read buffers to keep. One per outstanding read, plus room for a buffer
+/// coming back while another goes out.
+const POOL_LIMIT: usize = READ_AHEAD + 2;
+
+/// How many buffers to keep watching for reuse before giving up on them.
+const HOLDING_LIMIT: usize = 16;
+
+impl Buffers {
+    fn new() -> Self {
+        Self {
+            pool: Mutex::new(Vec::new()),
+            holding: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// A buffer to read into: a recycled one if any is free, otherwise a fresh one.
+    fn take(&self) -> BytesMut {
+        let mut buf = lock(&self.pool)
+            .pop()
+            .unwrap_or_else(|| BytesMut::with_capacity(READ_BUFFER));
+        buf.clear();
+        buf
+    }
+
+    /// Offers a fed buffer back, and reclaims any earlier one that has come free.
+    fn release(&self, buffer: bytes::Bytes) {
+        lock(&self.holding).push(buffer);
+        self.sweep();
+    }
+
+    fn sweep(&self) {
+        let waiting: Vec<bytes::Bytes> = core::mem::take(&mut *lock(&self.holding));
+        let mut still = Vec::with_capacity(waiting.len());
+
+        for buffer in waiting {
+            match buffer.try_into_mut() {
+                Ok(mut buf) => {
+                    let mut pool = lock(&self.pool);
+                    if pool.len() < POOL_LIMIT {
+                        buf.clear();
+                        pool.push(buf);
+                    }
+                }
+                Err(buffer) => still.push(buffer),
+            }
+        }
+
+        // Oldest first, so what is dropped is what has been held longest.
+        let excess = still.len().saturating_sub(HOLDING_LIMIT);
+        *lock(&self.holding) = still.split_off(excess);
+    }
 }
 
 /// Runs the connection until the peer goes away or nothing is left to do.
@@ -203,7 +368,7 @@ where
     // and defeat the auto-trait inference the transport traits are shaped around. The
     // locks are never contended — the halves are polled one at a time on one task.
     let inbox = Mutex::new(VecDeque::<BytesMut>::new());
-    let pool = Mutex::new(Vec::<BytesMut>::new());
+    let buffers = Buffers::new();
     let intake = Mutex::new(Intake::default());
 
     let reading = async {
@@ -219,10 +384,7 @@ where
             })
             .await;
 
-            let mut buf = lock(&pool)
-                .pop()
-                .unwrap_or_else(|| BytesMut::with_capacity(READ_BUFFER));
-            buf.clear();
+            let buf = buffers.take();
 
             let (result, buf) = reader.read(buf).await;
             match result {
@@ -251,11 +413,20 @@ where
         let mut events = Events::default();
 
         loop {
+            buffers.sweep();
+
             for command in queue.drain() {
                 let Command::SendRequest { request, slot } = command;
                 if let Err(error) = submit(&mut session, &shared, &registry, request, &slot) {
                     slot.fail(error);
                 }
+            }
+
+            // Hand back the window the application has finished with. Done before
+            // anything else touches the session, so the `WINDOW_UPDATE` this queues goes
+            // out in the same pass rather than waiting for the next wake.
+            for (stream, len) in shared.take_credits() {
+                session.consume(StreamId::new(stream), len)?;
             }
 
             for stream in shared.take_ready() {
@@ -272,10 +443,23 @@ where
             let mut fed = false;
             loop {
                 let next = lock(&inbox).pop_front();
-                let Some(mut buf) = next else { break };
-                session.recv(&buf, &mut events)?;
-                buf.clear();
-                lock(&pool).push(buf);
+                let Some(buf) = next else { break };
+
+                // Frozen before it is read from, so the chunks the handlers see can be
+                // recovered as refcounted views of this very buffer rather than copies.
+                let buf = buf.freeze();
+                let mark = events.list.len();
+                events.base = buf.as_ptr() as usize;
+                events.limit = events.base + buf.len();
+
+                let outcome = session.recv(&buf, &mut events);
+
+                events.base = 0;
+                events.limit = 0;
+                outcome?;
+
+                resolve(&mut events, &buf, mark);
+                buffers.release(buf);
                 fed = true;
             }
             if fed {
@@ -284,11 +468,11 @@ where
                 shared.wake_driver();
             }
 
-            dispatch(&mut session, &mut events, &registry)?;
+            dispatch(&mut session, &mut events, &registry, &shared)?;
             flush(&mut session, &mut writer, &mut events).await?;
             // Serialising fires the stream-close handler, so what it observed is
             // dispatched too rather than waiting for the next pass.
-            dispatch(&mut session, &mut events, &registry)?;
+            dispatch(&mut session, &mut events, &registry, &shared)?;
 
             if lock(&intake).finished && lock(&inbox).is_empty() {
                 if let Some(failure) = lock(&intake).failure.take() {
@@ -322,6 +506,7 @@ where
                 // wake is coming for.
                 let idle = queue.is_empty()
                     && shared.ready_len() == 0
+                    && shared.credits_len() == 0
                     && lock(&inbox).is_empty()
                     && !lock(&intake).finished
                     && !wants_write
@@ -385,6 +570,9 @@ where
     // Dropped when the stream leaves the registry, at which point every waker that names
     // this stream stops being able to enqueue anything.
     let liveness = Arc::new(());
+    // Created with the stream rather than with the response head, so payload that arrives
+    // before anything has looked for it still has somewhere to go.
+    let incoming = Arc::new(Incoming::default());
 
     let stream = if body.is_end_stream() {
         session.submit_request(&views)?
@@ -401,48 +589,90 @@ where
         stream
     };
 
-    registry.insert(stream.get(), Arc::clone(slot), liveness);
+    registry.insert(stream.get(), Arc::clone(slot), incoming, liveness);
     Ok(())
 }
 
-/// Acts on everything the handlers observed.
-fn dispatch(session: &mut Session<Events>, events: &mut Events, registry: &Registry) -> Result<()> {
-    for (stream, len) in events.data.drain(..) {
-        // Phase 4 moves this to the receiving body, where the credit follows what the
-        // application has actually read. Crediting on arrival keeps the window open in
-        // the meantime, and exercises the manual flow-control path from the start.
-        //
-        // A stream that has since closed is not an error: the connection-level window
-        // still needs the credit, which is what this call gives it.
-        let _ = session.consume(StreamId::new(stream), len);
-    }
-
-    for (stream, fields) in core::mem::take(&mut events.heads) {
-        let Some(slot) = registry.slot(stream) else {
-            continue;
-        };
-        match head::response_head(&fields) {
-            Ok(head) => slot.complete(head),
-            Err(error) => {
-                slot.fail(error);
-                session.reset_stream(StreamId::new(stream), ErrorCode::PROTOCOL_ERROR)?;
+/// Acts on everything the handlers observed, in the order they observed it.
+fn dispatch(
+    session: &mut Session<Events>,
+    events: &mut Events,
+    registry: &Registry,
+    shared: &Arc<Shared>,
+) -> Result<()> {
+    for event in core::mem::take(&mut events.list) {
+        match event {
+            Event::Head { stream, fields } => {
+                let (Some(slot), Some(incoming)) =
+                    (registry.slot(stream), registry.incoming(stream))
+                else {
+                    continue;
+                };
+                match head::response_head(&fields) {
+                    Ok(head) => slot.complete(head.map(|()| {
+                        IncomingBody::new(stream, Arc::clone(&incoming), Arc::clone(shared))
+                    })),
+                    Err(error) => {
+                        slot.fail(error);
+                        incoming.fail(Error::new(
+                            ErrorKind::Protocol,
+                            "the peer sent a response head this crate could not accept",
+                        ));
+                        session.reset_stream(StreamId::new(stream), ErrorCode::PROTOCOL_ERROR)?;
+                    }
+                }
             }
-        }
-    }
 
-    for (stream, code) in events.closes.drain(..) {
-        let Some(entry) = registry.remove(stream) else {
-            continue;
-        };
-        if !entry.slot.is_settled() {
-            entry.slot.fail(if code == ErrorCode::NO_ERROR {
-                Error::new(
-                    ErrorKind::Stream,
-                    "the stream closed before a response head arrived",
-                )
-            } else {
-                Error::new(ErrorKind::Stream, "the peer reset the stream")
-            });
+            Event::Trailers { stream, fields } => {
+                let Some(incoming) = registry.incoming(stream) else {
+                    continue;
+                };
+                match head::trailers(&fields) {
+                    Ok(trailers) => incoming.set_trailers(trailers),
+                    Err(error) => {
+                        incoming.fail(error);
+                        session.reset_stream(StreamId::new(stream), ErrorCode::PROTOCOL_ERROR)?;
+                    }
+                }
+            }
+
+            Event::Data { stream, data, .. } => {
+                let len = data.len();
+                // Nothing will read payload for a stream nobody is tracking, or one whose
+                // body has been dropped, so its window capacity is returned at once rather
+                // than being held against a reader that will never arrive.
+                let unwanted = registry
+                    .incoming(stream)
+                    .map_or(len, |incoming| incoming.push(data));
+                if unwanted > 0 {
+                    session.consume(StreamId::new(stream), unwanted)?;
+                }
+            }
+
+            Event::End { stream } => {
+                if let Some(incoming) = registry.incoming(stream) {
+                    incoming.finish();
+                }
+            }
+
+            Event::Close { stream, code } => {
+                let Some(entry) = registry.remove(stream) else {
+                    continue;
+                };
+                if !entry.slot.is_settled() {
+                    entry.slot.fail(if code == ErrorCode::NO_ERROR {
+                        Error::new(
+                            ErrorKind::Stream,
+                            "the stream closed before a response head arrived",
+                        )
+                    } else {
+                        Error::new(ErrorKind::Stream, "the peer reset the stream")
+                    });
+                }
+                // A no-op once the message has ended: what is still queued is the whole
+                // of it, and the caller is entitled to read it after the stream is gone.
+                entry.incoming.fail(shared::truncated());
+            }
         }
     }
 

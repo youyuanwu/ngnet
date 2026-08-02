@@ -123,6 +123,7 @@ pub struct Duplex {
     /// strategies can be exercised against the same in-memory plumbing.
     borrowed_writes: bool,
     writes: Arc<Mutex<usize>>,
+    reads: Arc<Mutex<Vec<(usize, usize)>>>,
 }
 
 /// Creates a connected pair.
@@ -139,12 +140,14 @@ pub fn duplex(borrowed_writes: bool) -> (Duplex, Duplex) {
             outgoing: Arc::clone(&two),
             borrowed_writes,
             writes: Arc::new(Mutex::new(0)),
+            reads: Arc::new(Mutex::new(Vec::new())),
         },
         Duplex {
             incoming: two,
             outgoing: one,
             borrowed_writes,
             writes: Arc::new(Mutex::new(0)),
+            reads: Arc::new(Mutex::new(Vec::new())),
         },
     )
 }
@@ -166,9 +169,76 @@ impl Duplex {
         }
     }
 
+    /// A handle that keeps observing the read buffers after the transport is split.
+    ///
+    /// The buffers the driver reads into are its own business and reach nothing else —
+    /// except the transport, which is handed each one. That makes this the only vantage
+    /// point from which "the octets a caller was given are the octets that were read" can
+    /// be checked rather than assumed.
+    pub fn buffer_log(&self) -> BufferLog {
+        BufferLog {
+            reads: Arc::clone(&self.reads),
+        }
+    }
+
     /// Signals end of stream to the peer.
     pub fn close(&self) {
         notifying(&self.outgoing, Pipe::close);
+    }
+}
+
+/// Where each read put its octets, in the order the reads happened.
+#[derive(Debug, Clone)]
+pub struct BufferLog {
+    reads: Arc<Mutex<Vec<(usize, usize)>>>,
+}
+
+impl BufferLog {
+    /// Every filled region so far, as `(address, length)`.
+    pub fn regions(&self) -> Vec<(usize, usize)> {
+        self.reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many reads have happened, for marking a point in time.
+    pub fn reads(&self) -> usize {
+        self.reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Whether `chunk` lies inside a region that was read into.
+    pub fn holds(&self, chunk: &[u8]) -> bool {
+        let start = chunk.as_ptr() as usize;
+        let end = start + chunk.len();
+        self.regions()
+            .into_iter()
+            .any(|(base, len)| start >= base && end <= base + len)
+    }
+
+    /// Whether any read from `mark` onwards wrote over the region `chunk` occupies.
+    pub fn overwrote(&self, chunk: &[u8], mark: usize) -> bool {
+        let start = chunk.as_ptr() as usize;
+        let end = start + chunk.len();
+        self.regions()
+            .into_iter()
+            .skip(mark)
+            .any(|(base, len)| start < base + len && base < end)
+    }
+
+    /// How many reads landed in a buffer an earlier read had already used.
+    ///
+    /// Without this, "no read overwrote the chunk you were holding" could pass simply
+    /// because no buffer was ever reused at all — a pool that recycles nothing satisfies
+    /// the letter of the rule and none of its point.
+    pub fn reuses(&self) -> usize {
+        let regions = self.regions();
+        let distinct: std::collections::BTreeSet<usize> =
+            regions.iter().map(|(base, _)| *base).collect();
+        regions.len() - distinct.len()
     }
 }
 
@@ -194,6 +264,7 @@ impl WriteCounter {
 #[derive(Debug)]
 pub struct DuplexReader {
     incoming: Arc<Mutex<Pipe>>,
+    reads: Arc<Mutex<Vec<(usize, usize)>>>,
 }
 
 /// The writing half of a [`Duplex`].
@@ -212,6 +283,7 @@ impl Transport for Duplex {
         (
             DuplexReader {
                 incoming: self.incoming,
+                reads: self.reads,
             },
             DuplexWriter {
                 outgoing: self.outgoing,
@@ -225,6 +297,7 @@ impl Transport for Duplex {
 impl TransportRead for DuplexReader {
     fn read(&mut self, mut buf: BytesMut) -> impl Future<Output = (io::Result<usize>, BytesMut)> {
         let incoming = Arc::clone(&self.incoming);
+        let reads = Arc::clone(&self.reads);
         async move {
             // Wait for something to read, or for the peer to close. Parking here rather
             // than returning zero is deliberate: a test that deadlocks should hang and
@@ -255,6 +328,12 @@ impl TransportRead for DuplexReader {
                 .drain(..take)
                 .collect();
             buf.extend_from_slice(&chunk);
+            // Recorded after the fill, so the region named is exactly the one the octets
+            // landed in.
+            reads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((buf.as_ptr() as usize, buf.len()));
             (Ok(take), buf)
         }
     }
@@ -515,8 +594,14 @@ impl http_body::Body for Scripted {
 
 /// Runs a sans-I/O session over a transport, as the peer of the connection under test.
 ///
-/// `step` runs once per pass with the session and the caller's state, which is where a
-/// test decides what to answer. Returns when the peer stops sending.
+/// `step` runs until it has nothing more to add, then whatever the session produced is
+/// written, then the peer waits for more input. Returns when the peer stops sending.
+///
+/// The step is re-run after each write rather than once per pass because some things only
+/// become legal once the previous thing has gone out — trailers, for one, cannot be
+/// submitted until the body they follow has been serialised. A peer that stepped only once
+/// per read would sit on them until the connection under test happened to send something,
+/// which is a property of this scaffolding rather than of HTTP/2.
 pub async fn serve<T: Transport, C>(
     transport: T,
     mut session: crate::Session<C>,
@@ -526,13 +611,16 @@ pub async fn serve<T: Transport, C>(
     let (mut reader, mut writer) = transport.split();
 
     loop {
-        step(&mut session, context);
+        loop {
+            step(&mut session, context);
 
-        let mut out = BytesMut::new();
-        while let Some(block) = session.send(context).expect("serialising") {
-            out.extend_from_slice(block);
-        }
-        if !out.is_empty() {
+            let mut out = BytesMut::new();
+            while let Some(block) = session.send(context).expect("serialising") {
+                out.extend_from_slice(block);
+            }
+            if out.is_empty() {
+                break;
+            }
             let (result, _returned) = writer.write(out.freeze()).await;
             result?;
         }

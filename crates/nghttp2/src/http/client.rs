@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use http_body::Body;
 
+use super::body::IncomingBody;
 use super::driver::{self, DriverGuard};
 use super::error::{Error, Result};
 use super::shared::{Command, HandleToken, Queue, Registry, Shared, Slot};
@@ -184,7 +185,7 @@ pub struct ResponseFuture {
 }
 
 impl Future for ResponseFuture {
-    type Output = Result<http::Response<()>>;
+    type Output = Result<http::Response<IncomingBody>>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         self.slot.poll(context.waker())
