@@ -1,0 +1,16 @@
+# The toolchain everyone builds with, contributors and CI alike. Pinned rather than
+# tracking `stable` so that a lint added by a new release lands when someone chooses to
+# raise this number, not on the morning it ships — a red build nobody caused is a red
+# build nobody owns.
+#
+# This is *not* the minimum supported version. That is `rust-version` in each library
+# crate's manifest (1.85), which nothing currently verifies — the benchmark crate's
+# Criterion dependency needs 1.86, so a workspace-wide check cannot pass. The two numbers
+# move independently: raising this is routine, raising the MSRV is a breaking change for
+# anyone depending on the crate.
+#
+# rustup reads this file automatically, so `cargo test` in a clone uses it with no setup.
+[toolchain]
+channel = "1.95.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

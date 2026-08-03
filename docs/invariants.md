@@ -72,6 +72,10 @@ frames, not the one-off cost of standing a stream up.
 The feature matrix matters: a doc link to a `tokio`-gated item once passed `--all-features`
 and broke every other configuration.
 
+`.github/workflows/ci.yml` runs everything below on every pull request. It reads the
+compiler from `rust-toolchain.toml`, so a local run uses the same one. **If you add a check
+to CI, add it here too** — this list and that workflow are meant to say the same thing.
+
 ```sh
 cargo test --workspace --all-features
 cargo test --workspace
@@ -85,7 +89,16 @@ cargo clippy -p nghttp2 --no-default-features --all-targets -- -D warnings
 for f in "" "--no-default-features" "--all-features" "--features tokio"; do
   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p nghttp2 $f
 done
+
+# Runs each benchmark once without timing it. Benchmarks are not part of `cargo test`, so
+# without this they rot silently as the API moves.
+cargo bench --workspace -- --test
 ```
 
 Run `touch crates/nghttp2/src/lib.rs` before a final run so no stale incremental artefact
 flatters the result.
+
+Two things CI deliberately does not do, both explained in the workflow: no repository-wide
+`cargo fmt --check` (this repo is not globally rustfmt-clean, and the convention is to
+format only touched files), and no MSRV job (the benchmark crate's Criterion needs 1.86,
+above the libraries' declared 1.85, so a workspace-wide check cannot pass).

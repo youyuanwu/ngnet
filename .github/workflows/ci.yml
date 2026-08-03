@@ -1,0 +1,112 @@
+name: CI
+
+# Everything this workflow runs is listed in docs/invariants.md. If you add a check here,
+# add it there too, so the two do not drift.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push makes an in-flight run obsolete. Cancelling matters more here than in most
+# repositories: the build compiles libnghttp2 from source, so a superseded run is not merely
+# noise, it is several minutes of a runner.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Costs nothing until something fails, and when it fails on a machine you cannot attach
+  # to, it is the only thing you have.
+  RUST_BACKTRACE: 1
+
+jobs:
+  ci:
+    name: Test, clippy and docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Non-recursive on purpose. nghttp2 declares nested submodules — mruby,
+          # neverbleed, munit and more — that only its own tests and tooling need, while
+          # this repository builds the library alone. `true` is the non-recursive form and
+          # matches the minimum checkout the README documents; `recursive` would fetch the lot.
+          submodules: true
+
+      # Reads the channel and components from rust-toolchain.toml, so the pin lives in one
+      # place and a contributor's local `cargo test` uses the same compiler this does.
+      # Caching comes with this action, which is worth having when a cold build is dominated
+      # by compiling libnghttp2 from source.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev
+
+      # Three genuinely different builds. The async layer sits behind a default-on feature
+      # and the sans-I/O core has to stand up without it; `--all-features` additionally
+      # pulls in the compio transport, which exists to show the transport traits fit a
+      # completion-based runtime rather than only a readiness-based one.
+      - name: Test (all features)
+        run: cargo test --workspace --all-features
+
+      - name: Test (default features)
+        run: cargo test --workspace
+
+      - name: Test (sans-I/O core alone)
+        run: cargo test -p nghttp2 --no-default-features
+
+      # `--all-targets` reaches benchmarks and examples as well as tests, which is half of
+      # what keeps the benchmark crate from rotting.
+      - name: Clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Clippy (default features)
+        run: cargo clippy -p nghttp2 --all-targets -- -D warnings
+
+      - name: Clippy (sans-I/O core alone)
+        run: cargo clippy -p nghttp2 --no-default-features --all-targets -- -D warnings
+
+      # Four configurations rather than one, because of a bug this repository actually
+      # shipped: a doc link to an item behind the `tokio` feature passed `--all-features`
+      # and broke every build without it. `--all-features` alone is not a documentation check.
+      - name: Rustdoc across the feature matrix
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          for features in "" "--no-default-features" "--all-features" "--features tokio"; do
+            echo "::group::cargo doc ${features:-(default)}"
+            cargo doc --no-deps -p nghttp2 $features
+            echo "::endgroup::"
+          done
+
+      # Benchmarks are not run here for their numbers. A shared runner has noisy
+      # neighbours, no frequency control and no guaranteed CPU model, so a timing threshold
+      # would fail on scheduling luck and be muted within a fortnight — and a muted alarm
+      # still costs attention. `--test` runs each benchmark once and checks it completes,
+      # which catches the real risk: benchmarks are not part of `cargo test`, so they rot
+      # silently as the API moves.
+      #
+      # Tracking performance over time needs a dedicated machine with a pinned core and
+      # saved baselines. See docs/benchmarks.md.
+      - name: Benchmarks compile and run once
+        run: cargo bench --workspace -- --test
+
+# Deliberately absent: a `cargo fmt --check` gate. This repository is not globally
+# rustfmt-clean, and the convention is to format only the files a change touches
+# (`rustfmt --edition 2024 <file>`). A repository-wide gate would fail on every pull request
+# for reasons unrelated to the change in it. Reformatting everything at once would settle
+# the matter, but that is a decision to take deliberately rather than a side effect of
+# adding CI.
+#
+# Also absent: an MSRV job. The library crates still declare `rust-version = "1.85"`, but
+# the benchmark crate's Criterion dependency requires 1.86, so a workspace-wide check fails
+# for a crate that is never published. Checking the published crates alone would mean a
+# second toolchain and a second cold build of libnghttp2 for a claim that changes rarely.

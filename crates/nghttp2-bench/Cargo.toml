@@ -1,0 +1,41 @@
+[package]
+name = "nghttp2-bench"
+version = "0.1.0"
+description = "Criterion benchmarks comparing the nghttp2 async HTTP/2 stack against hyper over an in-memory duplex"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# This crate exists so the comparison against a third-party HTTP/2 stack lives outside
+# `nghttp2`, which takes exactly one dependency and no dev-dependencies. Everything the
+# benches need is declared in the workspace and pulled in here, never there.
+[dependencies]
+# The `tokio` feature is what supplies this crate's own `TokioIo` transport adapter.
+nghttp2 = { workspace = true, features = ["tokio"] }
+tokio.workspace = true
+
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+# `harness = false` on each bench hands the whole `main` to Criterion rather than to
+# libtest, which is what lets Criterion time and report the iterations itself.
+[[bench]]
+name = "serial_latency"
+harness = false
+
+[[bench]]
+name = "concurrent_throughput"
+harness = false
+
+[[bench]]
+name = "body_throughput"
+harness = false

@@ -8,6 +8,7 @@ what is here is the reasoning a reader cannot recover from the source.
 | [`design.md`](design.md) | How the crates fit together, the mechanisms the async layer rests on, and why each was chosen over the alternative that looks simpler. |
 | [`pending-work.md`](pending-work.md) | Known gaps and deferred decisions, each with the evidence that produced it and what would settle it. |
 | [`invariants.md`](invariants.md) | The properties the test suite pins rather than merely exercises, and where each is enforced. |
+| [`benchmarks.md`](benchmarks.md) | How the `nghttp2` vs hyper HTTP/2 benchmarks are run, what their numbers do and do not mean, and which protocol settings are matched between the two stacks. |
 
 ## Orientation
 
