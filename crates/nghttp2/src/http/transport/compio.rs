@@ -44,8 +44,12 @@
 //! dependency graph, so if *anything else* in your build enables compio's `polling` feature,
 //! compio compiles its fusion driver and regains the silent epoll fallback — without this
 //! crate asking for it or being able to prevent it. A caller who depends on running on
-//! io_uring should assert it at runtime rather than infer it from this crate's manifest;
-//! `compio::runtime::Runtime::driver_type` reports what was actually obtained.
+//! io_uring should check it rather than infer it from this crate's manifest.
+//! `compio::runtime::Runtime::driver_type` reports what was obtained, though note it can only
+//! reveal a *fallback that actually happened*: in a build without `polling` it is a
+//! compile-time constant, and in a fusion build on a host that has io_uring it will report
+//! io_uring quite correctly while the fallback sits armed for a host that does not.
+//! `cargo tree -e features` is what shows whether `polling` reached the build at all.
 
 use bytes::{Bytes, BytesMut};
 use compio::buf::BufResult;

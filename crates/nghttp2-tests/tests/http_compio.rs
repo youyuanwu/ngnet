@@ -14,14 +14,31 @@
 //! earlier version of this file skipped when a runtime could not be created, which was right
 //! when compiling was the claim and is wrong now that running is.
 //!
-//! # Why the backend is asserted rather than assumed
+//! # Why the backend is asserted, and exactly what that does and does not catch
 //!
 //! The manifest is not a guarantee, because cargo unifies features across the whole
 //! dependency graph: if any crate anywhere in a build enables compio's `polling` feature,
 //! compio compiles its fusion driver, which probes the kernel and silently degrades to epoll.
-//! Nothing in this workspace asks for `polling` today, but nothing in this workspace could
-//! stop a future dependency from doing so either. The assertion below is what would notice —
-//! it is the only check that survives a change to a manifest nobody here owns.
+//! Nothing in this workspace asks for `polling` today, and nothing in it could stop a future
+//! dependency from doing so.
+//!
+//! The assertion below is worth having, but it is narrower than it first appears and the
+//! difference matters. In the build this workspace actually produces — io_uring alone — the
+//! reported driver type is a compile-time constant
+//! (`compio-driver-0.12.4/src/sys/driver/iour/mod.rs:148-150`), so the assertion is trivially
+//! true and costs nothing. It can only *fail* in a fusion build running on a host that lacks
+//! io_uring. So:
+//!
+//! - It **catches** a real degradation: a fusion build that quietly fell back to epoll,
+//!   which is the outcome that would make every measurement taken through this transport a
+//!   lie.
+//! - It **does not catch** a `polling` feature arriving through unification on a host that
+//!   has io_uring, because the fusion driver would still probe and choose io_uring there. The
+//!   build would be less guaranteed than intended and every test would still pass.
+//!
+//! The check for that second case is the dependency tree, not a runtime assertion:
+//! `cargo tree -e features` shows whether `compio-driver` carries `polling`. That is manual
+//! verification, and it is recorded as such rather than dressed up as automated.
 
 #![cfg(feature = "completion")]
 
@@ -83,22 +100,21 @@ async fn echo(request: http::Request<IncomingBody>) -> http::Response<Full> {
         .expect("a well-formed response")
 }
 
-/// The runtime this build actually gets is io_uring, not a readiness driver wearing its name.
+/// The runtime this build gets is io_uring, not a readiness driver wearing its name.
 ///
-/// Guards the property the whole feature rests on. `polling` is absent from this workspace's
-/// compio features, so compio builds its io_uring driver alone — but feature unification means
-/// a dependency added years from now could put `polling` back, restoring the fusion driver and
-/// its silent epoll fallback. This test is what turns that from an invisible regression into a
-/// failing build.
+/// See the module documentation for what this catches and what it does not: it fires only in
+/// a fusion build on a host without io_uring, which is the case where a silent fallback would
+/// otherwise make everything measured through this transport misleading.
 #[test]
 fn the_completion_transport_runs_on_io_uring() {
     let runtime = compio::runtime::Runtime::new().expect("compio needs io_uring to start");
     assert_eq!(
         runtime.driver_type(),
         compio::driver::DriverType::IoUring,
-        "the completion transport must run on io_uring; a readiness driver here means \
-         compio's `polling` feature was enabled somewhere in the dependency graph, which \
-         restores the fusion driver and its silent fallback to epoll"
+        "the completion transport is running on a readiness driver. Both of these are true: \
+         compio's `polling` feature is enabled somewhere in the dependency graph, so the \
+         fusion driver was compiled; and io_uring could not be obtained on this host, so it \
+         fell back. Check `cargo tree -e features` for the first and the kernel for the second"
     );
 }
 
@@ -107,12 +123,10 @@ fn the_completion_transport_runs_on_io_uring() {
 /// Failing to start a runtime is a failure of this test, not a reason to skip it.
 #[test]
 fn an_exchange_completes_over_the_shipped_compio_transport() {
+    // The driver is asserted once, in `the_completion_transport_runs_on_io_uring`. Repeating
+    // it here would be noise rather than defence: both construct the runtime the same way, so
+    // neither could fail without the other.
     let runtime = compio::runtime::Runtime::new().expect("compio needs io_uring to start");
-    assert_eq!(
-        runtime.driver_type(),
-        compio::driver::DriverType::IoUring,
-        "this exchange must run on io_uring for it to be evidence about a completion transport"
-    );
 
     runtime.block_on(async {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("binding");
