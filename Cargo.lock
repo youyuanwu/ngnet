@@ -322,6 +322,7 @@ dependencies = [
  "compio-io",
  "compio-log",
  "compio-send-wrapper",
+ "criterion",
  "futures-util",
  "libc",
  "pin-project-lite",
@@ -840,6 +841,7 @@ name = "nghttp2-bench"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "compio",
  "criterion",
  "http",
  "http-body",

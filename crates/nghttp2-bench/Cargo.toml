@@ -12,9 +12,15 @@ rust-version.workspace = true
 # `nghttp2`, which takes exactly one dependency and no dev-dependencies. Everything the
 # benches need is declared in the workspace and pulled in here, never there.
 [dependencies]
-# The `tokio` feature is what supplies this crate's own `TokioIo` transport adapter.
-nghttp2 = { workspace = true, features = ["tokio"] }
+# The `tokio` feature supplies this crate's own `TokioIo` transport adapter; `completion`
+# supplies `CompioIo`, the io_uring transport the second benchmark family measures. Both
+# adapters ship in `nghttp2`; this crate only enables them.
+nghttp2 = { workspace = true, features = ["tokio", "completion"] }
 tokio.workspace = true
+# The completion runtime under test. Its `criterion` feature adds the `AsyncExecutor` impl
+# for compio's `Runtime`, so `b.to_async(&compio_runtime)` drives it exactly as the tokio
+# benches drive a tokio runtime.
+compio = { workspace = true, features = ["criterion"] }
 
 bytes.workspace = true
 http.workspace = true
@@ -38,4 +44,19 @@ harness = false
 
 [[bench]]
 name = "body_throughput"
+harness = false
+
+# The completion-vs-readiness family. Same three measures as above, but holding the HTTP/2
+# stack constant and varying only the transport: `CompioSocket` on io_uring against
+# `TokioSocket` on epoll, over a real loopback socket.
+[[bench]]
+name = "transport_serial_latency"
+harness = false
+
+[[bench]]
+name = "transport_concurrent_throughput"
+harness = false
+
+[[bench]]
+name = "transport_body_throughput"
 harness = false
