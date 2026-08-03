@@ -99,13 +99,22 @@ independent runs:
 | Body 64 KiB | **283–358 MiB/s** | 241–283 MiB/s | compio ahead |
 | Body 1 MiB | 369–391 MiB/s | 329–398 MiB/s | tie |
 
-**The crossover is the finding, not either endpoint.** io_uring is *slower* for a single
-request in flight and roughly twice as fast once eight or more streams are multiplexed on the
-connection. One mechanism explains both: a single request has nothing to batch, so it pays
-io_uring's per-operation submission cost against epoll's cheaper single syscall; at high
-concurrency the ring batches many submissions and completions into far fewer syscalls than a
-readiness loop can. This was checked rather than assumed — the "it is really task-scheduling
-overhead" explanation was falsified by the N=1 result, where tokio wins the identical spawn
+**The crossover is the finding, not either endpoint.** io_uring loses on an *empty-body*
+round trip and wins everywhere there is more I/O to do — roughly twice as fast once eight
+streams are multiplexed, and ahead on every body size up to the point where copying starts to
+dominate.
+
+The organising quantity is how many I/O operations there are to batch, not concurrency as
+such. An empty-body exchange is a handful of operations with nothing to fold together, so
+io_uring pays its per-operation submission cost against epoll's cheaper single syscall and
+loses. Add body bytes, or add streams, and the ring folds many submissions and completions
+into far fewer syscalls than a readiness loop can manage. That is why compio leads at 1 KiB
+and 64 KiB despite those also being one request at a time — a fact worth stating, because
+"io_uring is slower for a single request" would be the obvious summary and this table
+contradicts it.
+
+The mechanism was checked rather than assumed: the "it is really task-scheduling overhead"
+explanation was falsified by the N=1 concurrent result, where tokio wins the identical spawn
 pattern.
 
 The 1 MiB tie is consistent with the write-path asymmetry described below: tokio's borrowed

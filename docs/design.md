@@ -93,8 +93,9 @@ features` is what shows whether `polling` reached the build at all. Neither chec
 other, and conflating them was a mistake caught in review.
 
 **What it costs, measured.** io_uring is about twice as fast once several streams are
-multiplexed on a connection, and *slower* for a single request in flight — one mechanism
-explains both, since a lone request has nothing to batch. See `docs/benchmarks.md` for the
+multiplexed on a connection, and *slower* only on empty-body round trips — one mechanism
+explains both, since what it batches is I/O operations, and an empty exchange has almost none
+to fold together. See `docs/benchmarks.md` for the
 numbers and, more importantly, for the three confounds that bound what they license.
 
 ## Decisions that cost a wrong attempt first

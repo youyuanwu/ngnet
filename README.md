@@ -107,15 +107,20 @@ assert_eq!(response.status(), 200);
 The `TokioIo` transport comes from the optional, off-by-default `tokio` feature. A second
 ready-made transport, `CompioIo`, comes from the off-by-default `completion` feature and runs
 on [compio](https://github.com/compio-rs/compio) over **io_uring** — the completion-based
-shape these traits were designed around. It compiles no readiness backend, so it uses io_uring
-or fails to start rather than quietly falling back to epoll; enable it only where io_uring is
-available. On any other runtime, implementing the three transport traits is a twenty-line job.
+shape these traits were designed around. This crate asks compio for no readiness backend, so
+a build that takes its dependency as declared uses io_uring or fails to start rather than
+quietly falling back to epoll; enable it only where io_uring is available. That is not an
+absolute guarantee — cargo unifies features across a whole dependency graph, so another crate
+enabling compio's `polling` would restore the fallback, and the module documentation explains
+how to check. On any other runtime, implementing the three transport traits is a twenty-line
+job.
 A runnable server is in
 [`examples/h2c_async_server.rs`](crates/nghttp2/examples/h2c_async_server.rs), answering
 the same `curl --http2-prior-knowledge` as the blocking one.
 
 Which to pick is measured rather than asserted: io_uring is roughly twice as fast once several
-streams are multiplexed on a connection, and slower for a single request in flight. See
+streams are multiplexed on a connection, and slower only on empty-body round trips, where there
+is nothing for it to batch. See
 [`docs/benchmarks.md`](docs/benchmarks.md), which also bounds what those numbers license.
 
 ### When to disable the feature
