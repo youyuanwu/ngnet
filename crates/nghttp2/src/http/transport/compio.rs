@@ -33,24 +33,32 @@
 //!
 //! # The backend
 //!
-//! The crate depends on compio with its `io-uring` backend and no other, so a runtime either
-//! uses io_uring or fails to start. There is deliberately no fallback to a readiness driver:
-//! a transport that quietly became epoll while still calling itself completion-based would
-//! make every measurement taken through it a lie, and would answer a question the caller did
-//! not ask. Where io_uring is unavailable, this feature is the wrong feature to enable.
+//! This crate depends on compio with its `io-uring` backend and asks for no readiness one, so
+//! by default there is nothing to fall back to: a runtime either uses io_uring or fails to
+//! start. That is deliberate. A transport that quietly became epoll while still calling itself
+//! completion-based would make every measurement taken through it a lie, and would answer a
+//! question the caller did not ask. Where io_uring is unavailable, this is the wrong feature
+//! to enable.
+//!
+//! One caveat, because the guarantee is not absolute: cargo unifies features across a
+//! dependency graph, so if *anything else* in your build enables compio's `polling` feature,
+//! compio compiles its fusion driver and regains the silent epoll fallback — without this
+//! crate asking for it or being able to prevent it. A caller who depends on running on
+//! io_uring should assert it at runtime rather than infer it from this crate's manifest;
+//! `compio::runtime::Runtime::driver_type` reports what was actually obtained.
 
 use bytes::{Bytes, BytesMut};
 use compio::buf::BufResult;
-use compio::io::{AsyncReadExt, AsyncWrite};
-use compio::net::TcpStream;
+use compio::io::util::Splittable;
+use compio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 use super::{Transport, TransportRead, TransportWrite};
 
-/// Carries a compio TCP stream into this crate's transport traits.
+/// Carries a compio byte stream into this crate's transport traits.
 ///
-/// Named for a concrete stream type rather than generic over compio's I/O traits, because
-/// compio splits a stream by cloning its underlying descriptor rather than through a generic
-/// `split`, and that is a property of the socket types rather than of the traits.
+/// Generic over compio's [`Splittable`], so a `TcpStream` and a `UnixStream` are both
+/// accepted rather than only the one this was first written for — the connection does not
+/// care what the octets travel over.
 ///
 /// ```no_run
 /// # use nghttp2::http::testing::Empty;
@@ -64,55 +72,66 @@ use super::{Transport, TransportRead, TransportWrite};
 /// # }
 /// ```
 #[derive(Debug)]
-pub struct CompioIo {
-    stream: TcpStream,
+pub struct CompioIo<T> {
+    stream: T,
 }
 
-impl CompioIo {
+impl<T> CompioIo<T> {
     /// Wraps a compio stream.
-    pub const fn new(stream: TcpStream) -> Self {
+    pub const fn new(stream: T) -> Self {
         Self { stream }
     }
 
     /// Hands the stream back.
-    pub fn into_inner(self) -> TcpStream {
+    pub fn into_inner(self) -> T {
         self.stream
     }
 }
 
-impl Transport for CompioIo {
-    type Reader = CompioHalf;
-    type Writer = CompioHalf;
+impl<T> Transport for CompioIo<T>
+where
+    T: Splittable,
+    T::ReadHalf: AsyncRead,
+    T::WriteHalf: AsyncWrite,
+{
+    type Reader = CompioReader<T::ReadHalf>;
+    type Writer = CompioWriter<T::WriteHalf>;
 
     fn split(self) -> (Self::Reader, Self::Writer) {
-        let (reader, writer) = self.stream.into_split();
-        (CompioHalf { stream: reader }, CompioHalf { stream: writer })
+        // compio's own split, which for a socket hands back two handles to one descriptor
+        // rather than two distinct types. That is not the serialising fallback the transport
+        // trait warns about: there is no lock between them, so neither direction waits on the
+        // other and no head-of-line stall is reintroduced.
+        let (reader, writer) = self.stream.split();
+        (CompioReader { half: reader }, CompioWriter { half: writer })
     }
 }
 
-/// One direction of a [`CompioIo`].
-///
-/// Both halves are the same type because compio's split hands back two handles to the same
-/// socket rather than two distinct types. They are still independent for the purpose the
-/// split exists to serve: each can be borrowed and awaited without waiting on the other.
+/// The reading half of a [`CompioIo`].
 #[derive(Debug)]
-pub struct CompioHalf {
-    stream: TcpStream,
+pub struct CompioReader<R> {
+    half: R,
 }
 
-impl TransportRead for CompioHalf {
+/// The writing half of a [`CompioIo`].
+#[derive(Debug)]
+pub struct CompioWriter<W> {
+    half: W,
+}
+
+impl<R: AsyncRead> TransportRead for CompioReader<R> {
     async fn read(&mut self, buf: BytesMut) -> (std::io::Result<usize>, BytesMut) {
         // `append` rather than `read`, so octets land after whatever the buffer already
         // holds — the contract the connection relies on, and the same one tokio's `read_buf`
         // provides.
-        let BufResult(result, buf) = self.stream.append(buf).await;
+        let BufResult(result, buf) = self.half.append(buf).await;
         (result, buf)
     }
 }
 
-impl TransportWrite for CompioHalf {
+impl<W: AsyncWrite> TransportWrite for CompioWriter<W> {
     async fn write(&mut self, buf: Bytes) -> (std::io::Result<usize>, Bytes) {
-        let BufResult(result, buf) = self.stream.write(buf).await;
+        let BufResult(result, buf) = self.half.write(buf).await;
         (result, buf)
     }
 

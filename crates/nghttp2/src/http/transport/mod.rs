@@ -46,7 +46,7 @@ mod compio;
 mod tokio;
 
 #[cfg(feature = "completion")]
-pub use compio::{CompioHalf, CompioIo};
+pub use compio::{CompioIo, CompioReader, CompioWriter};
 #[cfg(feature = "tokio")]
 pub use tokio::{TokioIo, TokioReader, TokioWriter};
 
