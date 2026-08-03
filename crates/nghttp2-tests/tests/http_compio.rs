@@ -7,12 +7,21 @@
 //!
 //! # Why there is no tolerance of a missing io_uring
 //!
-//! The crate depends on compio with the `io-uring` backend and no other, so there is no
-//! readiness driver compiled in to fall back to. A host without io_uring fails to start a
-//! runtime, and that is the intended behaviour rather than a case to be tolerated — the
-//! alternative would be a transport quietly running on epoll while still calling itself
-//! completion-based. An earlier version of this file skipped when a runtime could not be
-//! created, which was right when compiling was the claim and is wrong now that running is.
+//! This workspace asks compio for the `io-uring` backend and no readiness one, so there is
+//! nothing compiled in to fall back to. A host without io_uring fails to start a runtime, and
+//! that is the intended behaviour rather than a case to be tolerated — the alternative would
+//! be a transport quietly running on epoll while still calling itself completion-based. An
+//! earlier version of this file skipped when a runtime could not be created, which was right
+//! when compiling was the claim and is wrong now that running is.
+//!
+//! # Why the backend is asserted rather than assumed
+//!
+//! The manifest is not a guarantee, because cargo unifies features across the whole
+//! dependency graph: if any crate anywhere in a build enables compio's `polling` feature,
+//! compio compiles its fusion driver, which probes the kernel and silently degrades to epoll.
+//! Nothing in this workspace asks for `polling` today, but nothing in this workspace could
+//! stop a future dependency from doing so either. The assertion below is what would notice —
+//! it is the only check that survives a change to a manifest nobody here owns.
 
 #![cfg(feature = "completion")]
 
@@ -74,13 +83,36 @@ async fn echo(request: http::Request<IncomingBody>) -> http::Response<Full> {
         .expect("a well-formed response")
 }
 
+/// The runtime this build actually gets is io_uring, not a readiness driver wearing its name.
+///
+/// Guards the property the whole feature rests on. `polling` is absent from this workspace's
+/// compio features, so compio builds its io_uring driver alone — but feature unification means
+/// a dependency added years from now could put `polling` back, restoring the fusion driver and
+/// its silent epoll fallback. This test is what turns that from an invisible regression into a
+/// failing build.
+#[test]
+fn the_completion_transport_runs_on_io_uring() {
+    let runtime = compio::runtime::Runtime::new().expect("compio needs io_uring to start");
+    assert_eq!(
+        runtime.driver_type(),
+        compio::driver::DriverType::IoUring,
+        "the completion transport must run on io_uring; a readiness driver here means \
+         compio's `polling` feature was enabled somewhere in the dependency graph, which \
+         restores the fusion driver and its silent fallback to epoll"
+    );
+}
+
 /// A whole exchange over the shipped transport, on a real socket, on compio's runtime.
 ///
-/// Failing to start a runtime is a failure of this test, not a reason to skip it. The
-/// feature compiles no readiness backend, so a runtime that starts is on io_uring.
+/// Failing to start a runtime is a failure of this test, not a reason to skip it.
 #[test]
 fn an_exchange_completes_over_the_shipped_compio_transport() {
     let runtime = compio::runtime::Runtime::new().expect("compio needs io_uring to start");
+    assert_eq!(
+        runtime.driver_type(),
+        compio::driver::DriverType::IoUring,
+        "this exchange must run on io_uring for it to be evidence about a completion transport"
+    );
 
     runtime.block_on(async {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("binding");
