@@ -87,6 +87,24 @@ jobs:
             echo "::endgroup::"
           done
 
+      # The completion transport's guarantee is that no readiness backend is compiled, so it
+      # cannot silently degrade to epoll. That is a property of the resolved dependency
+      # graph, not of any source file, and cargo unifies features across the whole workspace
+      # — so a crate added later could enable compio's `polling` and undo it with nothing in
+      # the code changing. The runtime assertion in the compio test only fires where io_uring
+      # is genuinely absent, which is not here; this is the check that catches it on a host
+      # that has io_uring, which is to say on this runner and on any developer's machine.
+      - name: The completion transport compiles no readiness backend
+        run: |
+          if cargo tree -p nghttp2 --features completion -e features \
+               | grep -q 'compio-driver feature "polling"'; then
+            echo "::error::compio's polling feature reached the build, which restores the"
+            echo "::error::fusion driver and its silent fallback to epoll. Find who enabled"
+            echo "::error::it with: cargo tree -p nghttp2 --features completion -e features"
+            exit 1
+          fi
+          echo "no readiness backend in the completion build"
+
       # Benchmarks are not run here for their numbers. A shared runner has noisy
       # neighbours, no frequency control and no guaranteed CPU model, so a timing threshold
       # would fail on scheduling luck and be muted within a fortnight — and a muted alarm

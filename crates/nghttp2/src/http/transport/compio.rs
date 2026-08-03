@@ -49,7 +49,8 @@
 //! reveal a *fallback that actually happened*: in a build without `polling` it is a
 //! compile-time constant, and in a fusion build on a host that has io_uring it will report
 //! io_uring quite correctly while the fallback sits armed for a host that does not.
-//! `cargo tree -e features` is what shows whether `polling` reached the build at all.
+//! `cargo tree -e features` is what shows whether `polling` reached the build at all, and this
+//! repository's CI runs exactly that check on every change.
 
 use bytes::{Bytes, BytesMut};
 use compio::buf::BufResult;

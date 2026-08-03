@@ -37,8 +37,9 @@
 //!   build would be less guaranteed than intended and every test would still pass.
 //!
 //! The check for that second case is the dependency tree, not a runtime assertion:
-//! `cargo tree -e features` shows whether `compio-driver` carries `polling`. That is manual
-//! verification, and it is recorded as such rather than dressed up as automated.
+//! `cargo tree -e features` shows whether `compio-driver` carries `polling`. CI runs that
+//! check on every change, so the two together cover both cases — this test catches a fallback
+//! that happened, and the tree check catches a build where one became possible.
 
 #![cfg(feature = "completion")]
 

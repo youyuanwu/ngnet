@@ -98,7 +98,21 @@ cargo bench --workspace -- --test
 Run `touch crates/nghttp2/src/lib.rs` before a final run so no stale incremental artefact
 flatters the result.
 
+CI additionally checks a property no source file carries: that the completion transport's
+build contains **no readiness backend**. That is a fact about the resolved dependency graph,
+and cargo unifies features across the workspace, so a crate added later could enable compio's
+`polling` and restore the silent epoll fallback without a line of code changing. The runtime
+assertion in the compio test only fires where io_uring is genuinely absent, which is not true
+of CI or of most developer machines — this is the check that catches it where io_uring exists.
+
+```sh
+cargo tree -p nghttp2 --features completion -e features | grep 'compio-driver feature "polling"'
+```
+
 Two things CI deliberately does not do, both explained in the workflow: no repository-wide
 `cargo fmt --check` (this repo is not globally rustfmt-clean, and the convention is to
-format only touched files), and no MSRV job (the benchmark crate's Criterion needs 1.86,
-above the libraries' declared 1.85, so a workspace-wide check cannot pass).
+format only touched files), and no MSRV job. On the second, note that the `completion`
+feature has a **higher minimum toolchain** than the crate's declared `rust-version`: compio's
+buffer crate needs a newer compiler than 1.85. The default and `tokio` builds do honour 1.85,
+which was not true before this was checked — a let-chain had been present since the first
+commit, making the declared minimum wrong from the beginning.
