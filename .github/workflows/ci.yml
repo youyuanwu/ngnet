@@ -81,7 +81,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          for features in "" "--no-default-features" "--all-features" "--features tokio"; do
+          for features in "" "--no-default-features" "--all-features" "--features tokio" "--features completion"; do
             echo "::group::cargo doc ${features:-(default)}"
             cargo doc --no-deps -p nghttp2 $features
             echo "::endgroup::"

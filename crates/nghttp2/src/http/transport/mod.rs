@@ -40,9 +40,13 @@ use core::future::Future;
 
 use bytes::{Bytes, BytesMut};
 
+#[cfg(feature = "completion")]
+mod compio;
 #[cfg(feature = "tokio")]
 mod tokio;
 
+#[cfg(feature = "completion")]
+pub use compio::{CompioHalf, CompioIo};
 #[cfg(feature = "tokio")]
 pub use tokio::{TokioIo, TokioReader, TokioWriter};
 

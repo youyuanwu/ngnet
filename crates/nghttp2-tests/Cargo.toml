@@ -12,11 +12,11 @@ rust-version.workspace = true
 # the wrapper itself acquiring a dependency on one. `nghttp2` has exactly one dependency
 # and no dev-dependencies, and a test asserts as much; anything needing more belongs here.
 [features]
-# Compiles the async layer's transport traits against a real completion-based runtime.
-# Off by default because io_uring is not available everywhere, and compiling is the bar:
-# what is being proven is that the traits *fit* a completion API — its buffer types and its
-# thread-per-core executor included — not that this machine can run one.
-completion = ["dep:compio"]
+# Exercises the shipped compio transport over a real io_uring socket. Off by default
+# because it requires io_uring: the crate compiles no readiness backend, so running is the
+# bar rather than compiling, and a host without io_uring fails rather than quietly using
+# epoll while still calling itself completion-based.
+completion = ["dep:compio", "nghttp2/completion"]
 
 [dependencies]
 nghttp2 = { workspace = true, features = ["tokio"] }

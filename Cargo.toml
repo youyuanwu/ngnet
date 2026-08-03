@@ -19,14 +19,17 @@ rust-version = "1.85"
 [workspace.dependencies]
 bindgen = "0.72"
 bytes = "1"
-# `polling` rather than the default `io-uring`: what is being proven is that the transport
-# traits fit a completion API, and the epoll-backed driver presents the same completion
-# shape while running anywhere. Environments with io_uring can swap the feature.
+# `io-uring` and deliberately *not* `polling`: with both, compio compiles a fusion driver
+# that probes the kernel and silently falls back to epoll when io_uring cannot be obtained.
+# A transport that quietly became readiness-based while still calling itself completion-based
+# would make every measurement taken through it a lie, and pinning the driver at each call
+# site cannot help a downstream user who builds their own runtime. With one backend compiled
+# there is nothing to fall back to: the runtime uses io_uring or fails to start.
 compio = { version = "0.19", default-features = false, features = [
     "bytes",
     "io",
+    "io-uring",
     "net",
-    "polling",
     "runtime",
 ] }
 cmake = "0.1"

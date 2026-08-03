@@ -86,7 +86,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo clippy -p nghttp2 --all-targets -- -D warnings
 cargo clippy -p nghttp2 --no-default-features --all-targets -- -D warnings
 
-for f in "" "--no-default-features" "--all-features" "--features tokio"; do
+for f in "" "--no-default-features" "--all-features" "--features tokio" "--features completion"; do
   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p nghttp2 $f
 done
 
