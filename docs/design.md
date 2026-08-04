@@ -70,6 +70,34 @@ of each pass. Because a waker can fire re-entrantly from *inside* a session call
 waking itself while being read — every structure written from a callback takes only a short
 leaf-level lock that the driver never holds across a session call.
 
+## The completion transport, and why it compiles no fallback
+
+A second transport ships behind the off-by-default `completion` feature: compio, over
+io_uring. It exists because a completion runtime is where these traits' shape earns itself —
+`read`/`write` pass buffer ownership in and hand it back, which is what a completion API
+requires and what a readiness API satisfies for free.
+
+The workspace asks compio for its `io-uring` backend and **no readiness one**. That is
+deliberate and it is the whole design. With both backends compiled, compio builds a *fusion*
+driver that probes the kernel and silently degrades to epoll when io_uring cannot be obtained.
+A transport that quietly became readiness-based while still calling itself completion-based
+would make every measurement taken through it a lie. Pinning the driver at our own call sites
+would not fix that, because a transport ships to users who construct their own runtimes — so
+the guarantee has to live somewhere they inherit it, which is the manifest.
+
+The guarantee is not absolute, and the documentation says so rather than pretending otherwise:
+cargo unifies features across a whole dependency graph, so a crate elsewhere in a build
+enabling compio's `polling` would restore the fusion driver, and nothing here could prevent it.
+A runtime assertion catches the case where a fallback *actually happened*; `cargo tree -e
+features` is what shows whether `polling` reached the build at all. Neither check subsumes the
+other, and conflating them was a mistake caught in review.
+
+**What it costs, measured.** io_uring is about twice as fast once several streams are
+multiplexed on a connection, and *slower* only on empty-body round trips — one mechanism
+explains both, since what it batches is I/O operations, and an empty exchange has almost none
+to fold together. See `docs/benchmarks.md` for the
+numbers and, more importantly, for the three confounds that bound what they license.
+
 ## Decisions that cost a wrong attempt first
 
 - **`Role::signals` returns live closures, not booleans.** Reading the role's "busy"/"done"

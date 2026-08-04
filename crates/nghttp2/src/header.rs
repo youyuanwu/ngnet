@@ -159,12 +159,14 @@ pub(crate) fn validate(headers: &[Header<'_>]) -> Result<()> {
             }
         }
 
-        if let (Some(&first), Some(&last)) = (header.value.first(), header.value.last())
-            && (matches!(first, b' ' | b'\t') || matches!(last, b' ' | b'\t'))
-        {
-            return Err(invalid(
-                "a header value must not begin or end with whitespace",
-            ));
+        // Nested rather than a let-chain: those stabilised in 1.88, above this crate's
+        // declared minimum.
+        if let (Some(&first), Some(&last)) = (header.value.first(), header.value.last()) {
+            if matches!(first, b' ' | b'\t') || matches!(last, b' ' | b'\t') {
+                return Err(invalid(
+                    "a header value must not begin or end with whitespace",
+                ));
+            }
         }
     }
 

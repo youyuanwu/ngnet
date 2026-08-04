@@ -7,6 +7,18 @@
 //! protocol and wrapper CPU work, never the kernel. See `docs/benchmarks.md` for what that
 //! does and does not tell you.
 //!
+//! # The second comparison: completion vs readiness I/O
+//!
+//! A second benchmark family holds the HTTP/2 stack constant — `nghttp2` on both sides — and
+//! varies only the transport underneath: [`CompioSocket`] carries it over io_uring on
+//! compio, [`TokioSocket`] over epoll on tokio, both over a real loopback TCP connection.
+//! Where the duplex benches ask which *stack* is faster, these ask what the *I/O model*
+//! costs or saves for one fixed stack. Because a duplex has no file descriptor, no
+//! completion runtime can appear in the first family at all; these fixtures use real sockets
+//! precisely so it can. The confound controls those benches rely on — matched `TCP_NODELAY`,
+//! one worker thread each, external `taskset` pinning — are set here in the fixtures and
+//! documented in `docs/benchmarks.md`.
+//!
 //! # The two `TokioIo` types
 //!
 //! This crate touches two unrelated adapters that happen to share a name:
@@ -27,7 +39,12 @@ use tokio::io::duplex;
 use tokio::runtime::{Builder, Runtime};
 use tokio::task::JoinSet;
 
-use nghttp2::http::transport::TokioIo as NgHttpIo;
+use compio::driver::DriverType;
+use compio::net::{TcpListener as CompioTcpListener, TcpStream as CompioTcpStream};
+use compio::runtime::Runtime as CompioRuntime;
+use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
+
+use nghttp2::http::transport::{CompioIo, TokioIo as NgHttpIo};
 use nghttp2::http::{Config, IncomingBody, SendRequest, handshake_with, serve_with};
 
 use hyper::client::conn::http2 as hyper_client;
@@ -322,6 +339,190 @@ impl Hyper {
         }
         while let Some(joined) = set.join_next().await {
             joined.expect("a request task");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Completion vs readiness I/O, over a real socket
+// ---------------------------------------------------------------------------
+//
+// The two fixtures below run the *same* `nghttp2` stack over the *same* workload; the only
+// thing that differs is the transport and the runtime driving it. Everything the two share —
+// the `Config`, the request shape, the echo handler, the drain — is reused from above rather
+// than restated, so a difference in the numbers cannot be a difference in what was measured.
+
+/// A single-threaded compio runtime, asserted to be io_uring.
+///
+/// One worker thread, to match the tokio side's `current_thread` runtime: comparing a
+/// thread-per-core runtime against a work-stealing one spread over every core would measure
+/// the schedulers, not the I/O model. The backend is checked here and printed, because a
+/// benchmark result outlives the manifest that produced it — a number carried forward without
+/// its provenance is worthless, and a number from epoll wearing io_uring's name is worse.
+/// Anything but io_uring aborts the run rather than publishing.
+pub fn compio_runtime() -> CompioRuntime {
+    let runtime = CompioRuntime::new().expect("compio needs io_uring to start");
+    let backend = runtime.driver_type();
+    assert_eq!(
+        backend,
+        DriverType::IoUring,
+        "the completion transport must run on io_uring; a readiness driver here means \
+         compio's `polling` feature was enabled somewhere in the dependency graph, and any \
+         numbers taken through it would not be about a completion transport"
+    );
+    println!("completion transport backend: {backend:?}");
+    runtime
+}
+
+/// Sets the confound-controlling socket options both transports must agree on.
+///
+/// `TCP_NODELAY` on both ends: Nagle waiting on a delayed ACK is exactly the kind of thing
+/// that would dominate a small-request benchmark and say nothing about the I/O model, so it
+/// is switched off identically here rather than left to a default the two runtimes happen to
+/// share. This is the readiness side; [`compio_nodelay`] is its completion-side twin, kept
+/// separate only because the two runtimes' `TcpStream` types are unrelated.
+fn tokio_nodelay(stream: &TokioTcpStream) {
+    stream.set_nodelay(true).expect("TCP_NODELAY on tokio");
+}
+
+/// The completion-side twin of [`tokio_nodelay`]; see it for why this is set explicitly.
+fn compio_nodelay(stream: &CompioTcpStream) {
+    stream.set_nodelay(true).expect("TCP_NODELAY on compio");
+}
+
+/// A live `nghttp2` client and server over one real loopback TCP connection, driven on
+/// tokio's readiness runtime. The readiness arm of the transport comparison.
+pub struct TokioSocket {
+    handle: SendRequest<BenchBody>,
+}
+
+impl TokioSocket {
+    /// Binds, connects, accepts and spawns both drivers — all here, outside the measured
+    /// closure, so Criterion attributes none of the handshake to the routine under test. The
+    /// connection is established once and reused for every iteration, which is also what
+    /// keeps many-iteration runs from exhausting ephemeral ports.
+    pub async fn establish() -> Self {
+        let listener = TokioTcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding an ephemeral port");
+        let addr = listener.local_addr().expect("the bound address");
+
+        // The connect completes against the listen backlog, so awaiting it before the accept
+        // does not deadlock on loopback; the accept then dequeues the same connection.
+        let client_io = TokioTcpStream::connect(addr)
+            .await
+            .expect("connecting to the server");
+        let (server_io, _peer) = listener.accept().await.expect("accepting the client");
+        tokio_nodelay(&client_io);
+        tokio_nodelay(&server_io);
+
+        let server = serve_with(NgHttpIo::new(server_io), ngrs_echo, ngrs_config())
+            .expect("a server connection");
+        tokio::spawn(server);
+
+        let (handle, connection) =
+            handshake_with::<_, BenchBody>(NgHttpIo::new(client_io), ngrs_config())
+                .expect("a client connection");
+        tokio::spawn(connection);
+
+        Self { handle }
+    }
+
+    /// One request, awaited to its response head and then drained. See [`Ngrs::round_trip`].
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        let response = self
+            .handle
+            .send_request(request_for(body))
+            .await
+            .expect("a response head");
+        assert!(response.status().is_success());
+        drain(response.into_body()).await
+    }
+
+    /// `n` concurrent requests on the one connection. See [`Ngrs::concurrent`].
+    pub async fn concurrent(&self, n: usize) {
+        let mut set = JoinSet::new();
+        for _ in 0..n {
+            let handle = self.handle.clone();
+            set.spawn(async move {
+                let response = handle
+                    .send_request(request_for(Bytes::new()))
+                    .await
+                    .expect("a response head");
+                drain(response.into_body()).await
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            joined.expect("a request task");
+        }
+    }
+}
+
+/// A live `nghttp2` client and server over one real loopback TCP connection, driven on
+/// compio's io_uring runtime. The completion arm of the transport comparison — identical to
+/// [`TokioSocket`] down to the workload, differing only in transport and runtime.
+pub struct CompioSocket {
+    handle: SendRequest<BenchBody>,
+}
+
+impl CompioSocket {
+    /// The completion-side mirror of [`TokioSocket::establish`]: same establish-outside-timing
+    /// shape, same one-connection reuse, spawning on compio's runtime instead of tokio's.
+    /// Must be called inside a compio runtime's `block_on`, which is where its `spawn` finds
+    /// the current runtime.
+    pub async fn establish() -> Self {
+        let listener = CompioTcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding an ephemeral port");
+        let addr = listener.local_addr().expect("the bound address");
+
+        let client_io = CompioTcpStream::connect(addr)
+            .await
+            .expect("connecting to the server");
+        let (server_io, _peer) = listener.accept().await.expect("accepting the client");
+        compio_nodelay(&client_io);
+        compio_nodelay(&server_io);
+
+        let server = serve_with(CompioIo::new(server_io), ngrs_echo, ngrs_config())
+            .expect("a server connection");
+        compio::runtime::spawn(server).detach();
+
+        let (handle, connection) =
+            handshake_with::<_, BenchBody>(CompioIo::new(client_io), ngrs_config())
+                .expect("a client connection");
+        compio::runtime::spawn(connection).detach();
+
+        Self { handle }
+    }
+
+    /// One request, awaited to its response head and then drained. See [`Ngrs::round_trip`].
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        let response = self
+            .handle
+            .send_request(request_for(body))
+            .await
+            .expect("a response head");
+        assert!(response.status().is_success());
+        drain(response.into_body()).await
+    }
+
+    /// `n` concurrent requests on the one connection, spawned so all `n` are in flight before
+    /// any is awaited — the compio equivalent of [`Ngrs::concurrent`]. compio's tasks carry no
+    /// `Send` bound, which is the property a thread-per-core runtime needs.
+    pub async fn concurrent(&self, n: usize) {
+        let mut handles = Vec::with_capacity(n);
+        for _ in 0..n {
+            let handle = self.handle.clone();
+            handles.push(compio::runtime::spawn(async move {
+                let response = handle
+                    .send_request(request_for(Bytes::new()))
+                    .await
+                    .expect("a response head");
+                drain(response.into_body()).await
+            }));
+        }
+        for joined in handles {
+            joined.await.expect("a request task");
         }
     }
 }

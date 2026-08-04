@@ -1,9 +1,15 @@
 # Benchmarks
 
-`crates/nghttp2-bench` compares this repo's async HTTP/2 client and server against
-[hyper](https://hyper.rs)'s HTTP/2, both driven on tokio over a `tokio::io::duplex` — an
-in-memory pipe, no sockets. It is a [Criterion](https://bheisler.github.io/criterion.rs/)
-harness: latency comes from Criterion's per-iteration timing, and throughput is derived by
+`crates/nghttp2-bench` holds two [Criterion](https://bheisler.github.io/criterion.rs/)
+comparisons, which answer different questions and must not be read as one:
+
+- **This stack against [hyper](https://hyper.rs)**, both on tokio over a `tokio::io::duplex` —
+  an in-memory pipe, no sockets. Varies the *HTTP/2 implementation*, holding I/O constant.
+- **Completion I/O against readiness I/O** — this stack on compio's io_uring runtime against
+  the same stack on tokio, over real loopback TCP. Varies the *transport*, holding the HTTP/2
+  implementation constant. The `transport_*` benches.
+
+In both, latency comes from Criterion's per-iteration timing, and throughput is derived by
 putting a known number of requests or bytes in each iteration and declaring it with
 `Throughput::Elements` / `Throughput::Bytes`.
 
@@ -14,8 +20,11 @@ anything needing a third-party stack — here, hyper — belongs in a crate of i
 ## Running
 
 ```sh
-# All three benches.
+# Everything. The transport benches need the completion feature and a host with io_uring.
 cargo bench -p nghttp2-bench
+
+# Completion against readiness, on one pinned core so the numbers are comparable.
+taskset -c 3 cargo bench -p nghttp2-bench --bench transport_concurrent_throughput
 
 # One at a time.
 cargo bench -p nghttp2-bench --bench serial_latency
@@ -42,7 +51,7 @@ Pin to one core and keep the machine otherwise idle, or the delta will be buried
 taskset -c 2 cargo bench -p nghttp2-bench -- --baseline before
 ```
 
-## The three benches
+## The duplex benches: this stack against hyper
 
 - **`serial_latency`** — one request in flight at a time on a persistent connection, empty
   body. Criterion's home ground: mean/median with confidence intervals and outlier
@@ -61,7 +70,90 @@ taskset -c 2 cargo bench -p nghttp2-bench -- --baseline before
   flow control and the read-buffer pool start to matter: at 1 MiB the 64 KiB initial window
   forces repeated `WINDOW_UPDATE` round trips.
 
+## The transport benches: completion against readiness
+
+`transport_serial_latency`, `transport_concurrent_throughput` and `transport_body_throughput`
+run the *same* HTTP/2 stack over two transports — `CompioIo` on compio's io_uring runtime, and
+`TokioIo` on tokio — across real loopback TCP. Everything else is held still: same request,
+same headers, same `Config`, same echo handler, same draining, same number of spawned tasks.
+A difference in the numbers is therefore a difference in the I/O model, not in two libraries'
+protocol code.
+
+They require the `completion` feature and a host with io_uring. The compio arm asserts it
+obtained `DriverType::IoUring` and aborts rather than publishing numbers from anything else,
+and prints the backend alongside the results — a benchmark result outlives the manifest that
+produced it.
+
+### What was measured
+
+Medians on one pinned core (`taskset -c 3`), backend confirmed `IoUring`, reproduced across
+independent runs:
+
+| Measure | compio (io_uring) | tokio (epoll) | |
+| --- | --- | --- | --- |
+| Serial latency, empty body | 33–38 µs | **29 µs** | tokio ~15–25% faster |
+| Concurrent, N=1 | ~28 Kelem/s | ~33 Kelem/s | tokio ~10% faster |
+| Concurrent, N=8 | **105–123 Kelem/s** | 50–62 Kelem/s | compio ~2× |
+| Concurrent, N=64 | **129–155 Kelem/s** | 55–66 Kelem/s | compio ~2.3× |
+| Body 1 KiB | **20–25 MiB/s** | 13–16 MiB/s | compio ahead |
+| Body 64 KiB | **283–358 MiB/s** | 241–283 MiB/s | compio ahead |
+| Body 1 MiB | 369–391 MiB/s | 329–398 MiB/s | tie |
+
+**The crossover is the finding, not either endpoint.** io_uring loses on an *empty-body*
+round trip and wins everywhere there is more I/O to do — roughly twice as fast once eight
+streams are multiplexed, and ahead on every body size up to the point where copying starts to
+dominate.
+
+The organising quantity is how many I/O operations there are to batch, not concurrency as
+such. An empty-body exchange is a handful of operations with nothing to fold together, so
+io_uring pays its per-operation submission cost against epoll's cheaper single syscall and
+loses. Add body bytes, or add streams, and the ring folds many submissions and completions
+into far fewer syscalls than a readiness loop can manage. That is why compio leads at 1 KiB
+and 64 KiB despite those also being one request at a time — a fact worth stating, because
+"io_uring is slower for a single request" would be the obvious summary and this table
+contradicts it.
+
+The mechanism was checked rather than assumed: the "it is really task-scheduling overhead"
+explanation was falsified by the N=1 concurrent result, where tokio wins the identical spawn
+pattern.
+
+The 1 MiB tie is consistent with the write-path asymmetry described below: tokio's borrowed
+zero-copy write roughly cancels io_uring's syscall advantage once bodies are large enough for
+copying to dominate.
+
+### Confounds, and which way each pushes
+
+Three could not be eliminated. Each is named here with its direction, because a number without
+its bias is not evidence:
+
+- **The write-path asymmetry.** The tokio transport takes the borrowed write path — the
+  session's own blocks handed over directly, no allocation, no copy. A completion transport
+  structurally cannot: the kernel must own the buffer for the duration, so compio takes the
+  coalescing owned path, trading an allocation and a copy for fewer, larger writes. This
+  **favours compio on small bodies**, where syscall count dominates, and **favours tokio on
+  large ones**, where the copy does. The 1 MiB tie is this confound becoming visible.
+- **Loopback, not a network interface.** No real network latency, no device interrupts, no
+  driver work — precisely the costs io_uring exists to amortise. This **biases against
+  compio**; a real NIC would be expected to widen its lead rather than narrow it. Nothing here
+  licenses a claim about what these transports do on a real network.
+- **Scheduler non-separability.** compio is thread-per-core and `!Send`; tokio is
+  work-stealing. Both arms are held to one worker thread and one pinned core, which is as
+  close as the two can be brought, but the runtime and the I/O model are not separable in
+  either — a residual scheduler difference is inseparably mixed into every number above.
+
+Controlled rather than merely disclosed: `TCP_NODELAY` is set explicitly on all four endpoints
+(both sides of both arms), since Nagle meeting delayed ACK would dominate a small-request
+benchmark and say nothing about io_uring; each runtime gets exactly one worker thread; and
+pinning is left to external `taskset` because compio can pin natively while tokio cannot, so
+pinning one side would manufacture the asymmetry the control exists to remove.
+
 ## What these numbers do and do not mean
+
+The duplex benches delete the kernel entirely, so they measure protocol and wrapper CPU work
+rather than performance. The transport benches put the kernel back but keep it on loopback, so
+they measure syscall and scheduling behaviour rather than anything a network would do. Neither
+family measures CPU time or memory: Criterion reports wall-clock, so a stack burning more CPU
+for the same wall time looks identical here.
 
 Read them as a measure of **protocol and wrapper CPU work**, and nothing else.
 

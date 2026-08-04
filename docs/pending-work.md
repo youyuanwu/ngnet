@@ -46,6 +46,25 @@ live gap. Retained here only as a possible defence-in-depth *test* — one that 
 loudly if a future libnghttp2 upgrade relaxed that validation. Worth roughly the cost of one
 test, and no more.
 
+## Left by the completion-transport work
+
+- **Only one completion runtime.** compio ships; tokio-uring, monoio and glommio do not.
+  compio was chosen because it implements its buffer traits for `bytes` types, so the adapter
+  needs no `unsafe` — tokio-uring's are `unsafe` and `Vec<u8>`-only, which would have collided
+  with the no-`unsafe`-under-`src/http` invariant. The transport is generic over compio's
+  `Splittable`, so `TcpStream` and `UnixStream` both work; extending to another runtime means
+  another adapter, not a change to the traits.
+- **No fallback where io_uring is absent.** The feature fails loudly instead, by decision.
+  Revisiting that means compiling a readiness backend and accepting the silent-degradation
+  hazard that comes with it.
+- **The write-path asymmetry is unmeasured on a real NIC.** Benchmarks show tokio's borrowed
+  zero-copy write cancelling io_uring's syscall advantage at 1 MiB bodies, over loopback. Whether
+  that holds where real device interrupts exist is unknown, and loopback biases against
+  io_uring, so the crossover point is probably not where these numbers put it.
+- **SC-006's error path is evidenced by construction only.** No test exercises what a caller
+  sees when io_uring is unavailable, because this machine cannot make it unavailable to order
+  and a mocked one would test the mock.
+
 ## Deliberate scope boundaries
 
 These are not gaps. They are decisions, recorded so they are not mistaken for oversights.

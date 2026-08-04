@@ -15,6 +15,16 @@ http = ["dep:bytes", "dep:http", "dep:http-body"]
 # A ready-made transport for tokio. Off by default: a caller on another runtime should not
 # pay for this one, and writing a transport for an unsupported runtime is a small job.
 tokio = ["http", "dep:tokio"]
+# A ready-made transport for compio, over io_uring. Off by default for the same reason, and
+# additionally because it compiles no readiness backend: enabling it on a host without
+# io_uring gets a runtime that fails to start rather than one that quietly uses epoll.
+#
+# This feature has a higher minimum toolchain than the crate's `rust-version`. compio's
+# buffer crate needs a newer compiler than 1.85, and pinning compio back far enough to reach
+# it would mean an ancient io_uring stack. The baseline applies to the crate as published —
+# default and `tokio` builds honour it — and enabling this feature opts into a newer
+# compiler, which is why it is off by default.
+completion = ["http", "dep:compio"]
 
 # Exactly one *non-optional* dependency. A test fails the build if that grows, and
 # requires every optional one to be reachable only through a declared feature.
@@ -22,6 +32,7 @@ tokio = ["http", "dep:tokio"]
 nghttp2-sys.workspace = true
 
 bytes = { workspace = true, optional = true }
+compio = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 http-body = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }

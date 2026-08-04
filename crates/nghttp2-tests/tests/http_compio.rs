@@ -1,70 +1,54 @@
-//! The transport traits against a real completion-based runtime.
+//! The shipped compio transport, over io_uring, against a real socket.
 //!
-//! Enabled by the optional `completion` feature. Compiling is the bar: what is being proven
-//! is that the traits *fit* a completion API — its buffer ownership, its `BufResult` shape,
-//! its thread-per-core executor — rather than only fitting an in-process imitation of one.
-//! io_uring is not available everywhere, so the exchange at the bottom is attempted and its
-//! absence tolerated, while the adapter above it must always compile.
+//! Enabled by the optional `completion` feature. This file used to carry its own adapter and
+//! prove the transport traits *fit* a completion runtime by compiling. The adapter now ships
+//! in the `nghttp2` crate, so what is proven here changed: that the public transport works
+//! over a real completion-based socket, not that one could be written.
 //!
-//! # What this file is evidence of
+//! # Why there is no tolerance of a missing io_uring
 //!
-//! The adapter is four lines of body. `compio`'s
-//! `async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B>` is, after
-//! destructuring, exactly `(io::Result<usize>, B)` — the same thing
-//! [`TransportRead::read`] asks for. That correspondence is not a coincidence: the traits
-//! were shaped from the completion side precisely so that the runtimes hardest to serve
-//! need no translation, and the readiness-based ones pay a single overridable copy instead.
+//! This workspace asks compio for the `io-uring` backend and no readiness one, so there is
+//! nothing compiled in to fall back to. A host without io_uring fails to start a runtime, and
+//! that is the intended behaviour rather than a case to be tolerated — the alternative would
+//! be a transport quietly running on epoll while still calling itself completion-based. An
+//! earlier version of this file skipped when a runtime could not be created, which was right
+//! when compiling was the claim and is wrong now that running is.
+//!
+//! # Why the backend is asserted, and exactly what that does and does not catch
+//!
+//! The manifest is not a guarantee, because cargo unifies features across the whole
+//! dependency graph: if any crate anywhere in a build enables compio's `polling` feature,
+//! compio compiles its fusion driver, which probes the kernel and silently degrades to epoll.
+//! Nothing in this workspace asks for `polling` today, and nothing in it could stop a future
+//! dependency from doing so.
+//!
+//! The assertion below is worth having, but it is narrower than it first appears and the
+//! difference matters. In the build this workspace actually produces — io_uring alone — the
+//! reported driver type is a compile-time constant
+//! (`compio-driver-0.12.4/src/sys/driver/iour/mod.rs:148-150`), so the assertion is trivially
+//! true and costs nothing. It can only *fail* in a fusion build running on a host that lacks
+//! io_uring. So:
+//!
+//! - It **catches** a real degradation: a fusion build that quietly fell back to epoll,
+//!   which is the outcome that would make every measurement taken through this transport a
+//!   lie.
+//! - It **does not catch** a `polling` feature arriving through unification on a host that
+//!   has io_uring, because the fusion driver would still probe and choose io_uring there. The
+//!   build would be less guaranteed than intended and every test would still pass.
+//!
+//! The check for that second case is the dependency tree, not a runtime assertion:
+//! `cargo tree -e features` shows whether `compio-driver` carries `polling`. CI runs that
+//! check on every change, so the two together cover both cases — this test catches a fallback
+//! that happened, and the tree check catches a build where one became possible.
 
 #![cfg(feature = "completion")]
 
-use bytes::{Bytes, BytesMut};
-use compio::buf::BufResult;
-use compio::io::{AsyncReadExt, AsyncWrite};
+use bytes::Bytes;
 use compio::net::{TcpListener, TcpStream};
+use core::future::Future;
 use http_body::{Body, Frame};
-use nghttp2::http::transport::{Transport, TransportRead, TransportWrite};
+use nghttp2::http::transport::CompioIo;
 use nghttp2::http::{IncomingBody, server};
-
-/// Carries a compio stream into this crate's transport traits.
-struct CompioIo {
-    stream: TcpStream,
-}
-
-impl Transport for CompioIo {
-    type Reader = CompioHalf;
-    type Writer = CompioHalf;
-
-    fn split(self) -> (Self::Reader, Self::Writer) {
-        let (reader, writer) = self.stream.into_split();
-        (CompioHalf { stream: reader }, CompioHalf { stream: writer })
-    }
-}
-
-/// One direction of a compio stream. Both halves are the same type here, because compio's
-/// own split hands back two handles to the same socket.
-struct CompioHalf {
-    stream: TcpStream,
-}
-
-impl TransportRead for CompioHalf {
-    async fn read(&mut self, buf: BytesMut) -> (std::io::Result<usize>, BytesMut) {
-        // `append` rather than `read`, so octets land after whatever the buffer already
-        // holds — the same contract tokio's `read_buf` has, and the one the connection
-        // relies on.
-        let BufResult(result, buf) = self.stream.append(buf).await;
-        (result, buf)
-    }
-}
-
-impl TransportWrite for CompioHalf {
-    async fn write(&mut self, buf: Bytes) -> (std::io::Result<usize>, Bytes) {
-        let BufResult(result, buf) = self.stream.write(buf).await;
-        (result, buf)
-    }
-
-    // `write_borrowed` is deliberately not overridden. A completion runtime cannot lend the
-    // kernel a borrowed buffer, which is the whole reason the owned path is the default.
-}
 
 /// A body already held in memory.
 #[derive(Debug, Default)]
@@ -117,54 +101,33 @@ async fn echo(request: http::Request<IncomingBody>) -> http::Response<Full> {
         .expect("a well-formed response")
 }
 
-/// Names every part of the adapter, so it must compile whether or not it can run.
+/// The runtime this build gets is io_uring, not a readiness driver wearing its name.
 ///
-/// This is the assertion the phase actually makes. A `#[test]` that only ran where
-/// io_uring happens to be available would prove nothing on the machines where it does not,
-/// and the claim being made — that the traits fit a completion API — is a claim about
-/// types.
+/// See the module documentation for what this catches and what it does not: it fires only in
+/// a fusion build on a host without io_uring, which is the case where a silent fallback would
+/// otherwise make everything measured through this transport misleading.
 #[test]
-fn the_transport_traits_fit_a_completion_runtime() {
-    fn assert_transport<T: Transport>() {}
-    fn assert_read<R: TransportRead>() {}
-    fn assert_write<W: TransportWrite>() {}
-
-    assert_transport::<CompioIo>();
-    assert_read::<CompioHalf>();
-    assert_write::<CompioHalf>();
-
-    // And the connection builds over it, which is what actually has to hold.
-    fn assert_serves<T: Transport>(transport: T) {
-        let _ = server::serve(transport, echo);
-    }
-    let _: fn(CompioIo) = assert_serves::<CompioIo>;
-
-    fn assert_asks<T: Transport>(transport: T) {
-        let _ = nghttp2::http::handshake::<T, Full>(transport);
-    }
-    let _: fn(CompioIo) = assert_asks::<CompioIo>;
+fn the_completion_transport_runs_on_io_uring() {
+    let runtime = compio::runtime::Runtime::new().expect("compio needs io_uring to start");
+    assert_eq!(
+        runtime.driver_type(),
+        compio::driver::DriverType::IoUring,
+        "the completion transport is running on a readiness driver. Both of these are true: \
+         compio's `polling` feature is enabled somewhere in the dependency graph, so the \
+         fusion driver was compiled; and io_uring could not be obtained on this host, so it \
+         fell back. Check `cargo tree -e features` for the first and the kernel for the second"
+    );
 }
 
-/// Runs a whole exchange on compio's own runtime, where the platform allows one.
+/// A whole exchange over the shipped transport, on a real socket, on compio's runtime.
 ///
-/// The tolerance is deliberately narrow: only *creating* the runtime is allowed to fail,
-/// because a driver may be unavailable and the claim above is already made by compiling.
-/// Everything after that runs with its assertions intact — wrapping the exchange itself
-/// would turn every failure inside it into a pass.
+/// Failing to start a runtime is a failure of this test, not a reason to skip it.
 #[test]
-fn an_exchange_completes_on_compio_where_the_platform_allows() {
-    let started = std::panic::catch_unwind(compio::runtime::Runtime::new);
-    let runtime = match started {
-        Ok(Ok(runtime)) => runtime,
-        Ok(Err(error)) => {
-            eprintln!("compio could not start a runtime here: {error}");
-            return;
-        }
-        Err(_panic) => {
-            eprintln!("compio has no driver here; the adapter still compiles");
-            return;
-        }
-    };
+fn an_exchange_completes_over_the_shipped_compio_transport() {
+    // The driver is asserted once, in `the_completion_transport_runs_on_io_uring`. Repeating
+    // it here would be noise rather than defence: both construct the runtime the same way, so
+    // neither could fail without the other.
+    let runtime = compio::runtime::Runtime::new().expect("compio needs io_uring to start");
 
     runtime.block_on(async {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("binding");
@@ -172,14 +135,14 @@ fn an_exchange_completes_on_compio_where_the_platform_allows() {
 
         let serving = compio::runtime::spawn(async move {
             let (stream, _peer) = listener.accept().await.expect("accepting");
-            let _ = server::serve(CompioIo { stream }, echo)
+            let _ = server::serve(CompioIo::new(stream), echo)
                 .expect("serving")
                 .await;
         });
 
         let stream = TcpStream::connect(addr).await.expect("connecting");
         let (requests, connection) =
-            nghttp2::http::handshake::<_, Full>(CompioIo { stream }).expect("handshake");
+            nghttp2::http::handshake::<_, Full>(CompioIo::new(stream)).expect("handshake");
 
         let response = requests.send_request(
             http::Request::builder()

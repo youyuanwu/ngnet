@@ -481,6 +481,27 @@ mod asynchronous {
         drop((reader, writer));
     }
 
+    /// The ready-made compio transport, when the feature that provides it is on.
+    ///
+    /// Generic over compio's `Splittable`, so the halves are named through associated types
+    /// rather than as one concrete pair — a caller wrapping a `UnixStream` is entitled to
+    /// the same promise as one wrapping a `TcpStream`.
+    #[cfg(feature = "completion")]
+    pub(super) fn compio_transport_surface<T>(stream: T)
+    where
+        T: compio::io::util::Splittable,
+        T::ReadHalf: compio::io::AsyncRead,
+        T::WriteHalf: compio::io::AsyncWrite,
+    {
+        use nghttp2::http::transport::{CompioIo, CompioReader, CompioWriter};
+
+        let carried: CompioIo<T> = CompioIo::new(stream);
+        let (reader, writer): (CompioReader<T::ReadHalf>, CompioWriter<T::WriteHalf>) =
+            Transport::split(carried);
+        write_half_surface::<CompioWriter<T::WriteHalf>>();
+        drop((reader, writer));
+    }
+
     /// The writing half's contract, pinned by the shape of its two overridable points.
     ///
     /// The borrowed fast path is a *single* override: `write_borrowed` returns an
@@ -529,6 +550,11 @@ fn the_asynchronous_surface_is_unchanged() {
     #[cfg(feature = "tokio")]
     {
         let _: fn(tokio::net::TcpStream) = asynchronous::tokio_transport_surface::<_>;
+    }
+    #[cfg(feature = "completion")]
+    {
+        let _: fn(compio::net::TcpStream) = asynchronous::compio_transport_surface::<_>;
+        let _: fn(compio::net::UnixStream) = asynchronous::compio_transport_surface::<_>;
     }
 
     // `serve` is reachable both through the module and at the top of `http`, and both are
