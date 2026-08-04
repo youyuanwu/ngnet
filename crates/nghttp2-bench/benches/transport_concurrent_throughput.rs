@@ -1,16 +1,18 @@
-//! Concurrent throughput, completion vs readiness: `N` requests issued together on one real
-//! loopback connection and awaited as a group, so Criterion's per-iteration time covers `N`
-//! whole exchanges. `Throughput::Elements` turns that into requests/sec. `N` sweeps the same
-//! 1, 8, 64 as the duplex family, so the two are comparable in shape.
+//! Concurrent throughput on a real socket: `N` requests issued together on one connection and
+//! awaited as a group, so Criterion's per-iteration time covers `N` whole exchanges.
+//! `Throughput::Elements` turns that into requests/sec. `N` sweeps the same 1, 8, 64 as the
+//! duplex family, so the two are comparable in shape.
 //!
-//! Only the transport differs between the two arms — `CompioSocket` over io_uring against
-//! `TokioSocket` over epoll — with `nghttp2` held constant on both. One worker thread each
-//! (compio single-threaded, tokio `current_thread`), so this measures the I/O model rather
-//! than one scheduler doing work the other's is spared.
+//! Three arms, read pairwise: `ngrs-compio` against `ngrs-tokio` isolates the I/O model,
+//! `ngrs-tokio` against `hyper-tokio` isolates the HTTP/2 stack, and `ngrs-compio` against
+//! `hyper-tokio` varies both. One worker thread each (compio single-threaded, tokio
+//! `current_thread`), so no arm gets to spread over cores the others cannot.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use nghttp2_bench::{CompioSocket, TokioSocket, compio_runtime, current_thread_runtime};
+use nghttp2_bench::{
+    CompioSocket, HyperSocket, TokioSocket, compio_runtime, current_thread_runtime,
+};
 
 const CONCURRENCY: [usize; 3] = [1, 8, 64];
 
@@ -18,19 +20,27 @@ fn transport_concurrent_throughput(c: &mut Criterion) {
     let compio = compio_runtime();
     let compio_socket = compio.block_on(CompioSocket::establish());
 
+    // One runtime per arm; see `transport_serial_latency` for why.
     let tokio = current_thread_runtime();
     let tokio_socket = tokio.block_on(TokioSocket::establish());
+
+    let hyper = current_thread_runtime();
+    let hyper_socket = hyper.block_on(HyperSocket::establish());
 
     let mut group = c.benchmark_group("transport_concurrent_throughput");
     for n in CONCURRENCY {
         group.throughput(Throughput::Elements(n as u64));
 
-        group.bench_with_input(BenchmarkId::new("compio", n), &n, |b, &n| {
+        group.bench_with_input(BenchmarkId::new("ngrs-compio", n), &n, |b, &n| {
             b.to_async(&compio).iter(|| compio_socket.concurrent(n));
         });
 
-        group.bench_with_input(BenchmarkId::new("tokio", n), &n, |b, &n| {
+        group.bench_with_input(BenchmarkId::new("ngrs-tokio", n), &n, |b, &n| {
             b.to_async(&tokio).iter(|| tokio_socket.concurrent(n));
+        });
+
+        group.bench_with_input(BenchmarkId::new("hyper-tokio", n), &n, |b, &n| {
+            b.to_async(&hyper).iter(|| hyper_socket.concurrent(n));
         });
     }
     group.finish();

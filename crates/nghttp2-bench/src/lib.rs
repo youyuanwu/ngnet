@@ -7,17 +7,23 @@
 //! protocol and wrapper CPU work, never the kernel. See `docs/benchmarks.md` for what that
 //! does and does not tell you.
 //!
-//! # The second comparison: completion vs readiness I/O
+//! # The second family: a real socket, three arms
 //!
-//! A second benchmark family holds the HTTP/2 stack constant — `nghttp2` on both sides — and
-//! varies only the transport underneath: [`CompioSocket`] carries it over io_uring on
-//! compio, [`TokioSocket`] over epoll on tokio, both over a real loopback TCP connection.
-//! Where the duplex benches ask which *stack* is faster, these ask what the *I/O model*
-//! costs or saves for one fixed stack. Because a duplex has no file descriptor, no
-//! completion runtime can appear in the first family at all; these fixtures use real sockets
-//! precisely so it can. The confound controls those benches rely on — matched `TCP_NODELAY`,
-//! one worker thread each, external `taskset` pinning — are set here in the fixtures and
-//! documented in `docs/benchmarks.md`.
+//! A second benchmark family runs over a real loopback TCP connection, which is what a
+//! completion runtime needs to appear at all — a duplex has no file descriptor, so compio
+//! cannot enter the first family. It has three arms, and they complete the matrix:
+//!
+//! | | tokio (epoll) | compio (io_uring) |
+//! | --- | --- | --- |
+//! | **`nghttp2`** | [`TokioSocket`] | [`CompioSocket`] |
+//! | **hyper** | [`HyperSocket`] | n/a — hyper has no completion transport |
+//!
+//! Read pairwise: [`CompioSocket`] against [`TokioSocket`] varies only the I/O model,
+//! [`TokioSocket`] against [`HyperSocket`] varies only the HTTP/2 stack, and
+//! [`CompioSocket`] against [`HyperSocket`] varies both at once and so attributes to
+//! neither. The confound controls these benches rely on — matched `TCP_NODELAY`, one worker
+//! thread each, external `taskset` pinning — are set here in the fixtures and documented in
+//! `docs/benchmarks.md`.
 //!
 //! # The two `TokioIo` types
 //!
@@ -261,6 +267,52 @@ impl Ngrs {
 // The hyper stack
 // ---------------------------------------------------------------------------
 
+/// The hyper server handler: drain the request body, echo it back. The mirror of
+/// [`ngrs_echo`], differing only in the body type hyper hands it and the `Result` its
+/// `Service` signature requires.
+async fn hyper_echo(
+    request: http::Request<hyper::body::Incoming>,
+) -> Result<http::Response<BenchBody>, Infallible> {
+    let body = collect(request.into_body()).await;
+    Ok(response_for(body))
+}
+
+/// hyper's server builder with every knob pinned to libnghttp2's defaults.
+///
+/// Factored out because hyper now appears on two transports — an in-memory duplex and a real
+/// socket — and a matched-configuration table is only worth anything if there is exactly one
+/// place the matching happens. Two copies drifting apart would silently turn a settings
+/// difference into a result.
+fn hyper_server_builder() -> hyper_server::Builder<TokioExecutor> {
+    let mut builder = hyper_server::Builder::new(TokioExecutor::new());
+    builder
+        .initial_stream_window_size(WINDOW)
+        .initial_connection_window_size(WINDOW)
+        .adaptive_window(false)
+        .max_frame_size(MAX_FRAME_SIZE)
+        .header_table_size(HEADER_TABLE_SIZE)
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .max_header_list_size(MAX_HEADER_LIST_SIZE)
+        // hyper's server adds a `Date` header to every response by default; this crate's
+        // server adds none. Switched off so both put the same header set on the wire.
+        .auto_date_header(false);
+    builder
+}
+
+/// hyper's client builder, pinned to the same defaults. See [`hyper_server_builder`].
+fn hyper_client_builder() -> hyper_client::Builder<TokioExecutor> {
+    let mut builder = hyper_client::Builder::new(TokioExecutor::new());
+    builder
+        .initial_stream_window_size(WINDOW)
+        .initial_connection_window_size(WINDOW)
+        .adaptive_window(false)
+        .max_frame_size(MAX_FRAME_SIZE)
+        .header_table_size(HEADER_TABLE_SIZE)
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .max_header_list_size(MAX_HEADER_LIST_SIZE);
+    builder
+}
+
 /// A live hyper client connected to a live hyper server over one duplex, with both drivers
 /// already spawned. The mirror of [`Ngrs`], down to the same workload and the same drain.
 pub struct Hyper {
@@ -274,35 +326,13 @@ impl Hyper {
     pub async fn establish() -> Self {
         let (client_io, server_io) = duplex(DUPLEX_CAPACITY);
 
-        let service = service_fn(|request: http::Request<hyper::body::Incoming>| async move {
-            let body = collect(request.into_body()).await;
-            Ok::<_, Infallible>(response_for(body))
-        });
-
-        let server = hyper_server::Builder::new(TokioExecutor::new())
-            .initial_stream_window_size(WINDOW)
-            .initial_connection_window_size(WINDOW)
-            .adaptive_window(false)
-            .max_frame_size(MAX_FRAME_SIZE)
-            .header_table_size(HEADER_TABLE_SIZE)
-            .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
-            .max_header_list_size(MAX_HEADER_LIST_SIZE)
-            // hyper's server adds a `Date` header to every response by default; this crate's
-            // server adds none. Switched off so both put the same header set on the wire.
-            .auto_date_header(false)
-            .serve_connection(HyperHttpIo::new(server_io), service);
+        let server = hyper_server_builder()
+            .serve_connection(HyperHttpIo::new(server_io), service_fn(hyper_echo));
         tokio::spawn(async move {
             let _ = server.await;
         });
 
-        let (sender, connection) = hyper_client::Builder::new(TokioExecutor::new())
-            .initial_stream_window_size(WINDOW)
-            .initial_connection_window_size(WINDOW)
-            .adaptive_window(false)
-            .max_frame_size(MAX_FRAME_SIZE)
-            .header_table_size(HEADER_TABLE_SIZE)
-            .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
-            .max_header_list_size(MAX_HEADER_LIST_SIZE)
+        let (sender, connection) = hyper_client_builder()
             .handshake(HyperHttpIo::new(client_io))
             .await
             .expect("a client connection");
@@ -344,13 +374,23 @@ impl Hyper {
 }
 
 // ---------------------------------------------------------------------------
-// Completion vs readiness I/O, over a real socket
+// The real-socket family: three arms, two axes
 // ---------------------------------------------------------------------------
 //
-// The two fixtures below run the *same* `nghttp2` stack over the *same* workload; the only
-// thing that differs is the transport and the runtime driving it. Everything the two share —
-// the `Config`, the request shape, the echo handler, the drain — is reused from above rather
-// than restated, so a difference in the numbers cannot be a difference in what was measured.
+// The three fixtures below all run the same workload over a real loopback TCP connection,
+// and are meant to be read *pairwise*, never as a single ranking:
+//
+//   `CompioSocket` vs `TokioSocket` — same `nghttp2` stack, different I/O model. Isolates
+//       completion against readiness.
+//   `TokioSocket`  vs `HyperSocket` — same tokio/epoll I/O, different HTTP/2 stack. Isolates
+//       this crate against hyper, on a real socket rather than the duplex.
+//   `CompioSocket` vs `HyperSocket` — *both* differ. This is the end-to-end "fastest thing
+//       here against the reference implementation" number, and nothing in it can be
+//       attributed to either axis alone.
+//
+// Everything the three share — the `Config` and its hyper-side match, the request shape, the
+// echo handler, the drain, `TCP_NODELAY` on every endpoint — is reused from above rather than
+// restated, so a difference in the numbers cannot be a difference in what was measured.
 
 /// A single-threaded compio runtime, asserted to be io_uring.
 ///
@@ -390,6 +430,30 @@ fn compio_nodelay(stream: &CompioTcpStream) {
     stream.set_nodelay(true).expect("TCP_NODELAY on compio");
 }
 
+/// Binds an ephemeral loopback port, connects, accepts, and sets `TCP_NODELAY` on both ends.
+///
+/// Shared by both tokio-side fixtures so the `nghttp2` and hyper arms sit on sockets set up
+/// identically — the readiness-side socket setup is not something either arm should be able
+/// to differ in. The connect completes against the listen backlog, so awaiting it before the
+/// accept does not deadlock on loopback; the accept then dequeues the same connection. The
+/// listener is dropped on return: the connection is already established, and nothing here
+/// accepts a second one.
+async fn tokio_socket_pair() -> (TokioTcpStream, TokioTcpStream) {
+    let listener = TokioTcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binding an ephemeral port");
+    let addr = listener.local_addr().expect("the bound address");
+
+    let client_io = TokioTcpStream::connect(addr)
+        .await
+        .expect("connecting to the server");
+    let (server_io, _peer) = listener.accept().await.expect("accepting the client");
+    tokio_nodelay(&client_io);
+    tokio_nodelay(&server_io);
+
+    (client_io, server_io)
+}
+
 /// A live `nghttp2` client and server over one real loopback TCP connection, driven on
 /// tokio's readiness runtime. The readiness arm of the transport comparison.
 pub struct TokioSocket {
@@ -402,19 +466,7 @@ impl TokioSocket {
     /// connection is established once and reused for every iteration, which is also what
     /// keeps many-iteration runs from exhausting ephemeral ports.
     pub async fn establish() -> Self {
-        let listener = TokioTcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("binding an ephemeral port");
-        let addr = listener.local_addr().expect("the bound address");
-
-        // The connect completes against the listen backlog, so awaiting it before the accept
-        // does not deadlock on loopback; the accept then dequeues the same connection.
-        let client_io = TokioTcpStream::connect(addr)
-            .await
-            .expect("connecting to the server");
-        let (server_io, _peer) = listener.accept().await.expect("accepting the client");
-        tokio_nodelay(&client_io);
-        tokio_nodelay(&server_io);
+        let (client_io, server_io) = tokio_socket_pair().await;
 
         let server = serve_with(NgHttpIo::new(server_io), ngrs_echo, ngrs_config())
             .expect("a server connection");
@@ -523,6 +575,72 @@ impl CompioSocket {
         }
         for joined in handles {
             joined.await.expect("a request task");
+        }
+    }
+}
+
+/// A live hyper client and server over one real loopback TCP connection, driven on tokio's
+/// readiness runtime — the reference-implementation arm of the real-socket family.
+///
+/// This is [`TokioSocket`] with the HTTP/2 stack swapped and nothing else changed: same
+/// socket setup via [`tokio_socket_pair`], same runtime, same workload, same echo, same
+/// drain, and the same matched protocol settings via [`hyper_server_builder`] /
+/// [`hyper_client_builder`]. It is [`Hyper`] moved off the duplex onto a real socket, which
+/// is what makes hyper comparable against the completion arm at all — a duplex has no file
+/// descriptor, so no completion runtime can appear in that family.
+pub struct HyperSocket {
+    sender: hyper_client::SendRequest<BenchBody>,
+}
+
+impl HyperSocket {
+    /// Binds, connects, accepts and spawns both drivers, all outside the measured closure.
+    /// See [`TokioSocket::establish`], whose shape this follows exactly.
+    pub async fn establish() -> Self {
+        let (client_io, server_io) = tokio_socket_pair().await;
+
+        let server = hyper_server_builder()
+            .serve_connection(HyperHttpIo::new(server_io), service_fn(hyper_echo));
+        tokio::spawn(async move {
+            let _ = server.await;
+        });
+
+        let (sender, connection) = hyper_client_builder()
+            .handshake(HyperHttpIo::new(client_io))
+            .await
+            .expect("a client connection");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        Self { sender }
+    }
+
+    /// One request, awaited to its response head and then drained. See [`Ngrs::round_trip`].
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        let mut sender = self.sender.clone();
+        let response = sender
+            .send_request(request_for(body))
+            .await
+            .expect("a response head");
+        assert!(response.status().is_success());
+        drain(response.into_body()).await
+    }
+
+    /// `n` concurrent requests on the one connection. See [`Ngrs::concurrent`].
+    pub async fn concurrent(&self, n: usize) {
+        let mut set = JoinSet::new();
+        for _ in 0..n {
+            let mut sender = self.sender.clone();
+            set.spawn(async move {
+                let response = sender
+                    .send_request(request_for(Bytes::new()))
+                    .await
+                    .expect("a response head");
+                drain(response.into_body()).await
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            joined.expect("a request task");
         }
     }
 }
