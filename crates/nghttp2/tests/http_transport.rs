@@ -178,9 +178,15 @@ impl TransportWrite for VectoredOnly {
 }
 
 /// A transport that offers **both** fast paths, so precedence has something to arbitrate.
+///
+/// Both counters live in the futures' `poll`, for the reason `RecordOnPoll` explains and for
+/// a second one specific to precedence: what matters is which path was *taken*, not which was
+/// *offered*. Counting at construction would answer the wrong question — every path this
+/// transport implements is offered on every pass, and the driver's unpolled election probe
+/// would be indistinguishable from a real write.
 struct OffersBoth {
-    borrowed_elections: Rc<RefCell<usize>>,
-    vectored_elections: Rc<RefCell<usize>>,
+    borrowed_writes: Rc<RefCell<usize>>,
+    vectored_writes: Rc<RefCell<usize>>,
 }
 
 impl TransportWrite for OffersBoth {
@@ -193,17 +199,38 @@ impl TransportWrite for OffersBoth {
         &'w mut self,
         data: &'w [u8],
     ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
-        *self.borrowed_elections.borrow_mut() += 1;
-        Some(core::future::ready(Ok(data.len())))
+        Some(CountOnPoll {
+            len: data.len(),
+            counter: Rc::clone(&self.borrowed_writes),
+        })
     }
 
     fn write_vectored<'w>(
         &'w mut self,
         regions: &'w [io::IoSlice<'w>],
     ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
-        *self.vectored_elections.borrow_mut() += 1;
-        let total = regions.iter().map(|region| region.len()).sum();
-        Some(core::future::ready(Ok(total)))
+        Some(CountOnPoll {
+            len: regions.iter().map(|region| region.len()).sum(),
+            counter: Rc::clone(&self.vectored_writes),
+        })
+    }
+}
+
+/// Reports a fixed length and counts the call, on poll rather than on construction.
+struct CountOnPoll {
+    len: usize,
+    counter: Rc<RefCell<usize>>,
+}
+
+impl Future for CountOnPoll {
+    type Output = io::Result<usize>;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        *self.counter.borrow_mut() += 1;
+        core::task::Poll::Ready(Ok(self.len))
     }
 }
 
@@ -248,23 +275,41 @@ fn a_transport_can_elect_the_vectored_path_alone() {
 
 #[test]
 fn a_transport_may_offer_both_fast_paths() {
-    let borrowed_elections = Rc::new(RefCell::new(0));
-    let vectored_elections = Rc::new(RefCell::new(0));
+    let borrowed_writes = Rc::new(RefCell::new(0));
+    let vectored_writes = Rc::new(RefCell::new(0));
     let mut writer = OffersBoth {
-        borrowed_elections: Rc::clone(&borrowed_elections),
-        vectored_elections: Rc::clone(&vectored_elections),
+        borrowed_writes: Rc::clone(&borrowed_writes),
+        vectored_writes: Rc::clone(&vectored_writes),
     };
 
-    // Both are on offer; which one the driver *takes* is asserted where the driver is,
-    // since precedence is the driver's rule rather than the transport's.
+    // Both are on offer. Which one the driver *takes* is asserted where the driver is,
+    // since precedence is the driver's rule rather than the transport's; here the point is
+    // only that overriding one does not preclude overriding the other.
     assert!(writer.write_borrowed(b"borrowed").is_some());
-    assert!(
-        writer
-            .write_vectored(&[io::IoSlice::new(b"vectored")])
-            .is_some()
+    let regions = [io::IoSlice::new(b"vectored")];
+    assert!(writer.write_vectored(&regions).is_some());
+    assert_eq!(
+        (*borrowed_writes.borrow(), *vectored_writes.borrow()),
+        (0, 0),
+        "offering a path is not performing it: neither future was polled, so neither may \
+         have counted a write"
     );
-    assert_eq!(*borrowed_elections.borrow(), 1);
-    assert_eq!(*vectored_elections.borrow(), 1);
+
+    let written = block_on(writer.write_borrowed(b"borrowed").expect("borrowed")).unwrap();
+    assert_eq!(written, b"borrowed".len());
+    assert_eq!(
+        (*borrowed_writes.borrow(), *vectored_writes.borrow()),
+        (1, 0),
+        "polling the borrowed future counts exactly one borrowed write and no vectored one"
+    );
+
+    let written = block_on(writer.write_vectored(&regions).expect("vectored")).unwrap();
+    assert_eq!(written, b"vectored".len());
+    assert_eq!(
+        (*borrowed_writes.borrow(), *vectored_writes.borrow()),
+        (1, 1),
+        "and the vectored one likewise"
+    );
 }
 
 #[test]

@@ -9,11 +9,11 @@
 //!
 //! tokio is readiness-based, so nothing here needs to own a buffer while an operation is in
 //! flight. Reads take the buffer, fill it and hand it straight back, with no copy. Writes
-//! elect [`TransportWrite::write_vectored`], gathering the session's small output blocks
-//! into one `writev` while handing large ones to the socket uncopied — so a pass costs few
-//! syscalls without copying a body. [`TransportWrite::write_borrowed`] is kept as the
-//! fallback: it is what runs when the underlying I/O reports it does not really gather, and
-//! would otherwise write only the first region of each call.
+//! offer [`TransportWrite::write_vectored`], so the driver can gather the session's small
+//! output blocks into one `writev` while handing large ones to the socket uncopied — few
+//! syscalls per pass without copying a body. [`TransportWrite::write_borrowed`] is offered
+//! alongside it as the fallback: it is what runs when the underlying I/O reports it does not
+//! really gather, and would otherwise write only the first region of each call.
 //!
 //! Because the `AsyncWrite` bound also admits buffering wrappers, whose `write` only fills a
 //! buffer, [`TransportWrite::commit`] flushes: without it a `BufWriter` or `BufStream` would
