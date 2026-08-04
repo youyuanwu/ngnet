@@ -558,6 +558,8 @@ fn the_asynchronous_surface_is_unchanged() {
     // The vectored testing transport and its observation handle. Hidden from the docs but
     // still public, and integration tests are separate crates that can reach nothing else.
     let _: fn() -> (Duplex, Duplex) = nghttp2::http::testing::duplex_vectored;
+    let _: fn() -> (Duplex, Duplex) = nghttp2::http::testing::duplex_offering_both;
+    let _: fn(&Duplex, usize) = Duplex::decline_vectored_after;
     let _: fn(&Duplex) -> nghttp2::http::testing::VectoredLog = Duplex::vectored_log;
     let _: fn(&nghttp2::http::testing::VectoredLog) -> Vec<Vec<usize>> =
         nghttp2::http::testing::VectoredLog::calls;

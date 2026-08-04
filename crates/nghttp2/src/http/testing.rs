@@ -126,6 +126,7 @@ pub struct Duplex {
     reads: Arc<Mutex<Vec<(usize, usize)>>>,
     vectored: Arc<Mutex<VectoredRecord>>,
     limits: Arc<Mutex<VecDeque<usize>>>,
+    decline_after: Arc<Mutex<Option<usize>>>,
 }
 
 /// Which write strategy a [`Duplex`] half offers the driver.
@@ -137,6 +138,18 @@ enum WriteShape {
     Borrowed,
     /// Overrides the vectored path: small blocks gathered with a driver-owned buffer.
     Vectored,
+    /// Overrides both fast paths, so the driver's precedence rule has something to decide.
+    Both,
+}
+
+impl WriteShape {
+    const fn offers_borrowed(self) -> bool {
+        matches!(self, Self::Borrowed | Self::Both)
+    }
+
+    const fn offers_vectored(self) -> bool {
+        matches!(self, Self::Vectored | Self::Both)
+    }
 }
 
 /// What a vectored duplex half saw, recorded as the writes actually happened.
@@ -151,7 +164,6 @@ struct VectoredRecord {
     /// Whether the previous call was short, which makes the next one a retry.
     last_was_short: bool,
 }
-
 /// Creates a connected pair.
 ///
 /// `borrowed_writes` selects which write path each side advertises, so a test can cover
@@ -179,6 +191,14 @@ pub fn duplex_vectored() -> (Duplex, Duplex) {
     pair(WriteShape::Vectored)
 }
 
+/// Creates a connected pair offering **both** fast paths.
+///
+/// The driver's precedence rule — vectored wins — is only observable against a transport
+/// that genuinely offers both, since with either alone there is nothing to arbitrate.
+pub fn duplex_offering_both() -> (Duplex, Duplex) {
+    pair(WriteShape::Both)
+}
+
 fn pair(shape: WriteShape) -> (Duplex, Duplex) {
     let one = Arc::new(Mutex::new(Pipe::default()));
     let two = Arc::new(Mutex::new(Pipe::default()));
@@ -192,6 +212,7 @@ fn pair(shape: WriteShape) -> (Duplex, Duplex) {
             reads: Arc::new(Mutex::new(Vec::new())),
             vectored: Arc::new(Mutex::new(VectoredRecord::default())),
             limits: Arc::new(Mutex::new(VecDeque::new())),
+            decline_after: Arc::new(Mutex::new(None)),
         },
         Duplex {
             incoming: two,
@@ -201,6 +222,7 @@ fn pair(shape: WriteShape) -> (Duplex, Duplex) {
             reads: Arc::new(Mutex::new(Vec::new())),
             vectored: Arc::new(Mutex::new(VectoredRecord::default())),
             limits: Arc::new(Mutex::new(VecDeque::new())),
+            decline_after: Arc::new(Mutex::new(None)),
         },
     )
 }
@@ -258,6 +280,22 @@ impl Duplex {
         let mut limits = self.limits.lock().expect("write limits");
         limits.clear();
         limits.extend(caps);
+    }
+
+    /// Has this half stop offering the vectored path once it has performed `writes` of them.
+    ///
+    /// Models a transport violating the contract: the election is meant to be a fixed
+    /// property, read once per pass and held, but nothing in the signature stops a later
+    /// call returning `None`. The driver must survive that by falling back to coalescing —
+    /// paying the copy it was avoiding, but neither losing an octet nor panicking — and
+    /// this is how that branch gets driven. Left alone, the vectored path is offered
+    /// forever.
+    ///
+    /// Counted against writes actually performed, not futures constructed, so the driver's
+    /// unpolled election probe never spends one: with a limit of at least one, the path is
+    /// always elected first and declined later, which is precisely the mid-pass case.
+    pub fn decline_vectored_after(&self, writes: usize) {
+        *self.decline_after.lock().expect("decline limit") = Some(writes);
     }
 
     /// Signals end of stream to the peer.
@@ -391,6 +429,7 @@ pub struct DuplexWriter {
     writes: Arc<Mutex<usize>>,
     vectored: Arc<Mutex<VectoredRecord>>,
     limits: Arc<Mutex<VecDeque<usize>>>,
+    decline_after: Arc<Mutex<Option<usize>>>,
 }
 
 impl Transport for Duplex {
@@ -409,6 +448,7 @@ impl Transport for Duplex {
                 writes: self.writes,
                 vectored: self.vectored,
                 limits: self.limits,
+                decline_after: self.decline_after,
             },
         )
     }
@@ -490,7 +530,7 @@ impl TransportWrite for DuplexWriter {
         // elects the zero-copy path, the owned one declines it and is coalesced through
         // `write`. Returning the write here — rather than a separate flag — is the whole
         // decision.
-        if self.shape != WriteShape::Borrowed {
+        if !self.shape.offers_borrowed() {
             return None;
         }
         *self.writes.lock().expect("write count") += 1;
@@ -502,8 +542,17 @@ impl TransportWrite for DuplexWriter {
         &'w mut self,
         regions: &'w [io::IoSlice<'w>],
     ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
-        if self.shape != WriteShape::Vectored {
+        if !self.shape.offers_vectored() {
             return None;
+        }
+        // The contract-violation knob. Read against writes performed rather than futures
+        // built, so the driver's unpolled election probe never trips it: with any limit at
+        // all, the path is elected at the start of the pass and declined partway through,
+        // which is the case worth testing.
+        let performed = self.vectored.lock().expect("vectored record").calls.len();
+        match *self.decline_after.lock().expect("decline limit") {
+            Some(limit) if performed >= limit => return None,
+            _ => {}
         }
         // Note what is *not* here: nothing is recorded, and no octet moves. The driver
         // elects a strategy by building one of these and dropping it without polling, so

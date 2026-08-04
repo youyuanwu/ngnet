@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
 
-use nghttp2::http::testing::{block_on, duplex, duplex_vectored};
+use nghttp2::http::testing::{block_on, duplex, duplex_offering_both, duplex_vectored};
 use nghttp2::http::{Transport, TransportRead, TransportWrite};
 
 use bytes::{Bytes, BytesMut};
@@ -418,6 +418,53 @@ fn a_vectored_duplex_can_report_a_successful_write_of_nothing() {
         written, 0,
         "the fault the driver must turn into an error rather than spin on: success \
          reporting no progress"
+    );
+}
+
+#[test]
+fn a_vectored_duplex_can_be_told_to_decline_the_path_it_elected() {
+    let (client, _peer) = duplex_vectored();
+    let log = client.vectored_log();
+    // Offer the path, then withdraw it after one write has actually happened.
+    client.decline_vectored_after(1);
+    let (_reader, mut writer) = Transport::split(client);
+
+    let probe = writer.write_vectored(&[]);
+    assert!(
+        probe.is_some(),
+        "the election must still succeed — the probe is not a write, so it may not spend \
+         the budget, or this would be a transport that never elected the path at all \
+         rather than one that abandoned it partway"
+    );
+    drop(probe);
+
+    let first = [io::IoSlice::new(b"elected")];
+    assert!(block_on(writer.write_vectored(&first).expect("vectored")).is_ok());
+
+    assert!(
+        writer
+            .write_vectored(&[io::IoSlice::new(b"declined")])
+            .is_none(),
+        "and now the transport reneges mid-pass, which the contract forbids and the driver \
+         must nonetheless survive"
+    );
+    assert_eq!(log.calls().len(), 1, "the declined call never happened");
+}
+
+#[test]
+fn a_duplex_can_offer_both_fast_paths_at_once() {
+    let (client, _peer) = duplex_offering_both();
+    let (_reader, mut writer) = Transport::split(client);
+
+    assert!(
+        writer.write_borrowed(b"borrowed").is_some(),
+        "both overrides are on offer; precedence between them is the driver's rule, and \
+         needs a transport like this one to have anything to arbitrate"
+    );
+    assert!(
+        writer
+            .write_vectored(&[io::IoSlice::new(b"vectored")])
+            .is_some()
     );
 }
 
