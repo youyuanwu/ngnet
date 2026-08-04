@@ -18,7 +18,15 @@
 use core::future::{Future, poll_fn};
 use core::task::{Context, Poll};
 
-use nghttp2::http::testing::{Empty, alongside, block_on, buffering, http_crate as http};
+use std::cell::Cell;
+use std::io;
+use std::rc::Rc;
+
+use nghttp2::http::testing::{
+    Duplex, DuplexReader, DuplexWriter, Empty, Full, alongside, block_on, buffering,
+    bytes_crate as bytes, duplex, http_crate as http,
+};
+use nghttp2::http::transport::{Transport, TransportWrite};
 use nghttp2::http::{IncomingBody, server};
 
 /// Drives `work`, but gives up after `budget` self-woken polls.
@@ -99,5 +107,157 @@ fn a_buffering_transport_still_completes_an_exchange() {
         outcome.is_some(),
         "the exchange never completed: without the driver's commit, a buffering transport \
          holds the request and the peer never sees it",
+    );
+}
+
+// ----- the same obligation, on the gathering path -----
+
+/// A buffering transport that elects the *vectored* write path.
+///
+/// `testing::buffering()` leaves both fast-path overrides at their defaults, so it can only
+/// ever make its point about the coalesced drain. The gathering drain reaches `commit`
+/// through a different sequence of calls, and a driver that flushed only after an owned
+/// write would pass the test above while stranding every gathered pass — so the obligation
+/// has to be restated against a transport that gathers.
+///
+/// Defined here rather than in `testing.rs` on purpose: it exists to make one point in one
+/// file, and the crate's public testing surface is pinned by `compat_surface.rs`, which is
+/// not a place to add things casually.
+struct GatheringBuffer {
+    inner: Duplex,
+    /// Gathering calls actually polled, shared with the test so it can tell whether the
+    /// path it means to exercise was taken at all.
+    gathered: Rc<Cell<usize>>,
+}
+
+struct GatheringBufferWriter {
+    inner: DuplexWriter,
+    /// Octets written but not yet handed to the peer — the user-space buffer a `BufWriter`
+    /// would keep.
+    buffer: Vec<u8>,
+    gathered: Rc<Cell<usize>>,
+}
+
+impl Transport for GatheringBuffer {
+    type Reader = DuplexReader;
+    type Writer = GatheringBufferWriter;
+
+    fn split(self) -> (Self::Reader, Self::Writer) {
+        let (reader, writer) = self.inner.split();
+        (
+            reader,
+            GatheringBufferWriter {
+                inner: writer,
+                buffer: Vec::new(),
+                gathered: self.gathered,
+            },
+        )
+    }
+}
+
+impl TransportWrite for GatheringBufferWriter {
+    fn write(
+        &mut self,
+        buf: bytes::Bytes,
+    ) -> impl Future<Output = (io::Result<usize>, bytes::Bytes)> {
+        self.buffer.extend_from_slice(&buf);
+        let written = buf.len();
+        core::future::ready((Ok(written), buf))
+    }
+
+    fn write_vectored<'w>(
+        &'w mut self,
+        regions: &'w [io::IoSlice<'w>],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        // Nothing happens here: the driver builds one of these with no regions at all to
+        // learn which path this transport offers, and drops it without polling. An `async`
+        // block is inert until polled, so the copy below only ever runs for a real write.
+        Some(async move {
+            self.gathered.set(self.gathered.get() + 1);
+            let mut written = 0;
+            for region in regions {
+                self.buffer.extend_from_slice(region);
+                written += region.len();
+            }
+            Ok(written)
+        })
+    }
+
+    async fn commit(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let data = core::mem::take(&mut self.buffer);
+        let (result, _buf) = self.inner.write(bytes::Bytes::from(data)).await;
+        result.map(|_| ())
+    }
+}
+
+#[test]
+fn a_buffering_transport_that_gathers_still_completes_an_exchange() {
+    // The same exchange as above, over a transport that elects the gathering path. The
+    // budget is what turns "the driver stopped committing after a gathered pass" into a
+    // failure rather than a hung suite.
+    let (client_transport, server_transport) = duplex(false);
+    let gathered = Rc::new(Cell::new(0usize));
+    let client_transport = GatheringBuffer {
+        inner: client_transport,
+        gathered: Rc::clone(&gathered),
+    };
+
+    let (requests, connection) =
+        nghttp2::http::handshake::<_, Full>(client_transport).expect("handshake");
+
+    let serving = server::serve(server_transport, |request: http::Request<IncomingBody>| {
+        drop(request.into_body());
+        async move {
+            http::Response::builder()
+                .status(200)
+                .header("x-answered", "yes")
+                .body(Full::new(&b"gathered"[..]))
+                .expect("a response")
+        }
+    })
+    .expect("serving");
+
+    let exchange = async {
+        let response = requests
+            .send_request(
+                http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri("http://example.test/gathered")
+                    // Larger than the driver's threshold, so the pass carries a block that
+                    // is gathered beside the accumulation rather than folded into it: both
+                    // halves of the strategy run before `commit` is reached.
+                    .body(Full::new(vec![b'x'; 4096]))
+                    .expect("a request"),
+            )
+            .await
+            .expect("a response");
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-answered")
+                .and_then(|value| value.to_str().ok()),
+            Some("yes"),
+            "the response did not round-trip through the gathering transport",
+        );
+        drop(requests);
+    };
+
+    let outcome = block_on(within_budget(
+        alongside(alongside(exchange, connection), serving),
+        200_000,
+    ));
+
+    assert!(
+        outcome.is_some(),
+        "the exchange never completed: a gathered pass left behind a buffer nobody flushed",
+    );
+    assert!(
+        gathered.get() > 0,
+        "no gathering call was ever polled, so this exercised the coalesced path again and \
+         proved nothing the test above had not",
     );
 }
