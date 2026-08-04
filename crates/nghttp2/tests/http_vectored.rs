@@ -611,9 +611,14 @@ fn declining_on_the_retry_after_a_short_write_recovers_both_regions() {
 #[test]
 fn declining_before_a_single_gathering_write_leaves_the_pass_to_the_owned_path() {
     // The degenerate end of SC-012a: the transport offers the path to the election probe
-    // and then refuses the very first real call. Nothing has accumulated in the driver's
-    // buffer yet at that point for the large-block case, which is the branch where an
-    // off-by-one in the fallback's arithmetic would slice from the wrong side.
+    // and then refuses the very first real call, with the driver's accumulation buffer
+    // already holding the head of the pass. That makes it the `done == 0` case of the
+    // fallback — nothing of the offer was accepted, so the whole accumulation *and* the
+    // whole block have to be recovered into the coalescing buffer, in that order.
+    //
+    // The fixture can express this only because it recognises the probe by its empty region
+    // list; counting it as a write would decline the election itself and quietly turn this
+    // into a second test of the plain owned path.
     let unlimited = observe(Run::new(Shape::Vectored, BOUNDARY_BODY));
     let observed = observe(
         Run::new(Shape::Vectored, BOUNDARY_BODY)

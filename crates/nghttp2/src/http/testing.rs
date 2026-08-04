@@ -291,9 +291,11 @@ impl Duplex {
     /// this is how that branch gets driven. Left alone, the vectored path is offered
     /// forever.
     ///
-    /// Counted against writes actually performed, not futures constructed, so the driver's
-    /// unpolled election probe never spends one: with a limit of at least one, the path is
-    /// always elected first and declined later, which is precisely the mid-pass case.
+    /// Counted against writes actually performed, not futures constructed, and never
+    /// against the driver's region-less election probe — which is why a limit of zero is
+    /// meaningful rather than degenerate: the path is elected, and then the very first real
+    /// call is refused, with the driver's accumulation buffer still holding everything the
+    /// pass has gathered so far.
     pub fn decline_vectored_after(&self, writes: usize) {
         *self.decline_after.lock().expect("decline limit") = Some(writes);
     }
@@ -545,14 +547,18 @@ impl TransportWrite for DuplexWriter {
         if !self.shape.offers_vectored() {
             return None;
         }
-        // The contract-violation knob. Read against writes performed rather than futures
-        // built, so the driver's unpolled election probe never trips it: with any limit at
-        // all, the path is elected at the start of the pass and declined partway through,
-        // which is the case worth testing.
-        let performed = self.vectored.lock().expect("vectored record").calls.len();
-        match *self.decline_after.lock().expect("decline limit") {
-            Some(limit) if performed >= limit => return None,
-            _ => {}
+        // The contract-violation knob. Two things keep it from swallowing the election
+        // itself. It is read against writes *performed* rather than futures built, so a
+        // constructed-and-dropped probe never spends one; and the probe is recognisable —
+        // it is the only call with no regions at all — so a limit of zero declines the
+        // first real write while still electing the path, which is the case that would
+        // otherwise be unreachable.
+        if !regions.is_empty() {
+            let performed = self.vectored.lock().expect("vectored record").calls.len();
+            match *self.decline_after.lock().expect("decline limit") {
+                Some(limit) if performed >= limit => return None,
+                _ => {}
+            }
         }
         // Note what is *not* here: nothing is recorded, and no octet moves. The driver
         // elects a strategy by building one of these and dropping it without polling, so
