@@ -119,6 +119,154 @@ impl TransportWrite for ReadinessHalf {
     }
 }
 
+/// A transport that offers only the vectored path, counting **polled** writes.
+///
+/// The recording sits in the future's `poll`, not in `write_vectored` itself, and that
+/// placement is load-bearing: the driver elects a strategy by constructing one of these
+/// futures and dropping it without ever polling it. A fixture that recorded at construction
+/// would count a write that never happened, on every pass, and quietly corrupt every
+/// write-count assertion built on it.
+struct VectoredOnly {
+    polled_writes: Rc<RefCell<usize>>,
+    regions_seen: Rc<RefCell<Vec<usize>>>,
+}
+
+/// The future `VectoredOnly::write_vectored` hands back. Inert until polled.
+struct RecordOnPoll<'w> {
+    regions: &'w [io::IoSlice<'w>],
+    polled_writes: Rc<RefCell<usize>>,
+    regions_seen: Rc<RefCell<Vec<usize>>>,
+}
+
+impl Future for RecordOnPoll<'_> {
+    type Output = io::Result<usize>;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        let me = self.get_mut();
+        *me.polled_writes.borrow_mut() += 1;
+        me.regions_seen.borrow_mut().push(me.regions.len());
+        let total = me.regions.iter().map(|region| region.len()).sum();
+        core::task::Poll::Ready(Ok(total))
+    }
+}
+
+impl TransportRead for VectoredOnly {
+    async fn read(&mut self, buf: BytesMut) -> (io::Result<usize>, BytesMut) {
+        (Ok(0), buf)
+    }
+}
+
+impl TransportWrite for VectoredOnly {
+    async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
+        let written = buf.len();
+        (Ok(written), buf)
+    }
+
+    fn write_vectored<'w>(
+        &'w mut self,
+        regions: &'w [io::IoSlice<'w>],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        Some(RecordOnPoll {
+            regions,
+            polled_writes: Rc::clone(&self.polled_writes),
+            regions_seen: Rc::clone(&self.regions_seen),
+        })
+    }
+}
+
+/// A transport that offers **both** fast paths, so precedence has something to arbitrate.
+struct OffersBoth {
+    borrowed_elections: Rc<RefCell<usize>>,
+    vectored_elections: Rc<RefCell<usize>>,
+}
+
+impl TransportWrite for OffersBoth {
+    async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
+        let written = buf.len();
+        (Ok(written), buf)
+    }
+
+    fn write_borrowed<'w>(
+        &'w mut self,
+        data: &'w [u8],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        *self.borrowed_elections.borrow_mut() += 1;
+        Some(core::future::ready(Ok(data.len())))
+    }
+
+    fn write_vectored<'w>(
+        &'w mut self,
+        regions: &'w [io::IoSlice<'w>],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        *self.vectored_elections.borrow_mut() += 1;
+        let total = regions.iter().map(|region| region.len()).sum();
+        Some(core::future::ready(Ok(total)))
+    }
+}
+
+#[test]
+fn a_transport_can_elect_the_vectored_path_alone() {
+    let polled_writes = Rc::new(RefCell::new(0));
+    let regions_seen = Rc::new(RefCell::new(Vec::new()));
+    let mut writer = VectoredOnly {
+        polled_writes: Rc::clone(&polled_writes),
+        regions_seen: Rc::clone(&regions_seen),
+    };
+
+    assert!(
+        writer.write_borrowed(b"unused").is_none(),
+        "electing the vectored path says nothing about the borrowed one, which this \
+         transport never overrode"
+    );
+
+    // Exactly what the driver's election probe does: construct, inspect, drop unpolled.
+    let probe = writer.write_vectored(&[]);
+    assert!(probe.is_some(), "the vectored path is on offer");
+    drop(probe);
+    assert_eq!(
+        *polled_writes.borrow(),
+        0,
+        "constructing the election probe must not count as a write — the driver never \
+         polls it, and a fixture recording at construction would inflate every count"
+    );
+
+    let regions = [io::IoSlice::new(b"header"), io::IoSlice::new(b"payload")];
+    let write = writer.write_vectored(&regions).expect("the vectored path");
+    let written = block_on(write).unwrap();
+
+    assert_eq!(written, b"header".len() + b"payload".len());
+    assert_eq!(*polled_writes.borrow(), 1, "one polled call is one write");
+    assert_eq!(
+        &regions_seen.borrow()[..],
+        &[2],
+        "both regions arrive in a single call, in order — that is the whole point"
+    );
+}
+
+#[test]
+fn a_transport_may_offer_both_fast_paths() {
+    let borrowed_elections = Rc::new(RefCell::new(0));
+    let vectored_elections = Rc::new(RefCell::new(0));
+    let mut writer = OffersBoth {
+        borrowed_elections: Rc::clone(&borrowed_elections),
+        vectored_elections: Rc::clone(&vectored_elections),
+    };
+
+    // Both are on offer; which one the driver *takes* is asserted where the driver is,
+    // since precedence is the driver's rule rather than the transport's.
+    assert!(writer.write_borrowed(b"borrowed").is_some());
+    assert!(
+        writer
+            .write_vectored(&[io::IoSlice::new(b"vectored")])
+            .is_some()
+    );
+    assert_eq!(*borrowed_elections.borrow(), 1);
+    assert_eq!(*vectored_elections.borrow(), 1);
+}
+
 #[test]
 fn a_completion_transport_needs_no_borrowed_write_path() {
     // Compiling is most of the assertion: `Completion` above never mentions
@@ -138,6 +286,14 @@ fn a_completion_transport_needs_no_borrowed_write_path() {
         writer.write_borrowed(b"to the peer").is_none(),
         "a transport that has not overridden the borrowed path must decline it, so the \
          driver coalesces and writes owned"
+    );
+
+    assert!(
+        writer
+            .write_vectored(&[io::IoSlice::new(b"to the peer")])
+            .is_none(),
+        "nor may the vectored path be elected by a transport that never mentioned it — a \
+         completion transport must keep compiling untouched as strategies are added"
     );
 
     let (written, _buf) = block_on(writer.write(Bytes::from_static(b"to the peer")));

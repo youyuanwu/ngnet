@@ -502,13 +502,13 @@ mod asynchronous {
         drop((reader, writer));
     }
 
-    /// The writing half's contract, pinned by the shape of its two overridable points.
+    /// The writing half's contract, pinned by the shape of its three overridable points.
     ///
-    /// The borrowed fast path is a *single* override: `write_borrowed` returns an
-    /// `Option` of a future, so the decision (`Some`/`None`) and the write are one method —
-    /// a separate boolean flag would be a different, breakable, surface. `commit` returns a
-    /// future of `()`. Both are pinned as signatures rather than fn pointers because a
-    /// return-position `impl Future` has no nameable type.
+    /// Each fast path is a *single* override: `write_borrowed` and `write_vectored` each
+    /// return an `Option` of a future, so the decision (`Some`/`None`) and the write are one
+    /// method — a separate boolean flag would be a different, breakable, surface. `commit`
+    /// returns a future of `()`. All are pinned as signatures rather than fn pointers
+    /// because a return-position `impl Future` has no nameable type.
     pub(super) fn write_half_surface<W: TransportWrite>() {
         fn borrowed_is_one_optional_future<W: TransportWrite>(writer: &mut W, data: &[u8]) {
             fn assert_optional_future<F: core::future::Future<Output = std::io::Result<usize>>>(
@@ -517,11 +517,22 @@ mod asynchronous {
             }
             assert_optional_future(writer.write_borrowed(data));
         }
+        fn vectored_is_one_optional_future<W: TransportWrite>(
+            writer: &mut W,
+            regions: &[std::io::IoSlice<'_>],
+        ) {
+            fn assert_optional_future<F: core::future::Future<Output = std::io::Result<usize>>>(
+                _: Option<F>,
+            ) {
+            }
+            assert_optional_future(writer.write_vectored(regions));
+        }
         fn commit_returns_a_result_future<W: TransportWrite>(writer: &mut W) {
             fn assert_future<F: core::future::Future<Output = std::io::Result<()>>>(_: F) {}
             assert_future(writer.commit());
         }
         let _ = borrowed_is_one_optional_future::<W>;
+        let _ = vectored_is_one_optional_future::<W>;
         let _ = commit_returns_a_result_future::<W>;
     }
 

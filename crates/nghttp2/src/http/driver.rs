@@ -1027,12 +1027,14 @@ fn fail_stream(registry: &Registry, stream: i32, error: Error) {
 
 /// Writes out everything the session currently has to say.
 ///
-/// Which of the two strategies runs is the transport's choice, expressed once through
+/// Which strategy runs is the transport's choice, expressed once through
 /// [`TransportWrite::write_borrowed`]: it returns `Some` to take each block borrowed and
-/// uncopied, or `None` to have them coalesced into one owned write. The two cannot be
-/// combined — the session invalidates each block when the next is asked for, so blocks can
-/// only be gathered into one write by copying them — so the choice is read from the first
-/// block and held for the rest of the pass.
+/// uncopied, or `None` to have them coalesced into one owned write. Several session blocks
+/// cannot be gathered *with each other* into one write without copying, because the session
+/// invalidates each block when the next is asked for; so the choice is read from the first
+/// block and held for the rest of the pass. That constraint does not extend to gathering a
+/// block with memory the driver itself owns, which is what
+/// [`TransportWrite::write_vectored`] exists for.
 ///
 /// This does not commit the octets to the peer; [`TransportWrite::commit`] does, and the
 /// caller runs it once the pass is fully drained.

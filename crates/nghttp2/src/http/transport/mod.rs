@@ -35,6 +35,27 @@
 //! that is a serialising fallback: it reintroduces exactly the head-of-line stall the
 //! split exists to prevent, and an `Rc`-based cell additionally makes both halves
 //! non-`Send`.
+//!
+//! # How a pass gets drained
+//!
+//! [`TransportWrite`] offers two optional overrides, and between them they select one of
+//! three strategies for turning a pass of session output into writes.
+//!
+//! | elected by | strategy | writes per pass | driver-side copy |
+//! | --- | --- | --- | --- |
+//! | neither (default) | owned | one | every octet, every pass |
+//! | [`write_borrowed`](TransportWrite::write_borrowed) | borrowed | one per block | none |
+//! | [`write_vectored`](TransportWrite::write_vectored) | vectored | one, plus one per large block | none of the large blocks |
+//!
+//! The vectored strategy exists because the first two are each wrong for half of the
+//! traffic: under multiplexing a pass is dozens of tiny blocks, where one write per block
+//! is the dominant cost, and with a large body it is a handful of 16 KiB blocks, where
+//! copying them all to save three syscalls is the dominant cost. Gathering small blocks
+//! into a buffer the driver owns while handing large ones to the socket uncopied gets both.
+//!
+//! `write_vectored` takes precedence where both are overridden. Neither election is a
+//! separate flag: each is expressed by returning `Some(future)` from the method that also
+//! performs the write, so an implementation cannot claim a path it does not supply.
 
 use core::future::Future;
 
@@ -96,21 +117,30 @@ pub trait TransportWrite {
 
     /// The zero-copy write strategy, taken whole or not at all.
     ///
-    /// This is the transport's one say over how the driver drains a pass, and the decision
-    /// and the operation are deliberately the same method. Returning `Some` *is* electing
-    /// the borrowed path, and the future it carries *is* how that path writes; returning
-    /// `None` — the default — leaves the owned path. So an implementation cannot advertise
-    /// the fast path without supplying it, nor supply it without the driver taking it —
-    /// the two ways a separate flag and method could silently disagree.
+    /// This is one of the transport's two says over how the driver drains a pass, and the
+    /// decision and the operation are deliberately the same method. Returning `Some` *is*
+    /// electing the borrowed path, and the future it carries *is* how that path writes;
+    /// returning `None` — the default — leaves the owned path, unless
+    /// [`write_vectored`](TransportWrite::write_vectored) elects the vectored one. So an
+    /// implementation cannot advertise the fast path without supplying it, nor supply it
+    /// without the driver taking it — the two ways a separate flag and method could silently
+    /// disagree.
     ///
     /// The owned path coalesces a whole pass into one [`write`](TransportWrite::write): a
     /// syscall saved for an allocation and a copy of every outgoing octet, every pass. The
     /// borrowed path hands each of the session's own blocks over as it is produced,
-    /// uncopied — a few small writes per pass for zero allocation, and the only path on
-    /// which steady-state allocation reaches zero. The two are exclusive by construction:
-    /// the session invalidates each block when the next is asked for, so blocks cannot be
-    /// gathered into one write without copying them, which is why a single method chooses
-    /// between the paths rather than the driver combining them.
+    /// uncopied — zero allocation, at one write per block.
+    ///
+    /// These two cannot be *combined*, and the reason is worth stating precisely because it
+    /// is easy to overstate. The session lends one block at a time: asking for the next
+    /// invalidates the last, and this crate's [`Session::send`] signature enforces it by
+    /// borrowing the session for as long as the block lives. So several session blocks can
+    /// never be gathered *with each other* into one write without copying them. What that
+    /// does **not** foreclose is gathering one block with memory the driver itself owns,
+    /// which is what [`write_vectored`](TransportWrite::write_vectored) offers and how the
+    /// vectored path reaches one write per pass without copying large payloads.
+    ///
+    /// [`Session::send`]: crate::Session::send
     ///
     /// A completion-based transport cannot lend the kernel a borrowed buffer and so leaves
     /// this at its default; a readiness-based one overrides it. The choice must not depend
@@ -164,6 +194,76 @@ pub trait TransportWrite {
         data: &'w [u8],
     ) -> Option<impl Future<Output = std::io::Result<usize>> + 'w> {
         let _ = data;
+        None::<core::future::Ready<std::io::Result<usize>>>
+    }
+
+    /// The gathering write strategy, taken whole or not at all.
+    ///
+    /// Elected exactly like [`write_borrowed`](TransportWrite::write_borrowed) — returning
+    /// `Some` *is* the election and the future it carries *is* the write — and it takes
+    /// precedence over it: a transport overriding both gets the vectored path, and
+    /// `write_borrowed` becomes its fallback for the case below where the underlying I/O
+    /// cannot really gather.
+    ///
+    /// # What the regions are
+    ///
+    /// `regions` is a sequence of octet runs to be written **in order**, as one operation,
+    /// exactly as `writev` would. The return is the number of octets accepted across the
+    /// whole sequence; a short write is normal and the driver re-offers what remains.
+    ///
+    /// This library's driver never offers more than two regions, because that is all the
+    /// block lifetime permits: one live session block beside the driver's own accumulated
+    /// octets. The contract itself imposes no count, so an implementation should not assume
+    /// two. No region is ever empty.
+    ///
+    /// # How the election is read
+    ///
+    /// The driver decides once per pass, by calling this method and inspecting only whether
+    /// the result is `Some`. **It may drop that future without ever polling it**, so
+    /// constructing the returned future must have no side effect — an implementation that
+    /// records or begins the write at construction time will count a write that never
+    /// happened. For the same reason the decision must not depend on `regions`: it is a
+    /// fixed property of the transport, and the driver may probe it with an empty sequence.
+    ///
+    /// Returning `None` from a later call in a pass that already elected this path is a
+    /// contract violation. The driver tolerates it — it falls back to coalescing the
+    /// remainder rather than failing the connection — but the octets get copied, which is
+    /// the cost this path exists to avoid.
+    ///
+    /// # When not to elect it
+    ///
+    /// A transport whose underlying I/O merely *emulates* gathering — writing the first
+    /// region and ignoring the rest, as the default `poll_write_vectored` does — should
+    /// return `None` from the start and let one of the other paths run. Electing it there
+    /// is worse than not electing it, since each call would then move only one region.
+    ///
+    /// # Why `Some(())` cannot compile
+    ///
+    /// As with the borrowed path, electing is inseparable from supplying the write:
+    ///
+    /// ```compile_fail
+    /// use nghttp2::http::transport::TransportWrite;
+    /// use nghttp2::http::testing::bytes_crate::Bytes;
+    ///
+    /// struct GathersNothing;
+    /// impl TransportWrite for GathersNothing {
+    ///     async fn write(&mut self, buf: Bytes) -> (std::io::Result<usize>, Bytes) {
+    ///         let n = buf.len();
+    ///         (Ok(n), buf)
+    ///     }
+    ///     fn write_vectored<'w>(
+    ///         &'w mut self,
+    ///         _regions: &'w [std::io::IoSlice<'w>],
+    ///     ) -> Option<impl core::future::Future<Output = std::io::Result<usize>> + 'w> {
+    ///         Some(()) // claims the vectored path but `()` is not a write future
+    ///     }
+    /// }
+    /// ```
+    fn write_vectored<'w>(
+        &'w mut self,
+        regions: &'w [std::io::IoSlice<'w>],
+    ) -> Option<impl Future<Output = std::io::Result<usize>> + 'w> {
+        let _ = regions;
         None::<core::future::Ready<std::io::Result<usize>>>
     }
 

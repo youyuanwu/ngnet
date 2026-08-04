@@ -9,9 +9,11 @@
 //!
 //! tokio is readiness-based, so nothing here needs to own a buffer while an operation is in
 //! flight. Reads take the buffer, fill it and hand it straight back, with no copy. Writes
-//! elect [`TransportWrite::write_borrowed`], handing the session's own output blocks over
-//! directly instead of gathering them into an owned buffer first — the one cost the
-//! completion-shaped traits would otherwise impose on a runtime that does not need them.
+//! elect [`TransportWrite::write_vectored`], gathering the session's small output blocks
+//! into one `writev` while handing large ones to the socket uncopied — so a pass costs few
+//! syscalls without copying a body. [`TransportWrite::write_borrowed`] is kept as the
+//! fallback: it is what runs when the underlying I/O reports it does not really gather, and
+//! would otherwise write only the first region of each call.
 //!
 //! Because the `AsyncWrite` bound also admits buffering wrappers, whose `write` only fills a
 //! buffer, [`TransportWrite::commit`] flushes: without it a `BufWriter` or `BufStream` would
@@ -111,7 +113,25 @@ where
         // tokio never needs to own the octets, so the session's blocks are handed over as
         // they are produced rather than gathered into one owned buffer first — the zero-copy
         // path, elected by returning the write itself rather than by any separate flag.
+        // Kept alongside `write_vectored` because it is what runs on an I/O that cannot
+        // really gather; where both apply, the driver takes the vectored one.
         Some(self.half.write(data))
+    }
+
+    fn write_vectored<'w>(
+        &'w mut self,
+        regions: &'w [std::io::IoSlice<'w>],
+    ) -> Option<impl Future<Output = std::io::Result<usize>> + 'w> {
+        // The `AsyncWrite` bound admits implementations whose `poll_write_vectored` is the
+        // provided default: it writes the first region and silently ignores the rest, so
+        // electing this path there would move one region per syscall and be strictly worse
+        // than the borrowed path. Decline, and let `write_borrowed` run instead. Every type
+        // this crate puts behind `TokioIo` in practice — `TcpStream`, `UnixStream`,
+        // `DuplexStream`, and the buffering wrappers — reports `true`.
+        if !self.half.is_write_vectored() {
+            return None;
+        }
+        Some(self.half.write_vectored(regions))
     }
 
     async fn commit(&mut self) -> std::io::Result<()> {
