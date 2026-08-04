@@ -552,9 +552,21 @@ fn the_asynchronous_surface_is_unchanged() {
         asynchronous::client_surface::<Duplex, Empty>;
     let _: fn(&nghttp2::http::IncomingBody) = asynchronous::incoming_body_surface;
     let _: fn(&nghttp2::http::Cancelled) = asynchronous::cancelled_surface;
-    // The writing half's two overridable points, pinned generically so the shape holds for
+    // The writing half's three overridable points, pinned generically so the shape holds for
     // every transport, not only the ready-made tokio one.
     asynchronous::write_half_surface::<nghttp2::http::testing::DuplexWriter>();
+    // The vectored testing transport and its observation handle. Hidden from the docs but
+    // still public, and integration tests are separate crates that can reach nothing else.
+    let _: fn() -> (Duplex, Duplex) = nghttp2::http::testing::duplex_vectored;
+    let _: fn(&Duplex) -> nghttp2::http::testing::VectoredLog = Duplex::vectored_log;
+    let _: fn(&nghttp2::http::testing::VectoredLog) -> Vec<Vec<usize>> =
+        nghttp2::http::testing::VectoredLog::calls;
+    let _: fn(&nghttp2::http::testing::VectoredLog) -> Vec<u8> =
+        nghttp2::http::testing::VectoredLog::octets;
+    let _: fn(&nghttp2::http::testing::VectoredLog) -> usize =
+        nghttp2::http::testing::VectoredLog::retries;
+    let _: fn(&nghttp2::http::testing::VectoredLog) = nghttp2::http::testing::VectoredLog::reset;
+    let _: fn(&Duplex, Vec<usize>) = |duplex, caps| duplex.accept_at_most(caps);
     let _: fn() = asynchronous::config_surface;
     let _: fn(Duplex, nghttp2::http::Config) -> core::result::Result<(), nghttp2::http::Error> =
         asynchronous::client_with_config_surface::<Duplex, Empty>;

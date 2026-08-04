@@ -119,18 +119,67 @@ fn notifying(pipe: &Mutex<Pipe>, act: impl FnOnce(&mut Pipe) -> Option<Waker>) {
 pub struct Duplex {
     incoming: Arc<Mutex<Pipe>>,
     outgoing: Arc<Mutex<Pipe>>,
-    /// Set when this transport overrides the borrowed-write path, so both drain
-    /// strategies can be exercised against the same in-memory plumbing.
-    borrowed_writes: bool,
+    /// Which of the three drain strategies this half advertises, so all of them can be
+    /// exercised against the same in-memory plumbing.
+    shape: WriteShape,
     writes: Arc<Mutex<usize>>,
     reads: Arc<Mutex<Vec<(usize, usize)>>>,
+    vectored: Arc<Mutex<VectoredRecord>>,
+    limits: Arc<Mutex<VecDeque<usize>>>,
+}
+
+/// Which write strategy a [`Duplex`] half offers the driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteShape {
+    /// Overrides nothing, so the driver coalesces a pass into one owned write.
+    Owned,
+    /// Overrides the borrowed path: one write per session block, nothing copied.
+    Borrowed,
+    /// Overrides the vectored path: small blocks gathered with a driver-owned buffer.
+    Vectored,
+}
+
+/// What a vectored duplex half saw, recorded as the writes actually happened.
+#[derive(Debug, Default)]
+struct VectoredRecord {
+    /// The region lengths of each polled call, in order.
+    calls: Vec<Vec<usize>>,
+    /// Every octet handed over, concatenated in the order it was offered.
+    octets: Vec<u8>,
+    /// Calls that re-offered the remainder of a short write, rather than new octets.
+    retries: usize,
+    /// Whether the previous call was short, which makes the next one a retry.
+    last_was_short: bool,
 }
 
 /// Creates a connected pair.
 ///
 /// `borrowed_writes` selects which write path each side advertises, so a test can cover
-/// the coalescing and zero-copy strategies without a second transport implementation.
+/// the coalescing and zero-copy strategies without a second transport implementation. For
+/// the vectored strategy, see [`duplex_vectored`].
 pub fn duplex(borrowed_writes: bool) -> (Duplex, Duplex) {
+    let shape = if borrowed_writes {
+        WriteShape::Borrowed
+    } else {
+        WriteShape::Owned
+    };
+    pair(shape)
+}
+
+/// Creates a connected pair whose halves elect the vectored write path.
+///
+/// Separate from [`duplex`] rather than another argument to it: the boolean there names a
+/// choice between two strategies at around seventy-five call sites, and rewriting all of
+/// them to say "not vectored" would be a large diff that could only lose information.
+///
+/// A half made this way records what it was offered — see [`Duplex::vectored_log`] — and can
+/// be told to accept only a prefix of each call, see [`Duplex::accept_at_most`], which is how
+/// short writes are driven deterministically rather than hoped for.
+pub fn duplex_vectored() -> (Duplex, Duplex) {
+    pair(WriteShape::Vectored)
+}
+
+fn pair(shape: WriteShape) -> (Duplex, Duplex) {
     let one = Arc::new(Mutex::new(Pipe::default()));
     let two = Arc::new(Mutex::new(Pipe::default()));
 
@@ -138,16 +187,20 @@ pub fn duplex(borrowed_writes: bool) -> (Duplex, Duplex) {
         Duplex {
             incoming: Arc::clone(&one),
             outgoing: Arc::clone(&two),
-            borrowed_writes,
+            shape,
             writes: Arc::new(Mutex::new(0)),
             reads: Arc::new(Mutex::new(Vec::new())),
+            vectored: Arc::new(Mutex::new(VectoredRecord::default())),
+            limits: Arc::new(Mutex::new(VecDeque::new())),
         },
         Duplex {
             incoming: two,
             outgoing: one,
-            borrowed_writes,
+            shape,
             writes: Arc::new(Mutex::new(0)),
             reads: Arc::new(Mutex::new(Vec::new())),
+            vectored: Arc::new(Mutex::new(VectoredRecord::default())),
+            limits: Arc::new(Mutex::new(VecDeque::new())),
         },
     )
 }
@@ -181,9 +234,72 @@ impl Duplex {
         }
     }
 
+    /// A handle that keeps observing the vectored writes after the transport is split.
+    ///
+    /// Empty unless this half came from [`duplex_vectored`], since the other two shapes
+    /// never reach the vectored path.
+    pub fn vectored_log(&self) -> VectoredLog {
+        VectoredLog {
+            record: Arc::clone(&self.vectored),
+        }
+    }
+
+    /// Caps how many octets each subsequent vectored call accepts.
+    ///
+    /// One cap per call, consumed in order; once they run out, every call accepts
+    /// everything it is offered. A cap of zero has the transport report a successful write
+    /// of nothing, which the driver must treat as an error rather than spin on.
+    ///
+    /// This is how partial writes get driven deterministically. A real socket short-writes
+    /// when it feels like it, which is untestable; naming the prefix makes the interesting
+    /// cases — a cut inside the first region, a cut exactly on the boundary between the two,
+    /// a cut one octet from the end — reachable on purpose.
+    pub fn accept_at_most(&self, caps: impl IntoIterator<Item = usize>) {
+        let mut limits = self.limits.lock().expect("write limits");
+        limits.clear();
+        limits.extend(caps);
+    }
+
     /// Signals end of stream to the peer.
     pub fn close(&self) {
         notifying(&self.outgoing, Pipe::close);
+    }
+}
+
+/// What a vectored transport half was offered, and accepted.
+#[derive(Debug, Clone)]
+pub struct VectoredLog {
+    record: Arc<Mutex<VectoredRecord>>,
+}
+
+impl VectoredLog {
+    /// The region lengths of each polled call, in order.
+    ///
+    /// One entry per call, so the length of this is the number of writes and each inner
+    /// vector's length is how many regions that write gathered.
+    pub fn calls(&self) -> Vec<Vec<usize>> {
+        self.record.lock().expect("vectored record").calls.clone()
+    }
+
+    /// Every octet handed over, concatenated in the order it was offered.
+    ///
+    /// The point of comparison for "the vectored path puts the same octets on the wire, in
+    /// the same order, as the coalescing path would".
+    pub fn octets(&self) -> Vec<u8> {
+        self.record.lock().expect("vectored record").octets.clone()
+    }
+
+    /// Calls that re-offered the remainder of a short write rather than new octets.
+    ///
+    /// Counted apart from the calls in [`calls`](VectoredLog::calls) so that a bound on
+    /// writes per pass can exclude retries without having to reconstruct which was which.
+    pub fn retries(&self) -> usize {
+        self.record.lock().expect("vectored record").retries
+    }
+
+    /// Forgets everything so far, so a test can measure one driver pass at a time.
+    pub fn reset(&self) {
+        *self.record.lock().expect("vectored record") = VectoredRecord::default();
     }
 }
 
@@ -271,8 +387,10 @@ pub struct DuplexReader {
 #[derive(Debug)]
 pub struct DuplexWriter {
     outgoing: Arc<Mutex<Pipe>>,
-    borrowed_writes: bool,
+    shape: WriteShape,
     writes: Arc<Mutex<usize>>,
+    vectored: Arc<Mutex<VectoredRecord>>,
+    limits: Arc<Mutex<VecDeque<usize>>>,
 }
 
 impl Transport for Duplex {
@@ -287,8 +405,10 @@ impl Transport for Duplex {
             },
             DuplexWriter {
                 outgoing: self.outgoing,
-                borrowed_writes: self.borrowed_writes,
+                shape: self.shape,
                 writes: self.writes,
+                vectored: self.vectored,
+                limits: self.limits,
             },
         )
     }
@@ -370,12 +490,86 @@ impl TransportWrite for DuplexWriter {
         // elects the zero-copy path, the owned one declines it and is coalesced through
         // `write`. Returning the write here — rather than a separate flag — is the whole
         // decision.
-        if !self.borrowed_writes {
+        if self.shape != WriteShape::Borrowed {
             return None;
         }
         *self.writes.lock().expect("write count") += 1;
         notifying(&self.outgoing, |pipe| pipe.put(data));
         Some(core::future::ready(Ok(data.len())))
+    }
+
+    fn write_vectored<'w>(
+        &'w mut self,
+        regions: &'w [io::IoSlice<'w>],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        if self.shape != WriteShape::Vectored {
+            return None;
+        }
+        // Note what is *not* here: nothing is recorded, and no octet moves. The driver
+        // elects a strategy by building one of these and dropping it without polling, so
+        // any effect at construction time would be an effect that never happened. All of it
+        // lives in `poll` below. The borrowed path above can afford to be laxer because
+        // nothing probes it with an empty slice.
+        Some(DuplexVectoredWrite {
+            regions,
+            outgoing: Arc::clone(&self.outgoing),
+            writes: Arc::clone(&self.writes),
+            record: Arc::clone(&self.vectored),
+            limits: Arc::clone(&self.limits),
+        })
+    }
+}
+
+/// The write a vectored [`DuplexWriter`] hands back — inert until polled.
+#[derive(Debug)]
+struct DuplexVectoredWrite<'w> {
+    regions: &'w [io::IoSlice<'w>],
+    outgoing: Arc<Mutex<Pipe>>,
+    writes: Arc<Mutex<usize>>,
+    record: Arc<Mutex<VectoredRecord>>,
+    limits: Arc<Mutex<VecDeque<usize>>>,
+}
+
+impl Future for DuplexVectoredWrite<'_> {
+    type Output = io::Result<usize>;
+
+    fn poll(self: core::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        let offered: usize = me.regions.iter().map(|region| region.len()).sum();
+        let cap = me
+            .limits
+            .lock()
+            .expect("write limits")
+            .pop_front()
+            .unwrap_or(offered);
+        let accepted = cap.min(offered);
+
+        let mut record = me.record.lock().expect("vectored record");
+        // A call that follows a short one is re-offering octets already counted, so it is a
+        // retry rather than another logical write. Keeping the two apart is what lets a test
+        // bound writes per pass without first having to work out which was which.
+        if record.last_was_short {
+            record.retries += 1;
+        } else {
+            *me.writes.lock().expect("write count") += 1;
+        }
+        record
+            .calls
+            .push(me.regions.iter().map(|region| region.len()).collect());
+        record.last_was_short = accepted < offered;
+
+        let mut remaining = accepted;
+        for region in me.regions {
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(region.len());
+            record.octets.extend_from_slice(&region[..take]);
+            notifying(&me.outgoing, |pipe| pipe.put(&region[..take]));
+            remaining -= take;
+        }
+
+        Poll::Ready(Ok(accepted))
     }
 }
 

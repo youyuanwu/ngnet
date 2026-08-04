@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
 
-use nghttp2::http::testing::{block_on, duplex};
+use nghttp2::http::testing::{block_on, duplex, duplex_vectored};
 use nghttp2::http::{Transport, TransportRead, TransportWrite};
 
 use bytes::{Bytes, BytesMut};
@@ -309,6 +309,115 @@ fn a_transport_may_offer_both_fast_paths() {
         (*borrowed_writes.borrow(), *vectored_writes.borrow()),
         (1, 1),
         "and the vectored one likewise"
+    );
+}
+
+#[test]
+fn a_vectored_duplex_gathers_regions_and_records_them_on_poll() {
+    let (client, peer) = duplex_vectored();
+    let log = client.vectored_log();
+    let counter = client.write_counter();
+    let (_reader, mut writer) = Transport::split(client);
+
+    // The election probe: constructed, inspected, dropped unpolled.
+    let probe = writer.write_vectored(&[]);
+    assert!(
+        probe.is_some(),
+        "a vectored duplex offers the vectored path"
+    );
+    drop(probe);
+    assert_eq!(
+        (counter.get(), log.calls().len()),
+        (0, 0),
+        "the probe is not a write and must leave no trace — the driver builds one every \
+         pass and never polls it"
+    );
+
+    assert!(
+        writer.write_borrowed(b"unused").is_none(),
+        "a vectored duplex declines the borrowed path, so the driver has one strategy to \
+         pick and no ambiguity to resolve"
+    );
+
+    let regions = [
+        io::IoSlice::new(b"small blocks gathered"),
+        io::IoSlice::new(b"; then a large one"),
+    ];
+    let written = block_on(writer.write_vectored(&regions).expect("vectored")).unwrap();
+
+    assert_eq!(written, b"small blocks gathered; then a large one".len());
+    assert_eq!(counter.get(), 1, "one polled call is one write");
+    assert_eq!(log.calls(), vec![vec![21, 18]], "two regions, in one call");
+    assert_eq!(log.octets(), b"small blocks gathered; then a large one");
+    assert_eq!(log.retries(), 0);
+
+    // And the octets really crossed to the peer, in the order they were offered.
+    let (mut peer_reader, _peer_writer) = Transport::split(peer);
+    let (read, buf) = block_on(peer_reader.read(BytesMut::with_capacity(64)));
+    assert_eq!(read.unwrap(), written);
+    assert_eq!(&buf[..], b"small blocks gathered; then a large one");
+}
+
+#[test]
+fn a_vectored_duplex_can_be_told_to_accept_only_a_prefix() {
+    let (client, _peer) = duplex_vectored();
+    let log = client.vectored_log();
+    let counter = client.write_counter();
+    // A cut inside the first region, then one landing exactly on the region boundary.
+    client.accept_at_most([3, 2]);
+    let (_reader, mut writer) = Transport::split(client);
+
+    let regions = [io::IoSlice::new(b"abcde"), io::IoSlice::new(b"fghij")];
+
+    let first = block_on(writer.write_vectored(&regions).expect("vectored")).unwrap();
+    assert_eq!(
+        first, 3,
+        "the cap is honoured, and it cut inside region one"
+    );
+
+    // The driver would now re-offer the remainder; here the fixture is driven directly, so
+    // the regions are trimmed by hand to model exactly that.
+    let retry = [io::IoSlice::new(b"de"), io::IoSlice::new(b"fghij")];
+    let second = block_on(writer.write_vectored(&retry).expect("vectored")).unwrap();
+    assert_eq!(second, 2, "the second cap lands exactly on the boundary");
+
+    // Which is the interesting case: the remainder is now the second region alone. Offering
+    // it beside a zero-length first region would be the bug — hence one region, not two.
+    let last = [io::IoSlice::new(b"fghij")];
+    let third = block_on(writer.write_vectored(&last).expect("vectored")).unwrap();
+    assert_eq!(
+        third, 5,
+        "caps exhausted, so everything offered is accepted"
+    );
+
+    assert_eq!(log.octets(), b"abcdefghij", "no octet lost, none reordered");
+    assert_eq!(
+        log.calls(),
+        vec![vec![5, 5], vec![2, 5], vec![5]],
+        "and no call was ever offered an empty region"
+    );
+    assert_eq!(
+        (counter.get(), log.retries()),
+        (1, 2),
+        "a call following a short one re-offers octets already counted, so it is a retry \
+         rather than another logical write — which is what lets a per-pass write bound \
+         exclude retries without reconstructing which was which"
+    );
+}
+
+#[test]
+fn a_vectored_duplex_can_report_a_successful_write_of_nothing() {
+    let (client, _peer) = duplex_vectored();
+    client.accept_at_most([0]);
+    let (_reader, mut writer) = Transport::split(client);
+
+    let regions = [io::IoSlice::new(b"offered but not taken")];
+    let written = block_on(writer.write_vectored(&regions).expect("vectored")).unwrap();
+
+    assert_eq!(
+        written, 0,
+        "the fault the driver must turn into an error rather than spin on: success \
+         reporting no progress"
     );
 }
 
