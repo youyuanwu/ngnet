@@ -92,11 +92,18 @@ A runtime assertion catches the case where a fallback *actually happened*; `carg
 features` is what shows whether `polling` reached the build at all. Neither check subsumes the
 other, and conflating them was a mistake caught in review.
 
-**What it costs, measured.** io_uring is about twice as fast once several streams are
-multiplexed on a connection, and *slower* only on empty-body round trips — one mechanism
-explains both, since what it batches is I/O operations, and an empty exchange has almost none
-to fold together. See `docs/benchmarks.md` for the
-numbers and, more importantly, for the three confounds that bound what they license.
+**What it costs, measured — and a correction.** io_uring is about twice as fast as this
+crate's tokio transport once several streams are multiplexed, and slower on empty-body round
+trips. The obvious reading of that pair — completion I/O multiplexes better than readiness
+I/O — is **wrong**, and benchmarking hyper over a real socket is what showed it: hyper
+reaches the same throughput on epoll. The gap is not the I/O model but the number of write
+syscalls per pass. The tokio transport elects the borrowed path and issues a write per
+session block; a completion transport structurally cannot, so it coalesces, and hyper
+coalesces by buffering. The two fast arms are the two coalescing ones. Flipping only
+`TokioWriter::write_borrowed` to `None` erases the gap. See `docs/benchmarks.md` for the
+numbers and the three confounds that bound them, and `docs/pending-work.md` for the design
+question this leaves open — the borrowed path is what makes the steady state
+zero-allocation, so it is a trade rather than a bug.
 
 ## Decisions that cost a wrong attempt first
 

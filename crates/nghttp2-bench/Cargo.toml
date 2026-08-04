@@ -1,7 +1,7 @@
 [package]
 name = "nghttp2-bench"
 version = "0.1.0"
-description = "Criterion benchmarks comparing the nghttp2 async HTTP/2 stack against hyper over an in-memory duplex"
+description = "Criterion benchmarks comparing the nghttp2 async HTTP/2 stack against hyper, and completion I/O against readiness I/O"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -46,9 +46,10 @@ harness = false
 name = "body_throughput"
 harness = false
 
-# The completion-vs-readiness family. Same three measures as above, but holding the HTTP/2
-# stack constant and varying only the transport: `CompioSocket` on io_uring against
-# `TokioSocket` on epoll, over a real loopback socket.
+# The real-socket family. Same three measures as above, over a real loopback TCP connection,
+# with three arms: `CompioSocket` (nghttp2 on io_uring), `TokioSocket` (nghttp2 on epoll) and
+# `HyperSocket` (hyper on epoll). Read pairwise — the first two isolate the I/O model, the
+# last two isolate the HTTP/2 stack.
 [[bench]]
 name = "transport_serial_latency"
 harness = false

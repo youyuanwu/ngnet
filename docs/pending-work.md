@@ -57,6 +57,28 @@ test, and no more.
 - **No fallback where io_uring is absent.** The feature fails loudly instead, by decision.
   Revisiting that means compiling a readiness backend and accepting the silent-degradation
   hazard that comes with it.
+- **The tokio transport's borrowed write path costs a factor of two on a real socket.** This
+  is the largest open performance question in the crate, and it was invisible until hyper was
+  benchmarked over a socket rather than a duplex. `TokioWriter::write_borrowed` returns
+  `Some`, so the driver hands each of the session's blocks to `write` separately: zero-copy
+  and zero-allocation, but one `write(2)` per block, and the block count grows with the
+  number of multiplexed streams. Flipping only that method to return `None` — taking the
+  coalescing path every other transport takes — measured **+95% at N=8 and +128% at N=64**
+  concurrent requests, moving the tokio arm level with io_uring and past hyper. See
+  `docs/benchmarks.md`.
+
+  It is a genuine trade, not an oversight, which is why it is recorded here rather than
+  simply fixed. The borrowed path is what makes the steady state zero-allocation, which
+  `crates/nghttp2/tests/http_zero_alloc.rs` pins as an invariant; the coalescing path
+  allocates a `BytesMut` per pass. It is also the faster path where it was originally
+  measured — single-request serial latency, and 1 MiB bodies, where the saved copy outweighs
+  the syscalls. The obvious escape, gathering the blocks into one vectored write, is closed
+  off by the session invalidating each block when the next is requested, so any gather
+  implies the copy.
+
+  Resolving it properly means deciding whether zero-allocation or syscall count is the
+  invariant worth keeping, and probably means making it a choice rather than a default —
+  the answer differs by workload, and both defaults are defensible.
 - **The write-path asymmetry is unmeasured on a real NIC.** Benchmarks show tokio's borrowed
   zero-copy write cancelling io_uring's syscall advantage at 1 MiB bodies, over loopback. Whether
   that holds where real device interrupts exist is unknown, and loopback biases against

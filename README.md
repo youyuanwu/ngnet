@@ -118,10 +118,13 @@ A runnable server is in
 [`examples/h2c_async_server.rs`](crates/nghttp2/examples/h2c_async_server.rs), answering
 the same `curl --http2-prior-knowledge` as the blocking one.
 
-Which to pick is measured rather than asserted: io_uring is roughly twice as fast once several
-streams are multiplexed on a connection, and slower only on empty-body round trips, where there
-is nothing for it to batch. See
-[`docs/benchmarks.md`](docs/benchmarks.md), which also bounds what those numbers license.
+Which to pick is measured rather than asserted: over a real socket, `CompioIo` is roughly
+twice as fast as `TokioIo` once several streams are multiplexed, and slightly slower on a
+single empty-body round trip. That gap is not what it looks like, though — benchmarking hyper
+over the same socket showed it reaching the same throughput on epoll, so what separates them
+is the number of write syscalls per pass rather than the I/O model. See
+[`docs/benchmarks.md`](docs/benchmarks.md), which gives the numbers, the mechanism and the
+confounds that bound what they license.
 
 ### When to disable the feature
 

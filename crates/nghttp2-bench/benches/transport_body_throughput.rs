@@ -1,19 +1,24 @@
-//! Body throughput, completion vs readiness: a request/response body sweep on a persistent
-//! real loopback connection, with `Throughput::Bytes` so Criterion reports MB/s. The server
-//! echoes the body, so each iteration moves `size` bytes up and `size` back; throughput is
-//! normalised to one body's worth. The sweep reuses the duplex family's points so the two are
-//! comparable in shape.
+//! Body throughput on a real socket: a request/response body sweep on a persistent connection,
+//! with `Throughput::Bytes` so Criterion reports MB/s. The server echoes the body, so each
+//! iteration moves `size` bytes up and `size` back; throughput is normalised to one body's
+//! worth. The sweep reuses the duplex family's points so the two are comparable in shape.
 //!
-//! Only the transport differs — `CompioSocket` over io_uring against `TokioSocket` over epoll,
-//! `nghttp2` on both. This is where the write-path asymmetry named in `docs/benchmarks.md`
-//! bites: the readiness arm takes the borrowed zero-copy write path, the completion arm cannot,
-//! so a large-body difference is partly transport strategy and not purely the I/O model.
+//! Three arms, read pairwise: `ngrs-compio` against `ngrs-tokio` isolates the I/O model,
+//! `ngrs-tokio` against `hyper-tokio` isolates the HTTP/2 stack, and `ngrs-compio` against
+//! `hyper-tokio` varies both.
+//!
+//! This is where the write-path asymmetry named in `docs/benchmarks.md` bites hardest: the two
+//! readiness arms buffer or borrow outbound bytes in ways the completion arm structurally
+//! cannot, so a large-body difference is partly write strategy and not purely I/O model or
+//! stack.
 
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use nghttp2_bench::{CompioSocket, TokioSocket, body_of, compio_runtime, current_thread_runtime};
+use nghttp2_bench::{
+    CompioSocket, HyperSocket, TokioSocket, body_of, compio_runtime, current_thread_runtime,
+};
 
 /// 0 B exercises the headers-only path; the rest climb until the initial window and the
 /// buffer pool dominate. The same points as the duplex `body_throughput` bench.
@@ -23,8 +28,12 @@ fn transport_body_throughput(c: &mut Criterion) {
     let compio = compio_runtime();
     let compio_socket = compio.block_on(CompioSocket::establish());
 
+    // One runtime per arm; see `transport_serial_latency` for why.
     let tokio = current_thread_runtime();
     let tokio_socket = tokio.block_on(TokioSocket::establish());
+
+    let hyper = current_thread_runtime();
+    let hyper_socket = hyper.block_on(HyperSocket::establish());
 
     let mut group = c.benchmark_group("transport_body_throughput");
     for size in SIZES {
@@ -37,16 +46,22 @@ fn transport_body_throughput(c: &mut Criterion) {
         }
         let payload = body_of(size);
 
-        group.bench_with_input(BenchmarkId::new("compio", size), &size, |b, _| {
+        group.bench_with_input(BenchmarkId::new("ngrs-compio", size), &size, |b, _| {
             let payload = payload.clone();
             b.to_async(&compio)
                 .iter(|| async { black_box(compio_socket.round_trip(payload.clone()).await) });
         });
 
-        group.bench_with_input(BenchmarkId::new("tokio", size), &size, |b, _| {
+        group.bench_with_input(BenchmarkId::new("ngrs-tokio", size), &size, |b, _| {
             let payload = payload.clone();
             b.to_async(&tokio)
                 .iter(|| async { black_box(tokio_socket.round_trip(payload.clone()).await) });
+        });
+
+        group.bench_with_input(BenchmarkId::new("hyper-tokio", size), &size, |b, _| {
+            let payload = payload.clone();
+            b.to_async(&hyper)
+                .iter(|| async { black_box(hyper_socket.round_trip(payload.clone()).await) });
         });
     }
     group.finish();
