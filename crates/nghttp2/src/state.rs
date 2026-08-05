@@ -7,23 +7,92 @@
 use core::ptr::NonNull;
 use std::collections::{HashMap, HashSet};
 
+#[cfg(feature = "http")]
+use bytes::Bytes;
+
+#[cfg(feature = "http")]
+use crate::body::SharedBodySource;
 use crate::body::{BodyError, BodySource};
 use crate::stream::StreamId;
 
+/// How an outgoing body produces its payload.
+///
+/// The push arm writes into a buffer libnghttp2 offers; the shared arm hands over octets
+/// it already owns for a no-copy `DATA` frame. The enum exists in every configuration so
+/// the surrounding code is shape-stable; without the `http` feature (which brings
+/// `bytes`) only the push arm is present.
+pub(crate) enum Source {
+    /// A caller's [`BodySource`], filled into the session's frame buffer.
+    Push(Box<dyn BodySource>),
+    /// A caller's [`SharedBodySource`], handed to the transport uncopied.
+    // Constructed only through `BodyEntry::new_shared`, which Phase 1 reaches only from
+    // tests; the connection entry points that build it in production arrive in Phase 2.
+    #[cfg(feature = "http")]
+    #[allow(dead_code)]
+    Shared(Box<dyn SharedBodySource>),
+}
+
 /// One outgoing body, at an address libnghttp2 holds for the life of its stream.
 pub(crate) struct BodyEntry {
-    pub(crate) source: Box<dyn BodySource>,
+    pub(crate) source: Source,
     /// Set once the source reports that trailers will follow.
     pub(crate) trailers_ready: bool,
+    /// The chunk a no-copy read callback set aside for the send callback to hand over.
+    ///
+    /// `read_shared_body` stages one chunk per frame here and `send_data` takes it. It is
+    /// an *overwrite*, never a queue: if libnghttp2 packs a no-copy frame and then never
+    /// sends it — the documented case where the stream closes between pack and send — the
+    /// stale chunk is released either by the next stage overwriting it or by this entry
+    /// being dropped at stream close, so a chunk is never handed over twice.
+    #[cfg(feature = "http")]
+    pub(crate) staged: Option<Bytes>,
 }
 
 impl BodyEntry {
     pub(crate) fn new(source: Box<dyn BodySource>) -> Self {
         Self {
-            source,
+            source: Source::Push(source),
             trailers_ready: false,
+            #[cfg(feature = "http")]
+            staged: None,
         }
     }
+
+    /// An entry backed by a no-copy [`SharedBodySource`].
+    // Reached only from the shared submit methods, which have no production caller until
+    // Phase 2 wires the connection entry points; in a non-test build it is unused.
+    #[cfg(feature = "http")]
+    #[allow(dead_code)]
+    pub(crate) fn new_shared(source: Box<dyn SharedBodySource>) -> Self {
+        Self {
+            source: Source::Shared(source),
+            trailers_ready: false,
+            staged: None,
+        }
+    }
+}
+
+/// One no-copy `DATA` frame, waiting to be handed to the driver's sink.
+///
+/// libnghttp2 serialises only the header for a no-copy frame and leaves the payload to
+/// the application; the send callback deposits both here for the driver to collect after
+/// [`crate::session::Session::send_into`].
+///
+/// The header is an inline nine-octet array rather than a `Bytes`: it must be owned (it is
+/// copied out of libnghttp2's own buffer, which is invalidated the instant the frame
+/// completes), it is exactly nine octets, and allocating a `Bytes` per frame would show
+/// up in the steady-state allocation harness. The payload is the caller's own `Bytes`,
+/// moved out of the staging slot, so it costs no allocation at all.
+#[cfg(feature = "http")]
+#[derive(Debug)]
+pub(crate) struct SendRecord {
+    // Read by the driver when it writes the records out, which it does not yet do in Phase
+    // 1 (the sink is always empty because nothing constructs a shared body). Phase 2's
+    // ordering write reads both fields and removes this allowance.
+    #[allow(dead_code)]
+    pub(crate) header: [u8; 9],
+    #[allow(dead_code)]
+    pub(crate) payload: Bytes,
 }
 
 /// Outgoing message bodies, keyed by the stream they belong to.
@@ -39,8 +108,10 @@ pub(crate) struct BodyRegistry {
 }
 
 // SAFETY: the registry owns its entries exclusively, and `BodyEntry` holds only a
-// `Box<dyn BodySource>` where `BodySource: Send`. Moving the registry between threads
-// therefore moves only data that is itself `Send`.
+// `Source` — a `Box<dyn BodySource>` or, under the `http` feature, a
+// `Box<dyn SharedBodySource>`, both bounded `Send` — together with a staged `Bytes`,
+// which is itself `Send`. Moving the registry between threads therefore moves only data
+// that is itself `Send`.
 unsafe impl Send for BodyRegistry {}
 
 impl BodyRegistry {
@@ -254,12 +325,9 @@ impl FrameProgress {
                     self.pending[have..FRAME_HEADER].copy_from_slice(&input[..taken]);
                     input = &input[taken..];
 
-                    let length = u32::from_be_bytes([
-                        0,
-                        self.pending[0],
-                        self.pending[1],
-                        self.pending[2],
-                    ]) as usize;
+                    let length =
+                        u32::from_be_bytes([0, self.pending[0], self.pending[1], self.pending[2]])
+                            as usize;
 
                     self.state = if length == 0 {
                         Framing::Header(0)

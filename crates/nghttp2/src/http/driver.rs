@@ -40,6 +40,7 @@ use bytes::{Bytes, BytesMut};
 use http_body::Body;
 
 use crate::settings::Setting;
+use crate::state::SendRecord;
 use crate::{
     ErrorCode, FrameType, HeaderAction, HeaderCategory, Session, SessionBuilder, StreamId,
 };
@@ -627,6 +628,12 @@ where
         // dropped what it was given. See the note there — the reuse only holds because of
         // that pairing, and writing `freeze()` would silently restore a per-pass allocation.
         let mut coalesced = BytesMut::new();
+        // The no-copy record sink, retained across passes exactly as the buffers above
+        // are. `send_into` appends the header/payload records the send callback deposited,
+        // and `flush` drains it after every call. In this phase nothing constructs a shared
+        // body, so it stays empty; keeping it here makes the seam live and lets a later
+        // phase write its contents without touching this loop's shape.
+        let mut send_records: Vec<SendRecord> = Vec::new();
 
         loop {
             buffers.sweep();
@@ -708,6 +715,7 @@ where
                 &mut events,
                 &mut gathered,
                 &mut coalesced,
+                &mut send_records,
             )
             .await?;
             // A body announces its trailers while it is being serialised, so they can only
@@ -719,6 +727,7 @@ where
                     &mut events,
                     &mut gathered,
                     &mut coalesced,
+                    &mut send_records,
                 )
                 .await?;
             }
@@ -1092,6 +1101,7 @@ async fn flush<W: TransportWrite>(
     events: &mut Events,
     gathered: &mut BytesMut,
     out: &mut BytesMut,
+    send_records: &mut Vec<SendRecord>,
 ) -> Result<()> {
     let mut coalescing = false;
     // The election. Reading it costs one constructed future that is immediately dropped
@@ -1104,7 +1114,24 @@ async fn flush<W: TransportWrite>(
     gathered.clear();
     out.clear();
 
-    while let Some(block) = session.send(events)? {
+    loop {
+        let block = session.send_into(events, send_records)?;
+
+        // Records the send callback deposited during this call belong on the wire before
+        // the block the call returns. Draining after *every* call — the final one that
+        // returns `None` included — is required: libnghttp2's no-copy branch can deposit a
+        // record without contributing any octets to the returned block, so a record can
+        // ride along with a `None`. In this phase nothing constructs a shared body, so the
+        // sink is always empty and this drain is a no-op; a later phase writes the records,
+        // in order, at exactly this point.
+        debug_assert!(
+            send_records.is_empty(),
+            "no shared body exists in this phase, so the send callback cannot have recorded a frame"
+        );
+        send_records.clear();
+
+        let Some(block) = block else { break };
+
         if coalescing {
             out.extend_from_slice(block);
             continue;
