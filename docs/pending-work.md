@@ -82,16 +82,60 @@ test, and no more.
   frame's `writev` (-15% at 1 KiB, -14% at 64 KiB); at 1 MiB the effect is neutral, which is
   what was wanted there — the goal at large bodies was to avoid the copy a coalescing path
   would have imposed, not to gain. See `docs/benchmarks.md`.
-- **True zero-copy DATA payloads are still open, and are now the remaining copy.** Gathering
-  removed the driver's copy, but libnghttp2 still copies every body into its own serialisation
-  buffer before we ever see it — measurement confirms DATA reaches us as 16393-byte blocks,
-  i.e. the 9-byte frame header already joined to a copied 16384-byte payload.
-  `NGHTTP2_DATA_FLAG_NO_COPY` with `nghttp2_send_data_callback` would eliminate it, handing the
-  frame header and the payload over separately so the payload can go straight into a `writev`
-  region. It was scoped out of the vectored work deliberately: it requires a send-data callback
-  whose reentrancy interacts with the existing bridge, and gathering alone already brought this
-  crate level with hyper at 1 MiB. This is the obvious next lever if large-body throughput ever
-  needs to improve.
+- **The gathering accumulator is not preallocated.** `gathered` starts as `BytesMut::new()`
+  and grows to its steady-state high-water mark, reallocating a few times during warm-up
+  before it settles — which is why `http_zero_alloc.rs` measures only the steady state. `h2`
+  instead preallocates 16 KiB per connection (`DEFAULT_BUFFER_CAPACITY`), sized so a maximal
+  `HEADERS` frame always fits without growth. Preallocating would trade a fixed per-connection
+  footprint for the removal of the warm-up reallocations, which matters most for short-lived
+  connections that may never reach steady state — precisely the case the current shape serves
+  worst. Sizing it is the open question, and it should be measured rather than copied from
+  `h2`: the accumulator only ever holds blocks *below* `VECTORED_THRESHOLD`, so its high-water
+  mark is set by how many small blocks a multiplexed pass produces, not by the maximum frame
+  size. The multiplexed benchmark pass accumulates thousands of 73-byte blocks, so 16 KiB may
+  well be the wrong number in either direction.
+- **True zero-copy DATA payloads are still open, and are now the remaining copy — in fact two.**
+  Gathering removed the driver's copy, but every body byte is still touched twice before it
+  reaches a socket, both inside the read-body callback (`crates/nghttp2/src/callbacks.rs`):
+  libnghttp2 hands over an uninitialised frame buffer, which is `write_bytes(.., 0, length)`
+  zeroed in full — necessary today, both because forming a `&mut [u8]` over uninitialised
+  memory is undefined behaviour and because a body source must never observe another stream's
+  plaintext left in a reused buffer — and the source then copies the payload into it. So a
+  16 KiB DATA frame costs a 16 KiB memset plus a 16 KiB copy before the write even starts.
+
+  `NGHTTP2_DATA_FLAG_NO_COPY` with `nghttp2_send_data_callback` would remove both, handing the
+  9-byte frame header and the payload over separately so the payload can go straight into a
+  `writev` region from the caller's own `Bytes`. **The costs are real and were the reason it
+  was scoped out:**
+
+  1. **The callback is synchronous and all-or-nothing.** It is invoked from inside
+     `nghttp2_session_mem_send2` (`nghttp2_session.c:3043`, `session_call_send_data`), so
+     nothing inside it can `.await`. It must send the *complete* frame; the header is explicit
+     that a partial send is unrecoverable and leaves teardown as the only option.
+  2. **`WOULDBLOCK` is not usable as backpressure as things stand.** Returning it makes
+     `mem_send_internal` `return 0`, which `Session::send` maps to `Ok(None)` — indistinguishable
+     from "nothing left to send", so the driver would treat the pass as finished and park.
+  3. **So the only viable shape is "record, don't write":** copy the 9-byte header (it points
+     into libnghttp2's own buffer and *is* invalidated), clone the payload handle, append both
+     to a pending region list, return 0, and let the driver's `writev` do the writing after
+     `mem_send2` returns. That means reporting a frame as sent slightly before it is on the
+     wire, which is tolerable only because a transport error tears the connection down anyway.
+  4. **It reintroduces `IOV_MAX`.** The present design is capped at two regions, which is why
+     the limit is currently a non-concern; a pass full of no-copy DATA frames would produce
+     many, needing a cap and a generalised partial-`writev` retry.
+  5. **It crosses the no-`unsafe` boundary.** The callback is `extern "C"` and must live below
+     `src/http/`, while the region list it appends to belongs to the driver inside it — so this
+     needs a new plumbing seam rather than a local change.
+  6. **It changes public API.** `fill(&mut [u8])` is a push model; no-copy needs a source that
+     *hands out* bytes it already owns. Sources that genuinely generate bytes gain nothing, so
+     both paths would have to coexist.
+
+  **Measure before building.** The prize is one memset plus one copy per body byte, which
+  should matter only on large bodies — order 10% of a 1 MiB exchange on a back-of-the-envelope
+  memory-bandwidth estimate, and nothing at all on the small-body and multiplexed workloads
+  where this crate already sits at parity. A targeted measurement of what fraction of a 1 MiB
+  exchange is spent in the memset and the copy is the cheap next step, and would decide whether
+  any of the above is worth paying.
 - **The write-path asymmetry is unmeasured on a real NIC.** Benchmarks show tokio's borrowed
   zero-copy write cancelling io_uring's syscall advantage at 1 MiB bodies, over loopback. Whether
   that holds where real device interrupts exist is unknown, and loopback biases against
