@@ -268,8 +268,10 @@ impl Duplex {
 
     /// A handle that keeps observing the vectored writes after the transport is split.
     ///
-    /// Empty unless this half came from [`duplex_vectored`], since the other two shapes
-    /// never reach the vectored path.
+    /// Populated by the vectored shape, which logs each gathering call, and by the borrowed
+    /// shape, which logs each uncopied `write_borrowed` as a single-region call — so the
+    /// pointer-coverage assertion can see both. Empty on the owned shape, which reaches
+    /// neither fast path and is coalesced through `write`.
     pub fn vectored_log(&self) -> VectoredLog {
         VectoredLog {
             record: Arc::clone(&self.vectored),
@@ -559,6 +561,18 @@ impl TransportWrite for DuplexWriter {
             return None;
         }
         *self.writes.lock().expect("write count") += 1;
+        // Record where these octets came from, exactly as the vectored path does, so the
+        // two-sided pointer-coverage assertion (design decision D8) can pin a handed-over
+        // payload to the caller's own memory on the borrowed strategy too — not only on the
+        // vectored one. One borrowed write is one region, so it is logged as a single-region
+        // call. The address is meaningful only for the instant of the call, as the vectored
+        // log's own note explains.
+        {
+            let mut record = self.vectored.lock().expect("vectored record");
+            record.calls.push(vec![data.len()]);
+            record.bases.push(vec![data.as_ptr() as usize]);
+            record.octets.extend_from_slice(data);
+        }
         notifying(&self.outgoing, |pipe| pipe.put(data));
         Some(core::future::ready(Ok(data.len())))
     }
@@ -677,7 +691,41 @@ pub struct Failing {
 /// `on_read` chooses the direction that breaks, since a socket may fail either way and the
 /// two reach the driver through different paths.
 pub fn failing(after: usize, on_read: bool) -> (Failing, Duplex) {
-    let (one, two) = duplex(false);
+    over(duplex(false), after, on_read)
+}
+
+/// A [`Failing`] whose unbroken half elects the **vectored** write path, and its peer.
+///
+/// Separate from [`failing`] rather than another argument to it, for the same reason
+/// [`duplex_vectored`] is separate from [`duplex`]: the shape a transport advertises is a
+/// property of the transport, so it belongs in the constructor's name, not in a boolean
+/// threaded through every call site. It exists because [`failing`] alone can only break the
+/// owned/coalescing path — the fast paths run through the driver's `flush_regions`, which
+/// `failing` never reaches — so a transport that fails *while* electing the vectored strategy
+/// is the only way to drive a transport error through that code. Observe what it gathered
+/// through [`Failing::vectored_log`].
+pub fn failing_vectored(after: usize, on_read: bool) -> (Failing, Duplex) {
+    over(duplex_vectored(), after, on_read)
+}
+
+/// A [`Failing`] whose unbroken half elects the **borrowed** (zero-copy) write path, and its
+/// peer.
+///
+/// The borrowed counterpart to [`failing_vectored`], and separate from [`failing`] for the
+/// same reason: the borrowed strategy also runs through `flush_regions`, so a transport that
+/// fails while lending the borrowed path is the second way — beside the vectored one — to
+/// drive a transport error through that code. Where the vectored path fails on one gathered
+/// write of many regions, the borrowed path writes one region per call, so a failure lands on
+/// a single named region; [`Failing::vectored_log`] records each as a single-region write.
+pub fn failing_borrowed(after: usize, on_read: bool) -> (Failing, Duplex) {
+    over(duplex(true), after, on_read)
+}
+
+/// Builds a [`Failing`] over the already-made duplex pair, arming the first half.
+///
+/// The three `failing*` constructors differ only in which strategy their duplex advertises,
+/// so the countdown wiring lives here once rather than being repeated three times.
+fn over((one, two): (Duplex, Duplex), after: usize, on_read: bool) -> (Failing, Duplex) {
     (
         Failing {
             inner: one,
@@ -686,6 +734,21 @@ pub fn failing(after: usize, on_read: bool) -> (Failing, Duplex) {
         },
         two,
     )
+}
+
+impl Failing {
+    /// A handle that keeps observing the unbroken half's vectored writes after the transport
+    /// is split.
+    ///
+    /// [`Transport::split`] consumes the transport, so a test driving a failing connection
+    /// must take this before handing the transport to the driver. Populated exactly as
+    /// [`Duplex::vectored_log`] is — by the vectored shape logging each gathering call and the
+    /// borrowed shape logging each uncopied write as a single region — which is how a test can
+    /// prove the failing write really was carrying payload regions rather than a bare
+    /// handshake block.
+    pub fn vectored_log(&self) -> VectoredLog {
+        self.inner.vectored_log()
+    }
 }
 
 /// The reading half of a [`Failing`].
@@ -774,6 +837,47 @@ impl TransportWrite for FailingWriter {
                 (result, buf)
             }
         }
+    }
+
+    fn write_borrowed<'w>(
+        &'w mut self,
+        data: &'w [u8],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        // Election passes straight through: whether the borrowed path is offered is the inner
+        // duplex's shape to decide, so `None` from it is `None` here and the driver takes
+        // another path. Note that the inner duplex performs a borrowed write *at
+        // construction* and returns a ready future — long-standing behaviour the driver
+        // accommodates by never probing this election speculatively, unlike the vectored one.
+        // So it is only the countdown that is deferred into the returned future here, and the
+        // reason is narrower than on the vectored path: it keeps the accounting in one place
+        // across both, so a countdown reads the same number of operations either way.
+        let countdown = Arc::clone(&self.countdown);
+        let armed = self.armed;
+        let inner = self.inner.write_borrowed(data)?;
+        Some(async move {
+            let failed = spent(&countdown, armed);
+            let written = inner.await;
+            if failed { Err(broken()) } else { written }
+        })
+    }
+
+    fn write_vectored<'w>(
+        &'w mut self,
+        regions: &'w [io::IoSlice<'w>],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        // As with the borrowed path, the election is the inner duplex's to make and the
+        // countdown is spent only when the write is actually performed. This matters more
+        // here: the driver probes the vectored election by building this future with an empty
+        // region list and dropping it unpolled, so spending at construction would charge an
+        // operation for a write that never happened and shift the failure onto the wrong one.
+        let countdown = Arc::clone(&self.countdown);
+        let armed = self.armed;
+        let inner = self.inner.write_vectored(regions)?;
+        Some(async move {
+            let failed = spent(&countdown, armed);
+            let written = inner.await;
+            if failed { Err(broken()) } else { written }
+        })
     }
 }
 

@@ -26,11 +26,12 @@ use std::sync::{Arc, Mutex};
 use core::future::Future;
 
 use nghttp2::http::testing::{
-    Duplex, DuplexReader, DuplexWriter, Empty, Full, Scripted, alongside, block_on,
-    bytes_crate as bytes, duplex, duplex_vectored, failing, http_crate as http, scripted, serve,
+    Duplex, DuplexReader, DuplexWriter, Empty, Failing, Full, Scripted, VectoredLog, alongside,
+    block_on, bytes_crate as bytes, duplex, duplex_vectored, failing, failing_borrowed,
+    failing_vectored, http_crate as http, scripted, serve,
 };
 use nghttp2::http::transport::{Transport, TransportWrite};
-use nghttp2::http::{Error as HttpError, IncomingBody};
+use nghttp2::http::{Error as HttpError, IncomingBody, ResponseFuture, SendRequest};
 use nghttp2::{
     BytesBody, ErrorCode, FrameType, Header, HeaderAction, HeaderCategory, Session, SessionBuilder,
     StreamId,
@@ -455,6 +456,241 @@ fn the_copying_fallback_transport_still_delivers_every_octet() {
 }
 
 // ---------------------------------------------------------------------------
+// Pointer coverage — the SC-001 proof (design decision D8, instrument 2)
+// ---------------------------------------------------------------------------
+
+/// The shared handle through which a [`TrackingBody`]'s handed-over chunk ranges are read:
+/// each entry is a `(base, len)` pair naming one caller allocation. Aliased so the coverage
+/// assertion and the body's constructor name the same thing rather than repeating the nested
+/// generic.
+type Ranges = Arc<Mutex<Vec<(usize, usize)>>>;
+
+/// A body that hands over `Bytes` and records the address range of every chunk it yields.
+///
+/// This is the instrument the no-copy proof is made with. The recorded ranges are caller
+/// memory — the very allocations the body owns — so a transport region whose address falls
+/// inside one of them is octets travelling to the wire *without a copy*. A region that landed
+/// in the driver's own buffer instead would fall outside every range, and the coverage sum
+/// would come up short. `Bytes` is a view over a stable heap allocation, so moving the value
+/// into a frame does not move the octets: the pointer recorded here is the pointer the driver
+/// slices its per-frame payloads from.
+struct TrackingBody {
+    chunks: std::collections::VecDeque<Bytes>,
+    ranges: Ranges,
+}
+
+impl TrackingBody {
+    /// A body over `chunks`, and the handle through which its handed-over ranges are read.
+    fn new(chunks: Vec<Bytes>) -> (Self, Ranges) {
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                chunks: chunks.into(),
+                ranges: Arc::clone(&ranges),
+            },
+            ranges,
+        )
+    }
+}
+
+impl Body for TrackingBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        match self.chunks.pop_front() {
+            Some(chunk) => {
+                // Recorded before the chunk is moved into the frame; the address is the
+                // allocation's, unchanged by the move.
+                self.ranges
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((chunk.as_ptr() as usize, chunk.len()));
+                core::task::Poll::Ready(Some(Ok(Frame::data(chunk))))
+            }
+            None => core::task::Poll::Ready(None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.chunks.is_empty()
+    }
+}
+
+/// Uploads `body` over `client_side`, served by a live peer over `server_side`, and returns
+/// what the peer received. The transport shape `client_side` was built with — vectored,
+/// borrowed or owned — is what decides which write strategy the driver takes, so the same
+/// helper drives all three.
+fn upload_tracked(client_side: Duplex, server_side: Duplex, body: TrackingBody) -> ServerPeer {
+    let (requests, connection) =
+        nghttp2::http::handshake_shared::<_, TrackingBody>(client_side).expect("handshake");
+    let response = requests.send_request(upload("/coverage", body));
+
+    let exchange = async {
+        let head = response.await.expect("a response");
+        assert_eq!(head.status(), http::StatusCode::OK);
+        for _ in 0..64 {
+            yield_now().await;
+        }
+        drop(requests);
+    };
+
+    let mut peer = ServerPeer::default();
+    block_on(alongside(
+        alongside(exchange, connection),
+        serve(server_side, server_peer(), &mut peer, answer_at_once),
+    ));
+    peer
+}
+
+/// Asserts the two-sided no-copy proof over the regions a readiness transport logged.
+///
+/// A region is a *handed-over payload* exactly when its address range intersects caller
+/// memory — a frame header (nine octets in the driver's record sink) or a serialised block
+/// (the driver's gathering buffer) is a distinct allocation and intersects nothing here.
+///
+/// Both sides are required, and neither suffices alone:
+///
+/// * **Wholly inside (no copy).** Every payload region lies entirely within one caller chunk.
+///   A region that merely *overlapped* a chunk would mean the driver had gathered caller
+///   octets together with octets from elsewhere — a copy. Checking containment alone,
+///   though, would pass a run that quietly dropped half the body.
+/// * **Sums to the body (no drop).** The payload regions' lengths total the body length
+///   exactly. This alone would pass a path that copied every octet into its own buffer and
+///   never touched caller memory, since then there would be no payload regions to fall short
+///   — which is why the containment side is needed beside it.
+fn assert_pointer_coverage(
+    log: &VectoredLog,
+    ranges: &[(usize, usize)],
+    body_len: usize,
+    strategy: &str,
+) {
+    let calls = log.calls();
+    let bases = log.bases();
+    let mut covered = 0usize;
+    for (lengths, addresses) in calls.iter().zip(&bases) {
+        for (&len, &base) in lengths.iter().zip(addresses) {
+            let start = base;
+            let end = base + len;
+            let intersects = ranges.iter().any(|&(chunk_start, chunk_len)| {
+                start < chunk_start + chunk_len && chunk_start < end
+            });
+            if !intersects {
+                continue;
+            }
+            let inside = ranges.iter().any(|&(chunk_start, chunk_len)| {
+                start >= chunk_start && end <= chunk_start + chunk_len
+            });
+            assert!(
+                inside,
+                "{strategy}: a handed-over region [{start:#x}, {end:#x}) straddled the boundary of \
+                 caller memory rather than lying wholly inside one chunk; the driver gathered \
+                 caller octets together with octets from elsewhere, which is a copy",
+            );
+            covered += len;
+        }
+    }
+    assert_eq!(
+        covered, body_len,
+        "{strategy}: the handed-over payload regions summed to {covered} octets, not the whole \
+         {body_len}-octet body; some payload was copied through the driver's buffer rather than \
+         handed over, or dropped",
+    );
+}
+
+#[test]
+fn the_readiness_paths_hand_over_the_whole_payload_from_caller_memory() {
+    // Spec SC-001, the phase's headline: on a readiness transport the payload reaches the
+    // wire uncopied. The proof is two-sided pointer coverage (design decision D8, instrument
+    // 2), run against a transport electing the vectored strategy and again against one
+    // electing the borrowed strategy: every region the transport was offered that touches
+    // caller memory lies wholly inside it, and those regions account for the body in full.
+    //
+    // The body is handed over in three chunks of unequal, non-frame-aligned length, so the
+    // driver's per-frame slicing crosses chunk boundaries and a chunk both larger and smaller
+    // than a 16 KiB frame is exercised; their ranges are what the coverage is measured
+    // against. `answer_at_once` lets the peer settle the response while the body is still in
+    // flight, and its `WINDOW_UPDATE`s spread the upload over several passes — so the log
+    // holds many gathering writes, not one, and the proof is over all of them.
+    let chunks = [200_001usize, 4_096, 120_003];
+    let body_len: usize = chunks.iter().sum();
+    let make_body = || {
+        let mut offset = 0u8;
+        let pieces: Vec<Bytes> = chunks
+            .iter()
+            .map(|&len| {
+                let piece: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_add(offset)).collect();
+                offset = offset.wrapping_add(37);
+                Bytes::from(piece)
+            })
+            .collect();
+        let expected: Vec<u8> = pieces.iter().flat_map(|p| p.to_vec()).collect();
+        let (body, ranges) = TrackingBody::new(pieces);
+        (body, ranges, expected)
+    };
+
+    // Vectored: the payload regions are interleaved with header and gathered-run regions in
+    // multi-region gathering writes.
+    {
+        let (client_side, server_side) = duplex_vectored();
+        let log = client_side.vectored_log();
+        let (body, ranges, expected) = make_body();
+        let peer = upload_tracked(client_side, server_side, body);
+        assert_eq!(
+            peer.bodies.get(&1).cloned().unwrap_or_default(),
+            expected,
+            "the vectored path did not deliver the body intact",
+        );
+        assert_pointer_coverage(
+            &log,
+            &ranges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            body_len,
+            "vectored",
+        );
+    }
+
+    // Borrowed: each payload is its own single-region uncopied write, logged the same way.
+    {
+        let (client_side, server_side) = duplex(true);
+        let log = client_side.vectored_log();
+        let (body, ranges, expected) = make_body();
+        let peer = upload_tracked(client_side, server_side, body);
+        assert_eq!(
+            peer.bodies.get(&1).cloned().unwrap_or_default(),
+            expected,
+            "the borrowed path did not deliver the body intact",
+        );
+        assert_pointer_coverage(
+            &log,
+            &ranges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            body_len,
+            "borrowed",
+        );
+    }
+
+    // Coalescing: asserted for byte fidelity only. This path copies the payload into the
+    // owned buffer by construction, so pointer coverage does not apply — the point of the
+    // contrast is that correctness holds on all three while only the first two are copy-free.
+    {
+        let (client_side, server_side) = duplex(false);
+        let (body, _ranges, expected) = make_body();
+        let peer = upload_tracked(client_side, server_side, body);
+        assert_eq!(
+            peer.bodies.get(&1).cloned().unwrap_or_default(),
+            expected,
+            "the coalescing path did not deliver the body intact",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Ordering (SC-008)
 // ---------------------------------------------------------------------------
 
@@ -801,12 +1037,104 @@ fn payloads_and_serialised_blocks_keep_their_order_under_a_mixed_workload() {
     );
 }
 
+/// A request whose head is large enough that its serialised `HEADERS` block clears the
+/// vectored threshold, so a fast-path pass carries a genuine *large* block beside its small
+/// `WINDOW_UPDATE`s and its handed-over records — the three-way mix design decision D9's
+/// block-triggered mid-pass flush has to keep in order.
+fn request_with_large_head<B>(body: B) -> http::Request<B> {
+    http::Request::builder()
+        .method(http::Method::POST)
+        .uri("http://example.test/ordering-mixed")
+        .header("x-bulk", "z".repeat(1024))
+        .body(body)
+        .expect("building a request")
+}
+
+/// Drives the mixed exchange to completion, draining the response body so the client emits
+/// `WINDOW_UPDATE`s of its own. Generic over the connection future so the copying and
+/// handed-over entry points share it; `requests` is moved in and dropped last so the request
+/// half stays open until the exchange is done.
+fn drive_mixed(
+    requests: SendRequest<Full>,
+    connection: impl Future<Output = Result<(), HttpError>>,
+    response: ResponseFuture,
+    server_side: Duplex,
+) {
+    let exchange = async move {
+        let head = response.await.expect("a response");
+        let mut body = head.into_body();
+        while let Some(frame) = drain_frame(&mut body).await {
+            frame.expect("a response body frame");
+        }
+        for _ in 0..64 {
+            yield_now().await;
+        }
+        drop(requests);
+    };
+
+    let mut peer = ServerPeer::default();
+    block_on(alongside(
+        alongside(exchange, connection),
+        serve(server_side, server_peer(), &mut peer, answer_with_body),
+    ));
+}
+
+/// Runs the mixed workload over the *vectored* transport and returns the octets it put on the
+/// wire, captured through [`VectoredLog::octets`]. `shared` chooses the handed-over entry
+/// point over the copying one; the workload, the peer and the driving are otherwise identical.
+fn mixed_ordering_vectored_octets(shared: bool) -> Vec<u8> {
+    let (client_side, server_side) = duplex_vectored();
+    let log = client_side.vectored_log();
+    let request = request_with_large_head(Full::new(payload(ORDERING_UPLOAD)));
+    if shared {
+        let (requests, connection) =
+            nghttp2::http::handshake_shared::<_, Full>(client_side).expect("handshake");
+        let response = requests.send_request(request);
+        drive_mixed(requests, connection, response, server_side);
+    } else {
+        let (requests, connection) =
+            nghttp2::http::handshake::<_, Full>(client_side).expect("handshake");
+        let response = requests.send_request(request);
+        drive_mixed(requests, connection, response, server_side);
+    }
+    log.octets()
+}
+
+#[test]
+fn a_large_block_among_records_keeps_its_place_on_the_gathering_path() {
+    // Spec SC-008, on the fast path this time. The test above proves ordering over the owned
+    // Recording transport; this proves it where design decision D9 actually decides order —
+    // the gathering path, whose block-triggered mid-pass flush is the one piece of ordering
+    // logic the crate owns rather than inherits from libnghttp2. The workload is the mixed
+    // one plus a large request head, so a single fast-path pass gathers all three region
+    // kinds: runs of small `WINDOW_UPDATE` blocks, the large `HEADERS` block that forces an
+    // immediate flush, and the handed-over `DATA` records between them.
+    //
+    // The oracle is again the *push* path — the same exchange copied into libnghttp2's
+    // buffer, whose octet order is libnghttp2's alone — captured over the same vectored
+    // duplex so the two wires are directly comparable. If the fast path reorders a record and
+    // a block across a mid-pass flush, the two wires diverge.
+    let oracle = mixed_ordering_vectored_octets(false);
+    let fast = mixed_ordering_vectored_octets(true);
+
+    assert!(
+        !fast.is_empty(),
+        "the fast path put nothing on the wire, so the comparison proved nothing",
+    );
+    assert_eq!(
+        fast, oracle,
+        "the gathering path put different octets on the wire than the copying path did for the \
+         same mixed exchange; a record and a block swapped places across a mid-pass flush",
+    );
+}
+
 #[test]
 fn the_vectored_transport_carries_a_handed_over_body_intact() {
-    // The gathering strategy writes its blocks *immediately* and its coalescing buffer only
-    // at the end of a pass, so a record it must interleave forces the pass onto the
-    // coalescing path. Driving a real body over the vectored duplex is what exercises that
-    // switch; the body arriving intact is what proves the switch preserved order.
+    // The gathering strategy writes its large blocks immediately and its small-block runs at
+    // the end of a pass, interleaving the handed-over records between them as regions of one
+    // uncopied gathering write rather than coalescing them. Driving a real body over the
+    // vectored duplex is what exercises that interleaving; the body arriving intact is what
+    // proves it preserved order.
     let expected = payload(200 * 1024);
 
     let (client_side, server_side) = duplex_vectored();
@@ -1250,6 +1578,153 @@ fn a_transport_failure_while_writing_a_payload_closes_the_connection() {
     assert!(
         request_outcome.is_err(),
         "a request reported success though its body never reached the peer",
+    );
+}
+
+/// Drives a handed-over body over a failing transport and returns the connection's verdict,
+/// the request's verdict, and what the transport logged before it broke.
+///
+/// The three SC-013 fast-path tests differ only in which failing transport they run over, so
+/// the capture dance — the connection surfaces the broken transport, the request only learns
+/// its connection went away, so the connection's verdict is taken from a background future
+/// while the request future is the main one — lives here once.
+fn broken_fast_path_exchange(
+    client_side: Failing,
+    bytes: Bytes,
+) -> (
+    Result<(), HttpError>,
+    Result<http::Response<IncomingBody>, HttpError>,
+) {
+    let (requests, connection) =
+        nghttp2::http::handshake_shared::<_, Full>(client_side).expect("handshake");
+    let response = requests.send_request(upload("/broken-fast-path", Full::new(bytes)));
+
+    let captured = Arc::new(Mutex::new(None));
+    let sink = Arc::clone(&captured);
+    let driven = async move {
+        *sink.lock().expect("verdict") = Some(connection.await);
+    };
+    let exchange = async {
+        let outcome = response.await;
+        drop(requests);
+        outcome
+    };
+
+    let request_outcome = block_on(alongside(exchange, driven));
+    let connection_outcome = captured
+        .lock()
+        .expect("verdict")
+        .take()
+        .expect("connection ended");
+    (connection_outcome, request_outcome)
+}
+
+#[test]
+fn a_vectored_transport_failure_while_writing_a_payload_closes_the_connection_and_releases_it() {
+    // Spec SC-013 on the *vectored* fast path. The test above drives the owned/coalescing
+    // path only — `failing` hands the driver a transport that elects no fast path — so the
+    // transport error it raises never travels through `flush_regions`, the code the vectored
+    // and borrowed strategies share. `failing_vectored` fixes that: it fails while electing
+    // the gathering write, so the error surfaces from the fast path.
+    //
+    // A 400 KiB body cannot leave in one write, so the first pass gathers a run of small
+    // handshake blocks *with* the payload into one vectored write of many regions; failing
+    // that first write lands the failure on a write genuinely carrying payload, which the
+    // log assertion below confirms rather than assumes.
+    let (bytes, alive) = witnessed(400 * 1024);
+    assert_eq!(
+        Arc::strong_count(&alive),
+        2,
+        "the witness should see the payload held before the exchange begins",
+    );
+
+    let (client_side, _server_side) = failing_vectored(1, false);
+    let log = client_side.vectored_log();
+    let (connection_outcome, request_outcome) = broken_fast_path_exchange(client_side, bytes);
+
+    let error = connection_outcome.expect_err("a vectored transport that broke while writing");
+    assert_eq!(
+        error.kind(),
+        nghttp2::http::ErrorKind::Transport,
+        "a broken vectored transport reported something else: {error}",
+    );
+    assert!(
+        request_outcome.is_err(),
+        "a request reported success though its body never reached the peer",
+    );
+
+    // Proof the failure reached `flush_regions` with a populated region list: the transport
+    // saw a single gathering write of more than one region, one of them a whole payload
+    // frame. A failure on a bare handshake write would show neither.
+    let calls = log.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|regions| { regions.len() > 1 && regions.iter().any(|&len| len >= 16 * 1024) }),
+        "the failing vectored write did not gather a payload region: {calls:?}",
+    );
+
+    // And the caller's `Bytes` is not retained past the connection's death. This holds
+    // whether or not `flush_regions` disposed of its sink on the error exit — teardown
+    // releases the sink either way — so it guards against a leak rather than proving *when*
+    // the release happened; the driver unit tests pin the on-error disposal directly.
+    assert_eq!(
+        Arc::strong_count(&alive),
+        1,
+        "a broken vectored connection retained a handle to the caller's payload",
+    );
+}
+
+#[test]
+fn a_borrowed_transport_failure_while_writing_a_payload_closes_the_connection_and_releases_it() {
+    // Spec SC-013 on the *borrowed* fast path, the vectored test's twin. The borrowed
+    // strategy cannot gather, so `flush_regions` reaches it as one write per region: the run
+    // of handshake blocks, then each `DATA` frame's header and payload on their own. The
+    // fifth write is the first payload region, so failing there — rather than on the very
+    // first handshake write — lands the failure on octets that are actually the body, which
+    // the log assertion confirms.
+    let (bytes, alive) = witnessed(400 * 1024);
+    assert_eq!(
+        Arc::strong_count(&alive),
+        2,
+        "the witness should see the payload held before the exchange begins",
+    );
+
+    let (client_side, _server_side) = failing_borrowed(5, false);
+    let log = client_side.vectored_log();
+    let (connection_outcome, request_outcome) = broken_fast_path_exchange(client_side, bytes);
+
+    let error = connection_outcome.expect_err("a borrowed transport that broke while writing");
+    assert_eq!(
+        error.kind(),
+        nghttp2::http::ErrorKind::Transport,
+        "a broken borrowed transport reported something else: {error}",
+    );
+    assert!(
+        request_outcome.is_err(),
+        "a request reported success though its body never reached the peer",
+    );
+
+    // Proof the failing write carried payload: the borrowed path logs each uncopied write as
+    // a single region, and the last one before the break is a whole payload frame, not a
+    // handshake block. A borrowed write is never multi-region, so "carrying payload" is read
+    // as a large final region rather than a gathered one.
+    let calls = log.calls();
+    let last = calls.last().expect("the transport wrote before it broke");
+    assert_eq!(
+        last.len(),
+        1,
+        "a borrowed write should offer exactly one region: {calls:?}",
+    );
+    assert!(
+        last[0] >= 16 * 1024,
+        "the failing borrowed write was not carrying a payload region: {calls:?}",
+    );
+
+    assert_eq!(
+        Arc::strong_count(&alive),
+        1,
+        "a broken borrowed connection retained a handle to the caller's payload",
     );
 }
 

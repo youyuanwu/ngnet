@@ -44,8 +44,8 @@
 //! | elected by | strategy | writes per pass | driver-side copy |
 //! | --- | --- | --- | --- |
 //! | neither (default) | owned | one | every octet, every pass |
-//! | [`write_borrowed`](TransportWrite::write_borrowed) | borrowed | one per block | none |
-//! | [`write_vectored`](TransportWrite::write_vectored) | vectored | one, plus one per large block | none of the large blocks |
+//! | [`write_borrowed`](TransportWrite::write_borrowed) | borrowed | one per region | none |
+//! | [`write_vectored`](TransportWrite::write_vectored) | vectored | one per large block and per region-cap flush, plus at most one for the remainder | none |
 //!
 //! The vectored strategy exists because the first two are each wrong for half of the
 //! traffic: under multiplexing a pass is dozens of tiny blocks, where one write per block
@@ -213,10 +213,13 @@ pub trait TransportWrite {
     /// exactly as `writev` would. The return is the number of octets accepted across the
     /// whole sequence; a short write is normal and the driver re-offers what remains.
     ///
-    /// This library's driver never offers more than two regions, because that is all the
-    /// block lifetime permits: one live session block beside the driver's own accumulated
-    /// octets. The contract itself imposes no count, so an implementation should not assume
-    /// two. No region is ever empty.
+    /// This library's driver offers at most `MAX_REGIONS + 1` regions, currently 65: a
+    /// gathering write's descriptor list is capped at `MAX_REGIONS`, and one live session
+    /// block may ride as its trailing region. A pass carrying no handed-over payloads offers
+    /// at most two — one accumulated run beside one live block, which is all the block
+    /// lifetime permits — and only records grow the list beyond that. The contract itself
+    /// imposes no count, so an implementation should not assume any particular one. No region
+    /// is ever empty.
     ///
     /// # How the election is read
     ///

@@ -657,6 +657,16 @@ fn the_asynchronous_surface_is_unchanged() {
     let _: fn(&nghttp2::http::testing::VectoredLog) -> Vec<Vec<usize>> =
         nghttp2::http::testing::VectoredLog::bases;
     let _: fn(&Duplex, Vec<usize>) = |duplex, caps| duplex.accept_at_most(caps);
+    // The failing transport's two readiness-strategy constructors and its log handle, added
+    // so a transport error can be driven through the vectored and borrowed fast paths. Hidden
+    // from the docs like the rest of `testing`, but public, so pinned here beside the duplex
+    // constructors they mirror.
+    let _: fn(usize, bool) -> (nghttp2::http::testing::Failing, Duplex) =
+        nghttp2::http::testing::failing_vectored;
+    let _: fn(usize, bool) -> (nghttp2::http::testing::Failing, Duplex) =
+        nghttp2::http::testing::failing_borrowed;
+    let _: fn(&nghttp2::http::testing::Failing) -> nghttp2::http::testing::VectoredLog =
+        nghttp2::http::testing::Failing::vectored_log;
     let _: fn() = asynchronous::config_surface;
     let _: fn(Duplex, nghttp2::http::Config) -> core::result::Result<(), nghttp2::http::Error> =
         asynchronous::client_with_config_surface::<Duplex, Empty>;

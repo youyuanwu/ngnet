@@ -34,8 +34,11 @@
 //! `'static`, since the kernel writes from the buffers after submission, while this trait
 //! hands out borrowed `IoSlice`s. Owning the session's blocks would mean copying them, which
 //! is the coalescing path already taken, so electing the vectored path here would buy
-//! nothing. Should libnghttp2's no-copy DATA facility ever be adopted, the payload would
-//! become caller-owned `Bytes` and this calculus would change; see `docs/pending-work.md`.
+//! nothing. That calculus is now changing: libnghttp2's no-copy `DATA` facility *is* adopted
+//! by this crate, so a handed-over payload is caller-owned `Bytes` rather than a borrow of
+//! libnghttp2's serialisation buffer, and `Bytes` does satisfy compio's ownership
+//! requirement. Acting on that is what this module's own gathering work covers; until then
+//! the coalescing path below remains what a completion transport takes.
 //!
 //! [`TransportWrite::commit`] is likewise left as its no-op default. A completion write is
 //! committed when it completes — there is no buffering layer between this and the kernel of

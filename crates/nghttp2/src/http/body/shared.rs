@@ -5,9 +5,11 @@
 //! [`bytes::Bytes`] the crate already owns, it hands that `Bytes` straight back through
 //! [`SharedBodySource::take`], and libnghttp2 serialises only the frame header. libnghttp2
 //! no longer memsets the frame buffer for this payload and this source never copies into
-//! it, so the payload is no longer *touched twice* the way the push path touches it. That
-//! does not yet make it untouched: the driver still coalesces it once into its own buffer
-//! before the write, and removing that copy is Phase 3 and Phase 4 work. The saved copy is
+//! it, so the payload is no longer *touched twice* the way the push path touches it. On the
+//! two readiness strategies it is not touched by the driver either: it travels to the
+//! transport as its own region, in the caller's own memory. The owned strategy still
+//! coalesces it once, which is inherent to a transport that takes ownership of what it is
+//! handed rather than something left to remove. The saved copy is
 //! the whole difference; everything else, the deferral bridge and the trailer question
 //! below, is the same shape as the push path, for the same reasons.
 //!
