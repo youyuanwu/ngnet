@@ -206,13 +206,15 @@ Two properties are pinned as tests rather than described (see [`invariants.md`](
 | --- | --- | --- |
 | Gathering (`write_vectored` → `Some`) | **one**, or one per large block | **zero** |
 | Borrowed (`write_borrowed` → `Some`) | one per session block | **zero** |
-| Owned (both `None`, default) | **one**, coalesced | one per block, plus growth |
+| Owned (both `None`, default) | **one**, coalesced | **zero**, but copies every octet |
 
-The gathering path dominates both others rather than trading against them: it reaches the
-borrowed path's zero steady-state allocation while matching or beating the coalesced path's
-write count, which is why the tokio adapter now takes it. Counted by
-`tests/http_zero_alloc.rs` on eight multiplexed streams, the three come out at 12 allocations
-and 1 write (owned), 0 allocations and 513 writes (borrowed), and 0 allocations and 1 write
+All three reach zero steady-state allocation; both driver buffers are reused across passes
+rather than rebuilt. What separates the three is the write count — a syscall count — and the
+copy. The gathering path dominates the other two: it reaches the borrowed path's zero
+allocation and zero copy of large blocks while matching or beating the coalesced path's write
+count, which is why the tokio adapter now takes it. Counted by `tests/http_zero_alloc.rs` on
+eight multiplexed streams, the three come out at 0 allocations and 1 write (owned, having
+copied every octet), 0 allocations and 513 writes (borrowed), and 0 allocations and 1 write
 (gathering). Per-stream setup is deliberately excluded from the measurement and documented as
 such — the recurring cost of moving frames is the claim, not the one-off cost of standing a
 stream up.

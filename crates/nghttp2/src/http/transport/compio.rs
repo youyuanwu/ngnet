@@ -19,13 +19,23 @@
 //! Shaping the traits the other way round would have made this transport impossible rather
 //! than merely slower.
 //!
-//! # Why the borrowed-write path is not taken
+//! # Why neither fast write path is taken
 //!
 //! [`TransportWrite::write_borrowed`] returns `None` here, which is the default. This is not
 //! a missing optimisation: a completion runtime cannot lend the kernel a borrowed slice,
 //! because the operation outlives the call that started it. The owned coalescing path is the
 //! only correct one, and a reader who knows the tokio transport returns `Some` should not
 //! read this absence as an oversight.
+//!
+//! [`TransportWrite::write_vectored`] is declined for the same underlying reason, which is
+//! worth stating because compio *does* support gathering writes and does issue a real one to
+//! the kernel — `TcpStream::write_vectored` reaches `IORING_OP_SENDMSG` with an iovec array.
+//! What blocks it here is ownership, not capability: compio's `IoVectoredBuf` is bound by
+//! `'static`, since the kernel writes from the buffers after submission, while this trait
+//! hands out borrowed `IoSlice`s. Owning the session's blocks would mean copying them, which
+//! is the coalescing path already taken, so electing the vectored path here would buy
+//! nothing. Should libnghttp2's no-copy DATA facility ever be adopted, the payload would
+//! become caller-owned `Bytes` and this calculus would change; see `docs/pending-work.md`.
 //!
 //! [`TransportWrite::commit`] is likewise left as its no-op default. A completion write is
 //! committed when it completes — there is no buffering layer between this and the kernel of
@@ -140,6 +150,7 @@ impl<W: AsyncWrite> TransportWrite for CompioWriter<W> {
         (result, buf)
     }
 
-    // `write_borrowed` and `commit` are deliberately left at their defaults; see the module
-    // documentation for why neither is available to a completion runtime.
+    // `write_borrowed`, `write_vectored` and `commit` are deliberately left at their
+    // defaults; see the module documentation for why none is available to a completion
+    // runtime.
 }

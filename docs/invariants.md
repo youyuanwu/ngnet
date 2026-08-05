@@ -51,7 +51,7 @@ frames, not the one-off cost of standing a stream up.
 | `the_borrowed_write_path_writes_each_block_separately` | More than one write per pass on identical traffic, constant across passes. |
 | `the_vectored_write_path_coalesces_a_multiplexed_pass_into_one_write` | One write for a whole multiplexed pass — the coalesced path's write count at the borrowed path's allocation count, which is the entire claim of the strategy. |
 | `the_vectored_write_path_writes_once_per_large_block_and_no_more` | A large block still costs exactly one write, so gathering never degenerates into a write per region. |
-| `the_owned_write_path_allocates_on_every_pass` | The owned path's cost recurs and does not amortise — the fact that makes the tokio adapter's choice of a zero-allocation path meaningful. |
+| `the_owned_write_path_reuses_its_coalescing_buffer` | The owned path reuses its coalescing buffer rather than rebuilding it per pass, so it too allocates nothing in steady state — it pays a copy, not an allocation. |
 | `waking_parked_handlers_allocates_nothing` | Waking parked server handlers repeatedly allocates nothing. |
 | `the_counter_notices_a_deliberate_allocation` | The measuring instrument works, guarding every test above against a false pass. |
 

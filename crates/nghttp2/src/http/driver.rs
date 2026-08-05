@@ -36,7 +36,7 @@ use std::collections::VecDeque;
 use std::error::Error as StdError;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use http_body::Body;
 
 use crate::settings::Setting;
@@ -620,6 +620,13 @@ where
         // collections above are: cleared rather than reallocated, so it stops allocating
         // once it has grown to the size a pass needs. Untouched on the other two paths.
         let mut gathered = BytesMut::new();
+        // The owned path's coalescing buffer, reused for the same reason. It reaches the
+        // transport as an owned `Bytes`, which would ordinarily consume the allocation and
+        // force the next pass to start from nothing; `flush` hands it over with
+        // `split().freeze()` instead, so the capacity comes back here once the transport has
+        // dropped what it was given. See the note there — the reuse only holds because of
+        // that pairing, and writing `freeze()` would silently restore a per-pass allocation.
+        let mut coalesced = BytesMut::new();
 
         loop {
             buffers.sweep();
@@ -695,11 +702,25 @@ where
                 &shared,
                 &mut guard.role,
             )?;
-            flush(&mut session, &mut writer, &mut events, &mut gathered).await?;
+            flush(
+                &mut session,
+                &mut writer,
+                &mut events,
+                &mut gathered,
+                &mut coalesced,
+            )
+            .await?;
             // A body announces its trailers while it is being serialised, so they can only
             // be submitted once that pass is over — and then written by a second one.
             if submit_trailers(&mut session, &shared, &registry)? {
-                flush(&mut session, &mut writer, &mut events, &mut gathered).await?;
+                flush(
+                    &mut session,
+                    &mut writer,
+                    &mut events,
+                    &mut gathered,
+                    &mut coalesced,
+                )
+                .await?;
             }
             // Serialising fires the stream-close handler, so what it observed is
             // dispatched too rather than waiting for the next pass.
@@ -1053,7 +1074,9 @@ fn fail_stream(registry: &Registry, stream: i32, error: Error) {
 ///   pass of only small blocks therefore costs one write, and a pass of large ones costs
 ///   one per block with nothing copied.
 /// * **Borrowed.** Each block is written on its own, uncopied: one write per block.
-/// * **Owned.** Every block is copied into one buffer and sent in a single write.
+/// * **Owned.** Every block is copied into `out`, a second driver-owned buffer reused the
+///   same way, and sent in a single write. The copy is unavoidable here — the transport
+///   takes ownership — but the buffer behind it is not reallocated per pass.
 ///
 /// Several session blocks cannot be gathered *with each other*, because the session
 /// invalidates each block when the next is asked for and [`Session::send`] enforces that by
@@ -1068,17 +1091,18 @@ async fn flush<W: TransportWrite>(
     writer: &mut W,
     events: &mut Events,
     gathered: &mut BytesMut,
+    out: &mut BytesMut,
 ) -> Result<()> {
-    // Empty until the owned path is taken, and never touched on the other two, so they keep
-    // their zero-allocation promise: `BytesMut::new` does not allocate.
-    let mut out = BytesMut::new();
     let mut coalescing = false;
     // The election. Reading it costs one constructed future that is immediately dropped
     // without being polled, which the trait's contract requires transports to tolerate.
     let vectored = writer.write_vectored(&[]).is_some();
     // Whatever a previous pass left behind has already been written or copied; starting
-    // from empty means no error path can leak a remainder into the next pass.
+    // from empty means no error path can leak a remainder into the next pass. Both buffers
+    // keep their capacity across the clear, which is what makes the steady state free of
+    // allocation on the vectored and owned paths alike.
     gathered.clear();
+    out.clear();
 
     while let Some(block) = session.send(events)? {
         if coalescing {
@@ -1146,7 +1170,25 @@ async fn flush<W: TransportWrite>(
         gathered.clear();
     }
 
-    let mut pending = out.freeze();
+    // `split` rather than `freeze`: the transport takes ownership of what it is handed, so
+    // freezing `out` itself would give the allocation away and leave the next pass to build
+    // a new one — which is exactly what this path used to do, at four allocations on a plain
+    // upload and twelve on a multiplexed pass. Splitting hands over the octets while leaving
+    // the allocation here, and `bytes` returns the capacity once the transport has dropped
+    // its handle, so the steady state allocates nothing. The reclaim depends on that handle
+    // actually being dropped before the next pass; a transport that retained it would simply
+    // cost an allocation again rather than misbehave.
+    //
+    // The empty case is taken first and is not merely an optimisation of the common path —
+    // it keeps this buffer's cost off the two strategies that never fill it. Once `out` has
+    // been split even once it is `KIND_ARC`, and from then on `split` is an atomic increment
+    // and the dropped handle an atomic decrement. Paying two atomics per pass to hand over
+    // nothing would tax the vectored and borrowed paths for a buffer they do not use.
+    let mut pending = if out.is_empty() {
+        Bytes::new()
+    } else {
+        out.split().freeze()
+    };
     while !pending.is_empty() {
         let (result, returned) = writer.write(pending).await;
         let written = result?;

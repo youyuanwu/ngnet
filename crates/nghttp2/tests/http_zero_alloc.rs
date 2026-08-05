@@ -53,16 +53,27 @@
 //!
 //! | shape | upload: allocations / writes | multiplexed: allocations / writes | pinned by |
 //! |-------|------------------------------|-----------------------------------|-----------|
-//! | owned (neither override)   | `>0`, constant (4) / `1` | `>0`, constant (12) / `1` | `the_owned_write_path_coalesces_a_pass_into_one_write`, `the_owned_write_path_allocates_on_every_pass` |
+//! | owned (neither override)   | `0` / `1` | `0` / `1` | `the_owned_write_path_coalesces_a_pass_into_one_write`, `the_owned_write_path_reuses_its_coalescing_buffer` |
 //! | borrowed (`write_borrowed`) | `0` / one per block (4) | `0` / one per block (513) | `steady_state_send_allocates_nothing_on_the_borrowed_path`, `the_borrowed_write_path_writes_each_block_separately` |
 //! | gathering (`write_vectored`) | `0` / one per frame (4) | `0` / `1` | `steady_state_send_allocates_nothing_on_the_vectored_path`, `steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path`, `the_vectored_write_path_coalesces_a_multiplexed_pass_into_one_write`, `the_vectored_write_path_writes_once_per_large_block_and_no_more` |
 //!
-//! Read down the two middle columns and the old dilemma is plain. The borrowed shape traded
-//! writes for zero allocation and zero copy; the owned shape traded an allocation and a copy
-//! of every outgoing octet for a single write. On an upload that trade is close — four
-//! writes against four allocations — but on multiplexed traffic it is not close at all: 513
-//! writes against 12 allocations, and the write count is a syscall count, which is what the
-//! benchmarks in `crates/nghttp2-bench` measure as the dominant cost on a real socket.
+//! All three shapes now reach zero steady-state allocation, but they arrived there at
+//! different times and for different reasons, and the history is worth keeping because the
+//! table above was once the argument for a design decision.
+//!
+//! The owned shape used to allocate every pass — four times on an upload, twelve on a
+//! multiplexed pass — and that recurring cost was the stated reason the tokio adapter took
+//! the borrowed path instead. It turned out not to be inherent. `flush` was building its
+//! coalescing buffer as a local and handing the whole allocation to the transport with
+//! `freeze()`, so each pass started from nothing; hoisting the buffer and handing over
+//! `split().freeze()` lets `bytes` reclaim the capacity, and the cost simply went away. What
+//! remains inherent to that shape is the *copy* of every outgoing octet, which the transport
+//! taking ownership genuinely requires.
+//!
+//! So the column that still separates the three is the write count, and it is a syscall
+//! count — which is what the benchmarks in `crates/nghttp2-bench` measure as the dominant
+//! cost on a real socket. The borrowed shape pays one per block: four on an upload, and 513
+//! on multiplexed traffic.
 //!
 //! The gathering shape does not make that trade. It costs no allocation on either workload
 //! and the *lower* of the two write counts on both, because the two things being traded were
@@ -79,9 +90,11 @@
 //! emulate `writev` by copying — in which case the emulation would reintroduce exactly the
 //! copy the strategy exists to avoid, and one write per block is the better bargain.
 //!
-//! The crate's headline commitment — steady-state zero allocation — was previously reachable
-//! only on the borrowed path. It is now reachable on two of the three, and the one it is not
-//! reachable on is the one that exists for transports which structurally cannot do better.
+//! The crate's headline commitment — steady-state zero allocation — was once reachable only
+//! on the borrowed path, and that fact was the argument for the tokio adapter taking it. It
+//! is now reachable on all three, the owned path included: what remained there was never the
+//! allocation but the *copy* of every outgoing octet, which a transport taking ownership
+//! genuinely requires and which no reuse can remove.
 //!
 #![cfg(feature = "http")]
 
@@ -675,37 +688,47 @@ fn the_borrowed_write_path_writes_each_block_separately() {
 }
 
 #[test]
-fn the_owned_write_path_allocates_on_every_pass() {
-    // The case for the tokio default resting on the borrowed path is only sound if the owned
-    // path really does allocate every steady-state pass — otherwise the module-doc conclusion
-    // is rhetoric. This pins that cost so it fails the day it stops being true.
+fn the_owned_write_path_reuses_its_coalescing_buffer() {
+    // This test used to assert the opposite — that the owned path allocates on every pass —
+    // and that assertion was the stated justification for the tokio adapter preferring the
+    // borrowed path. It was true, but it was never *inherent*: the cost came from `flush`
+    // building its coalescing buffer as a local and handing the whole allocation away with
+    // `freeze()`, so every pass began from nothing. Hoisting the buffer beside the gathering
+    // one and handing the octets over with `split().freeze()` instead lets `bytes` reclaim
+    // the capacity once the transport drops its handle, and the recurring cost disappears.
     //
-    // The property asserted is "allocates on every pass, and does not grow pass to pass",
-    // not an exact count: the owned flush coalesces into a `BytesMut` that grows block by
-    // block, so the number of reallocations is a function of the window's block count. That
-    // is stable in steady state but is an implementation detail of `bytes`' growth policy, so
-    // pinning `> 0` and constant captures what matters — a recurring, non-amortising cost —
-    // without welding the test to an incidental number.
+    // What is pinned here is therefore the reuse, not a count. The owned path still copies
+    // every outgoing octet — that is inherent, because the transport takes ownership — but it
+    // must not reallocate to do so. A regression to `freeze()`, or to declaring the buffer
+    // inside `flush`, would restore the per-pass allocation and fail here.
     let owned = run_send(Shape::Owned);
     let borrowed = run_send(Shape::Borrowed);
 
     assert!(
-        owned.allocations.iter().all(|&count| count > 0),
-        "the owned path allocates a coalescing buffer on every pass, saw {:?}",
-        owned.allocations,
-    );
-    let first = owned.allocations[0];
-    assert!(
-        owned.allocations.iter().all(|&count| count == first),
-        "the owned path's per-pass allocation is a fixed recurring cost, not a growing one, \
+        owned.allocations.iter().all(|&count| count == 0),
+        "the owned path must reuse its coalescing buffer rather than rebuild it per pass, \
          saw {:?}",
         owned.allocations,
     );
-    // The contrast is the whole point: identical traffic, zero on the borrowed path.
+    // Kept as the control it always was: identical traffic, and the borrowed path — which
+    // never had a coalescing buffer to reuse — is still zero. Without this, a change that
+    // broke the measurement itself could pass the assertion above vacuously.
     assert!(
         borrowed.allocations.iter().all(|&count| count == 0),
         "the borrowed path carries the same traffic for no allocation, saw {:?}",
         borrowed.allocations,
+    );
+    // The two paths now agree on allocation, so the thing that still separates them is the
+    // write count. Asserted here so the comparison this test used to draw is not simply lost.
+    assert!(
+        owned.writes.iter().all(|&count| count == 1),
+        "the owned path still coalesces each pass into one write, saw {:?}",
+        owned.writes,
+    );
+    assert!(
+        borrowed.writes.iter().all(|&count| count > 1),
+        "the borrowed path still pays one write per block, saw {:?}",
+        borrowed.writes,
     );
 }
 
