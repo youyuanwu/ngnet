@@ -502,13 +502,13 @@ mod asynchronous {
         drop((reader, writer));
     }
 
-    /// The writing half's contract, pinned by the shape of its two overridable points.
+    /// The writing half's contract, pinned by the shape of its three overridable points.
     ///
-    /// The borrowed fast path is a *single* override: `write_borrowed` returns an
-    /// `Option` of a future, so the decision (`Some`/`None`) and the write are one method —
-    /// a separate boolean flag would be a different, breakable, surface. `commit` returns a
-    /// future of `()`. Both are pinned as signatures rather than fn pointers because a
-    /// return-position `impl Future` has no nameable type.
+    /// Each fast path is a *single* override: `write_borrowed` and `write_vectored` each
+    /// return an `Option` of a future, so the decision (`Some`/`None`) and the write are one
+    /// method — a separate boolean flag would be a different, breakable, surface. `commit`
+    /// returns a future of `()`. All are pinned as signatures rather than fn pointers
+    /// because a return-position `impl Future` has no nameable type.
     pub(super) fn write_half_surface<W: TransportWrite>() {
         fn borrowed_is_one_optional_future<W: TransportWrite>(writer: &mut W, data: &[u8]) {
             fn assert_optional_future<F: core::future::Future<Output = std::io::Result<usize>>>(
@@ -517,11 +517,22 @@ mod asynchronous {
             }
             assert_optional_future(writer.write_borrowed(data));
         }
+        fn vectored_is_one_optional_future<W: TransportWrite>(
+            writer: &mut W,
+            regions: &[std::io::IoSlice<'_>],
+        ) {
+            fn assert_optional_future<F: core::future::Future<Output = std::io::Result<usize>>>(
+                _: Option<F>,
+            ) {
+            }
+            assert_optional_future(writer.write_vectored(regions));
+        }
         fn commit_returns_a_result_future<W: TransportWrite>(writer: &mut W) {
             fn assert_future<F: core::future::Future<Output = std::io::Result<()>>>(_: F) {}
             assert_future(writer.commit());
         }
         let _ = borrowed_is_one_optional_future::<W>;
+        let _ = vectored_is_one_optional_future::<W>;
         let _ = commit_returns_a_result_future::<W>;
     }
 
@@ -541,9 +552,23 @@ fn the_asynchronous_surface_is_unchanged() {
         asynchronous::client_surface::<Duplex, Empty>;
     let _: fn(&nghttp2::http::IncomingBody) = asynchronous::incoming_body_surface;
     let _: fn(&nghttp2::http::Cancelled) = asynchronous::cancelled_surface;
-    // The writing half's two overridable points, pinned generically so the shape holds for
+    // The writing half's three overridable points, pinned generically so the shape holds for
     // every transport, not only the ready-made tokio one.
     asynchronous::write_half_surface::<nghttp2::http::testing::DuplexWriter>();
+    // The vectored testing transport and its observation handle. Hidden from the docs but
+    // still public, and integration tests are separate crates that can reach nothing else.
+    let _: fn() -> (Duplex, Duplex) = nghttp2::http::testing::duplex_vectored;
+    let _: fn() -> (Duplex, Duplex) = nghttp2::http::testing::duplex_offering_both;
+    let _: fn(&Duplex, usize) = Duplex::decline_vectored_after;
+    let _: fn(&Duplex) -> nghttp2::http::testing::VectoredLog = Duplex::vectored_log;
+    let _: fn(&nghttp2::http::testing::VectoredLog) -> Vec<Vec<usize>> =
+        nghttp2::http::testing::VectoredLog::calls;
+    let _: fn(&nghttp2::http::testing::VectoredLog) -> Vec<u8> =
+        nghttp2::http::testing::VectoredLog::octets;
+    let _: fn(&nghttp2::http::testing::VectoredLog) -> usize =
+        nghttp2::http::testing::VectoredLog::retries;
+    let _: fn(&nghttp2::http::testing::VectoredLog) = nghttp2::http::testing::VectoredLog::reset;
+    let _: fn(&Duplex, Vec<usize>) = |duplex, caps| duplex.accept_at_most(caps);
     let _: fn() = asynchronous::config_surface;
     let _: fn(Duplex, nghttp2::http::Config) -> core::result::Result<(), nghttp2::http::Error> =
         asynchronous::client_with_config_surface::<Duplex, Empty>;

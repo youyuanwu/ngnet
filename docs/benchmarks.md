@@ -121,10 +121,17 @@ produced it.
 
 ### What was measured
 
-Medians on one pinned core (`taskset -c 3`), backend confirmed `IoUring`, reproduced across
-two independent runs (both figures given where they differ):
+Two things were measured here at different times, and the second changed the first. The
+history is kept rather than overwritten, because the sequence is the point: a benchmark that
+is only ever reported after the fact teaches nothing about how its conclusion was reached.
 
-| Measure | `ngrs-compio` | `ngrs-tokio` | `hyper-tokio` |
+#### The three-arm comparison, before gathering existed
+
+Medians on one pinned core (`taskset -c 3`), backend confirmed `IoUring`, reproduced across
+two independent runs. `ngrs-tokio` here elects the **borrowed** write path, which is what
+`main` did at the time:
+
+| Measure | `ngrs-compio` | `ngrs-tokio` (borrowed) | `hyper-tokio` |
 | --- | --- | --- | --- |
 | Serial latency, empty body | 26.2 µs | **23.9 µs** | 26.1 µs |
 | Concurrent, N=1 | 33–36 Kelem/s | **37–39 Kelem/s** | 36 Kelem/s |
@@ -141,49 +148,134 @@ I/O. `hyper-tokio` falsifies that. hyper reaches 143–159 Kelem/s at N=64 on *e
 noise of compio's 160 — so almost none of the gap can be the I/O model, because hyper closes
 almost all of it without changing the I/O model at all.
 
-What the gap actually is: **the number of write syscalls per pass.** The transport trait lets
-an implementation take the session's blocks one at a time and uncopied
-(`write_borrowed` returns `Some`), or have them coalesced into a single owned write
-(`None` — the default). The tokio transport elects the borrowed path; the completion
-transport *structurally cannot* and so takes the coalescing path; hyper buffers outbound
-bytes and flushes in large writes, which is the same strategy by another name. So the two
-fast arms are the two coalescing arms, and the slow arm is the one issuing a `write(2)` per
-block — a cost that is invisible over a duplex and dominant over a socket, and that grows
-with the number of multiplexed streams because each stream adds blocks to the pass.
+What the gap actually is: **the number of write syscalls per pass.** The tokio transport
+elected the borrowed path and issued a `write(2)` per session block; the completion transport
+structurally cannot borrow and so coalesced; hyper buffers outbound bytes and flushes in large
+writes, which is the same strategy by another name. So the two fast arms were the two
+coalescing arms, and the slow arm was the one writing per block — a cost invisible over a
+duplex, dominant over a socket, and growing with the number of multiplexed streams because
+each stream adds blocks to the pass.
 
 This was confirmed directly rather than inferred. Flipping *only* `TokioWriter::write_borrowed`
 to return `None`, changing nothing else, moved `ngrs-tokio` by **+95% at N=8 and +128% at
-N=64** (to ~152 Kelem/s), putting it level with compio and ahead of hyper. One line, and the
-entire "I/O model" gap disappeared. See `docs/pending-work.md`, where the resulting design
-question is tracked — the borrowed path is what makes the steady state zero-allocation, so
-this is a real trade rather than an oversight.
+N=64** (to ~152 Kelem/s), putting it level with compio and ahead of hyper.
 
-What survives the correction:
+#### What that framing got wrong, and the gathering path
 
-- **`ngrs-tokio` is the fastest arm for a single empty-body round trip** (23.9 µs). With one
-  request in flight there is little to coalesce, so the borrowed path's saved copy is a real
-  win and io_uring's submission overhead is unamortised.
-- **compio still leads on small and medium bodies** (1 KiB, 64 KiB) — over hyper as well as
-  over `ngrs-tokio`, so that lead is not merely the coalescing artefact.
-- **hyper leads at 1 MiB** (526–541 MiB/s). Both `nghttp2` arms trail, which is a fact about
-  this crate's large-body handling and not about the I/O model, since the two arms sit either
-  side of `hyper-tokio`.
-- **The empty-body row is a near-tie across all three** (36–40 Kelem/s), which is the
-  reassuring control: with almost no I/O to do, three different stacks and two different I/O
-  models converge, as they should.
+The obvious reading — few syscalls or zero allocation, pick one — was recorded as an open
+trade. It was **false**, and the reason given for it was false too: that gathering blocks into
+one vectored write was "closed off by the session invalidating each block when the next is
+requested". Two facts were conflated. libnghttp2 recycles its serialisation buffer at
+frame-item boundaries, and `Session::send` hands back a slice borrowing the session, so at
+most one block is live at a time. That forecloses gathering blocks **with each other** —
+nothing more. A live block gathers perfectly well with memory the driver already owns.
+
+`TransportWrite::write_vectored` does exactly that: small blocks accumulate into a
+driver-owned buffer reused across passes, and a block at or above `VECTORED_THRESHOLD` goes
+out as the second region of a two-region `writev`, never copied.
+
+#### After: the gathering path measured
+
+`main` @ `c8dd79c` against the gathering branch, `taskset -c 3`, benchmarks pre-built so
+compilation never contends with measurement, two repetitions per side, run-to-run spread under
+2.5% on the concurrency arms. Only `ngrs-tokio` changed; the other two arms are unchanged code
+and serve as drift controls.
+
+| Measure | `ngrs-tokio` before (borrowed) | `ngrs-tokio` after (gathering) | change |
+| --- | --- | --- | --- |
+| Concurrent, N=8 | 129.05 µs (62.0 Kelem/s) | 61.63 µs (**129.8 Kelem/s**) | **−52.2%** |
+| Concurrent, N=64 | 937.32 µs (68.3 Kelem/s) | 385.51 µs (**166.0 Kelem/s**) | **−58.9%** |
+| Concurrent, N=1 | 25.16 µs | 25.68 µs | +2.1%, within drift |
+| Body 1 KiB | 52.33 µs (18.6 MiB/s) | 44.53 µs (21.9 MiB/s) | −14.9% |
+| Body 64 KiB | 165.05 µs (379 MiB/s) | 141.33 µs (**442 MiB/s**) | −14.4% |
+| Body 1 MiB | 2018.73 µs (495 MiB/s) | 1829.76 µs (547 MiB/s) | −9.4%, but see below — treat as neutral |
+
+In the same runs `ngrs-compio` measured 61.85 µs at N=8 and 379.83 µs at N=64, and
+`hyper-tokio` 67.78 µs and 391.27 µs — so **the tokio transport is now at parity with io_uring
+and slightly ahead of hyper**, having been 2.1× and 2.4× slower than compio at those points.
+At 1 MiB the three arms measured 547 (gathering tokio), 531 (hyper) and 482 (coalescing
+compio) MiB/s in the same runs — but see the caveat below before reading an ordering into the
+first two, which are within this arm's run-to-run spread of each other.
+
+**Why the body arms move, and why the 1 MiB figure should not be believed.** The explanation
+first written here was wrong and is worth recording as such: it claimed libnghttp2 emits each
+9-byte DATA frame header as its own block, so that the borrowed path wrote header and payload
+separately and gathering halved the count. Dumping the actual block sizes falsifies it —
+libnghttp2 hands back the header *already joined* to its payload, as a single 16393-byte block
+(16384 + 9). There is no separate header write to fold.
+
+The real arithmetic follows from the block distribution, which is sharply bimodal: control and
+`HEADERS` blocks are ≤ ~73 bytes, DATA blocks are 16392–16393. Only the small ones accumulate,
+so what gathering saves on a body upload is the *`HEADERS` block*, folded into the first DATA
+frame's `writev`, and nothing else — every DATA block already exceeds the threshold and goes
+out as its own single-region call either way:
+
+| Body | Borrowed writes | Gathering writes | Reduction |
+| --- | --- | --- | --- |
+| 1 KiB | 2 | **1** | 50% |
+| 64 KiB | 5 | **4** | 20% |
+| 1 MiB | 65 | **64** | 1.5% |
+
+That matches the measured −14.9% and −14.4% at 1 KiB and 64 KiB. It does **not** explain
+−9.4% at 1 MiB, where only one syscall in sixty-five is saved. That arm is also the noisiest in
+the suite — 10.2% spread between the two baseline repetitions alone — so the honest reading is
+that **1 MiB is neutral, within noise**, which is exactly what gathering was adopted to achieve
+there. The goal at large bodies was to avoid the regression coalescing would have caused by
+copying, not to produce a gain, and a gain should not be claimed merely because the number came
+out that way.
+
+**Two arms first appeared to regress, and both were drift.** Serial latency showed +6.8% and
+empty-body +5.1% under a design that ran both baseline repetitions and then both branch
+repetitions. That design cannot separate a real effect from machine drift, and this machine
+drifts: across one such session `hyper-tokio` moved 5.1% on serial latency and 9.9% at 1 MiB
+*without its code changing*. Re-measured with the branches interleaved (baseline, branch,
+baseline, branch) and the unchanged arms used as controls, serial latency moved +1.3% on the
+changed arm against +4.5% and +1.4% on the two controls — i.e. the changed arm moved *less*
+than either unchanged one — and the empty-body sign inverted to −4.7% against −0.9% and −0.6%.
+Neither regression survives. The lesson is recorded rather than the first numbers: **grouped
+A/B designs are not trustworthy on this machine, and unchanged arms are the cheapest available
+control.**
+
+`ngrs-compio`, which does not implement `write_vectored`, moved −0.2% (N=8), −0.7% (N=64),
++0.9% (serial) and +0.2% (1 MiB) — inert, as required.
+
+#### Allocation, counted rather than timed
+
+From `crates/nghttp2/tests/http_zero_alloc.rs`, exact counts per driver pass in steady state:
+
+| Strategy | Single upload | 8 multiplexed streams |
+| --- | --- | --- |
+| Owned (coalescing) | 4 allocs / 1 write | 12 allocs / 1 write |
+| Borrowed | 0 allocs / 4 writes | 0 allocs / **513 writes** |
+| **Gathering** | **0 allocs / 4 writes** | **0 allocs / 1 write** |
+
+Gathering strictly dominates both: the borrowed path's zero allocation with the coalescing
+path's write count. The 513-to-1 collapse is the mechanism behind the −58.9% at N=64. This is
+also why the trade the previous section framed turned out not to exist — no values judgement
+about the library was needed, because nothing had to be given up.
+
+What survives from the original three-arm comparison:
+
+- **compio still leads on small and medium bodies** over hyper as well, so that lead was never
+  merely a coalescing artefact.
+- **The empty-body row remains a near-tie across all three**, the reassuring control: with
+  almost no I/O to do, three stacks and two I/O models converge, as they should.
+- **`ngrs-tokio` remains the fastest arm for a single empty-body round trip**, and gathering
+  did not disturb that — at N=1 there is nothing to gather, so the path costs nothing.
 
 ### Confounds, and which way each pushes
 
 Each is named with its direction, because a number without its bias is not evidence:
 
-- **The write-path asymmetry — now known to be the dominant effect, not a footnote.** The
-  tokio transport takes the borrowed write path (no allocation, no copy, one write per
-  block); the completion transport structurally cannot, since the kernel must own the buffer
-  for the duration, so it coalesces; hyper coalesces by buffering. This **favours the
-  coalescing arms wherever syscalls dominate** — which on a real socket is nearly
-  everywhere except the single-request case — and **favours the borrowed arm on large
-  bodies**, where the saved copy finally outweighs the syscalls. It is measured above rather
-  than merely disclosed, and it accounts for the entire N=8/N=64 spread.
+- **The write-path asymmetry — was the dominant effect, and is now largely removed.** It is
+  kept here because it is the reason the arms ever diverged, and because it still applies to
+  the completion arm. The tokio transport now gathers (zero allocation, one `writev` per
+  pass); the completion transport structurally cannot borrow or gather a session block, since
+  the kernel must own the buffer for the duration, so it still coalesces and still pays a copy;
+  hyper coalesces by buffering. Before gathering, this **favoured the coalescing arms wherever
+  syscalls dominated** and accounted for the entire N=8/N=64 spread. With the tokio arm no
+  longer writing per block, what remains of the confound is the **copy** the completion arm
+  pays and the other two do not, which biases against compio on large bodies.
 - **Loopback, not a network interface.** No real network latency, no device interrupts, no
   driver work — precisely the costs io_uring exists to amortise. This **biases against
   compio**; a real NIC would be expected to widen its lead rather than narrow it. Nothing
@@ -250,18 +342,18 @@ implementation.
 
 What could **not** be matched:
 
-- **Outbound coalescing (`max_send_buf_size`).** hyper buffers outbound bytes and flushes in
-  larger writes; the default is large. This crate has no equivalent knob — its tokio adapter
-  takes the borrowed write path, which hands each of the session's own blocks to the
-  transport separately (zero-copy, zero-alloc, but several small writes per pass; see
-  `docs/design.md`). Over an in-memory duplex, where a write is cheap but not free, this
-  biases **large-body** throughput toward hyper, and the 1 MiB result is consistent with
-  that. Over a real socket, where a write is a syscall, it is not a bias but *the* effect:
-  it accounts for the whole `ngrs-tokio`/`hyper-tokio` concurrency gap measured above. This
-  is the one unmatched setting that turned out to matter more than everything matched.
-  Note that it is unmatched in **both** directions — this crate cannot coalesce like hyper,
-  and hyper cannot be made to write per block like this crate — so neither arm can be
-  configured onto the other's strategy to remove it.
+- **Outbound write batching.** hyper buffers outbound bytes and flushes in large writes, sized
+  by `max_send_buf_size`; this crate has no such knob, and reaches the same end differently.
+  Until the gathering path existed, the tokio adapter wrote each session block separately —
+  zero-copy and zero-alloc but several syscalls per pass — and this was **the** unmatched
+  setting that mattered more than everything matched, accounting for the whole
+  `ngrs-tokio`/`hyper-tokio` concurrency gap. It is now largely matched in effect if not in
+  mechanism: this crate emits one `writev` per pass where hyper emits one buffered `write`,
+  and hyper still chains large payloads uncopied much as gathering does. The residual
+  difference is a threshold (`VECTORED_THRESHOLD` = 256 here, `CHAIN_THRESHOLD` = 256 in `h2`
+  when vectored). Note that `tokio::io::duplex` also reports `is_write_vectored() == true`, so
+  the duplex family exercises the gathering path too — its `ngrs` arm is not measuring the old
+  per-block behaviour.
 - **Optimistic stream opening.** hyper's `initial_max_send_streams` lets it open streams
   before the peer's `SETTINGS` arrives; this crate waits. This only affects the first round
   trip, so on a persistent connection it is noise.

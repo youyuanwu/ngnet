@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
 
-use nghttp2::http::testing::{block_on, duplex};
+use nghttp2::http::testing::{block_on, duplex, duplex_offering_both, duplex_vectored};
 use nghttp2::http::{Transport, TransportRead, TransportWrite};
 
 use bytes::{Bytes, BytesMut};
@@ -119,6 +119,355 @@ impl TransportWrite for ReadinessHalf {
     }
 }
 
+/// A transport that offers only the vectored path, counting **polled** writes.
+///
+/// The recording sits in the future's `poll`, not in `write_vectored` itself, and that
+/// placement is load-bearing: the driver elects a strategy by constructing one of these
+/// futures and dropping it without ever polling it. A fixture that recorded at construction
+/// would count a write that never happened, on every pass, and quietly corrupt every
+/// write-count assertion built on it.
+struct VectoredOnly {
+    polled_writes: Rc<RefCell<usize>>,
+    regions_seen: Rc<RefCell<Vec<usize>>>,
+}
+
+/// The future `VectoredOnly::write_vectored` hands back. Inert until polled.
+struct RecordOnPoll<'w> {
+    regions: &'w [io::IoSlice<'w>],
+    polled_writes: Rc<RefCell<usize>>,
+    regions_seen: Rc<RefCell<Vec<usize>>>,
+}
+
+impl Future for RecordOnPoll<'_> {
+    type Output = io::Result<usize>;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        let me = self.get_mut();
+        *me.polled_writes.borrow_mut() += 1;
+        me.regions_seen.borrow_mut().push(me.regions.len());
+        let total = me.regions.iter().map(|region| region.len()).sum();
+        core::task::Poll::Ready(Ok(total))
+    }
+}
+
+impl TransportRead for VectoredOnly {
+    async fn read(&mut self, buf: BytesMut) -> (io::Result<usize>, BytesMut) {
+        (Ok(0), buf)
+    }
+}
+
+impl TransportWrite for VectoredOnly {
+    async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
+        let written = buf.len();
+        (Ok(written), buf)
+    }
+
+    fn write_vectored<'w>(
+        &'w mut self,
+        regions: &'w [io::IoSlice<'w>],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        Some(RecordOnPoll {
+            regions,
+            polled_writes: Rc::clone(&self.polled_writes),
+            regions_seen: Rc::clone(&self.regions_seen),
+        })
+    }
+}
+
+/// A transport that offers **both** fast paths, so precedence has something to arbitrate.
+///
+/// Both counters live in the futures' `poll`, for the reason `RecordOnPoll` explains and for
+/// a second one specific to precedence: what matters is which path was *taken*, not which was
+/// *offered*. Counting at construction would answer the wrong question — every path this
+/// transport implements is offered on every pass, and the driver's unpolled election probe
+/// would be indistinguishable from a real write.
+struct OffersBoth {
+    borrowed_writes: Rc<RefCell<usize>>,
+    vectored_writes: Rc<RefCell<usize>>,
+}
+
+impl TransportWrite for OffersBoth {
+    async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
+        let written = buf.len();
+        (Ok(written), buf)
+    }
+
+    fn write_borrowed<'w>(
+        &'w mut self,
+        data: &'w [u8],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        Some(CountOnPoll {
+            len: data.len(),
+            counter: Rc::clone(&self.borrowed_writes),
+        })
+    }
+
+    fn write_vectored<'w>(
+        &'w mut self,
+        regions: &'w [io::IoSlice<'w>],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        Some(CountOnPoll {
+            len: regions.iter().map(|region| region.len()).sum(),
+            counter: Rc::clone(&self.vectored_writes),
+        })
+    }
+}
+
+/// Reports a fixed length and counts the call, on poll rather than on construction.
+struct CountOnPoll {
+    len: usize,
+    counter: Rc<RefCell<usize>>,
+}
+
+impl Future for CountOnPoll {
+    type Output = io::Result<usize>;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        *self.counter.borrow_mut() += 1;
+        core::task::Poll::Ready(Ok(self.len))
+    }
+}
+
+#[test]
+fn a_transport_can_elect_the_vectored_path_alone() {
+    let polled_writes = Rc::new(RefCell::new(0));
+    let regions_seen = Rc::new(RefCell::new(Vec::new()));
+    let mut writer = VectoredOnly {
+        polled_writes: Rc::clone(&polled_writes),
+        regions_seen: Rc::clone(&regions_seen),
+    };
+
+    assert!(
+        writer.write_borrowed(b"unused").is_none(),
+        "electing the vectored path says nothing about the borrowed one, which this \
+         transport never overrode"
+    );
+
+    // Exactly what the driver's election probe does: construct, inspect, drop unpolled.
+    let probe = writer.write_vectored(&[]);
+    assert!(probe.is_some(), "the vectored path is on offer");
+    drop(probe);
+    assert_eq!(
+        *polled_writes.borrow(),
+        0,
+        "constructing the election probe must not count as a write — the driver never \
+         polls it, and a fixture recording at construction would inflate every count"
+    );
+
+    let regions = [io::IoSlice::new(b"header"), io::IoSlice::new(b"payload")];
+    let write = writer.write_vectored(&regions).expect("the vectored path");
+    let written = block_on(write).unwrap();
+
+    assert_eq!(written, b"header".len() + b"payload".len());
+    assert_eq!(*polled_writes.borrow(), 1, "one polled call is one write");
+    assert_eq!(
+        &regions_seen.borrow()[..],
+        &[2],
+        "both regions arrive in a single call, in order — that is the whole point"
+    );
+}
+
+#[test]
+fn a_transport_may_offer_both_fast_paths() {
+    let borrowed_writes = Rc::new(RefCell::new(0));
+    let vectored_writes = Rc::new(RefCell::new(0));
+    let mut writer = OffersBoth {
+        borrowed_writes: Rc::clone(&borrowed_writes),
+        vectored_writes: Rc::clone(&vectored_writes),
+    };
+
+    // Both are on offer. Which one the driver *takes* is asserted where the driver is,
+    // since precedence is the driver's rule rather than the transport's; here the point is
+    // only that overriding one does not preclude overriding the other.
+    assert!(writer.write_borrowed(b"borrowed").is_some());
+    let regions = [io::IoSlice::new(b"vectored")];
+    assert!(writer.write_vectored(&regions).is_some());
+    assert_eq!(
+        (*borrowed_writes.borrow(), *vectored_writes.borrow()),
+        (0, 0),
+        "offering a path is not performing it: neither future was polled, so neither may \
+         have counted a write"
+    );
+
+    let written = block_on(writer.write_borrowed(b"borrowed").expect("borrowed")).unwrap();
+    assert_eq!(written, b"borrowed".len());
+    assert_eq!(
+        (*borrowed_writes.borrow(), *vectored_writes.borrow()),
+        (1, 0),
+        "polling the borrowed future counts exactly one borrowed write and no vectored one"
+    );
+
+    let written = block_on(writer.write_vectored(&regions).expect("vectored")).unwrap();
+    assert_eq!(written, b"vectored".len());
+    assert_eq!(
+        (*borrowed_writes.borrow(), *vectored_writes.borrow()),
+        (1, 1),
+        "and the vectored one likewise"
+    );
+}
+
+#[test]
+fn a_vectored_duplex_gathers_regions_and_records_them_on_poll() {
+    let (client, peer) = duplex_vectored();
+    let log = client.vectored_log();
+    let counter = client.write_counter();
+    let (_reader, mut writer) = Transport::split(client);
+
+    // The election probe: constructed, inspected, dropped unpolled.
+    let probe = writer.write_vectored(&[]);
+    assert!(
+        probe.is_some(),
+        "a vectored duplex offers the vectored path"
+    );
+    drop(probe);
+    assert_eq!(
+        (counter.get(), log.calls().len()),
+        (0, 0),
+        "the probe is not a write and must leave no trace — the driver builds one every \
+         pass and never polls it"
+    );
+
+    assert!(
+        writer.write_borrowed(b"unused").is_none(),
+        "a vectored duplex declines the borrowed path, so the driver has one strategy to \
+         pick and no ambiguity to resolve"
+    );
+
+    let regions = [
+        io::IoSlice::new(b"small blocks gathered"),
+        io::IoSlice::new(b"; then a large one"),
+    ];
+    let written = block_on(writer.write_vectored(&regions).expect("vectored")).unwrap();
+
+    assert_eq!(written, b"small blocks gathered; then a large one".len());
+    assert_eq!(counter.get(), 1, "one polled call is one write");
+    assert_eq!(log.calls(), vec![vec![21, 18]], "two regions, in one call");
+    assert_eq!(log.octets(), b"small blocks gathered; then a large one");
+    assert_eq!(log.retries(), 0);
+
+    // And the octets really crossed to the peer, in the order they were offered.
+    let (mut peer_reader, _peer_writer) = Transport::split(peer);
+    let (read, buf) = block_on(peer_reader.read(BytesMut::with_capacity(64)));
+    assert_eq!(read.unwrap(), written);
+    assert_eq!(&buf[..], b"small blocks gathered; then a large one");
+}
+
+#[test]
+fn a_vectored_duplex_can_be_told_to_accept_only_a_prefix() {
+    let (client, _peer) = duplex_vectored();
+    let log = client.vectored_log();
+    let counter = client.write_counter();
+    // A cut inside the first region, then one landing exactly on the region boundary.
+    client.accept_at_most([3, 2]);
+    let (_reader, mut writer) = Transport::split(client);
+
+    let regions = [io::IoSlice::new(b"abcde"), io::IoSlice::new(b"fghij")];
+
+    let first = block_on(writer.write_vectored(&regions).expect("vectored")).unwrap();
+    assert_eq!(
+        first, 3,
+        "the cap is honoured, and it cut inside region one"
+    );
+
+    // The driver would now re-offer the remainder; here the fixture is driven directly, so
+    // the regions are trimmed by hand to model exactly that.
+    let retry = [io::IoSlice::new(b"de"), io::IoSlice::new(b"fghij")];
+    let second = block_on(writer.write_vectored(&retry).expect("vectored")).unwrap();
+    assert_eq!(second, 2, "the second cap lands exactly on the boundary");
+
+    // Which is the interesting case: the remainder is now the second region alone. Offering
+    // it beside a zero-length first region would be the bug — hence one region, not two.
+    let last = [io::IoSlice::new(b"fghij")];
+    let third = block_on(writer.write_vectored(&last).expect("vectored")).unwrap();
+    assert_eq!(
+        third, 5,
+        "caps exhausted, so everything offered is accepted"
+    );
+
+    assert_eq!(log.octets(), b"abcdefghij", "no octet lost, none reordered");
+    assert_eq!(
+        log.calls(),
+        vec![vec![5, 5], vec![2, 5], vec![5]],
+        "and no call was ever offered an empty region"
+    );
+    assert_eq!(
+        (counter.get(), log.retries()),
+        (1, 2),
+        "a call following a short one re-offers octets already counted, so it is a retry \
+         rather than another logical write — which is what lets a per-pass write bound \
+         exclude retries without reconstructing which was which"
+    );
+}
+
+#[test]
+fn a_vectored_duplex_can_report_a_successful_write_of_nothing() {
+    let (client, _peer) = duplex_vectored();
+    client.accept_at_most([0]);
+    let (_reader, mut writer) = Transport::split(client);
+
+    let regions = [io::IoSlice::new(b"offered but not taken")];
+    let written = block_on(writer.write_vectored(&regions).expect("vectored")).unwrap();
+
+    assert_eq!(
+        written, 0,
+        "the fault the driver must turn into an error rather than spin on: success \
+         reporting no progress"
+    );
+}
+
+#[test]
+fn a_vectored_duplex_can_be_told_to_decline_the_path_it_elected() {
+    let (client, _peer) = duplex_vectored();
+    let log = client.vectored_log();
+    // Offer the path, then withdraw it after one write has actually happened.
+    client.decline_vectored_after(1);
+    let (_reader, mut writer) = Transport::split(client);
+
+    let probe = writer.write_vectored(&[]);
+    assert!(
+        probe.is_some(),
+        "the election must still succeed — the probe is not a write, so it may not spend \
+         the budget, or this would be a transport that never elected the path at all \
+         rather than one that abandoned it partway"
+    );
+    drop(probe);
+
+    let first = [io::IoSlice::new(b"elected")];
+    assert!(block_on(writer.write_vectored(&first).expect("vectored")).is_ok());
+
+    assert!(
+        writer
+            .write_vectored(&[io::IoSlice::new(b"declined")])
+            .is_none(),
+        "and now the transport reneges mid-pass, which the contract forbids and the driver \
+         must nonetheless survive"
+    );
+    assert_eq!(log.calls().len(), 1, "the declined call never happened");
+}
+
+#[test]
+fn a_duplex_can_offer_both_fast_paths_at_once() {
+    let (client, _peer) = duplex_offering_both();
+    let (_reader, mut writer) = Transport::split(client);
+
+    assert!(
+        writer.write_borrowed(b"borrowed").is_some(),
+        "both overrides are on offer; precedence between them is the driver's rule, and \
+         needs a transport like this one to have anything to arbitrate"
+    );
+    assert!(
+        writer
+            .write_vectored(&[io::IoSlice::new(b"vectored")])
+            .is_some()
+    );
+}
+
 #[test]
 fn a_completion_transport_needs_no_borrowed_write_path() {
     // Compiling is most of the assertion: `Completion` above never mentions
@@ -138,6 +487,14 @@ fn a_completion_transport_needs_no_borrowed_write_path() {
         writer.write_borrowed(b"to the peer").is_none(),
         "a transport that has not overridden the borrowed path must decline it, so the \
          driver coalesces and writes owned"
+    );
+
+    assert!(
+        writer
+            .write_vectored(&[io::IoSlice::new(b"to the peer")])
+            .is_none(),
+        "nor may the vectored path be elected by a transport that never mentioned it — a \
+         completion transport must keep compiling untouched as strategies are added"
     );
 
     let (written, _buf) = block_on(writer.write(Bytes::from_static(b"to the peer")));

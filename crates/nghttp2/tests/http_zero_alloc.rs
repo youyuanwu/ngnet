@@ -30,31 +30,59 @@
 //! allocator — so what it counts is precisely this crate's own Rust allocations, which is
 //! exactly the attribution SC-017 asks for.
 //!
-//! # Deferred from Phase 8: is the borrowed path right for `TokioWriter`?
+//! # Answered: which drain strategy should `TokioWriter` elect?
 //!
-//! Measured here, per steady-state pass of a client upload, for each write shape. The
-//! `>0` / `0` allocation columns and the `1` write column are asserted by the tests named
-//! in the final column; the parenthesised counts (the "4"s) are illustrative — they are the
-//! values observed at the default 64 KiB window, but the tests pin the *properties* (one
-//! write however many blocks; more than one write, held constant; allocates every pass,
-//! held constant) rather than those incidental numbers, which move with the window size and
-//! `bytes`' growth policy.
+//! This section was written as an open question — whether the borrowed path was the right
+//! default for `TokioWriter` — and deferred, because the two shapes then available each
+//! bought one virtue at the other's expense and the harness could not say which mattered
+//! more. A third shape settles it, and this section now records the answer rather than the
+//! question.
 //!
-//! | shape (`write_borrowed`) | heap allocations / pass | transport writes / pass | pinned by |
-//! |--------------------------|-------------------------|-------------------------|-----------|
-//! | `Some` (borrowed)        | `0`                     | one per block (4 here)  | `steady_state_send_allocates_nothing_on_the_borrowed_path`, `the_borrowed_write_path_writes_each_block_separately` |
-//! | `None` (owned)           | `>0`, constant (4 here) | `1` (all blocks coalesced) | `the_owned_write_path_coalesces_a_pass_into_one_write`, `the_owned_write_path_allocates_on_every_pass` |
+//! Measured here, per steady-state pass, for each write shape and each of two workloads: a
+//! client upload, whose blocks are all full-sized `DATA` frames, and a multiplexed trickle
+//! of eight long-lived streams, whose blocks are all small. The two are not variations on
+//! one measurement — they are the two ends of the traffic this library sees, and the shapes
+//! rank differently on each, which is exactly why one of them alone would have answered the
+//! question wrongly.
 //!
-//! The borrowed shape trades a handful of small writes for zero allocation and zero copy;
-//! the owned shape buys a single write per pass by allocating a coalescing buffer and
-//! copying every outgoing octet into it, every pass. The block count is small and bounded
-//! by the flow-control window, so the writes the borrowed shape adds are few, while the
-//! allocation and copy the owned shape adds recur forever. The crate's headline commitment
-//! — steady-state zero allocation — is reachable *only* on the borrowed path, which
-//! `the_owned_write_path_allocates_on_every_pass` pins by showing the same traffic costs an
-//! allocation every pass on the owned shape and none on the borrowed one. The measurement
-//! therefore does not contradict the tokio default; it endorses it: `TokioWriter` should go
-//! on returning `Some` from `write_borrowed`.
+//! The allocation and write columns are asserted by the tests named in the final column;
+//! the parenthesised counts are illustrative — they are the values observed at the default
+//! 64 KiB window and eight streams, but the tests pin the *properties* rather than those
+//! incidental numbers, which move with the window size, the stream count and `bytes`'
+//! growth policy.
+//!
+//! | shape | upload: allocations / writes | multiplexed: allocations / writes | pinned by |
+//! |-------|------------------------------|-----------------------------------|-----------|
+//! | owned (neither override)   | `>0`, constant (4) / `1` | `>0`, constant (12) / `1` | `the_owned_write_path_coalesces_a_pass_into_one_write`, `the_owned_write_path_allocates_on_every_pass` |
+//! | borrowed (`write_borrowed`) | `0` / one per block (4) | `0` / one per block (513) | `steady_state_send_allocates_nothing_on_the_borrowed_path`, `the_borrowed_write_path_writes_each_block_separately` |
+//! | gathering (`write_vectored`) | `0` / one per frame (4) | `0` / `1` | `steady_state_send_allocates_nothing_on_the_vectored_path`, `steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path`, `the_vectored_write_path_coalesces_a_multiplexed_pass_into_one_write`, `the_vectored_write_path_writes_once_per_large_block_and_no_more` |
+//!
+//! Read down the two middle columns and the old dilemma is plain. The borrowed shape traded
+//! writes for zero allocation and zero copy; the owned shape traded an allocation and a copy
+//! of every outgoing octet for a single write. On an upload that trade is close — four
+//! writes against four allocations — but on multiplexed traffic it is not close at all: 513
+//! writes against 12 allocations, and the write count is a syscall count, which is what the
+//! benchmarks in `crates/nghttp2-bench` measure as the dominant cost on a real socket.
+//!
+//! The gathering shape does not make that trade. It costs no allocation on either workload
+//! and the *lower* of the two write counts on both, because the two things being traded were
+//! never actually in tension: a pass needs one block from the session live at a time, and a
+//! gathering write can carry that block beside memory the driver already owns. So the small
+//! blocks accumulate into a buffer that is reused pass after pass — which is why the
+//! allocation column stays at zero, and what
+//! `steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path` exists to pin —
+//! and a large block rides out beside that accumulation without being copied.
+//!
+//! So the answer to the question this section used to ask is: neither of the two shapes it
+//! was choosing between. `TokioWriter` elects the gathering path, and falls back to the
+//! borrowed one only where `is_write_vectored()` reports that the underlying stream would
+//! emulate `writev` by copying — in which case the emulation would reintroduce exactly the
+//! copy the strategy exists to avoid, and one write per block is the better bargain.
+//!
+//! The crate's headline commitment — steady-state zero allocation — was previously reachable
+//! only on the borrowed path. It is now reachable on two of the three, and the one it is not
+//! reachable on is the one that exists for transports which structurally cannot do better.
+//!
 #![cfg(feature = "http")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -183,10 +211,24 @@ struct Meter {
     bytes: usize,
 }
 
+/// Which of the three drain strategies a recording transport advertises.
+///
+/// The shape is fixed when the transport is built, exactly as a real transport's is: which
+/// strategy runs is a property of the transport, not a per-pass decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// Overrides nothing, so the driver coalesces each pass into one owned write.
+    Owned,
+    /// Overrides `write_borrowed`: one write per session block, nothing copied.
+    Borrowed,
+    /// Overrides `write_vectored`: small blocks gathered with the driver's own buffer.
+    Vectored,
+}
+
 struct Recording {
     inbound: Wire,
     outbound: Wire,
-    borrowed: bool,
+    shape: Shape,
     meter: Rc<RefCell<Meter>>,
 }
 
@@ -196,7 +238,7 @@ struct RecReader {
 
 struct RecWriter {
     outbound: Wire,
-    borrowed: bool,
+    shape: Shape,
     meter: Rc<RefCell<Meter>>,
 }
 
@@ -221,7 +263,7 @@ impl Transport for Recording {
             },
             RecWriter {
                 outbound: self.outbound,
-                borrowed: self.borrowed,
+                shape: self.shape,
                 meter: self.meter,
             },
         )
@@ -263,14 +305,46 @@ impl TransportWrite for RecWriter {
         &'w mut self,
         data: &'w [u8],
     ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
-        // The single override decides the drain strategy: `Some` elects the zero-copy
-        // borrowed path, `None` leaves the owned coalescing one. Which shape this writer is
+        // Which override answers decides the drain strategy, and which shape this writer is
         // was fixed when it was built.
-        if !self.borrowed {
+        if self.shape != Shape::Borrowed {
             return None;
         }
         self.record(data);
         Some(core::future::ready(Ok(data.len())))
+    }
+
+    fn write_vectored<'w>(
+        &'w mut self,
+        regions: &'w [io::IoSlice<'w>],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        if self.shape != Shape::Vectored {
+            return None;
+        }
+        // Nothing is recorded here, and no octet moves. The driver learns which path a
+        // transport offers by building one of these with no regions at all and dropping it
+        // unpolled — so recording at construction would charge this harness a phantom write
+        // and a phantom pile of octets on every single pass, and the write counts below
+        // would be measuring the election rather than the drain. An `async` block is inert
+        // until polled, which is exactly the property needed.
+        Some(async move {
+            let mut written = 0;
+            for region in regions {
+                written += region.len();
+            }
+            // One call, one write, however many regions it gathered: the whole point of the
+            // strategy is that the gathering is free and the syscall is what costs.
+            let mut meter = self.meter.borrow_mut();
+            meter.writes += 1;
+            meter.bytes += written;
+            drop(meter);
+            let mut outbound = self.outbound.borrow_mut();
+            for region in regions {
+                outbound.buf.extend(region.iter().copied());
+            }
+            drop(outbound);
+            Ok(written)
+        })
     }
 }
 
@@ -371,7 +445,7 @@ fn run_receive() -> Receive {
     let transport = Recording {
         inbound: Rc::clone(&s2c),
         outbound: Rc::clone(&c2s),
-        borrowed: true,
+        shape: Shape::Borrowed,
         meter: Rc::new(RefCell::new(Meter::default())),
     };
 
@@ -440,14 +514,14 @@ struct Send {
     bytes: Vec<usize>,
 }
 
-fn run_send(borrowed: bool) -> Send {
+fn run_send(shape: Shape) -> Send {
     let c2s = wire(1 << 22);
     let s2c = wire(1 << 20);
     let meter = Rc::new(RefCell::new(Meter::default()));
     let transport = Recording {
         inbound: Rc::clone(&s2c),
         outbound: Rc::clone(&c2s),
-        borrowed,
+        shape,
         meter: Rc::clone(&meter),
     };
 
@@ -544,7 +618,7 @@ fn the_read_buffer_pool_settles_to_a_fixed_size() {
 
 #[test]
 fn steady_state_send_allocates_nothing_on_the_borrowed_path() {
-    let measured = run_send(true);
+    let measured = run_send(Shape::Borrowed);
 
     assert!(
         measured.allocations.iter().all(|&count| count == 0),
@@ -555,7 +629,7 @@ fn steady_state_send_allocates_nothing_on_the_borrowed_path() {
 
 #[test]
 fn the_owned_write_path_coalesces_a_pass_into_one_write() {
-    let measured = run_send(false);
+    let measured = run_send(Shape::Owned);
 
     assert!(
         measured.writes.iter().all(|&count| count == 1),
@@ -575,8 +649,8 @@ fn the_owned_write_path_coalesces_a_pass_into_one_write() {
 
 #[test]
 fn the_borrowed_write_path_writes_each_block_separately() {
-    let borrowed = run_send(true);
-    let owned = run_send(false);
+    let borrowed = run_send(Shape::Borrowed);
+    let owned = run_send(Shape::Owned);
 
     // Same traffic, driven identically: the two shapes differ only in how they drain it.
     assert_eq!(
@@ -612,8 +686,8 @@ fn the_owned_write_path_allocates_on_every_pass() {
     // is stable in steady state but is an implementation detail of `bytes`' growth policy, so
     // pinning `> 0` and constant captures what matters — a recurring, non-amortising cost —
     // without welding the test to an incidental number.
-    let owned = run_send(false);
-    let borrowed = run_send(true);
+    let owned = run_send(Shape::Owned);
+    let borrowed = run_send(Shape::Borrowed);
 
     assert!(
         owned.allocations.iter().all(|&count| count > 0),
@@ -632,6 +706,244 @@ fn the_owned_write_path_allocates_on_every_pass() {
         borrowed.allocations.iter().all(|&count| count == 0),
         "the borrowed path carries the same traffic for no allocation, saw {:?}",
         borrowed.allocations,
+    );
+}
+
+// ----- the gathering path: one write for a multiplexed pass, and still no allocation -----
+//
+// The upload workload above is the wrong shape to prove what the gathering path is for. Its
+// steady-state passes are nothing but full-sized DATA frames, every one of them over the
+// driver's threshold, so the accumulation buffer is filled and drained within a single
+// block's handling and its reuse across passes is never exercised at all. What the strategy
+// exists for is the opposite traffic: a handful of streams each contributing a few dozen
+// octets, which today costs one write per stream.
+//
+// The obvious way to produce that traffic — many short requests — would be a trap. Standing
+// a stream up allocates, which this file says in its opening paragraphs and excludes from
+// the claim by construction; an arm built on request churn would fail for that reason and
+// say nothing whatever about the buffer. So the streams here are opened during warm-up and
+// never closed, and each contributes one sub-threshold chunk at a time forever.
+
+/// How many long-lived streams the multiplexed arm keeps open.
+const STREAMS: usize = 8;
+
+/// How much each of them contributes per chunk. Well below the driver's 256-octet threshold,
+/// so every block it produces accumulates rather than being gathered on its own.
+const TRICKLE: usize = 64;
+
+/// A body that never ends and never blocks, handing over the same octets again and again.
+///
+/// `Bytes::slice` is a refcount bump over memory allocated once when the body was built, so
+/// producing a chunk costs nothing the measured window can see. That matters more than it
+/// looks: a body that allocated per chunk would charge the harness for its own scaffolding
+/// and the assertion would be about this file rather than about the driver.
+struct Trickle {
+    source: Bytes,
+}
+
+impl Body for Trickle {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        Poll::Ready(Some(Ok(http_body::Frame::data(
+            self.source.slice(..TRICKLE),
+        ))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        false
+    }
+}
+
+/// Drives several long-lived streams that each trickle, and measures the same two things
+/// per pass as [`run_send`]: what the connection allocated, and what it cost in writes.
+fn run_multiplexed(shape: Shape) -> Send {
+    let c2s = wire(1 << 22);
+    let s2c = wire(1 << 20);
+    let meter = Rc::new(RefCell::new(Meter::default()));
+    let transport = Recording {
+        inbound: Rc::clone(&s2c),
+        outbound: Rc::clone(&c2s),
+        shape,
+        meter: Rc::clone(&meter),
+    };
+
+    let (requests, connection) =
+        nghttp2::http::handshake::<Recording, Trickle>(transport).expect("handshake");
+
+    let mut peer = peer_session();
+    let mut ctx = PeerCtx::default();
+
+    let source = Bytes::from(vec![b'x'; TRICKLE]);
+    let responses: Vec<_> = (0..STREAMS)
+        .map(|index| {
+            requests.send_request(
+                http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri(format!("http://example.test/{index}"))
+                    .body(Trickle {
+                        source: source.clone(),
+                    })
+                    .expect("request"),
+            )
+        })
+        .collect();
+
+    let flag = Arc::new(Flag(std::sync::atomic::AtomicBool::new(false)));
+    let waker = Waker::from(Arc::clone(&flag));
+
+    // The peer never answers, so none of these ever complete; they are held and polled only
+    // because dropping one would reset its stream, and a reset stream is exactly the churn
+    // this arm is built to avoid.
+    let drainer = async move {
+        for response in responses {
+            let _ = response.await;
+        }
+    };
+
+    let mut connection = core::pin::pin!(connection);
+    let mut drainer = core::pin::pin!(drainer);
+
+    for _ in 0..WARMUP {
+        pump_absorb(&mut peer, &mut ctx, &c2s, &s2c);
+        let _ = step(connection.as_mut(), &waker);
+        let _ = step(drainer.as_mut(), &waker);
+    }
+
+    let mut result = Send {
+        allocations: Vec::with_capacity(MEASURE),
+        writes: Vec::with_capacity(MEASURE),
+        bytes: Vec::with_capacity(MEASURE),
+    };
+    for _ in 0..MEASURE {
+        pump_absorb(&mut peer, &mut ctx, &c2s, &s2c);
+        *meter.borrow_mut() = Meter::default();
+        arm();
+        let _ = step(connection.as_mut(), &waker);
+        result.allocations.push(disarm());
+        let snapshot = meter.borrow();
+        result.writes.push(snapshot.writes);
+        result.bytes.push(snapshot.bytes);
+        drop(snapshot);
+        let _ = step(drainer.as_mut(), &waker);
+    }
+    result
+}
+
+#[test]
+fn steady_state_send_allocates_nothing_on_the_vectored_path() {
+    // SC-015. The gathering path buys its single write with an accumulation buffer, and a
+    // buffer that were reallocated each pass would have traded one recurring cost for
+    // another. It is not: the driver holds it across passes and clears rather than drops it,
+    // so once it has grown to what a pass needs it stops allocating entirely.
+    let measured = run_send(Shape::Vectored);
+
+    assert!(
+        measured.allocations.iter().all(|&count| count == 0),
+        "a steady-state send pass on the gathering path must allocate nothing, saw {:?}",
+        measured.allocations,
+    );
+}
+
+#[test]
+fn steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path() {
+    // The claim that matters, and the one the body workload cannot make: passes whose blocks
+    // all land *in* the accumulation buffer, so its reuse from one pass to the next is what
+    // is being measured rather than its emptiness.
+    let measured = run_multiplexed(Shape::Vectored);
+
+    assert!(
+        measured.allocations.iter().all(|&count| count == 0),
+        "a steady-state multiplexed pass on the gathering path must allocate nothing, saw \
+         {:?}",
+        measured.allocations,
+    );
+    // Without this the claim would be vacuous: a buffer that is never written cannot be
+    // shown not to reallocate.
+    assert!(
+        measured
+            .bytes
+            .iter()
+            .all(|&bytes| bytes > TRICKLE * STREAMS),
+        "each measured pass must carry more than one chunk from every stream, so the \
+         accumulation is genuinely being filled, saw byte counts {:?}",
+        measured.bytes,
+    );
+}
+
+#[test]
+fn the_vectored_write_path_coalesces_a_multiplexed_pass_into_one_write() {
+    // The syscall property the whole change exists to deliver, measured against the traffic
+    // it was measured to matter for. Every block a trickling stream produces is below the
+    // threshold, so the pass accumulates all of them and pays for exactly one write.
+    let vectored = run_multiplexed(Shape::Vectored);
+    let borrowed = run_multiplexed(Shape::Borrowed);
+
+    assert_eq!(
+        vectored.bytes, borrowed.bytes,
+        "the two shapes were not compared on the same traffic",
+    );
+    assert!(
+        vectored.writes.iter().all(|&count| count == 1),
+        "a multiplexed pass of sub-threshold blocks costs one write however many streams \
+         contributed, saw {:?}",
+        vectored.writes,
+    );
+    // The contrast is the point. This is the factor the benchmarks measure, stated as a
+    // property so it fails the day it stops being true.
+    assert!(
+        borrowed.writes.iter().all(|&count| count > STREAMS),
+        "the borrowed path pays a write per block, which is what makes the one above worth \
+         having, saw {:?}",
+        borrowed.writes,
+    );
+}
+
+#[test]
+fn the_vectored_write_path_writes_once_per_large_block_and_no_more() {
+    // The other half of the strategy: a block big enough to be worth a syscall of its own
+    // goes out uncopied, beside whatever has accumulated ahead of it rather than after it.
+    // So an upload costs one write per DATA frame — the same count the borrowed path pays,
+    // and for the same reason, but with the frame's header and any control frames riding
+    // along instead of costing writes of their own.
+    let vectored = run_send(Shape::Vectored);
+    let borrowed = run_send(Shape::Borrowed);
+    let owned = run_send(Shape::Owned);
+
+    assert_eq!(
+        vectored.bytes, borrowed.bytes,
+        "the shapes were not compared on the same traffic",
+    );
+    assert_eq!(
+        vectored.bytes, owned.bytes,
+        "the shapes were not compared on the same traffic",
+    );
+    assert!(
+        vectored.writes.iter().all(|&count| count > 1),
+        "a pass of several full-sized frames is several writes on the gathering path too: \
+         gathering avoids the copy, it does not avoid the syscall, saw {:?}",
+        vectored.writes,
+    );
+    assert!(
+        vectored
+            .writes
+            .iter()
+            .zip(&borrowed.writes)
+            .all(|(&gathered, &separate)| gathered <= separate),
+        "gathering must never cost more writes than writing each block on its own, saw {:?} \
+         against {:?}",
+        vectored.writes,
+        borrowed.writes,
+    );
+    let first = vectored.writes[0];
+    assert!(
+        vectored.writes.iter().all(|&count| count == first),
+        "one write per frame is a fixed cost of the traffic, not a growing one, saw {:?}",
+        vectored.writes,
     );
 }
 
@@ -690,7 +1002,7 @@ fn run_handlers() -> Vec<usize> {
     let transport = Recording {
         inbound: Rc::clone(&to_server),
         outbound: Rc::clone(&from_server),
-        borrowed: true,
+        shape: Shape::Borrowed,
         meter: Rc::new(RefCell::new(Meter::default())),
     };
 

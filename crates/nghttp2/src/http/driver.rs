@@ -64,6 +64,18 @@ pub(crate) const MANUAL_FLOW_CONTROL: bool = true;
 /// How much a single read may take in.
 const READ_BUFFER: usize = 16 * 1024;
 
+/// The block size at which the vectored path stops copying and starts gathering.
+///
+/// A session block below this is appended to a buffer the driver owns; one at or above it
+/// is handed to the socket as its own region, uncopied. The value separates two populations
+/// rather than cutting through one: a multiplexed pass is control and header frames of a
+/// few dozen octets, and a body pass is `DATA` frames of a little over 16 KiB, with nothing
+/// measured in between. So anything from about 64 to 16,384 would behave identically on
+/// real traffic, and the choice within that range is a tuning decision rather than a
+/// correctness one — 256 is what the ecosystem's other HTTP/2 implementation uses when
+/// gathering is available, and measurement here agreed.
+const VECTORED_THRESHOLD: usize = 256;
+
 /// How many filled buffers may wait to be fed before reading pauses.
 ///
 /// Without a bound the reading half would keep pulling octets in as fast as the peer
@@ -604,6 +616,10 @@ where
         let mut credited: Vec<(i32, usize)> = Vec::new();
         let mut to_reset: Vec<(i32, crate::ErrorCode)> = Vec::new();
         let mut to_resume: Vec<i32> = Vec::new();
+        // The vectored path's accumulation buffer, reused across passes exactly as the
+        // collections above are: cleared rather than reallocated, so it stops allocating
+        // once it has grown to the size a pass needs. Untouched on the other two paths.
+        let mut gathered = BytesMut::new();
 
         loop {
             buffers.sweep();
@@ -679,11 +695,11 @@ where
                 &shared,
                 &mut guard.role,
             )?;
-            flush(&mut session, &mut writer, &mut events).await?;
+            flush(&mut session, &mut writer, &mut events, &mut gathered).await?;
             // A body announces its trailers while it is being serialised, so they can only
             // be submitted once that pass is over — and then written by a second one.
             if submit_trailers(&mut session, &shared, &registry)? {
-                flush(&mut session, &mut writer, &mut events).await?;
+                flush(&mut session, &mut writer, &mut events, &mut gathered).await?;
             }
             // Serialising fires the stream-close handler, so what it observed is
             // dispatched too rather than waiting for the next pass.
@@ -1027,12 +1043,23 @@ fn fail_stream(registry: &Registry, stream: i32, error: Error) {
 
 /// Writes out everything the session currently has to say.
 ///
-/// Which of the two strategies runs is the transport's choice, expressed once through
-/// [`TransportWrite::write_borrowed`]: it returns `Some` to take each block borrowed and
-/// uncopied, or `None` to have them coalesced into one owned write. The two cannot be
-/// combined — the session invalidates each block when the next is asked for, so blocks can
-/// only be gathered into one write by copying them — so the choice is read from the first
-/// block and held for the rest of the pass.
+/// Which strategy runs is the transport's choice, expressed once through
+/// [`TransportWrite::write_vectored`] or [`TransportWrite::write_borrowed`]: the first that
+/// offers itself wins, and the choice is read once and held for the rest of the pass.
+///
+/// * **Vectored.** Blocks below [`VECTORED_THRESHOLD`] accumulate into `gathered`, a buffer
+///   the driver owns and reuses across passes; a block at or above it is handed to the
+///   socket beside whatever has accumulated, in one gathering call, and never copied. A
+///   pass of only small blocks therefore costs one write, and a pass of large ones costs
+///   one per block with nothing copied.
+/// * **Borrowed.** Each block is written on its own, uncopied: one write per block.
+/// * **Owned.** Every block is copied into one buffer and sent in a single write.
+///
+/// Several session blocks cannot be gathered *with each other*, because the session
+/// invalidates each block when the next is asked for and [`Session::send`] enforces that by
+/// borrowing the session for as long as the block lives. That is the whole of the
+/// constraint: one block gathers perfectly well with memory the driver already owns, which
+/// is why the vectored strategy needs at most two regions and never more.
 ///
 /// This does not commit the octets to the peer; [`TransportWrite::commit`] does, and the
 /// caller runs it once the pass is fully drained.
@@ -1040,14 +1067,49 @@ async fn flush<W: TransportWrite>(
     session: &mut Session<Events>,
     writer: &mut W,
     events: &mut Events,
+    gathered: &mut BytesMut,
 ) -> Result<()> {
-    // Empty until the owned path is taken, and never touched on the borrowed one, so the
-    // borrowed path keeps its zero-allocation promise: `BytesMut::new` does not allocate.
+    // Empty until the owned path is taken, and never touched on the other two, so they keep
+    // their zero-allocation promise: `BytesMut::new` does not allocate.
     let mut out = BytesMut::new();
     let mut coalescing = false;
+    // The election. Reading it costs one constructed future that is immediately dropped
+    // without being polled, which the trait's contract requires transports to tolerate.
+    let vectored = writer.write_vectored(&[]).is_some();
+    // Whatever a previous pass left behind has already been written or copied; starting
+    // from empty means no error path can leak a remainder into the next pass.
+    gathered.clear();
+
     while let Some(block) = session.send(events)? {
         if coalescing {
             out.extend_from_slice(block);
+            continue;
+        }
+        if vectored {
+            if block.len() < VECTORED_THRESHOLD {
+                gathered.extend_from_slice(block);
+                continue;
+            }
+            // Big enough to be worth a syscall of its own, so it goes out uncopied, with
+            // the accumulation riding along as the first region rather than as a second
+            // write.
+            match write_gathering(writer, gathered, block).await? {
+                Gathered::All => gathered.clear(),
+                Gathered::Declined { done } => {
+                    // The transport has reneged on its own election, which the contract
+                    // forbids. Failing the connection over it would be a worse answer than
+                    // paying the copy: the remainder joins the coalescing buffer, in order,
+                    // and the pass finishes on the owned path.
+                    if done < gathered.len() {
+                        out.extend_from_slice(&gathered[done..]);
+                        out.extend_from_slice(block);
+                    } else {
+                        out.extend_from_slice(&block[done - gathered.len()..]);
+                    }
+                    gathered.clear();
+                    coalescing = true;
+                }
+            }
             continue;
         }
         let mut offset = 0;
@@ -1074,6 +1136,16 @@ async fn flush<W: TransportWrite>(
         }
     }
 
+    // Small blocks with no large one behind them: the common multiplexed pass, and the one
+    // this strategy exists for. One write for the lot.
+    if !gathered.is_empty() {
+        match write_gathering(writer, gathered, &[]).await? {
+            Gathered::All => {}
+            Gathered::Declined { done } => out.extend_from_slice(&gathered[done..]),
+        }
+        gathered.clear();
+    }
+
     let mut pending = out.freeze();
     while !pending.is_empty() {
         let (result, returned) = writer.write(pending).await;
@@ -1087,6 +1159,61 @@ async fn flush<W: TransportWrite>(
         pending = returned.slice(written..);
     }
     Ok(())
+}
+
+/// How a gathering write ended.
+enum Gathered {
+    /// Every octet offered was accepted.
+    All,
+    /// The transport withdrew the path partway, having accepted `done` octets of the
+    /// logical concatenation.
+    Declined { done: usize },
+}
+
+/// Writes `head` immediately followed by `tail`, as one gathering operation.
+///
+/// Retries the remainder on a short write, which is why the two regions are recomputed each
+/// time round rather than advanced in place. Three cases arise and the middle one is the
+/// one worth naming: when the accepted prefix lands *exactly* on the boundary between the
+/// regions, what remains is the second region alone — offering it beside a now-empty first
+/// region would hand the transport a zero-length `IoSlice`, which the contract promises
+/// never to do and which some transports would count as a region for nothing.
+async fn write_gathering<W: TransportWrite>(
+    writer: &mut W,
+    head: &[u8],
+    tail: &[u8],
+) -> Result<Gathered> {
+    let total = head.len() + tail.len();
+    let mut done = 0;
+    while done < total {
+        let (first, second): (&[u8], &[u8]) = if done < head.len() {
+            (&head[done..], tail)
+        } else {
+            (&tail[done - head.len()..], &[])
+        };
+        // `first` is never empty: the loop condition guarantees octets remain, and both
+        // arms slice from a position strictly inside their own region.
+        let both = [std::io::IoSlice::new(first), std::io::IoSlice::new(second)];
+        let regions = if second.is_empty() {
+            &both[..1]
+        } else {
+            &both[..]
+        };
+        match writer.write_vectored(regions) {
+            Some(write) => {
+                let written = write.await?;
+                if written == 0 {
+                    return Err(Error::new(
+                        ErrorKind::Transport,
+                        "the transport accepted no octets and reported no error",
+                    ));
+                }
+                done += written;
+            }
+            None => return Ok(Gathered::Declined { done }),
+        }
+    }
+    Ok(Gathered::All)
 }
 
 #[cfg(test)]
