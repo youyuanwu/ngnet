@@ -82,18 +82,34 @@ test, and no more.
   frame's `writev` (-15% at 1 KiB, -14% at 64 KiB); at 1 MiB the effect is neutral, which is
   what was wanted there — the goal at large bodies was to avoid the copy a coalescing path
   would have imposed, not to gain. See `docs/benchmarks.md`.
-- **The gathering accumulator is not preallocated.** `gathered` starts as `BytesMut::new()`
-  and grows to its steady-state high-water mark, reallocating a few times during warm-up
-  before it settles — which is why `http_zero_alloc.rs` measures only the steady state. `h2`
-  instead preallocates 16 KiB per connection (`DEFAULT_BUFFER_CAPACITY`), sized so a maximal
-  `HEADERS` frame always fits without growth. Preallocating would trade a fixed per-connection
-  footprint for the removal of the warm-up reallocations, which matters most for short-lived
-  connections that may never reach steady state — precisely the case the current shape serves
-  worst. Sizing it is the open question, and it should be measured rather than copied from
-  `h2`: the accumulator only ever holds blocks *below* `VECTORED_THRESHOLD`, so its high-water
-  mark is set by how many small blocks a multiplexed pass produces, not by the maximum frame
-  size. The multiplexed benchmark pass accumulates thousands of 73-byte blocks, so 16 KiB may
-  well be the wrong number in either direction.
+- **Neither driver write buffer is preallocated.** `gathered` and `out` both start as
+  `BytesMut::new()` and grow to their steady-state high-water marks, reallocating a few times
+  during warm-up before settling — which is why `http_zero_alloc.rs` measures only the steady
+  state. `h2` instead preallocates 16 KiB per connection (`DEFAULT_BUFFER_CAPACITY`), sized so
+  a maximal `HEADERS` frame always fits without growth. Preallocating would trade a fixed
+  per-connection footprint for the removal of the warm-up reallocations, which matters most
+  for short-lived connections that may never reach steady state — precisely the case the
+  current shape serves worst.
+
+  Sizing is the open question, and the two buffers want different answers, so they should not
+  share a constant. `gathered` only ever holds blocks *below* `VECTORED_THRESHOLD` and is
+  drained whenever a large block arrives, so on an upload it stays near zero; its high-water
+  mark is set by how many small blocks a multiplexed pass produces — thousands of 73-byte
+  blocks in the benchmark. `out` is the looser of the two: it holds a whole coalesced pass,
+  16 KiB DATA frames included, so its bound is the flow-control window the *peer* advertises,
+  which a peer may raise. Measure before picking either; 16 KiB is unlikely to be right for
+  both. Removing `out`'s per-pass allocation was worth about 4-7% to the completion transport
+  (see `docs/benchmarks.md`), and the residual warm-up cost is what this entry is about.
+
+  Two second-order effects are worth knowing before anyone revisits this, neither a defect.
+  `BytesMut::reserve` folds the split offset into the requested capacity before doubling, so a
+  buffer whose passes land just past the remaining tail can settle at roughly *twice* the
+  high-water pass size rather than once. And the first `split()` on a fresh `BytesMut`
+  promotes it from `KIND_VEC` to `KIND_ARC`, which costs one small `Box<Shared>` per
+  connection — once, during warm-up, on every path including those where `out` stays empty.
+  A shrink policy for `out` is defensible on footprint grounds; it is not needed for
+  correctness, and retention is the same tradeoff the driver's other reused collections
+  already accept.
 - **True zero-copy DATA payloads are still open, and are now the remaining copy — in fact two.**
   Gathering removed the driver's copy, but every body byte is still touched twice before it
   reaches a socket, both inside the read-body callback (`crates/nghttp2/src/callbacks.rs`):
@@ -130,12 +146,34 @@ test, and no more.
      *hands out* bytes it already owns. Sources that genuinely generate bytes gain nothing, so
      both paths would have to coexist.
 
-  **Measure before building.** The prize is one memset plus one copy per body byte, which
-  should matter only on large bodies — order 10% of a 1 MiB exchange on a back-of-the-envelope
-  memory-bandwidth estimate, and nothing at all on the small-body and multiplexed workloads
-  where this crate already sits at parity. A targeted measurement of what fraction of a 1 MiB
-  exchange is spent in the memset and the copy is the cheap next step, and would decide whether
-  any of the above is worth paying.
+  **It would also unlock gathering for the completion transport, which is a second prize not
+  counted above.** `CompioIo` takes the coalescing path today and cannot do otherwise: compio's
+  vectored write is real — `TcpStream::write_vectored` reaches `IORING_OP_SENDMSG` with an
+  iovec array (`compio-net-0.12.2/src/tcp.rs:628`,
+  `compio-driver-0.12.4/src/sys/op/socket/iour.rs:159-171`) — but it is gated behind
+  `pub trait IoVectoredBuf: 'static` (`compio-buf-0.8.3/src/io_vec_buf.rs:12`). A completion
+  API must own its buffers, since the kernel writes from them after submission, and this
+  crate's `write_vectored` hands out borrowed `IoSlice`s that can never be `'static`. Owning
+  the large block would mean copying it, which is the coalescing path already taken, so there
+  is nothing to gain as things stand.
+
+  No-copy changes that: the payload becomes the caller's own `Bytes` rather than a borrow of
+  libnghttp2's serialisation buffer, and compio implements `IoBuf for bytes::Bytes` with
+  `IoVectoredBuf` for `[T; N]`, so `[header, payload]` becomes a valid vectored buffer and a
+  genuine zero-copy `SENDMSG` becomes reachable on io_uring. That would need an owned-buffer
+  variant of the trait method alongside the borrowed one — a fourth strategy, and a real
+  addition to the transport surface, so it is a cost as well as a benefit.
+
+  **Measure before building.** On the readiness transport the prize is one memset plus one copy
+  per body byte, which should matter only on large bodies — order 10% of a 1 MiB exchange on a
+  back-of-the-envelope memory-bandwidth estimate, and nothing at all on the small-body and
+  multiplexed workloads where this crate already sits at parity. On the completion transport
+  the prize is larger, because it is that same saving *plus* the syscall collapse the readiness
+  side already got from gathering, which `CompioIo` has never been able to take. A targeted
+  measurement of what fraction of a 1 MiB exchange is spent in the memset and the copy is the
+  cheap next step, and would decide whether any of the above is worth paying. Note that the two
+  prizes have different shapes: the readiness one is an incremental gain on a path already at
+  parity, the completion one closes a gap that is currently structural.
 - **The write-path asymmetry is unmeasured on a real NIC.** Benchmarks show tokio's borrowed
   zero-copy write cancelling io_uring's syscall advantage at 1 MiB bodies, over loopback. Whether
   that holds where real device interrupts exist is unknown, and loopback biases against

@@ -127,9 +127,11 @@ pub trait TransportWrite {
     /// disagree.
     ///
     /// The owned path coalesces a whole pass into one [`write`](TransportWrite::write): a
-    /// syscall saved for an allocation and a copy of every outgoing octet, every pass. The
-    /// borrowed path hands each of the session's own blocks over as it is produced,
-    /// uncopied — zero allocation, at one write per block.
+    /// syscall saved for a copy of every outgoing octet, which the transport taking
+    /// ownership requires. The buffer behind that copy is reused across passes, so it costs
+    /// no allocation in steady state. The borrowed path hands each of the session's own
+    /// blocks over as it is produced, uncopied — no allocation either, at one write per
+    /// block.
     ///
     /// These two cannot be *combined*, and the reason is worth stating precisely because it
     /// is easy to overstate. The session lends one block at a time: asking for the next

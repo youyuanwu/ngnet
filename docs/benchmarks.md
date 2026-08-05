@@ -239,20 +239,68 @@ control.**
 `ngrs-compio`, which does not implement `write_vectored`, moved −0.2% (N=8), −0.7% (N=64),
 +0.9% (serial) and +0.2% (1 MiB) — inert, as required.
 
+#### Reusing the coalescing buffer, measured
+
+Removing the owned path's per-pass allocation was measured separately, since `CompioIo` is the
+only shipped transport that takes that path. Against a saved baseline, `taskset -c 3`, with the
+two unchanged arms as drift controls:
+
+| Body | `ngrs-compio` (changed) | `ngrs-tokio` (control) | `hyper-tokio` (control) |
+| --- | --- | --- | --- |
+| 0 B | −5.9% | +2.0% | −0.9% |
+| 1 KiB | −5.8% | +7.1% | −1.2% |
+| 64 KiB | −3.8% | +0.9% | −0.4% |
+| 1 MiB | −7.0% | +1.1% | +0.8% |
+
+**About 4–7% for the completion transport**, in a run where the unchanged `hyper-tokio` control
+held within ±1.2% — the quietest conditions obtained for any measurement in this file, which is
+why this run is quoted rather than an average. A second run agreed on direction for compio but
+was noisier throughout.
+
+`ngrs-tokio` reads slightly positive here and that was investigated rather than waved through,
+since a regression on the default transport would matter more than the gain. It does not
+reproduce: on `transport_concurrent_throughput`, the workload that exercises the gathering path
+hardest, the same build measured −5.1%, −0.2% and +1.2% at N=1/8/64 against a control that had
+itself moved −3.1% to −5.0%. A cost that appears in one benchmark family and not the other,
+with no mechanism to explain it, is drift.
+
+There is no mechanism because the empty case is taken before the split (see `flush`): a pass
+that never coalesces hands over `Bytes::new()` and touches the buffer not at all. That guard is
+load-bearing rather than cosmetic — without it, `split` on an already-shared buffer costs an
+atomic increment and the dropped handle an atomic decrement, so the vectored and borrowed paths
+would have paid two atomics per pass for a buffer they never fill. That cost was measured and
+removed before these numbers were taken.
+
+The modest size is worth understanding rather than glossing. Twelve allocations per pass sounds
+substantial, but a same-size `malloc`/`free` pair under glibc's thread cache is tens of
+nanoseconds, so twelve is well under a microsecond against a 62 µs pass. What actually costs
+something is the *growth*: rebuilding the buffer from empty each pass re-copies its contents at
+every doubling, which is why the gain appears on the body sweep and not in concurrency. This is
+a good illustration of why the allocation counts in the next section are pinned as a *property*
+rather than treated as a proxy for time.
+
 #### Allocation, counted rather than timed
 
 From `crates/nghttp2/tests/http_zero_alloc.rs`, exact counts per driver pass in steady state:
 
 | Strategy | Single upload | 8 multiplexed streams |
 | --- | --- | --- |
-| Owned (coalescing) | 4 allocs / 1 write | 12 allocs / 1 write |
+| Owned (coalescing) | 0 allocs / 1 write | 0 allocs / 1 write |
 | Borrowed | 0 allocs / 4 writes | 0 allocs / **513 writes** |
 | **Gathering** | **0 allocs / 4 writes** | **0 allocs / 1 write** |
 
-Gathering strictly dominates both: the borrowed path's zero allocation with the coalescing
-path's write count. The 513-to-1 collapse is the mechanism behind the −58.9% at N=64. This is
-also why the trade the previous section framed turned out not to exist — no values judgement
-about the library was needed, because nothing had to be given up.
+The owned row read `4 allocs` and `12 allocs` when gathering was introduced, and that
+recurring cost was part of the argument for it. It has since been removed independently: the
+coalescing buffer was a local handed away whole with `freeze()`, so every pass rebuilt it;
+hoisting it and handing over `split().freeze()` lets `bytes` reclaim the capacity. What the
+owned path still pays, inherently, is a **copy** of every outgoing octet, because the
+transport takes ownership.
+
+So the separating column is the write count, and it is a syscall count. Gathering reaches the
+borrowed path's zero allocation and zero copy of large blocks at the coalescing path's write
+count; the 513-to-1 collapse is the mechanism behind the −58.9% at N=64. This is also why the
+trade the previous section framed turned out not to exist — no values judgement about the
+library was needed, because nothing had to be given up.
 
 What survives from the original three-arm comparison:
 
@@ -275,7 +323,10 @@ Each is named with its direction, because a number without its bias is not evide
   hyper coalesces by buffering. Before gathering, this **favoured the coalescing arms wherever
   syscalls dominated** and accounted for the entire N=8/N=64 spread. With the tokio arm no
   longer writing per block, what remains of the confound is the **copy** the completion arm
-  pays and the other two do not, which biases against compio on large bodies.
+  pays and the other two do not, which biases against compio on large bodies. That is not
+  permanent: the constraint is that a *session block* cannot be owned, and
+  `NGHTTP2_DATA_FLAG_NO_COPY` would make the payload the caller's own `Bytes` instead, which
+  compio can gather. See `docs/pending-work.md`.
 - **Loopback, not a network interface.** No real network latency, no device interrupts, no
   driver work — precisely the costs io_uring exists to amortise. This **biases against
   compio**; a real NIC would be expected to widen its lead rather than narrow it. Nothing
