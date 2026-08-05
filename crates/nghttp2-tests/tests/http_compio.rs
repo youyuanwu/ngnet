@@ -169,6 +169,68 @@ fn an_exchange_completes_over_the_shipped_compio_transport() {
     });
 }
 
+/// The same exchange over the *handed-over* entry point, so the completion transport takes
+/// its owned-region write path on a real io_uring socket rather than the coalescing one.
+///
+/// `handshake_shared` frames each `DATA` as a record the driver offers as an owned region,
+/// so a body spanning several frames drives a genuine multi-region `write_regions` — which on
+/// this transport reaches `TcpStream::write_vectored`, an `IORING_OP_SENDMSG`. The body is
+/// therefore several frames long: a single-frame body would gather one payload region and
+/// prove nothing a coalesced write would not. Correctness of the echo is the assertion; that
+/// the path taken is the gathering one is what makes this the completion counterpart of the
+/// in-memory owned-region tests.
+#[test]
+fn a_shared_body_exchange_gathers_over_the_shipped_compio_transport() {
+    let runtime = compio::runtime::Runtime::new().expect("compio needs io_uring to start");
+
+    runtime.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binding");
+        let addr = listener.local_addr().expect("an address");
+
+        let serving = compio::runtime::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accepting");
+            let _ = server::serve(CompioIo::new(stream), echo)
+                .expect("serving")
+                .await;
+        });
+
+        let stream = TcpStream::connect(addr).await.expect("connecting");
+        // Handed over rather than copied: this is the entry point that reaches the
+        // owned-region strategy, and the whole point of the exercise.
+        let (requests, connection) =
+            nghttp2::http::handshake_shared::<_, Full>(CompioIo::new(stream)).expect("handshake");
+
+        // Several frames' worth, so the gathering write carries a run of header and payload
+        // regions rather than a single coalesced one. The payload is a recognisable pattern
+        // so a dropped or reordered region would corrupt the echo rather than pass silently.
+        let body: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        let expected = body.clone();
+
+        let response = requests.send_request(
+            http::Request::builder()
+                .method(http::Method::POST)
+                .uri("http://example.test/echo")
+                .body(Full::new(body))
+                .expect("a request"),
+        );
+
+        let exchange = async {
+            let response = response.await.expect("a response");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let received = drain(response.into_body()).await;
+            drop(requests);
+            received
+        };
+
+        let received = alongside(exchange, connection).await;
+        assert_eq!(
+            received, expected,
+            "the handed-over body did not round-trip intact over the gathering write path",
+        );
+        serving.detach();
+    });
+}
+
 /// Polls two futures on one task, finishing when the first completes.
 ///
 /// Written out rather than taken from a combinator crate: this file exists to show what a

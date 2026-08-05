@@ -588,13 +588,17 @@ mod asynchronous {
         drop((reader, writer));
     }
 
-    /// The writing half's contract, pinned by the shape of its three overridable points.
+    /// The writing half's contract, pinned by the shape of its overridable points.
     ///
     /// Each fast path is a *single* override: `write_borrowed` and `write_vectored` each
     /// return an `Option` of a future, so the decision (`Some`/`None`) and the write are one
-    /// method — a separate boolean flag would be a different, breakable, surface. `commit`
-    /// returns a future of `()`. All are pinned as signatures rather than fn pointers
-    /// because a return-position `impl Future` has no nameable type.
+    /// method — a separate boolean flag would be a different, breakable, surface. The
+    /// owned-region path is the deliberate exception: its election (`gathers_owned_regions`,
+    /// a plain `bool`) is split from its write (`write_regions`, which takes an owned
+    /// `Vec<Bytes>` and hands it back), because a late `None` there would consume and lose
+    /// owned buffers that a borrowed slice can afford to drop. `commit` returns a future of
+    /// `()`. All are pinned as signatures rather than fn pointers because a return-position
+    /// `impl Future` has no nameable type.
     pub(super) fn write_half_surface<W: TransportWrite>() {
         fn borrowed_is_one_optional_future<W: TransportWrite>(writer: &mut W, data: &[u8]) {
             fn assert_optional_future<F: core::future::Future<Output = std::io::Result<usize>>>(
@@ -613,12 +617,29 @@ mod asynchronous {
             }
             assert_optional_future(writer.write_vectored(regions));
         }
+        fn owned_region_election_is_a_bool<W: TransportWrite>(writer: &W) {
+            let _: bool = writer.gathers_owned_regions();
+        }
+        fn write_regions_takes_and_returns_owned_regions<W: TransportWrite>(
+            writer: &mut W,
+            regions: Vec<bytes::Bytes>,
+        ) {
+            fn assert_future<
+                F: core::future::Future<Output = (std::io::Result<usize>, Vec<bytes::Bytes>)>,
+            >(
+                _: F,
+            ) {
+            }
+            assert_future(writer.write_regions(regions));
+        }
         fn commit_returns_a_result_future<W: TransportWrite>(writer: &mut W) {
             fn assert_future<F: core::future::Future<Output = std::io::Result<()>>>(_: F) {}
             assert_future(writer.commit());
         }
         let _ = borrowed_is_one_optional_future::<W>;
         let _ = vectored_is_one_optional_future::<W>;
+        let _ = owned_region_election_is_a_bool::<W>;
+        let _ = write_regions_takes_and_returns_owned_regions::<W>;
         let _ = commit_returns_a_result_future::<W>;
     }
 
@@ -645,6 +666,20 @@ fn the_asynchronous_surface_is_unchanged() {
     // still public, and integration tests are separate crates that can reach nothing else.
     let _: fn() -> (Duplex, Duplex) = nghttp2::http::testing::duplex_vectored;
     let _: fn() -> (Duplex, Duplex) = nghttp2::http::testing::duplex_offering_both;
+    // The completion-shaped transport: it elects the owned-region path, taking ownership of a
+    // list of `Bytes` rather than borrowing slices.
+    let _: fn() -> (Duplex, Duplex) = nghttp2::http::testing::duplex_owned_regions;
+    // The transport that advertises the vectored and owned-region paths at once, and the
+    // election handle a precedence or once-per-pass assertion reads. Added beside the duplex
+    // constructors they sit with; hidden from the docs like the rest of `testing`, but public.
+    let _: fn() -> (Duplex, Duplex) = nghttp2::http::testing::duplex_vectored_and_owned_regions;
+    let _: fn(&Duplex) -> nghttp2::http::testing::ElectionLog = Duplex::election_log;
+    let _: fn(&nghttp2::http::testing::ElectionLog) -> usize =
+        nghttp2::http::testing::ElectionLog::vectored_probes;
+    let _: fn(&nghttp2::http::testing::ElectionLog) -> usize =
+        nghttp2::http::testing::ElectionLog::owned_region_elections;
+    let _: fn(&nghttp2::http::testing::ElectionLog) -> usize =
+        nghttp2::http::testing::ElectionLog::region_writes;
     let _: fn(&Duplex, usize) = Duplex::decline_vectored_after;
     let _: fn(&Duplex) -> nghttp2::http::testing::VectoredLog = Duplex::vectored_log;
     let _: fn(&nghttp2::http::testing::VectoredLog) -> Vec<Vec<usize>> =

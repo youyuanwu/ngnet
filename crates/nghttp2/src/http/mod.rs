@@ -85,10 +85,11 @@
 //! IOCP) needs and a readiness API (tokio, `futures-io`) satisfies with no copy.
 //!
 //! One decision is the writer's, and it is not free either way.
-//! [`TransportWrite::write_borrowed`] and [`TransportWrite::write_vectored`] choose how the
-//! session is drained, and each is a single override point on purpose: overriding neither —
+//! [`TransportWrite::write_borrowed`], [`TransportWrite::write_vectored`] and
+//! [`TransportWrite::gathers_owned_regions`] choose how the session is drained, and each is a
+//! single override point on purpose: overriding none —
 //! the default — has the driver coalesce a whole pass into one owned buffer and issue a
-//! single [`write`](TransportWrite::write), which is one syscall per pass but allocates and
+//! single [`write`](TransportWrite::write), which is one syscall per pass but
 //! copies every outgoing octet, every pass. `write_borrowed` returning `Some(future)` hands
 //! each of the session's own regions over directly: **zero** allocation and zero copy, but
 //! one write per block — and *two* per handed-over payload, since its frame header and its
@@ -96,8 +97,22 @@
 //! multiplexed blocks. `write_vectored` returning `Some(future)`
 //! gathers those small blocks into a buffer the driver reuses and hands the socket that
 //! buffer alongside any large block and any handed-over payload, in one `writev` — few
-//! syscalls, no copy of large payloads, and still zero steady-state allocation. It takes
-//! precedence where both are overridden. Because each method carries both the choice and the
+//! syscalls, no copy of large payloads, and still zero steady-state allocation.
+//!
+//! `gathers_owned_regions` returning `true` is the same bargain for a *completion* transport,
+//! which cannot lend the kernel a borrowed slice at all — the kernel writes from the buffers
+//! after submission, so they must be owned. The driver instead builds a list of owned
+//! [`bytes::Bytes`] and passes it to [`TransportWrite::write_regions`], which takes ownership
+//! and returns the list so the allocation can be reused: every session-produced block is
+//! copied into a driver buffer there, with no size threshold, because a block borrowed from
+//! the session cannot be owned without a copy — but each handed-over payload rides as its own
+//! region in the caller's own memory, uncopied. That is the whole reason a completion
+//! transport can gather at all, and it is available only for handed-over bodies; a
+//! push-model body's `DATA` was never the caller's to hand over, so it is copied like any
+//! other block.
+//!
+//! Precedence among the four, highest first: vectored, owned-region, borrowed, owned. Because
+//! each method carries both the choice and the
 //! write, an adapter cannot advertise a fast path without providing it, nor provide it
 //! without the driver taking it.
 //!

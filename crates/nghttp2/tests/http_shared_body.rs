@@ -27,8 +27,8 @@ use core::future::Future;
 
 use nghttp2::http::testing::{
     Duplex, DuplexReader, DuplexWriter, Empty, Failing, Full, Scripted, VectoredLog, alongside,
-    block_on, bytes_crate as bytes, duplex, duplex_vectored, failing, failing_borrowed,
-    failing_vectored, http_crate as http, scripted, serve,
+    block_on, bytes_crate as bytes, duplex, duplex_owned_regions, duplex_vectored, failing,
+    failing_borrowed, failing_vectored, http_crate as http, scripted, serve,
 };
 use nghttp2::http::transport::{Transport, TransportWrite};
 use nghttp2::http::{Error as HttpError, IncomingBody, ResponseFuture, SendRequest};
@@ -672,6 +672,31 @@ fn the_readiness_paths_hand_over_the_whole_payload_from_caller_memory() {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             body_len,
             "borrowed",
+        );
+    }
+
+    // Owned-region (completion): the payloads ride uncopied in a `Vec<Bytes>` gathering
+    // write, interleaved with minted header regions and coalesced small-block runs — the
+    // same two-sided proof as the vectored path, on the strategy a completion runtime takes.
+    // This is design decision D8's instrument 2 retargeted to the owned path, the second
+    // headline of the whole work: a completion transport gathers rather than coalesces.
+    {
+        let (client_side, server_side) = duplex_owned_regions();
+        let log = client_side.vectored_log();
+        let (body, ranges, expected) = make_body();
+        let peer = upload_tracked(client_side, server_side, body);
+        assert_eq!(
+            peer.bodies.get(&1).cloned().unwrap_or_default(),
+            expected,
+            "the owned-region path did not deliver the body intact",
+        );
+        assert_pointer_coverage(
+            &log,
+            &ranges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            body_len,
+            "owned-region",
         );
     }
 

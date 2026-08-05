@@ -56,8 +56,15 @@
 //! | owned (neither override)   | `0` / `1` | `0` / `1` | `the_owned_write_path_coalesces_a_pass_into_one_write`, `the_owned_write_path_reuses_its_coalescing_buffer` |
 //! | borrowed (`write_borrowed`) | `0` / one per block (4) | `0` / one per block (513) | `steady_state_send_allocates_nothing_on_the_borrowed_path`, `the_borrowed_write_path_writes_each_block_separately` |
 //! | gathering (`write_vectored`) | `0` / one per frame (4) | `0` / `1` | `steady_state_send_allocates_nothing_on_the_vectored_path`, `steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path`, `the_vectored_write_path_coalesces_a_multiplexed_pass_into_one_write`, `the_vectored_write_path_writes_once_per_large_block_and_no_more` |
+//! | owned-region (`write_regions`) | `0` / `1` | — | `the_owned_region_write_path_coalesces_a_pass_into_one_write`, `steady_state_send_allocates_nothing_on_the_owned_region_path` |
 //!
-//! All three shapes now reach zero steady-state allocation, but they arrived there at
+//! The owned-region row carries no multiplexed column: this file's push-model workload never
+//! hands over a payload, so the completion strategy coalesces every block into its minting
+//! buffer and looks exactly like the owned shape from here — one write per pass, no
+//! allocation. Its distinguishing property, that a *handed-over* payload rides uncopied in
+//! its own region, needs a shared body to exercise and is proven in `http_shared_body.rs`.
+//!
+//! All four shapes now reach zero steady-state allocation, but they arrived there at
 //! different times and for different reasons, and the history is worth keeping because the
 //! table above was once the argument for a design decision.
 //!
@@ -236,6 +243,11 @@ enum Shape {
     Borrowed,
     /// Overrides `write_vectored`: small blocks gathered with the driver's own buffer.
     Vectored,
+    /// Overrides `gathers_owned_regions`/`write_regions`: the completion strategy, one
+    /// gathering write over an owned `Vec<Bytes>`. On a push-model connection every block is
+    /// coalesced into the driver's minting buffer, so the pass reaches this as a single owned
+    /// region — one write, and no allocation once that buffer has grown.
+    OwnedRegions,
 }
 
 struct Recording {
@@ -358,6 +370,30 @@ impl TransportWrite for RecWriter {
             drop(outbound);
             Ok(written)
         })
+    }
+
+    fn gathers_owned_regions(&self) -> bool {
+        // The completion election, fixed at construction like the readiness ones. Only the
+        // owned-region shape advertises it; the default `false` holds for every other shape.
+        self.shape == Shape::OwnedRegions
+    }
+
+    async fn write_regions(&mut self, regions: Vec<Bytes>) -> (io::Result<usize>, Vec<Bytes>) {
+        // One gathering write, one meter tick, however many regions it carried — the same
+        // accounting the vectored path uses, since both spend a single syscall on a list.
+        // The ownership round-trip a completion API needs is visible here: the `Vec` comes in
+        // and goes back out, so the driver can reuse it.
+        let written: usize = regions.iter().map(Bytes::len).sum();
+        let mut meter = self.meter.borrow_mut();
+        meter.writes += 1;
+        meter.bytes += written;
+        drop(meter);
+        let mut outbound = self.outbound.borrow_mut();
+        for region in &regions {
+            outbound.buf.extend(region.iter().copied());
+        }
+        drop(outbound);
+        (Ok(written), regions)
     }
 }
 
@@ -729,6 +765,46 @@ fn the_owned_write_path_reuses_its_coalescing_buffer() {
         borrowed.writes.iter().all(|&count| count > 1),
         "the borrowed path still pays one write per block, saw {:?}",
         borrowed.writes,
+    );
+}
+
+#[test]
+fn the_owned_region_write_path_coalesces_a_pass_into_one_write() {
+    // The completion strategy on push-model traffic: with no handed-over payload to ride
+    // uncopied, every block is coalesced into the minting buffer and the whole pass reaches
+    // the transport as a single owned region. So it looks exactly like the owned path from
+    // the write-count side — one gathering write per pass — which is what this pins.
+    let measured = run_send(Shape::OwnedRegions);
+
+    assert!(
+        measured.writes.iter().all(|&count| count == 1),
+        "the owned-region path issues exactly one gathering write per pass however many \
+         frames are pending, saw {:?}",
+        measured.writes,
+    );
+    assert!(
+        measured.bytes.iter().all(|&bytes| bytes > MAX_FRAME),
+        "each measured pass must carry more than one frame, so the single write genuinely \
+         coalesced several, saw byte counts {:?}",
+        measured.bytes,
+    );
+}
+
+#[test]
+fn steady_state_send_allocates_nothing_on_the_owned_region_path() {
+    // The completion counterpart of `the_owned_write_path_reuses_its_coalescing_buffer`: the
+    // owned-region path mints each region by `split().freeze()`ing the minting buffer, and
+    // `write_regions` returns the `Vec` so the transport's frozen handles are dropped before
+    // the next pass. That leaves the minting buffer the unique owner of its allocation, so
+    // `bytes` reclaims the capacity and the steady state allocates nothing. A regression to
+    // `freeze()` in place of `split().freeze()`, or to building the buffers inside `flush`,
+    // would restore a per-pass allocation and fail here.
+    let measured = run_send(Shape::OwnedRegions);
+
+    assert!(
+        measured.allocations.iter().all(|&count| count == 0),
+        "a steady-state send pass on the owned-region path must allocate nothing, saw {:?}",
+        measured.allocations,
     );
 }
 

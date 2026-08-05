@@ -5,9 +5,12 @@
 //! assertions are largely type-level:
 //!
 //! * a completion-based transport can be written without mentioning the borrowed-write
-//!   path at all;
-//! * a readiness-based one can elect it through the single override that carries both the
-//!   choice and the write;
+//!   path — or the owned-region path — at all;
+//! * a readiness-based one can elect the borrowed path through the single override that
+//!   carries both the choice and the write;
+//! * a completion-based one can elect the owned-region path through its own split
+//!   election — a plain predicate read once per pass, separate from the write that carries
+//!   the regions, because a late `None` there would consume and lose owned buffers;
 //! * neither is required to be `Send`, because the flagship completion runtimes are
 //!   thread-per-core and build their I/O on `Rc`. A `Send` bound in the traits would
 //!   exclude exactly the runtimes the abstraction exists to serve.
@@ -17,12 +20,20 @@
 use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Wake;
 
-use nghttp2::http::testing::{block_on, duplex, duplex_offering_both, duplex_vectored};
+use nghttp2::http::testing::{
+    Duplex, DuplexReader, Full, block_on, duplex, duplex_offering_both, duplex_owned_regions,
+    duplex_vectored, duplex_vectored_and_owned_regions, http_crate as http,
+};
 use nghttp2::http::{Transport, TransportRead, TransportWrite};
 
 use bytes::{Bytes, BytesMut};
 use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, Waker};
 
 /// A completion-based transport: owns its buffers, ignores the borrowed-write path.
 ///
@@ -231,6 +242,45 @@ impl Future for CountOnPoll {
     ) -> core::task::Poll<Self::Output> {
         *self.counter.borrow_mut() += 1;
         core::task::Poll::Ready(Ok(self.len))
+    }
+}
+
+/// A completion transport that elects the owned-region path, and *also* offers the vectored
+/// one — the arrangement precedence has to arbitrate. Which write actually runs is counted so
+/// a test can see it: the driver's rule is that vectored wins, so a transport advertising both
+/// must have its regions carried by the vectored path, never `write_regions`.
+struct OffersVectoredAndOwnedRegions {
+    vectored_writes: Rc<RefCell<usize>>,
+    region_writes: Rc<RefCell<usize>>,
+}
+
+impl TransportWrite for OffersVectoredAndOwnedRegions {
+    async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
+        let written = buf.len();
+        (Ok(written), buf)
+    }
+
+    fn write_vectored<'w>(
+        &'w mut self,
+        regions: &'w [io::IoSlice<'w>],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        Some(CountOnPoll {
+            len: regions.iter().map(|region| region.len()).sum(),
+            counter: Rc::clone(&self.vectored_writes),
+        })
+    }
+
+    fn gathers_owned_regions(&self) -> bool {
+        true
+    }
+
+    fn write_regions(
+        &mut self,
+        regions: Vec<Bytes>,
+    ) -> impl Future<Output = (io::Result<usize>, Vec<Bytes>)> {
+        *self.region_writes.borrow_mut() += 1;
+        let written = regions.iter().map(Bytes::len).sum();
+        core::future::ready((Ok(written), regions))
     }
 }
 
@@ -497,9 +547,368 @@ fn a_completion_transport_needs_no_borrowed_write_path() {
          completion transport must keep compiling untouched as strategies are added"
     );
 
+    assert!(
+        !writer.gathers_owned_regions(),
+        "a transport that has not overridden the owned-region election must decline it too, \
+         so the default is the coalescing owned write — the same additive guarantee the \
+         borrowed and vectored paths give"
+    );
+
+    // The default `write_regions` is unreachable by contract — the driver only calls it
+    // after `gathers_owned_regions` returns true — but it must still exist and be safe, so a
+    // completion transport that overrides neither keeps compiling. It reports `Unsupported`
+    // and, crucially, hands the regions straight back rather than dropping them.
+    let regions = vec![Bytes::from_static(b"to the peer")];
+    let (result, returned) = block_on(writer.write_regions(regions));
+    assert_eq!(
+        result.expect_err("the default declines").kind(),
+        io::ErrorKind::Unsupported,
+        "the default owned-region write must decline rather than pretend to have written"
+    );
+    assert_eq!(
+        returned,
+        vec![Bytes::from_static(b"to the peer")],
+        "and it must return the regions untouched — losing owned buffers is exactly the \
+         failure the split election exists to prevent"
+    );
+
     let (written, _buf) = block_on(writer.write(Bytes::from_static(b"to the peer")));
     assert_eq!(written.unwrap(), b"to the peer".len());
     assert_eq!(writer.written, b"to the peer");
+}
+
+#[test]
+fn a_transport_can_elect_the_owned_region_path() {
+    // The owned-region election and write in isolation, exercised directly rather than
+    // through the driver: this calls `gathers_owned_regions` and `write_regions` on the
+    // transport itself, so it pins the *contract* those two owe each other, not the driver's
+    // choice between them (precedence is pinned separately, driver-driven, below). The
+    // transport happens to offer the vectored path as well, which is immaterial here because
+    // nothing consults it. What matters is that the election is a plain predicate, read
+    // without offering any regions and repeatable — and that it is separate from the write,
+    // so a transport can never lose owned buffers by declining late the way a borrowed-path
+    // transport may drop a borrowed slice.
+    let region_writes = Rc::new(RefCell::new(0));
+    let mut writer = OffersVectoredAndOwnedRegions {
+        vectored_writes: Rc::new(RefCell::new(0)),
+        region_writes: Rc::clone(&region_writes),
+    };
+
+    assert!(
+        writer.gathers_owned_regions(),
+        "the election is a plain predicate, read without offering any regions"
+    );
+    // Reading it again yields the same answer: it is a fixed property of the transport, not a
+    // per-pass decision, and reading it has no side effect that a second read could disturb.
+    assert!(
+        writer.gathers_owned_regions(),
+        "the election is stable across reads within a pass"
+    );
+
+    let regions = vec![
+        Bytes::from_static(b"header"),
+        Bytes::from_static(b"payload"),
+    ];
+    let (result, returned) = block_on(writer.write_regions(regions));
+    assert_eq!(
+        result.unwrap(),
+        b"header".len() + b"payload".len(),
+        "the gathering write reports the whole list's length"
+    );
+    assert_eq!(
+        returned,
+        vec![
+            Bytes::from_static(b"header"),
+            Bytes::from_static(b"payload")
+        ],
+        "and hands the `Vec` back so the driver can reuse it — ownership in and back out"
+    );
+    assert_eq!(
+        *region_writes.borrow(),
+        1,
+        "one call is one gathering write"
+    );
+}
+
+#[test]
+fn the_vectored_path_takes_precedence_over_the_owned_region_one() {
+    // Precedence, pinned where it lives: inside the driver, over a real connection. The
+    // earlier version of this test was circular — it called `write_vectored` itself and
+    // checked the counters, so it asserted the *test's* belief about precedence rather than
+    // the driver's rule. Reversing the driver's precedence would not have failed it. This one
+    // hands a shared body to a transport that advertises *both* the vectored and the
+    // owned-region path and lets the driver choose; the observation is the driver's, so a
+    // reversed rule fails it. Verified by mutation: swapping the driver's two elections so
+    // the owned-region one is read first makes this test fail.
+    //
+    // The rule: the vectored election is read first, the owned-region one only when it
+    // declines. So the vectored path must carry every octet, and `write_regions` — the
+    // owned-region *write* — must never run.
+    let observed = drive_precedence(BODY, &[], PASSES);
+
+    assert!(
+        !observed.peer.is_empty(),
+        "the driver produced nothing, so nothing was driven: {observed:?}",
+    );
+    assert!(
+        observed.request_reached_peer(),
+        "the peer never received the request body the vectored path should have carried: \
+         {observed:?}",
+    );
+    assert_eq!(
+        observed.region_writes, 0,
+        "the owned-region write ran, so the driver did not give the vectored path precedence: \
+         {observed:?}",
+    );
+    assert_eq!(
+        observed.owned_region_elections, 0,
+        "the driver consulted the owned-region election, so it did not stop at the vectored \
+         one — the vectored election is meant to be read first and settle it: {observed:?}",
+    );
+    assert!(
+        !observed.calls.is_empty(),
+        "the vectored path performed no write, so it did not carry the traffic: {observed:?}",
+    );
+    assert!(
+        observed.vectored_probes >= 1,
+        "the driver never probed the vectored election, so no pass ran: {observed:?}",
+    );
+    // The vectored path carried the whole request: every octet the peer received came out of
+    // a gathering write, and none out of `write_regions`.
+    assert_eq!(
+        observed.vectored_octets, observed.peer,
+        "the octets the vectored path gathered are not the octets the peer received, so some \
+         traffic took another path: {observed:?}",
+    );
+}
+
+#[test]
+fn the_owned_region_election_is_read_once_a_pass_not_once_a_write() {
+    // Once-per-pass, pinned on the election this test is named for. The contract is that a
+    // strategy election is consulted once a pass and its answer does not depend on the regions
+    // later offered — never once per write.
+    //
+    // The shape matters. Over a transport advertising *both* paths the vectored election wins
+    // and the owned-region one is never consulted at all, so a run there could say nothing
+    // about it: a driver that re-read `gathers_owned_regions` before every `write_regions`
+    // would sail through unnoticed. This drives an owned-region-only transport instead, where
+    // that election is the one the driver actually reaches.
+    //
+    // The pass count comes from the vectored probe. The driver opens every pass by probing the
+    // vectored election, and the harness counts that probe before the declining shape gates it
+    // out — so on this transport `vectored_probes` *is* the number of passes, which turns the
+    // claim from an inequality into an equality: exactly one owned-region election per pass.
+    // A forced short write guarantees the write ran more often than the election, which is the
+    // half that rules out a per-write election.
+    let observed = drive_over(duplex_owned_regions(), BODY, &[SHORT_PREFIX], PASSES);
+
+    assert!(
+        observed.retries >= 1,
+        "no short write was forced, so the once-per-pass claim rests on nothing: {observed:?}",
+    );
+    assert!(
+        observed.region_writes > observed.owned_region_elections,
+        "the owned-region write ran {} times against {} elections; without the write \
+         outnumbering the election a per-write election would look identical: {observed:?}",
+        observed.region_writes,
+        observed.owned_region_elections,
+    );
+    assert_eq!(
+        observed.owned_region_elections, observed.vectored_probes,
+        "the owned-region election was read {} times across {} passes; it must be read exactly \
+         once a pass, not once a write: {observed:?}",
+        observed.owned_region_elections, observed.vectored_probes,
+    );
+}
+
+/// A request body large enough that its serialisation spans several regions — a run of small
+/// handshake blocks, the request head, and a handed-over `DATA` payload riding as its own
+/// region — so the gathering write the vectored path performs is a real multi-region one.
+const BODY: usize = 4_096;
+
+/// The prefix a forced short write accepts, small enough to cut inside the first region so the
+/// remainder is retried. Non-zero, since a zero-octet accept is an error the driver rejects
+/// rather than a short write it resumes.
+const SHORT_PREFIX: usize = 16;
+
+/// Polls enough to carry the whole request even when short writes stretch it over retries; a
+/// silent peer never answers, so extra polls past completion simply park.
+const PASSES: usize = 8;
+
+/// What one driven precedence run produced.
+#[derive(Debug)]
+struct PrecedenceRun {
+    /// Every octet the peer half actually received, in order.
+    peer: Vec<u8>,
+    /// The region lengths of each gathering write the vectored path performed, retries
+    /// included; empty if the vectored path never ran.
+    calls: Vec<Vec<usize>>,
+    /// Calls that re-offered the remainder of a short write rather than new octets.
+    retries: usize,
+    /// Every octet the vectored path gathered, concatenated in offer order.
+    vectored_octets: Vec<u8>,
+    /// Times the driver probed the vectored election — one construct-and-drop per pass.
+    vectored_probes: usize,
+    /// Times the driver read the owned-region election. Zero when vectored took precedence.
+    owned_region_elections: usize,
+    /// Times the owned-region write (`write_regions`) actually ran, retries included.
+    region_writes: usize,
+}
+
+impl PrecedenceRun {
+    /// Whether the peer received the request head and body — a `HEADERS` frame (type `0x1`)
+    /// and the `4096` `x` octets the body is — so "the vectored path carried the traffic" is a
+    /// claim about a real request having crossed, not an empty handshake.
+    fn request_reached_peer(&self) -> bool {
+        let body: Vec<u8> = vec![b'x'; BODY];
+        self.peer
+            .windows(body.len())
+            .any(|window| window == body.as_slice())
+    }
+}
+
+/// Wakes a hand-stepped connection.
+struct Flag(AtomicBool);
+
+impl Wake for Flag {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Polls one future once.
+fn step<F: Future>(future: Pin<&mut F>, waker: &Waker) -> Poll<F::Output> {
+    let mut context = Context::from_waker(waker);
+    future.poll(&mut context)
+}
+
+/// Reads whatever the peer half holds right now, stopping the moment its read parks.
+fn drain(reader: &mut DuplexReader, waker: &Waker) -> Vec<u8> {
+    let mut seen = Vec::new();
+    loop {
+        let read = reader.read(BytesMut::with_capacity(64 * 1024));
+        let mut read = core::pin::pin!(read);
+        match step(read.as_mut(), waker) {
+            Poll::Ready((result, buf)) => {
+                let count = result.expect("reading from the peer half");
+                if count == 0 {
+                    return seen;
+                }
+                seen.extend_from_slice(&buf);
+            }
+            Poll::Pending => return seen,
+        }
+    }
+}
+
+/// Drives one shared-body upload over the both-advertising transport, hand-stepping the
+/// connection against a silent peer so the write side is a self-contained, reproducible pass,
+/// and reports which election the driver consulted and what each path carried.
+///
+/// The body is handed over (`handshake_shared`), so its `DATA` payload rides as its own region
+/// — the arrangement the owned-region path exists for — and the choice between that path and
+/// the vectored one is the driver's alone. `caps`, if any, force short writes so the
+/// once-per-pass election can be told apart from a per-write one.
+fn drive_precedence(body: usize, caps: &[usize], passes: usize) -> PrecedenceRun {
+    drive_over(duplex_vectored_and_owned_regions(), body, caps, passes)
+}
+
+/// The same drive over a caller-chosen transport pair, so a test can pick which elections the
+/// driver will actually face.
+///
+/// Split out because precedence and once-per-pass need *different* shapes to say anything. A
+/// transport advertising both paths proves precedence but can never exercise the owned-region
+/// election, since the vectored one wins and short-circuits it; pinning that election needs a
+/// shape where it is the one the driver reaches.
+fn drive_over(
+    sides: (Duplex, Duplex),
+    body: usize,
+    caps: &[usize],
+    passes: usize,
+) -> PrecedenceRun {
+    let (client_side, server_side) = sides;
+    let vectored = client_side.vectored_log();
+    let elections = client_side.election_log();
+    if !caps.is_empty() {
+        client_side.accept_at_most(caps.iter().copied());
+    }
+    // Split rather than dropped: a dropped writing half closes the pipe, which the connection
+    // reads as a peer that hung up and ends before the pass under test.
+    let (mut peer_reader, _peer_writer) = Transport::split(server_side);
+
+    let request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri("http://example.test/precedence")
+        .body(Full::new(vec![b'x'; body]))
+        .expect("building a request");
+
+    let waker = Waker::from(Arc::new(Flag(AtomicBool::new(false))));
+
+    let (requests, connection) =
+        nghttp2::http::handshake_shared::<_, Full>(client_side).expect("handshake");
+    let response = requests.send_request(request);
+    let mut connection = core::pin::pin!(connection);
+    let mut response = core::pin::pin!(response);
+
+    for _ in 0..passes {
+        let _ = step(connection.as_mut(), &waker);
+        let _ = step(response.as_mut(), &waker);
+    }
+
+    let peer = drain(&mut peer_reader, &waker);
+    // Held until here: dropping the request handle earlier would close the request half before
+    // the pass finished.
+    drop(requests);
+
+    PrecedenceRun {
+        peer,
+        calls: vectored.calls(),
+        retries: vectored.retries(),
+        vectored_octets: vectored.octets(),
+        vectored_probes: elections.vectored_probes(),
+        owned_region_elections: elections.owned_region_elections(),
+        region_writes: elections.region_writes(),
+    }
+}
+
+#[test]
+fn a_duplex_can_elect_the_owned_region_path() {
+    // The in-memory harness counterpart: a duplex built for the owned-region shape advertises
+    // the completion election and declines both readiness paths, so the driver has exactly one
+    // strategy to take. This is what `http_shared_body.rs` drives a whole connection over.
+    let (client, peer) = duplex_owned_regions();
+    let (_reader, mut writer) = Transport::split(client);
+
+    assert!(
+        writer.gathers_owned_regions(),
+        "an owned-region duplex advertises the completion election"
+    );
+    assert!(
+        writer.write_vectored(&[]).is_none(),
+        "and declines the vectored path, so precedence has nothing to arbitrate"
+    );
+    assert!(
+        writer.write_borrowed(b"unused").is_none(),
+        "and the borrowed path likewise"
+    );
+
+    let regions = vec![
+        Bytes::from_static(b"header"),
+        Bytes::from_static(b"payload"),
+    ];
+    let (result, returned) = block_on(writer.write_regions(regions));
+    assert_eq!(result.unwrap(), b"header".len() + b"payload".len());
+    assert_eq!(
+        returned.len(),
+        2,
+        "the `Vec` comes back for reuse, both regions intact"
+    );
+
+    // The octets really crossed to the peer, in the order they were offered.
+    let (mut peer_reader, _peer_writer) = Transport::split(peer);
+    let (read, buf) = block_on(peer_reader.read(BytesMut::with_capacity(64)));
+    assert_eq!(read.unwrap(), b"headerpayload".len());
+    assert_eq!(&buf[..], b"headerpayload");
 }
 
 #[test]

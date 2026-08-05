@@ -654,28 +654,11 @@ where
         let mut credited: Vec<(i32, usize)> = Vec::new();
         let mut to_reset: Vec<(i32, crate::ErrorCode)> = Vec::new();
         let mut to_resume: Vec<i32> = Vec::new();
-        // The vectored path's accumulation buffer, reused across passes exactly as the
-        // collections above are: cleared rather than reallocated, so it stops allocating
-        // once it has grown to the size a pass needs. Untouched on the other two paths.
-        let mut gathered = BytesMut::new();
-        // The owned path's coalescing buffer, reused for the same reason. It reaches the
-        // transport as an owned `Bytes`, which would ordinarily consume the allocation and
-        // force the next pass to start from nothing; `flush` hands it over with
-        // `split().freeze()` instead, so the capacity comes back here once the transport has
-        // dropped what it was given. See the note there — the reuse only holds because of
-        // that pairing, and writing `freeze()` would silently restore a per-pass allocation.
-        let mut coalesced = BytesMut::new();
-        // The no-copy record sink, retained across passes exactly as the buffers above
-        // are. `send_into` appends the header/payload records the send callback deposited,
-        // and `flush` drains it — in order, ahead of each call's block — after every call.
-        // A push-model connection never constructs a shared body, so on those it stays
-        // empty; a no-copy connection fills and drains it every pass.
-        let mut send_records: Vec<SendRecord> = Vec::new();
-        // The gathering write's region list, retained across passes exactly as the buffers
-        // above are: cleared rather than reallocated. It holds the lifetime-free descriptors
-        // of design decision D9, so it survives across `send_into` calls even though each
-        // invalidates the last block. Empty on the owned strategy, which coalesces instead.
-        let mut regions: Vec<Region> = Vec::new();
+        // The write-side scratch, retained across passes so the steady state allocates
+        // nothing — every buffer keeps its capacity when cleared. Grouped into one value
+        // both to keep [`flush`]'s signature small and because the buffers share a lifetime
+        // and a purpose; the field comments record what each strategy uses.
+        let mut write = WriteBuffers::new();
 
         loop {
             buffers.sweep();
@@ -751,29 +734,11 @@ where
                 &shared,
                 &mut guard.role,
             )?;
-            flush(
-                &mut session,
-                &mut writer,
-                &mut events,
-                &mut gathered,
-                &mut coalesced,
-                &mut send_records,
-                &mut regions,
-            )
-            .await?;
+            flush(&mut session, &mut writer, &mut events, &mut write).await?;
             // A body announces its trailers while it is being serialised, so they can only
             // be submitted once that pass is over — and then written by a second one.
             if submit_trailers(&mut session, &shared, &registry)? {
-                flush(
-                    &mut session,
-                    &mut writer,
-                    &mut events,
-                    &mut gathered,
-                    &mut coalesced,
-                    &mut send_records,
-                    &mut regions,
-                )
-                .await?;
+                flush(&mut session, &mut writer, &mut events, &mut write).await?;
             }
             // Serialising fires the stream-close handler, so what it observed is
             // dispatched too rather than waiting for the next pass.
@@ -1254,6 +1219,49 @@ fn fail_stream(registry: &Registry, stream: i32, error: Error) {
     }
 }
 
+/// The driver's write-side scratch, retained across passes and reused so the steady state
+/// allocates nothing. Held by [`run`] and handed to [`flush`] as one value; each field is
+/// used by the strategy its comment names, and untouched by the others.
+struct WriteBuffers {
+    /// The vectored path's accumulation buffer: runs of small blocks land here, cleared
+    /// rather than reallocated each pass.
+    gathered: BytesMut,
+    /// The owned path's coalescing buffer. It reaches the transport as an owned `Bytes`,
+    /// which would ordinarily consume the allocation; `flush` hands it over with
+    /// `split().freeze()` so `bytes` reclaims the capacity once the transport drops its
+    /// handle. Writing `freeze()` in its place would silently restore a per-pass allocation.
+    coalesced: BytesMut,
+    /// The no-copy record sink. `send_into` appends the header/payload records the send
+    /// callback deposited, and the flush drains it — in order, ahead of each call's block —
+    /// after every call. Empty on a push-model connection.
+    send_records: Vec<SendRecord>,
+    /// The vectored path's lifetime-free descriptor list (design decision D9). It survives
+    /// across `send_into` calls even though each invalidates the last block.
+    regions: Vec<Region>,
+    /// The owned-region path's coalescing-and-header buffer. Runs of session blocks — all of
+    /// them, since that path has no size threshold — and each minted nine-octet frame header are split-frozen out of it into owned `Bytes` at
+    /// every region boundary; `bytes` reclaims its capacity across passes exactly as
+    /// `coalesced`'s is reclaimed, since [`TransportWrite::write_regions`] returns the list
+    /// and the transport drops the frozen slices.
+    minted: BytesMut,
+    /// The owned-region path's region list, handed to [`TransportWrite::write_regions`] and
+    /// taken back for reuse.
+    owned: Vec<Bytes>,
+}
+
+impl WriteBuffers {
+    fn new() -> Self {
+        Self {
+            gathered: BytesMut::new(),
+            coalesced: BytesMut::new(),
+            send_records: Vec::new(),
+            regions: Vec::new(),
+            minted: BytesMut::new(),
+            owned: Vec::new(),
+        }
+    }
+}
+
 /// The retained fast-path state a gathering flush works over: the accumulation buffer for
 /// runs of small blocks, the no-copy record sink, the descriptor list, and the two cursors
 /// that track how much of each the region list has already named. Bundled into one value so
@@ -1280,8 +1288,9 @@ struct Gather<'a> {
 /// Writes out everything the session currently has to say.
 ///
 /// Which strategy runs is the transport's choice, expressed once through
-/// [`TransportWrite::write_vectored`] or [`TransportWrite::write_borrowed`]: the first that
-/// offers itself wins, and the choice is read once and held for the rest of the pass.
+/// [`TransportWrite::write_vectored`], [`TransportWrite::gathers_owned_regions`] or
+/// [`TransportWrite::write_borrowed`]: the first that offers itself wins, in that precedence
+/// order, and the choice is read once and held for the rest of the pass.
 ///
 /// * **Vectored.** Blocks below [`VECTORED_THRESHOLD`] accumulate into `gathered`, a buffer
 ///   the driver owns and reuses across passes; a block at or above it is handed to the
@@ -1290,6 +1299,12 @@ struct Gather<'a> {
 ///   as their own regions of the same gathering write, so a run of small blocks, a record
 ///   and a large block leave in one `writev` with nothing copied. A pass of only small
 ///   blocks therefore still costs one write.
+/// * **Owned-region.** The completion-transport counterpart of the vectored path, handled
+///   entirely by [`flush_owned`]: it cannot lend a borrowed slice, so it gathers a list of
+///   *owned* [`Bytes`] — every session block coalesced into `minted` and split-frozen,
+///   each handed-over payload uncopied — and hands the list to
+///   [`TransportWrite::write_regions`]. The payload is never copied; the session's own blocks
+///   all are, with no size threshold, because a borrowed block cannot be owned without one.
 /// * **Borrowed.** Each region is written on its own, uncopied: one write per block, and
 ///   one per record header and payload.
 /// * **Owned.** Every block and record is copied into `out`, a second driver-owned buffer
@@ -1311,10 +1326,7 @@ async fn flush<W: TransportWrite>(
     session: &mut Session<Events>,
     writer: &mut W,
     events: &mut Events,
-    gathered: &mut BytesMut,
-    out: &mut BytesMut,
-    send_records: &mut Vec<SendRecord>,
-    regions: &mut Vec<Region>,
+    buffers: &mut WriteBuffers,
 ) -> Result<()> {
     let mut coalescing = false;
     // The election. Reading it costs one constructed future that is immediately dropped
@@ -1323,6 +1335,28 @@ async fn flush<W: TransportWrite>(
     // effects at construction — so it is discovered lazily, the first time a region is
     // offered to it, exactly as before this phase.
     let vectored = writer.write_vectored(&[]).is_some();
+    // The owned-region election, read once per pass and independent of the regions offered,
+    // exactly as the contract promises. Vectored takes precedence: a transport advertising
+    // both is a readiness one that also happens to own its buffers, and the vectored path
+    // avoids minting an owned `Bytes` per frame header. In practice the two never overlap.
+    // Owned-region in turn precedes the borrowed and owned strategies, which is why it is
+    // dispatched here rather than discovered lazily below.
+    if !vectored && writer.gathers_owned_regions() {
+        return flush_owned(
+            session,
+            writer,
+            events,
+            &mut buffers.minted,
+            &mut buffers.owned,
+            &mut buffers.send_records,
+        )
+        .await;
+    }
+    // Disjoint borrows of the remaining buffers for the readiness and owned strategies.
+    let gathered = &mut buffers.gathered;
+    let out = &mut buffers.coalesced;
+    let send_records = &mut buffers.send_records;
+    let regions = &mut buffers.regions;
     // Whatever a previous pass left behind has already been written or copied; starting
     // from empty means no error path can leak a remainder into the next pass. Every buffer
     // keeps its capacity across the clear, which is what makes the steady state free of
@@ -1743,6 +1777,214 @@ async fn write_borrowed_regions<W: TransportWrite>(
         }
     }
     Ok(FastWrite::All)
+}
+
+/// Drains a pass on the owned-region strategy: the completion-transport counterpart of
+/// [`flush`]'s vectored path.
+///
+/// A completion transport owns its buffers, so unlike the vectored path this cannot hand the
+/// socket a borrowed session block: everything it offers must be owned. It builds `owned`, a
+/// list of [`Bytes`], where every session block is coalesced into `minted` and
+/// split-frozen at each region boundary — there is no size threshold, unlike the vectored
+/// path, because a borrowed block cannot be owned without a copy — each frame header is
+/// minted into `minted` and frozen
+/// the same way, and each handed-over payload rides as its own region in the caller's own
+/// memory, uncopied. The whole list goes to [`TransportWrite::write_regions`], which reaches
+/// a single `writev`.
+///
+/// The payload is never copied; the session's own small blocks are, exactly as the vectored
+/// path copies them into its accumulation buffer, because a borrow of the session cannot be
+/// owned without one. Both `minted` and `owned` are retained across passes: `write_regions`
+/// returns the `Vec` and the transport drops the frozen slices, so `bytes` reclaims `minted`'s
+/// capacity and the steady state allocates nothing.
+///
+/// Ordering matches [`flush`]: records the send callback deposited during a `send_into` call
+/// belong on the wire before that call's returned block and after everything earlier calls
+/// produced, so the open run of coalesced blocks is closed ahead of the records that follow
+/// it. [`MAX_REGIONS`] bounds the list exactly as it bounds the vectored one — the list is
+/// flushed and restarted before it would exceed the cap — since [`crate::http`]'s region
+/// bound is transport-independent.
+async fn flush_owned<W: TransportWrite>(
+    session: &mut Session<Events>,
+    writer: &mut W,
+    events: &mut Events,
+    minted: &mut BytesMut,
+    owned: &mut Vec<Bytes>,
+    send_records: &mut Vec<SendRecord>,
+) -> Result<()> {
+    // Whatever a previous pass left has already been written and dropped; both buffers keep
+    // their capacity across the clear. `send_records` is drained to empty at every write and
+    // on the error exit, so it already starts empty.
+    minted.clear();
+    owned.clear();
+    // How many leading records in the sink `owned` already names as regions. Records a
+    // `send_into` call deposits sit past this; a write drains the prefix and resets it.
+    let mut regioned = 0usize;
+
+    loop {
+        let block = match session.send_into(events, send_records) {
+            Ok(block) => block,
+            Err(error) => {
+                // `send_into` appends whatever the send callback recorded before it reports a
+                // failure, so records can be sitting in the sink here. Dropping them keeps the
+                // drain-to-empty invariant of design decision D3 true on the error exit:
+                // releasing this crate's handle to the caller's `Bytes` is exactly what a
+                // torn-down connection should do.
+                send_records.clear();
+                owned.clear();
+                return Err(error.into());
+            }
+        };
+
+        // Records deposited during this call go on the wire before the block it returns, and
+        // after everything earlier calls produced. Processed after every call — the final one
+        // returning `None` included — because libnghttp2's no-copy branch can deposit a record
+        // without contributing octets to the returned block, so a record can ride with a `None`.
+        if send_records.len() > regioned {
+            // Close the open run of coalesced blocks so the records that follow are ordered
+            // after it. If the list is already at the cap there is no slot for the run region,
+            // so write first; a write empties the list and drains the records it named.
+            if !minted.is_empty() {
+                if owned.len() >= MAX_REGIONS {
+                    write_owned(writer, owned, send_records, &mut regioned).await?;
+                }
+                owned.push(minted.split().freeze());
+            }
+            while regioned < send_records.len() {
+                // Each record becomes a header region and, unless it is empty, a payload
+                // region. Write first whenever the pair would carry the list past the cap, so
+                // a single call framing more `DATA` than the cap admits still writes within
+                // the bound. Two slots are reserved even for an empty payload: the check is on
+                // the worst case, which keeps it a single rule.
+                if owned.len() + 2 > MAX_REGIONS {
+                    write_owned(writer, owned, send_records, &mut regioned).await?;
+                }
+                // `header` is a `[u8; 9]` (`Copy`), taken by value so no borrow of the sink is
+                // held across the `minted` mutation; `payload` is a refcount bump, not a copy.
+                let header = send_records[regioned].header;
+                let payload = send_records[regioned].payload.clone();
+                minted.extend_from_slice(&header);
+                owned.push(minted.split().freeze());
+                // A zero-length final `DATA` frame contributes a header but an empty payload,
+                // and the contract promises no empty region ever reaches the transport.
+                if !payload.is_empty() {
+                    owned.push(payload);
+                }
+                regioned += 1;
+            }
+        }
+
+        let Some(block) = block else { break };
+
+        // Coalesce the block into the open run. It cannot ride uncopied as the vectored path's
+        // large blocks do — the transport owns what it is handed — so there is no
+        // `VECTORED_THRESHOLD` split here: every block, large or small, joins `minted`. If the
+        // list is at the cap and no run is open, opening one would leave its eventual region no
+        // slot, so write first.
+        if minted.is_empty() && owned.len() >= MAX_REGIONS {
+            write_owned(writer, owned, send_records, &mut regioned).await?;
+        }
+        minted.extend_from_slice(block);
+    }
+
+    // The tail: a final open run with no records behind it (the common case), or records with
+    // no trailing block. One gathering write for the lot. The run-close guards the cap exactly
+    // as the mid-pass one does — an earlier record batch may have filled the list to the cap
+    // while a later small block left a run still open.
+    if !minted.is_empty() {
+        if owned.len() >= MAX_REGIONS {
+            write_owned(writer, owned, send_records, &mut regioned).await?;
+        }
+        owned.push(minted.split().freeze());
+    }
+    if !owned.is_empty() {
+        write_owned(writer, owned, send_records, &mut regioned).await?;
+    }
+
+    // The sink was drained at every write above, so it is empty on the success path exactly as
+    // on the error path — the drain-to-empty invariant of design decision D3, which is what
+    // makes it safe that libnghttp2's `want_write` knows nothing about the records.
+    debug_assert!(
+        send_records.is_empty(),
+        "flush_owned left records in the sink; they would outlive the pass and be lost"
+    );
+    debug_assert!(
+        owned.is_empty(),
+        "flush_owned left regions in the list; they would name a stale pass"
+    );
+    Ok(())
+}
+
+/// Hands `owned` to [`TransportWrite::write_regions`] as one gathering write, retrying the
+/// remainder on a short write, then disposes of exactly the records it named.
+///
+/// The list is moved in and taken back out — the `Vec` returns so its allocation is reused,
+/// and the buffer is restored to `*owned` on every exit — which is the ownership round-trip a
+/// completion API needs. A short write is resumed without a copy: the fully written regions
+/// are dropped from the front and the first partial one is [`Bytes::advance`]d, both free
+/// since [`Bytes`] is a view, and the remainder is offered again. An accepted write of zero
+/// octets is an error, exactly as on every other strategy.
+///
+/// On success the `regioned` leading records are drained from the sink — releasing this
+/// crate's handle to the caller's payload `Bytes` the moment they reach the transport — and
+/// the cursor is reset. A transport failure disposes of the *whole* sink instead: the
+/// connection is torn down, so no later pass will consume what remains, and design decision
+/// D3's drain-to-empty invariant asks for the handles to be released here.
+async fn write_owned<W: TransportWrite>(
+    writer: &mut W,
+    owned: &mut Vec<Bytes>,
+    send_records: &mut Vec<SendRecord>,
+    regioned: &mut usize,
+) -> Result<()> {
+    // Move the list out for the by-value write. The emptied handle keeps its capacity, and it
+    // — or the list `write_regions` returns — is restored to `*owned` before every return.
+    let mut regions = core::mem::take(owned);
+    loop {
+        let total: usize = regions.iter().map(Bytes::len).sum();
+        let (result, returned) = writer.write_regions(regions).await;
+        regions = returned;
+        let written = match result {
+            Ok(written) => written,
+            Err(error) => {
+                regions.clear();
+                *owned = regions;
+                send_records.clear();
+                *regioned = 0;
+                return Err(error.into());
+            }
+        };
+        if written == 0 {
+            regions.clear();
+            *owned = regions;
+            send_records.clear();
+            *regioned = 0;
+            return Err(Error::new(
+                ErrorKind::Transport,
+                "the transport accepted no octets and reported no error",
+            ));
+        }
+        if written >= total {
+            break;
+        }
+        // Drop the regions the write consumed whole and advance the first it landed inside.
+        let mut consumed = written;
+        let mut whole = 0;
+        for region in &mut regions {
+            if consumed >= region.len() {
+                consumed -= region.len();
+                whole += 1;
+            } else {
+                bytes::Buf::advance(region, consumed);
+                break;
+            }
+        }
+        regions.drain(0..whole);
+    }
+    regions.clear();
+    *owned = regions;
+    send_records.drain(0..*regioned);
+    *regioned = 0;
+    Ok(())
 }
 
 #[cfg(test)]

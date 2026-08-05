@@ -39,7 +39,7 @@ use core::task::{Context, Poll, Waker};
 
 use nghttp2::http::testing::{
     Duplex, DuplexReader, Full, bytes_crate as bytes, duplex, duplex_offering_both,
-    duplex_vectored, http_crate as http,
+    duplex_owned_regions, duplex_vectored, http_crate as http,
 };
 use nghttp2::http::transport::{Transport, TransportRead, TransportWrite};
 
@@ -115,6 +115,8 @@ enum Shape {
     Vectored,
     /// Both fast paths, so the driver's precedence rule has something to decide.
     Both,
+    /// The owned-region (completion) path: a gathering write over an owned `Vec<Bytes>`.
+    OwnedRegions,
 }
 
 impl Shape {
@@ -123,6 +125,7 @@ impl Shape {
             Self::Owned => duplex(false),
             Self::Vectored => duplex_vectored(),
             Self::Both => duplex_offering_both(),
+            Self::OwnedRegions => duplex_owned_regions(),
         }
     }
 }
@@ -689,6 +692,152 @@ fn a_partial_acceptor_across_a_multi_region_write_drops_and_duplicates_nothing()
             observed.outcome.as_ref().map(Result::is_err),
         );
     }
+}
+
+#[test]
+fn an_owned_region_pass_driven_past_the_region_cap_holds_the_bound_and_stays_correct() {
+    // SC-003 / D6 on the completion path. FR-007's region bound is transport-independent, so
+    // the owned-region strategy caps its `Vec<Bytes>` exactly as the vectored path caps its
+    // descriptor list: a `send_into` call that frames more `DATA` than the cap admits flushes
+    // the full list mid-pass and carries on. The bound is tighter here — the whole list is
+    // owned, so there is no separate live block riding beside it, and the ceiling is
+    // `MAX_REGIONS` rather than `MAX_REGIONS + 1`. Reaching the path needs the same crafted
+    // window-opening prelude and 1.5 MB body the vectored cap test uses.
+    let mut prelude = settings_initial_window(0x7fff_ffff);
+    prelude.extend(window_update(0x0080_0000));
+
+    let owned_regions = observe(
+        Run::new(Shape::OwnedRegions, REGION_CAP_BODY)
+            .shared()
+            .prelude(prelude.clone())
+            .passes(16),
+    );
+    // The coalescing path as the independent oracle: it copies every octet, so its flat wire
+    // is libnghttp2's own serialisation with no gathering decision of the driver's in it.
+    let owned = observe(
+        Run::new(Shape::Owned, REGION_CAP_BODY)
+            .shared()
+            .prelude(prelude)
+            .passes(16),
+    );
+
+    for regions in &owned_regions.calls {
+        assert!(
+            regions.len() <= MAX_REGIONS,
+            "a call was offered {} regions, past the {MAX_REGIONS} ceiling; the mid-pass \
+             flush failed to bound the list, saw lengths {:?}",
+            regions.len(),
+            owned_regions.calls.iter().map(Vec::len).collect::<Vec<_>>(),
+        );
+        assert!(
+            regions.iter().all(|&len| len > 0),
+            "a call was offered an empty region, saw {regions:?}",
+        );
+    }
+
+    let widest = owned_regions
+        .calls
+        .iter()
+        .map(Vec::len)
+        .max()
+        .expect("the pass performed at least one gathering write");
+    assert!(
+        widest >= MAX_REGIONS - 1,
+        "the widest call held only {widest} regions, so the list never approached the cap and \
+         the mid-pass flush was never exercised; the window or body is too small",
+    );
+
+    assert_eq!(
+        owned_regions.peer, owned.peer,
+        "driving the owned-region list past the cap changed the octets the peer received",
+    );
+    assert!(
+        !owned_regions.peer.is_empty(),
+        "the body never left, so the comparison proved nothing",
+    );
+}
+
+#[test]
+fn an_owned_region_partial_acceptor_drops_and_duplicates_nothing() {
+    // SC-009 on the completion path. A handed-over body frames several `DATA` records, so one
+    // owned-region write carries a run of alternating header and payload regions; the caps
+    // chop the transport's acceptance at awkward points — inside a payload, exactly on a
+    // region boundary, one octet short of the whole. The retry-and-resume path drops the
+    // fully written regions from the front and `Bytes::advance`s the first partial one (both
+    // free, since `Bytes` is a view), and must put every octet on the wire once, in order,
+    // matching what the coalescing path would have sent.
+    let unlimited = observe(
+        Run::new(Shape::OwnedRegions, BOUNDARY_BODY)
+            .shared()
+            .passes(8),
+    );
+    assert!(
+        unlimited.calls.iter().any(|regions| regions.len() > 2),
+        "the workload never produced a multi-region write, so nothing multi-region was tested, \
+         saw {:?}",
+        unlimited.calls,
+    );
+    // Every region offered is non-empty and the per-call count stays within the cap — the
+    // invariants the resume path must preserve across a short write, checked here so a cap
+    // that quietly dropped or duplicated a region would fail on shape before octets.
+    for regions in &unlimited.calls {
+        assert!(
+            (1..=MAX_REGIONS).contains(&regions.len()) && regions.iter().all(|&len| len > 0),
+            "a call was offered {} regions or an empty one, saw {:?}",
+            regions.len(),
+            unlimited.calls,
+        );
+    }
+    let first_call: usize = unlimited.calls[0].iter().sum();
+    let head = unlimited.calls[0][0];
+
+    // The oracle: the same handed-over body over the coalescing transport, which copies the
+    // lot into one owned write. Its octets are what a partial acceptor must reproduce.
+    let coalesced = observe(Run::new(Shape::Owned, BOUNDARY_BODY).shared().passes(8));
+
+    for caps in [
+        vec![1],
+        vec![head],
+        vec![head - 1],
+        vec![first_call - 1],
+        vec![1, head, 7, first_call - 1, 3],
+        vec![head, 1, MAX_FRAME, 5],
+    ] {
+        let observed = observe(
+            Run::new(Shape::OwnedRegions, BOUNDARY_BODY)
+                .shared()
+                .caps(caps.clone())
+                .passes(8),
+        );
+        assert_eq!(
+            observed.peer, coalesced.peer,
+            "caps {caps:?} changed the octets the peer received on the owned-region path",
+        );
+        assert!(
+            observed.outcome.is_none(),
+            "caps {caps:?} ended the connection: {:?}",
+            observed.outcome.as_ref().map(Result::is_err),
+        );
+    }
+}
+
+#[test]
+fn an_owned_region_transport_accepting_nothing_fails_the_connection_rather_than_spinning() {
+    // SC-010 on the completion path. A successful write of zero octets is a transport that
+    // will never make progress; the owned-region path must turn it into a `Transport` error
+    // exactly as the vectored and borrowed paths do, rather than spin re-offering the list.
+    let observed = observe(
+        Run::new(Shape::OwnedRegions, MAX_FRAME)
+            .shared()
+            .caps([0])
+            .passes(2),
+    );
+
+    let outcome = observed
+        .outcome
+        .expect("the connection must end rather than spin on a transport accepting nothing");
+    let error = outcome.expect_err("accepting no octets is a failure, not a clean close");
+    assert_eq!(error.kind(), nghttp2::http::ErrorKind::Transport);
 }
 
 #[test]
