@@ -50,13 +50,33 @@ the offset into a slice of the same buffer once the call returns. Zero-copy with
 somewhere else. A buffer returns to the pool only once no derived chunk still references it,
 so a retained chunk safely outlives the pass that read it.
 
-**4. The write strategy is the transport's choice, because the two goals are exclusive.**
-The session invalidates each output block when the next is requested, so blocks can never be
-gathered without copying. `TransportWrite::write_borrowed` returns `Option<impl Future>`:
-`Some` both elects the borrowed path and *is* how it writes — the session's own blocks go
-out directly, several small writes per pass but zero allocation and zero copy. `None` (the
-default) leaves the coalesced path: one write per pass, bought by allocating and copying
-every outgoing octet, every pass.
+**4. The write strategy is the transport's choice, and there are three of them.**
+Two separate facts bound what a strategy may do with the session's output blocks. The C
+library serialises from a reused buffer chain and recycles it at frame-item boundaries, so a
+block is invalidated by the *next* block being requested — earlier, in fact, than the
+published "until the next call of `nghttp2_session_mem_send2()`" wording promises.
+Independently, `Session::send` returns `Option<&[u8]>` borrowing `&mut self`, so the safe
+wrapper permits exactly **one live block borrow at a time** regardless of what the C library
+would tolerate. Together these mean two blocks can never be gathered *with each other*.
+They do **not** mean gathering is impossible: one live block may always be gathered with
+memory the driver already owns, and that is what the vectored path does.
+
+`TransportWrite` exposes the choice as two overridable methods, each of which both elects a
+strategy and *is* how that strategy writes:
+
+- `write_vectored` returns `Some` to elect the **gathering** path. The driver accumulates
+  small blocks into a buffer it owns and reuses, and when a block exceeds
+  `VECTORED_THRESHOLD` it emits `[accumulated, block]` as a two-region `writev` — the large
+  block is never copied. One syscall per pass in the common case, zero allocation in steady
+  state. Never more than two regions, so `IOV_MAX` is not a concern.
+- `write_borrowed` returns `Some` to elect the **borrowed** path: the session's own blocks go
+  out directly, several small writes per pass but zero allocation and zero copy.
+- Both returning `None` (the default) leaves the **coalesced** path: one write per pass,
+  bought by allocating and copying every outgoing octet, every pass.
+
+`write_vectored` takes precedence when a transport offers both. A transport may also decline
+mid-pass — return `None` after having returned `Some` earlier in the same pass — and the
+driver falls back to coalescing the remainder without losing octets.
 
 One method carries both the decision and the operation deliberately. An earlier form — a
 boolean plus a separately overridable method — let an adapter advertise the fast path
@@ -99,11 +119,16 @@ I/O — is **wrong**, and benchmarking hyper over a real socket is what showed i
 reaches the same throughput on epoll. The gap is not the I/O model but the number of write
 syscalls per pass. The tokio transport elects the borrowed path and issues a write per
 session block; a completion transport structurally cannot, so it coalesces, and hyper
-coalesces by buffering. The two fast arms are the two coalescing ones. Flipping only
-`TokioWriter::write_borrowed` to `None` erases the gap. See `docs/benchmarks.md` for the
-numbers and the three confounds that bound them, and `docs/pending-work.md` for the design
-question this leaves open — the borrowed path is what makes the steady state
-zero-allocation, so it is a trade rather than a bug.
+coalesces by buffering. The two fast arms were the two coalescing ones. Flipping only
+`TokioWriter::write_borrowed` to `None` erased the gap.
+
+That framing presented a trade — few syscalls or zero allocation, pick one — and the trade
+turned out to be false. The gathering path (mechanism 4 above) reaches both: it collapses a
+multiplexed pass from one write per block to a single `writev` while copying nothing that
+the driver did not already own. Measured on the tokio transport it moved concurrent
+throughput **+109% at N=8 and +143% at N=64**, to parity with compio and slightly ahead of
+hyper, and 1 MiB body throughput up rather than down. See `docs/benchmarks.md` for the
+numbers and the three confounds that bound them.
 
 ## Decisions that cost a wrong attempt first
 
@@ -168,13 +193,18 @@ Two properties are pinned as tests rather than described (see [`invariants.md`](
 
 | Path | Writes per driver pass | Allocation per pass in steady state |
 | --- | --- | --- |
-| Borrowed (`Some`) | one per session block | **zero** |
-| Owned (`None`, default) | **one**, coalesced | one per block, plus growth |
+| Gathering (`write_vectored` → `Some`) | **one**, or one per large block | **zero** |
+| Borrowed (`write_borrowed` → `Some`) | one per session block | **zero** |
+| Owned (both `None`, default) | **one**, coalesced | one per block, plus growth |
 
-Steady-state zero allocation is reachable only on the borrowed path, which is why the tokio
-adapter takes it. Per-stream setup is deliberately excluded from the measurement and
-documented as such — the recurring cost of moving frames is the claim, not the one-off cost
-of standing a stream up.
+The gathering path dominates both others rather than trading against them: it reaches the
+borrowed path's zero steady-state allocation while matching or beating the coalesced path's
+write count, which is why the tokio adapter now takes it. Counted by
+`tests/http_zero_alloc.rs` on eight multiplexed streams, the three come out at 12 allocations
+and 1 write (owned), 0 allocations and 513 writes (borrowed), and 0 allocations and 1 write
+(gathering). Per-stream setup is deliberately excluded from the measurement and documented as
+such — the recurring cost of moving frames is the claim, not the one-off cost of standing a
+stream up.
 
 ## Constraints that shape contributions
 

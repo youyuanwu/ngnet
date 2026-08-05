@@ -44,10 +44,14 @@ frames, not the one-off cost of standing a stream up.
 | --- | --- |
 | `steady_state_receive_allocates_nothing` | A steady-state receive pass — and the body drainer's poll — allocate **zero**. |
 | `steady_state_send_allocates_nothing_on_the_borrowed_path` | Likewise for sending, on the borrowed write path. |
+| `steady_state_send_allocates_nothing_on_the_vectored_path` | Likewise on the gathering path — so gathering costs nothing the borrowed path did not. |
+| `steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path` | And still zero when eight streams are multiplexed, which is where the driver's own buffer would be tempted to grow. |
 | `the_read_buffer_pool_settles_to_a_fixed_size` | The pool reaches a high-water mark during warm-up and does not grow afterwards. |
 | `the_owned_write_path_coalesces_a_pass_into_one_write` | One write per pass, with more than one frame's worth of bytes — so the single write is not trivially single. |
 | `the_borrowed_write_path_writes_each_block_separately` | More than one write per pass on identical traffic, constant across passes. |
-| `the_owned_write_path_allocates_on_every_pass` | The owned path's cost recurs and does not amortise — the fact the tokio adapter's choice rests on. |
+| `the_vectored_write_path_coalesces_a_multiplexed_pass_into_one_write` | One write for a whole multiplexed pass — the coalesced path's write count at the borrowed path's allocation count, which is the entire claim of the strategy. |
+| `the_vectored_write_path_writes_once_per_large_block_and_no_more` | A large block still costs exactly one write, so gathering never degenerates into a write per region. |
+| `the_owned_write_path_allocates_on_every_pass` | The owned path's cost recurs and does not amortise — the fact that makes the tokio adapter's choice of a zero-allocation path meaningful. |
 | `waking_parked_handlers_allocates_nothing` | Waking parked server handlers repeatedly allocates nothing. |
 | `the_counter_notices_a_deliberate_allocation` | The measuring instrument works, guarding every test above against a false pass. |
 
@@ -59,8 +63,9 @@ frames, not the one-off cost of standing a stream up.
 - `a_buffering_transport_still_completes_an_exchange` (`tests/http_flush.rs`) — a transport
   that releases writes only on `commit` still completes, under a bounded poll budget so a
   regression fails rather than hanging forever.
-- **Compile-fail doctests** on `TransportWrite::write_borrowed` — the two ways an adapter
-  could implement the write strategy inconsistently do not compile.
+- **Compile-fail doctests** on `TransportWrite::write_borrowed` and
+  `TransportWrite::write_vectored` — the ways an adapter could implement a write strategy
+  inconsistently do not compile.
 - **A compile-fail doctest** on `Connection` — discarding the driver is an error, because a
   connection that compiles and never sends a byte is the trap the type exists to prevent.
 - **A negative `Send` assertion** in `nghttp2-tests` — a connection over a non-`Send`

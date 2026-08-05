@@ -118,11 +118,13 @@ A runnable server is in
 [`examples/h2c_async_server.rs`](crates/nghttp2/examples/h2c_async_server.rs), answering
 the same `curl --http2-prior-knowledge` as the blocking one.
 
-Which to pick is measured rather than asserted: over a real socket, `CompioIo` is roughly
-twice as fast as `TokioIo` once several streams are multiplexed, and slightly slower on a
-single empty-body round trip. That gap is not what it looks like, though — benchmarking hyper
-over the same socket showed it reaching the same throughput on epoll, so what separates them
-is the number of write syscalls per pass rather than the I/O model. See
+Which to pick is measured rather than asserted, and the answer changed once the measurement
+was understood. `CompioIo` was roughly twice as fast as `TokioIo` under multiplexing — but
+benchmarking hyper over the same socket showed it reaching the same throughput on *epoll*, so
+the gap was never the I/O model. It was the number of write syscalls per pass. `TokioIo` now
+gathers its writes (`writev`, no copy of large blocks), which collapsed a multiplexed pass
+from 513 writes to 1 and left the two **within noise of each other** — so pick on ergonomics
+and runtime fit rather than on throughput. See
 [`docs/benchmarks.md`](docs/benchmarks.md), which gives the numbers, the mechanism and the
 confounds that bound what they license.
 

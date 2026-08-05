@@ -57,28 +57,37 @@ test, and no more.
 - **No fallback where io_uring is absent.** The feature fails loudly instead, by decision.
   Revisiting that means compiling a readiness backend and accepting the silent-degradation
   hazard that comes with it.
-- **The tokio transport's borrowed write path costs a factor of two on a real socket.** This
-  is the largest open performance question in the crate, and it was invisible until hyper was
-  benchmarked over a socket rather than a duplex. `TokioWriter::write_borrowed` returns
-  `Some`, so the driver hands each of the session's blocks to `write` separately: zero-copy
-  and zero-allocation, but one `write(2)` per block, and the block count grows with the
-  number of multiplexed streams. Flipping only that method to return `None` — taking the
-  coalescing path every other transport takes — measured **+95% at N=8 and +128% at N=64**
-  concurrent requests, moving the tokio arm level with io_uring and past hyper. See
+- **RESOLVED — the tokio transport's per-block writes cost a factor of two, and gathering
+  fixed it without a trade.** Recorded here because the reasoning is worth keeping, not
+  because work remains. `TokioWriter` used to elect the borrowed path, so the driver handed
+  each session block to `write` separately: zero-copy and zero-allocation, but one `write(2)`
+  per block, with the block count growing with the number of multiplexed streams. Flipping
+  that method to `None` measured **+95% at N=8 and +128% at N=64**, which framed the question
+  as zero-allocation *or* syscall count, with both defaults defensible.
+
+  **That framing was wrong, and so was the reason given for it.** This file previously
+  asserted that gathering blocks into one vectored write "is closed off by the session
+  invalidating each block when the next is requested, so any gather implies the copy". Two
+  facts were being conflated. The C library recycles its serialisation buffer at frame-item
+  boundaries, and `Session::send` returns a slice borrowing `&mut self`, so at most one block
+  is live at a time — which forecloses gathering blocks **with each other**, and nothing
+  more. One live block gathers perfectly well with memory the driver already owns.
+
+  So `TransportWrite::write_vectored` accumulates small blocks into a driver-owned reused
+  buffer and emits `[accumulated, large_block]` as a two-region `writev`, copying nothing
+  large. It reaches zero steady-state allocation *and* one write per pass: on eight
+  multiplexed streams, 0 allocations and 1 write, against the borrowed path's 0 and 513.
+  Measured, `ngrs-tokio` improved **-52% at N=8 and -59% at N=64**, reaching parity with
+  io_uring, and 1 MiB body throughput *rose* 9% rather than regressing. See
   `docs/benchmarks.md`.
-
-  It is a genuine trade, not an oversight, which is why it is recorded here rather than
-  simply fixed. The borrowed path is what makes the steady state zero-allocation, which
-  `crates/nghttp2/tests/http_zero_alloc.rs` pins as an invariant; the coalescing path
-  allocates a `BytesMut` per pass. It is also the faster path where it was originally
-  measured — single-request serial latency, and 1 MiB bodies, where the saved copy outweighs
-  the syscalls. The obvious escape, gathering the blocks into one vectored write, is closed
-  off by the session invalidating each block when the next is requested, so any gather
-  implies the copy.
-
-  Resolving it properly means deciding whether zero-allocation or syscall count is the
-  invariant worth keeping, and probably means making it a choice rather than a default —
-  the answer differs by workload, and both defaults are defensible.
+- **True zero-copy DATA payloads are still open.** Gathering avoids the driver's copy, but
+  libnghttp2 still copies each body into its own serialisation buffer before we see it.
+  `NGHTTP2_DATA_FLAG_NO_COPY` with `nghttp2_send_data_callback` would eliminate that too, by
+  handing the 9-byte frame header and the payload over separately. It was scoped out of the
+  vectored work deliberately: it requires a send-data callback whose reentrancy interacts
+  with the existing bridge, and the measured gain from gathering alone already put this crate
+  ahead of hyper at 1 MiB. Worth revisiting only if profiling shows that remaining copy
+  dominating.
 - **The write-path asymmetry is unmeasured on a real NIC.** Benchmarks show tokio's borrowed
   zero-copy write cancelling io_uring's syscall advantage at 1 MiB bodies, over loopback. Whether
   that holds where real device interrupts exist is unknown, and loopback biases against
@@ -108,11 +117,15 @@ These are not gaps. They are decisions, recorded so they are not mistaken for ov
   not physics. h2c on a trusted network may well want them looser, and a public-facing server
   may want them tighter.
 
-- **Whether the borrowed write path is right for TCP.** Measured, and it is: a few small
-  writes per pass buys zero allocation and zero copy, and steady-state zero allocation is
-  reachable no other way. But the measurement is against an in-memory transport, so it counts
-  syscalls rather than pricing them. If a workload emerges where write syscalls dominate, the
-  owned path is one method away and the trade should be re-measured against real sockets.
+- **Which write strategy a transport should elect.** Settled for the two that ship: the tokio
+  adapter gathers, and the completion adapter coalesces because a completion API needs the
+  kernel to own the buffer. Gathering was measured to dominate rather than trade — zero
+  steady-state allocation *and* one write per pass — so there is no longer a knob-shaped
+  question here for a readiness transport. What remains open is narrower: `VECTORED_THRESHOLD`
+  is 256 bytes, untuned, and deliberately so, because real block sizes are sharply bimodal
+  (at most ~74 bytes, or at least ~16 KiB) and any threshold between roughly 64 and 16384
+  partitions real traffic identically. A workload with a different frame-size distribution
+  would be the reason to revisit it.
 
 ## Testing gaps worth closing eventually
 
