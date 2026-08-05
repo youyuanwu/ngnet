@@ -476,8 +476,10 @@ fn every_ordering_puts_the_same_octets_on_the_wire_as_coalescing_would() {
 }
 
 #[test]
-fn no_call_is_ever_offered_more_than_two_regions_or_an_empty_one() {
-    // SC-003 / SC-011. Two facts, one universal and one path-specific.
+fn no_call_is_offered_an_empty_region_or_more_than_its_path_permits() {
+    // SC-003 / SC-009. Two facts, one universal and one path-specific. The name says "its
+    // path permits" rather than a number because the two paths now have different ceilings:
+    // two regions on the push path, `MAX_REGIONS + 1` on the shared one, as set out below.
     //
     // Universal: no call is ever offered an empty region. A zero-length `IoSlice` is legal
     // to write but is a region counted for nothing, and the trait's contract promises never
@@ -581,7 +583,7 @@ const REGION_CAP_BODY: usize = 1_500_000;
 
 #[test]
 fn a_pass_driven_past_the_region_cap_holds_the_bound_and_stays_correct() {
-    // SC-003 / D6. The region list is capped at `MAX_REGIONS` descriptors so it can be
+    // SC-009 / D6. The region list is capped at `MAX_REGIONS` descriptors so it can be
     // materialised into a fixed stack array; a `send_into` call that frames more `DATA` than
     // the cap admits must flush the full list mid-pass and carry on, never overrun the array.
     // Reaching that path needs a pass that emits far more than the sixty-five-region ceiling,
@@ -823,7 +825,7 @@ fn an_owned_region_partial_acceptor_drops_and_duplicates_nothing() {
 
 #[test]
 fn an_owned_region_transport_accepting_nothing_fails_the_connection_rather_than_spinning() {
-    // SC-010 on the completion path. A successful write of zero octets is a transport that
+    // SC-013 on the completion path. A successful write of zero octets is a transport that
     // will never make progress; the owned-region path must turn it into a `Transport` error
     // exactly as the vectored and borrowed paths do, rather than spin re-offering the list.
     let observed = observe(
@@ -912,7 +914,7 @@ fn an_arbitrary_prefix_acceptor_still_delivers_every_octet_in_order() {
 
 #[test]
 fn a_transport_accepting_nothing_fails_the_connection_rather_than_spinning() {
-    // SC-010. A successful write of zero octets is a transport that will never make
+    // SC-013. A successful write of zero octets is a transport that will never make
     // progress; treating it as anything but an error is an infinite loop, and the two
     // pre-existing drain paths already guard it the same way.
     let observed = observe(Run::new(Shape::Vectored, MAX_FRAME).caps([0]).passes(2));

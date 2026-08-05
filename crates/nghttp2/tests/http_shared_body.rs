@@ -1,4 +1,5 @@
-//! The no-copy sending path, end to end (Spec SC-007, SC-008, SC-012, SC-013).
+//! The no-copy sending path, end to end (Spec SC-001, SC-002, SC-007, SC-008, SC-012,
+//! SC-013).
 //!
 //! The push-model send tests in `http_body_send.rs` prove a caller's body reaches the peer
 //! under the caller's control. These prove the same of the *handed-over* body — the one
@@ -6,10 +7,15 @@
 //! buffer — reached through [`handshake_shared`](nghttp2::http::handshake_shared) and
 //! [`serve_shared`](nghttp2::http::serve_shared) rather than the copying entry points.
 //!
-//! Phase 2 makes the payload arrive correctly; it does not yet make it arrive without a
-//! copy into the driver's coalescing buffer (that is Phases 3–4). So every assertion here
-//! is about *fidelity, ordering and lifecycle*, never about copy or allocation volume of
-//! the payload itself — the one thing this phase deliberately does not promise.
+//! Most of what is asserted here is *fidelity, ordering and lifecycle*: the octets arrive
+//! intact and in order, and a handed-over payload is released exactly once however the
+//! stream ends. Two groups go further and assert the copy itself. The two-sided pointer
+//! coverage of SC-001 shows the octets the transport is offered occupy the same memory the
+//! caller supplied, and
+//! `handing_a_body_over_collapses_the_write_count_on_the_gathering_path` pins the write-count
+//! collapse that turned out to be the dominant mechanism behind the measured gain. (An
+//! earlier version of this note said the file never asserted copy or allocation volume. That
+//! was true when only Phase 2 had landed and stopped being true in Phase 3.)
 //!
 //! Everything runs on one task, as elsewhere in this suite: no runtime, no spawning.
 
@@ -362,7 +368,7 @@ where
 
 #[test]
 fn a_handed_over_body_arrives_intact_at_every_boundary() {
-    // Spec SC-008, the fidelity half: the same octets, in the same order, whatever the body
+    // Spec SC-002, the fidelity criterion: the same octets, in the same order, whatever the body
     // length does to the framing. Zero and one exercise the empty and single-octet edges; a
     // length just under the driver's vectored threshold, the two either side of the 16 KiB
     // maximum frame, and roughly a megabyte exercise frame-aligned, one-past-aligned and
@@ -1845,9 +1851,36 @@ fn no_bodies_allocates_no_differently_on_the_no_copy_path() {
     let shared = count_allocations(|| {
         let _ = nobody_exchange(true);
     });
+    // An equality between two counts is satisfied by `0 == 0`, so a counter that never fired
+    // would pass this test having measured nothing at all. Establishing an exchange
+    // allocates — the session, the buffers, the maps — so both arms must be non-zero for the
+    // equality below to mean anything. `the_counter_notices_a_deliberate_allocation` pins the
+    // counter itself; this pins that it was armed and firing across *these* two windows.
+    assert!(
+        push > 0 && shared > 0,
+        "the allocation counter recorded nothing for either arm ({push}, {shared}), so the \
+         equality below would hold vacuously",
+    );
     assert_eq!(
         push, shared,
         "a bodyless no-copy exchange allocated differently from the copying one",
+    );
+}
+
+#[test]
+fn the_counter_notices_a_deliberate_allocation() {
+    // The counter is a `#[global_allocator]` duplicated into this binary, and every
+    // allocation assertion in this file rests on it firing. A counter wired up wrongly —
+    // never armed, or armed on the wrong thread — would report zero for everything and make
+    // those assertions pass vacuously. This proves it fires, in this binary, on this thread.
+    // The same canary guards the sibling harness in `http_zero_alloc.rs`.
+    let counted = count_allocations(|| {
+        let boxed = Box::new([0u8; 64]);
+        core::hint::black_box(&boxed);
+    });
+    assert!(
+        counted >= 1,
+        "the allocation counter must observe a deliberate heap allocation",
     );
 }
 

@@ -111,10 +111,16 @@
 //! push-model body's `DATA` was never the caller's to hand over, so it is copied like any
 //! other block.
 //!
-//! Precedence among the four, highest first: vectored, owned-region, borrowed, owned. Because
-//! each method carries both the choice and the
-//! write, an adapter cannot advertise a fast path without providing it, nor provide it
-//! without the driver taking it.
+//! Precedence among the four, highest first: vectored, owned-region, borrowed, owned. The
+//! vectored and borrowed elections carry both the choice and the write in one call — an
+//! `Option`-returning method that gathers when it returns `Some` — so for those two an
+//! adapter cannot advertise a fast path without providing it, nor provide it without the
+//! driver taking it. The owned-region path is the deliberate exception: its election
+//! ([`TransportWrite::gathers_owned_regions`], a plain predicate) is *split* from its write
+//! ([`TransportWrite::write_regions`]). It has to be. A late `None` from a method already
+//! handed the owned `Vec<Bytes>` would consume the regions and lose them, where a declined
+//! borrowed slice can simply be dropped; ownership is the difference, and it is why the two
+//! idioms are not the same shape.
 //!
 //! What the session's block lifetime forecloses is narrower than it first looks. Asking for
 //! the next block invalidates the last, and [`Session::send`](crate::Session::send) enforces
@@ -122,11 +128,13 @@
 //! blocks* can never be gathered with each other. But one block can be gathered with memory
 //! the driver already owns — its accumulation buffer, and the handed-over payloads it holds
 //! as lifetime-free descriptors — and that is enough: it is exactly what the vectored path
-//! does. A readiness-based transport overrides these, which is why the `TokioIo`
-//! adapter behind the `tokio` feature does; a completion API leaves them at their defaults
-//! and maps onto the owned methods with no adapter code to speak of — its `read`/`write`
-//! already take and return the buffer — as `crates/nghttp2-tests/tests/http_compio.rs`
-//! demonstrates against a real one.
+//! does. A readiness-based transport overrides the borrowed and vectored methods, which is
+//! why the `TokioIo` adapter behind the `tokio` feature does. A completion transport cannot
+//! use either — both lend the kernel a borrowed slice — so it leaves them at their defaults
+//! and overrides the owned-region pair instead, which is what the shipped `CompioIo` adapter
+//! does (`transport/compio.rs`); before handed-over bodies existed it had no fast path at all
+//! and fell back to the plain owned `write`. `crates/nghttp2-tests/tests/http_compio.rs`
+//! demonstrates both against a real io_uring socket.
 //!
 //! The other obligation is [`TransportWrite::commit`]: the driver calls it after draining a
 //! pass and before it waits on the peer, so a transport that buffers its writes — a

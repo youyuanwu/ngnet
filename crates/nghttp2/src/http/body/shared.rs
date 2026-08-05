@@ -3,9 +3,13 @@
 //! The push-model sibling of this module, [`super::outgoing`], copies each chunk into the
 //! buffer libnghttp2 offers. This one does not: because the body's `Data` is a
 //! [`bytes::Bytes`] the crate already owns, it hands that `Bytes` straight back through
-//! [`SharedBodySource::take`], and libnghttp2 serialises only the frame header. libnghttp2
-//! no longer memsets the frame buffer for this payload and this source never copies into
-//! it, so the payload is no longer *touched twice* the way the push path touches it. On the
+//! [`SharedBodySource::take`], and libnghttp2 serialises only the frame header. Nothing
+//! zeroes the frame buffer for this payload — the memset the push path performs is the
+//! crate's own, in `read_push_body`, and it exists because that path must hand libnghttp2's
+//! reused, uninitialised buffer to a source that may fill less of it than it was offered.
+//! A handed-over payload never enters that buffer, so there is nothing to zero and this
+//! source never copies into it: the payload is no longer *touched twice* the way the push
+//! path touches it. On the
 //! two readiness strategies it is not touched by the driver either: it travels to the
 //! transport as its own region, in the caller's own memory. The owned strategy still
 //! coalesces it once, which is inherent to a transport that takes ownership of what it is

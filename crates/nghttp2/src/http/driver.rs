@@ -83,14 +83,19 @@ const VECTORED_THRESHOLD: usize = 256;
 ///
 /// A no-copy pass is a handful of regions in practice — the measured pass carries at most
 /// four `DATA` frames beside one accumulated control run, which this design splits into a
-/// header region and a payload region each, so about nine regions, never more. But
-/// `SETTINGS_INITIAL_WINDOW_SIZE` is the peer's to choose, and a peer advertising a large
+/// header region and a payload region each, so about nine regions. What holds it there is
+/// flow control: a peer's initial 64 KiB window admits about four 16 KiB frames per pass.
+/// But `SETTINGS_INITIAL_WINDOW_SIZE` is the peer's to choose, and a peer advertising a large
 /// window could have libnghttp2 serialise many `DATA` frames in a single `send_into`, each
-/// depositing a record. This cap is the guard rail against that: it is far below Linux's
-/// `IOV_MAX` of 1024 and far above the measured nine, so it never binds on real traffic and
-/// cannot be exceeded in principle. The stack array a write materialises into is one longer
-/// than this, because a live session block may ride as the trailing region of a list that
-/// is already this full (design decisions D6 and D9).
+/// depositing a record. This cap is the guard rail against exactly that: it is far below
+/// Linux's `IOV_MAX` of 1024 and far above the measured nine, so under a default window it
+/// never binds, and under a window large enough to reach it the list is flushed and restarted
+/// rather than overrunning. It is a bound that always holds, not a case that never arises —
+/// `http_vectored.rs::a_pass_driven_past_the_region_cap_holds_the_bound_and_stays_correct`
+/// drives a peer-advertised window big enough to bind it several times in one pass. The stack
+/// array a write materialises into is one longer than this, because a live session block may
+/// ride as the trailing region of a list that is already this full (design decisions D6
+/// and D9).
 const MAX_REGIONS: usize = 64;
 
 /// A lifetime-free description of one region of a gathering write.
@@ -1650,6 +1655,20 @@ fn materialise<'a>(
     tail: &'a [u8],
     slots: &mut [std::io::IoSlice<'a>],
 ) -> usize {
+    // The caller sizes `slots` at `MAX_REGIONS + 1` and the driver holds
+    // `regions.len() + open_run <= MAX_REGIONS`, so the writes below are always in bounds.
+    // That invariant lives in the caller, though, and this function is where it would be
+    // violated — a `slots[count]` overrun is a panic in the middle of a write, with a
+    // half-materialised list. Assert it here, where the bound is used, so a future change to
+    // the cap or to the pre-flush arithmetic fails loudly in test builds rather than
+    // depending on a reader connecting two distant pieces of code.
+    debug_assert!(
+        regions.len() + usize::from(!tail.is_empty()) <= slots.len(),
+        "materialisation array too small: {} regions plus {} tail into {} slots",
+        regions.len(),
+        usize::from(!tail.is_empty()),
+        slots.len(),
+    );
     let mut count = 0;
     for region in regions {
         let slice: &[u8] = match *region {

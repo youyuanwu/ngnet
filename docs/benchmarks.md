@@ -327,13 +327,22 @@ families measure it against the unchanged push path:
   control). Each shared arm is identical to its push twin but for the connection entry point.
 - `benches/shared_body.rs` — the duplex, three arms: `ngrs-push`, `ngrs-shared`, `hyper-tokio`.
 
-Arms are paired and adjacent within each size and sizes are the outer loop, so no arm runs to
-completion before its twin starts. The 0-byte point is a *mechanistic* control — with no body
-there is nothing to copy and nothing to gather, so the two arms cannot legitimately differ
-there — and, by a rule fixed before looking at the results, any replicate whose 0-byte paired
-delta exceeded ±5% was discarded whole. Three of ten socket replicates were excluded on that
-rule, leaving seven. `tests/fixtures_move_their_bytes.rs` asserts every arm echoes every size
-back at its exact length, so an arm cannot look faster by moving fewer bytes than its twin.
+Arms are paired and adjacent within each size and sizes are the outer loop, so a twin pair sits
+as close together in time as Criterion allows and no arm runs to completion across every size
+before its twin starts. This is adjacency rather than sample-level interleaving — Criterion
+samples one benchmark fully before beginning the next, and no arrangement of the calls changes
+that; replication over ten runs is what covers the remainder. The 0-byte point is a
+*mechanistic* control — with no body there is nothing to copy and nothing to gather, so the two
+arms cannot legitimately differ there — and, by a rule fixed before looking at the results, any
+replicate whose 0-byte paired delta exceeded ±5% was discarded whole. Three of ten socket
+replicates were excluded on that rule, leaving seven.
+`tests/fixtures_move_their_bytes.rs` asserts every arm echoes every size back at its exact
+length, so an arm cannot look faster by moving fewer bytes than its twin.
+
+The headline does not rest on that exclusion. Recomputed over all ten replicates with nothing
+discarded, `tokio` at 1 MiB is **−31.10%** against the −30.6% below, every individual replicate
+falls between −28.0% and −35.5%, and the conclusion is unchanged; the rule only ever mattered
+to `compio`, whose verdict is NOT MET either way.
 
 Negative is faster. Real socket, seven clean replicates:
 
@@ -365,12 +374,17 @@ here rather than the binding constraint.
 
 **SC-005 verdict: MET on the readiness transport, NOT MET on the completion transport.** The
 criterion requires the difference to exceed the movement of the drift controls in the same
-session.
+session. It does not say *which* controls, and the two readings disagree, so the choice is
+made on evidence and recorded: in the three replicates where `compio-push` wandered 24–42%,
+`tokio`'s own 0-byte control moved at most 4.6% and its 1 MiB result was indistinguishable from
+the clean runs. The disturbance was a property of the compio arms, not a session-wide noise
+floor, so each transport is judged against the controls on its own transport.
 
 - **`tokio`, 1 MiB: MET.** −30.6%, consistent in sign and magnitude across all seven clean
-  replicates (−28.0% to −35.5%), against a largest control movement of 7.22%. It clears the bar
-  by more than four times, and the 0-byte control shows no effect exactly where the mechanism
-  predicts none.
+  replicates (−28.0% to −35.5%) and −31.10% across all ten, against a largest same-transport
+  control movement of 7.22%. It clears the bar by more than four times, and the 0-byte control
+  shows no effect exactly where the mechanism predicts none. The duplex family corroborates it
+  independently — a separate binary with no compio arm at all, controls under 4.9%.
 - **`compio`, 1 MiB: NOT MET.** The measured gain is −4.07%, but its own untouched control arm,
   `compio-push`, moved **34.94%** across the same replicates, and by the criterion as written
   4.07% does not clear that. This is reported as measured, not reworded into a win. The honest

@@ -659,8 +659,9 @@ fn the_asynchronous_surface_is_unchanged() {
         asynchronous::client_surface::<Duplex, Empty>;
     let _: fn(&nghttp2::http::IncomingBody) = asynchronous::incoming_body_surface;
     let _: fn(&nghttp2::http::Cancelled) = asynchronous::cancelled_surface;
-    // The writing half's three overridable points, pinned generically so the shape holds for
-    // every transport, not only the ready-made tokio one.
+    // The writing half's overridable points — `write_vectored`, `write_borrowed`, `commit`,
+    // and the owned-region pair `gathers_owned_regions`/`write_regions` — pinned generically
+    // so the shape holds for every transport, not only the ready-made tokio one.
     asynchronous::write_half_surface::<nghttp2::http::testing::DuplexWriter>();
     // The vectored testing transport and its observation handle. Hidden from the docs but
     // still public, and integration tests are separate crates that can reach nothing else.
@@ -761,10 +762,21 @@ fn the_asynchronous_surface_is_unchanged() {
     .expect("serving");
     let (shared_direct, _peer) = nghttp2::http::testing::duplex(false);
     drop(nghttp2::http::serve_shared(shared_direct, answer).expect("serving"));
+    let (shared_qualified, _peer) = nghttp2::http::testing::duplex(false);
+    drop(nghttp2::http::server::serve_shared(shared_qualified, answer).expect("serving"));
     let (shared_configured, _peer) = nghttp2::http::testing::duplex(false);
     drop(
         nghttp2::http::serve_shared_with(
             shared_configured,
+            answer,
+            nghttp2::http::Config::default(),
+        )
+        .expect("serving"),
+    );
+    let (shared_qualified_cfg, _peer) = nghttp2::http::testing::duplex(false);
+    drop(
+        nghttp2::http::server::serve_shared_with(
+            shared_qualified_cfg,
             answer,
             nghttp2::http::Config::default(),
         )

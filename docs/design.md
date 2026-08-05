@@ -74,8 +74,11 @@ strategy is the one exception, splitting election from write for the reason give
   state. The driver keeps a retained list of lifetime-free region descriptors capped at
   `MAX_REGIONS` (currently 64) and materialises it into slices only at write time, so a write
   carries at most `MAX_REGIONS + 1` regions — the cap, plus one live session block riding as
-  the trailing region — which is well under `IOV_MAX` and never a concern. (An earlier design
-  capped this at two regions; handing bodies over made a longer list worth retaining.)
+  the trailing region — which is well under `IOV_MAX`. Under a default 64 KiB window the cap
+  never binds (a pass carries about nine regions); a peer may advertise a window large enough
+  to reach it, and then the list is flushed mid-pass and restarted rather than overrun. (An
+  earlier design capped this at two regions; handing bodies over made a longer list worth
+  retaining.)
 
   This does buffer, and the buffering is the point: small blocks are copied so that they cost
   no syscall, while anything large enough to be worth its own syscall is never copied. It is

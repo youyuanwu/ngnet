@@ -1,7 +1,7 @@
 //! The transport abstraction's contract, asserted mostly by compiling (Spec FR-013 to
 //! FR-016, SC-015 in part).
 //!
-//! Three properties matter here and none of them is about behaviour, which is why the
+//! Four properties matter here and none of them is about behaviour, which is why the
 //! assertions are largely type-level:
 //!
 //! * a completion-based transport can be written without mentioning the borrowed-write

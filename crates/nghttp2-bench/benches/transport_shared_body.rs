@@ -14,7 +14,11 @@
 //! 1. **The pairs are adjacent.** Within each size, `push` and `shared` for a transport run
 //!    back to back, so the two halves of a comparison sit as close together in time as
 //!    Criterion allows. Sizes are the outer loop, arms the inner one — never all of one arm
-//!    and then all of the other.
+//!    and then all of the other. This is adjacency, not sample-level interleaving: Criterion
+//!    samples one benchmark to completion before starting the next, and no arrangement of
+//!    `bench_with_input` calls can change that. Replication is what covers the rest — the
+//!    recorded result aggregates paired deltas over ten independent runs of this file, so a
+//!    slow drift must bias every one of them in the same direction to survive.
 //! 2. **`hyper-tokio` is carried as a drift control.** Nothing in this work touches hyper, so
 //!    whatever it does between runs is the session's noise floor. A shared-versus-push
 //!    difference smaller than the control's own movement is not a result.
