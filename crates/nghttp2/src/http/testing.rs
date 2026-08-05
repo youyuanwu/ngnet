@@ -157,6 +157,16 @@ impl WriteShape {
 struct VectoredRecord {
     /// The region lengths of each polled call, in order.
     calls: Vec<Vec<usize>>,
+    /// The base address of each region of each polled call, in the same shape as
+    /// [`calls`](Self::calls).
+    ///
+    /// Recorded so a test can ask *where* the octets a write gathered came from, not only
+    /// how many there were. Phase 2 records these addresses; the two-sided coverage
+    /// assertion that pins a caller's chunk to an untouched region is Phase 3's (design
+    /// decision D8). An address is only meaningful for the instant of the call that logged
+    /// it — the buffer behind it may be reused afterwards — so a reader must compare it
+    /// against ranges captured at the same time, never dereference it.
+    bases: Vec<Vec<usize>>,
     /// Every octet handed over, concatenated in the order it was offered.
     octets: Vec<u8>,
     /// Calls that re-offered the remainder of a short write, rather than new octets.
@@ -335,6 +345,19 @@ impl VectoredLog {
     /// writes per pass can exclude retries without having to reconstruct which was which.
     pub fn retries(&self) -> usize {
         self.record.lock().expect("vectored record").retries
+    }
+
+    /// The base address of each region of each polled call, shaped like
+    /// [`calls`](VectoredLog::calls).
+    ///
+    /// Lets a test see *where* a gathered write's octets came from — the driver's own
+    /// coalescing buffer, or a caller's `Bytes` handed over uncopied. Phase 2 records these
+    /// so Phase 3 can assert that a no-copy chunk's address falls inside a region the
+    /// transport was offered and outside the driver's buffer; on its own an address here
+    /// proves nothing and must never be dereferenced, since the buffer behind it may have
+    /// been reused by the time it is read.
+    pub fn bases(&self) -> Vec<Vec<usize>> {
+        self.record.lock().expect("vectored record").bases.clone()
     }
 
     /// Forgets everything so far, so a test can measure one driver pass at a time.
@@ -611,6 +634,12 @@ impl Future for DuplexVectoredWrite<'_> {
         record
             .calls
             .push(me.regions.iter().map(|region| region.len()).collect());
+        record.bases.push(
+            me.regions
+                .iter()
+                .map(|region| region.as_ptr() as usize)
+                .collect(),
+        );
         record.last_was_short = accepted < offered;
 
         let mut remaining = accepted;

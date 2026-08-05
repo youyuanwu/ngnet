@@ -25,10 +25,7 @@ pub(crate) enum Source {
     /// A caller's [`BodySource`], filled into the session's frame buffer.
     Push(Box<dyn BodySource>),
     /// A caller's [`SharedBodySource`], handed to the transport uncopied.
-    // Constructed only through `BodyEntry::new_shared`, which Phase 1 reaches only from
-    // tests; the connection entry points that build it in production arrive in Phase 2.
     #[cfg(feature = "http")]
-    #[allow(dead_code)]
     Shared(Box<dyn SharedBodySource>),
 }
 
@@ -59,10 +56,7 @@ impl BodyEntry {
     }
 
     /// An entry backed by a no-copy [`SharedBodySource`].
-    // Reached only from the shared submit methods, which have no production caller until
-    // Phase 2 wires the connection entry points; in a non-test build it is unused.
     #[cfg(feature = "http")]
-    #[allow(dead_code)]
     pub(crate) fn new_shared(source: Box<dyn SharedBodySource>) -> Self {
         Self {
             source: Source::Shared(source),
@@ -86,12 +80,7 @@ impl BodyEntry {
 #[cfg(feature = "http")]
 #[derive(Debug)]
 pub(crate) struct SendRecord {
-    // Read by the driver when it writes the records out, which it does not yet do in Phase
-    // 1 (the sink is always empty because nothing constructs a shared body). Phase 2's
-    // ordering write reads both fields and removes this allowance.
-    #[allow(dead_code)]
     pub(crate) header: [u8; 9],
-    #[allow(dead_code)]
     pub(crate) payload: Bytes,
 }
 

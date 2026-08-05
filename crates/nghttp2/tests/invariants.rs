@@ -31,6 +31,13 @@ const UNSAFE_TEST_EXEMPTIONS: &[(&str, &str)] = &[
         "http_zero_alloc.rs",
         "implements GlobalAlloc to count a future's allocations",
     ),
+    // The no-copy send tests measure SC-007's "no bodies changes no allocation count" the
+    // same way, installing their own GlobalAlloc — unsafe by language rule. Every use of
+    // this crate's API in the file is safe; the unsafe is measurement scaffolding.
+    (
+        "http_shared_body.rs",
+        "implements GlobalAlloc to count a bodyless exchange's allocations",
+    ),
 ];
 
 /// Facilities the crate's own source must not reach for.
@@ -1077,4 +1084,75 @@ fn the_send_path_has_nowhere_to_put_a_second_chunk() {
             "the send path gained a `{container}`, which can hold more than one chunk",
         );
     }
+}
+
+#[test]
+fn the_frame_buffer_is_zeroed_only_on_the_copying_read_path() {
+    // Design decision D8, instrument 1. The push read callback zeroes the frame buffer
+    // libnghttp2 hands it, because a `BodySource` receives a readable slice and must never
+    // see another stream's plaintext left there. The no-copy read callback hands nothing
+    // to the source and writes no payload into that buffer at all — libnghttp2 serialises
+    // only the header and the payload travels as the caller's own `Bytes` — so it has
+    // neither the hazard nor the memset. This pins that asymmetry: the zeroing must appear
+    // exactly once, and only inside `read_push_body`. A second `write_bytes`, or one that
+    // migrated into the shared path, would be either a needless cost or a sign the no-copy
+    // path had started touching the buffer it is supposed to leave alone.
+    let path = crate_root().join("src").join("callbacks.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {path:?}: {e}; the callbacks module has moved"));
+    let code = strip_comments_and_strings(&source);
+
+    let zeroings = code.matches("write_bytes").count();
+    assert_eq!(
+        zeroings, 1,
+        "expected exactly one `write_bytes`, the push path's memset, found {zeroings}",
+    );
+
+    // Textual position is not containment. The earlier form only asserted the memset lay
+    // *between* the declarations of `read_push_body` and `read_shared_body`, which any
+    // function declared in that gap would satisfy just as well — it never proved the
+    // memset was inside `read_push_body`'s own body. This finds the brace that opens that
+    // body, its matching close, and requires the memset to fall strictly inside the span
+    // they bound. A memset that migrated into a helper sitting between the two functions,
+    // or into the no-copy path, now fails here rather than passing unnoticed.
+    //
+    // `matching_brace` indexes the char vector by position, while `str::find` yields byte
+    // offsets; the two are reconciled by reading the brace positions' byte offsets back
+    // out of the vector (`chars[..].0`) so every comparison below is in byte space, which
+    // is where `find` reports the memset.
+    let chars: Vec<(usize, char)> = code.char_indices().collect();
+
+    let shared = code
+        .find("fn read_shared_body")
+        .expect("read_shared_body has moved; this scan is stale");
+    let push = code
+        .find("fn read_push_body")
+        .expect("read_push_body has moved; this scan is stale");
+    // The first `{` after the signature opens the body: a fn signature carries only `<>`,
+    // `()` and a brace-free return type, so nothing before the body can be mistaken for it.
+    let open = chars
+        .iter()
+        .position(|(byte, ch)| *byte > push && *ch == '{')
+        .expect("read_push_body has no body brace; this scan is stale");
+    let close = matching_brace(&chars, open)
+        .expect("read_push_body's body brace does not close; this scan is stale");
+    let (body_start, body_end) = (chars[open].0, chars[close].0);
+
+    let memset = code
+        .find("write_bytes")
+        .expect("the single write_bytes just counted");
+
+    assert!(
+        body_start < memset && memset < body_end,
+        "the frame-buffer memset is no longer inside read_push_body's body: its write_bytes \
+         sits at byte {memset}, while that body spans bytes {body_start}..{body_end}",
+    );
+    // The whole point of the split is that the no-copy path has no such memset; if it ever
+    // moved there, the span check above would already have failed, but a body that starts
+    // before the shared path keeps the two genuinely disjoint.
+    assert!(
+        body_end < shared,
+        "read_push_body's body now overlaps read_shared_body (spans {body_start}..{body_end}, \
+         read_shared_body begins at {shared}); the two paths are no longer distinct",
+    );
 }

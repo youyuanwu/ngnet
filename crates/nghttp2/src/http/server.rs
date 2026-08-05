@@ -44,6 +44,7 @@ use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use http_body::Body;
 
 use crate::{ErrorCode, Session, StreamId};
@@ -51,7 +52,7 @@ use crate::{ErrorCode, Session, StreamId};
 use super::body::{Direction, IncomingBody};
 use super::config::Config;
 use super::connection::Connection;
-use super::driver::{self, DriverGuard, Events, Role, Signals};
+use super::driver::{self, BodyPlan, DriverGuard, Events, PushBodies, Role, SharedBodies, Signals};
 use super::error::Result;
 use super::head;
 use super::shared::{Incoming, Registry, Shared};
@@ -111,12 +112,89 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
+    serve_planned::<T, H, F, B, PushBodies>(transport, handler, config)
+}
+
+/// Serves requests whose response bodies are handed over uncopied.
+///
+/// The no-copy counterpart of [`serve`]. Everything a handler sees is unchanged — the same
+/// `http::Request`/`http::Response`, the same concurrency model — except that each
+/// response body's octets reach the transport without being copied into libnghttp2's
+/// serialisation buffer. That is possible only when the body's `Data` is [`bytes::Bytes`],
+/// which the crate can hand over rather than copy, so this entry point bounds
+/// `B::Data = Bytes` where [`serve`] does not.
+///
+/// The choice is whole-connection: every response on a connection served here hands its
+/// body over. See [`serve`] for the returned future and how it is run.
+///
+/// # Errors
+///
+/// Fails if the underlying session cannot be created. Failures afterwards are reported by
+/// the returned future.
+pub fn serve_shared<T, H, F, B>(
+    transport: T,
+    handler: H,
+) -> Result<Connection<impl Future<Output = Result<()>>>>
+where
+    T: Transport,
+    H: FnMut(http::Request<IncomingBody>) -> F,
+    F: Future<Output = http::Response<B>>,
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    serve_shared_with(transport, handler, Config::default())
+}
+
+/// Serves no-copy responses with an explicit [`Config`].
+///
+/// The no-copy counterpart of [`serve_with`], and additive over [`serve_shared`] in
+/// exactly the way [`serve_with`] is over [`serve`]: it takes a [`Config`] by value.
+///
+/// # Errors
+///
+/// Fails if the underlying session cannot be created. Failures afterwards are reported by
+/// the returned future.
+pub fn serve_shared_with<T, H, F, B>(
+    transport: T,
+    handler: H,
+    config: Config,
+) -> Result<Connection<impl Future<Output = Result<()>>>>
+where
+    T: Transport,
+    H: FnMut(http::Request<IncomingBody>) -> F,
+    F: Future<Output = http::Response<B>>,
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    serve_planned::<T, H, F, B, SharedBodies>(transport, handler, config)
+}
+
+/// The shared body of the four public server entry points, parameterised by body plan.
+///
+/// The plain and `_shared` forms differ only in which [`BodyPlan`] they fix and the bound
+/// that plan needs, so the connection wiring lives here once rather than four times. `P`
+/// never escapes: the returned future and everything a handler sees are the same whichever
+/// plan is chosen.
+fn serve_planned<T, H, F, B, P>(
+    transport: T,
+    handler: H,
+    config: Config,
+) -> Result<Connection<impl Future<Output = Result<()>>>>
+where
+    T: Transport,
+    H: FnMut(http::Request<IncomingBody>) -> F,
+    F: Future<Output = http::Response<B>>,
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    P: BodyPlan<B>,
+{
     let session = driver::server_session(&config)?;
 
     let shared = Arc::new(Shared::default());
     let registry = Arc::new(Registry::default());
 
-    let role = ServerRole {
+    let role = ServerRole::<H, F, B, P> {
         shared: Arc::clone(&shared),
         registry: Arc::clone(&registry),
         handler,
@@ -125,6 +203,7 @@ where
         max_concurrent_streams: config.concurrency(),
         woken: Vec::new(),
         body: core::marker::PhantomData,
+        plan: core::marker::PhantomData,
     };
 
     let guard = DriverGuard::new(Arc::clone(&shared), Arc::clone(&registry), role);
@@ -223,7 +302,7 @@ impl CancelState {
 ///
 /// Work arrives from the wire rather than from a handle, and a completed header block is a
 /// job rather than an answer.
-struct ServerRole<H, F, B> {
+struct ServerRole<H, F, B, P> {
     shared: Arc<Shared>,
     registry: Arc<Registry>,
     handler: H,
@@ -237,15 +316,19 @@ struct ServerRole<H, F, B> {
     woken: Vec<i32>,
     /// Names the response body type, which only appears inside the handler's future.
     body: core::marker::PhantomData<fn() -> B>,
+    /// Names the body plan this connection was built with. Zero-sized; it selects the
+    /// submission path in [`respond`](ServerRole::respond) and nothing else.
+    plan: core::marker::PhantomData<fn() -> P>,
 }
 
-impl<H, F, B> ServerRole<H, F, B>
+impl<H, F, B, P> ServerRole<H, F, B, P>
 where
     H: FnMut(http::Request<IncomingBody>) -> F,
     F: Future<Output = http::Response<B>>,
     B: Body + Send + 'static,
     B::Data: Send,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    P: BodyPlan<B>,
 {
     /// Puts a finished handler's response on the wire, if there is still a stream for it.
     fn respond(
@@ -290,8 +373,16 @@ where
             // close path does. Nothing to answer.
             return Ok(());
         };
-        let (source, waker) = driver::outgoing_body(&self.shared, liveness, body);
-        session.submit_response_with_body(StreamId::new(stream), &views, source)?;
+        // The body plan chooses whether these octets are copied or handed over; naming the
+        // stream and binding the waker is the same either way.
+        let waker = P::submit_response(
+            &self.shared,
+            session,
+            liveness,
+            StreamId::new(stream),
+            &views,
+            body,
+        )?;
         // The stream identifier was known all along here, unlike on the client, but the
         // binding still has to happen before anything consults the body — and nothing can,
         // until the next `Session::send`.
@@ -300,13 +391,14 @@ where
     }
 }
 
-impl<H, F, B> Role for ServerRole<H, F, B>
+impl<H, F, B, P> Role for ServerRole<H, F, B, P>
 where
     H: FnMut(http::Request<IncomingBody>) -> F,
     F: Future<Output = http::Response<B>>,
     B: Body + Send + 'static,
     B::Data: Send,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    P: BodyPlan<B>,
 {
     fn advance(&mut self, session: &mut Session<Events>) -> Result<()> {
         // Only the handlers that were woken, which is the whole point of giving each its

@@ -130,11 +130,13 @@ pub mod transport;
 mod waker;
 
 pub use body::IncomingBody;
-pub use client::{ResponseFuture, SendRequest, handshake, handshake_with};
+pub use client::{
+    ResponseFuture, SendRequest, handshake, handshake_shared, handshake_shared_with, handshake_with,
+};
 pub use config::Config;
 pub use connection::Connection;
 pub use error::{Error, ErrorKind, Result};
-pub use server::{Cancelled, serve, serve_with};
+pub use server::{Cancelled, serve, serve_shared, serve_shared_with, serve_with};
 pub use transport::{Transport, TransportRead, TransportWrite};
 
 #[doc(hidden)]

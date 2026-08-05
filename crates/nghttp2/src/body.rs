@@ -68,7 +68,7 @@ pub trait BodySource: Send {
     ///
     /// On the push path `buf` is cleared before each call, so reading from it yields
     /// zeros rather than anything left by an earlier frame. There is nothing useful to
-    /// read; it is an output buffer. (The no-copy [`SharedBodySource`] path hands over
+    /// read; it is an output buffer. (The no-copy `SharedBodySource` path hands over
     /// octets it already owns and is never given a buffer to clear.)
     fn fill(&mut self, buf: &mut [u8]) -> BodyOutcome;
 }
@@ -85,10 +85,6 @@ pub trait BodySource: Send {
 /// over-long count from [`BodySource::fill`] is treated on the push path: acting on it
 /// would claim a frame length libnghttp2 never agreed to.
 #[cfg(feature = "http")]
-// Phase 1 has no production constructor for these variants — the shared body adapter that
-// builds them arrives in Phase 2 — so in a non-test build they are never constructed.
-// Removed when Phase 2 wires up `SharedOutgoing`.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum SharedOutcome {
     /// Handed over these octets; more will follow.

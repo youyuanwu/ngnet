@@ -300,7 +300,8 @@ mod asynchronous {
     };
     use nghttp2::http::{
         Config, Error, ErrorKind, IncomingBody, ResponseFuture, SendRequest, Transport,
-        TransportRead, TransportWrite, handshake, handshake_with,
+        TransportRead, TransportWrite, handshake, handshake_shared, handshake_shared_with,
+        handshake_with,
     };
 
     /// The connection configuration, pinned as a `Copy` builder with conservative
@@ -420,6 +421,47 @@ mod asynchronous {
         Ok(())
     }
 
+    /// The no-copy client entry point, pinned as returning exactly the pair `handshake`
+    /// does.
+    ///
+    /// The whole promise being pinned is that opting in to no-copy costs a caller nothing
+    /// in the surface: the handle is the same `SendRequest<B>`, the driver the same
+    /// `Connection`, the request the same `http::Request`. The only visible difference is
+    /// the bound — `B::Data` must be `Bytes` — which is why this is a separate function
+    /// from [`client_surface`] rather than a change to it.
+    pub(super) fn client_shared_surface<T, B>(transport: T) -> core::result::Result<(), Error>
+    where
+        T: Transport,
+        T::Reader: TransportRead,
+        T::Writer: TransportWrite,
+        B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let (requests, connection): (SendRequest<B>, nghttp2::http::Connection<_>) =
+            handshake_shared::<T, B>(transport)?;
+        drop((requests, connection));
+        Ok(())
+    }
+
+    /// The explicit-config no-copy client entry point, additive over
+    /// [`client_shared_surface`] exactly as `handshake_with` is over `handshake`.
+    pub(super) fn client_shared_with_config_surface<T, B>(
+        transport: T,
+        config: Config,
+    ) -> core::result::Result<(), Error>
+    where
+        T: Transport,
+        T::Reader: TransportRead,
+        T::Writer: TransportWrite,
+        B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let (requests, connection): (SendRequest<B>, nghttp2::http::Connection<_>) =
+            handshake_shared_with::<T, B>(transport, config)?;
+        drop((requests, connection));
+        Ok(())
+    }
+
     /// The server entry point, pinned the same way as the client's.
     ///
     /// A handler is an ordinary `FnMut` returning an ordinary future; nothing here is a
@@ -460,6 +502,50 @@ mod asynchronous {
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
         let connection = nghttp2::http::serve_with(transport, handler, config)?;
+        drop(connection);
+        Ok(())
+    }
+
+    /// The no-copy server entry point, pinned as returning exactly what `serve` does.
+    ///
+    /// As with the client, the only visible difference from [`server_surface`] is the
+    /// bound `B::Data = Bytes`; the handler, its request, its response type and the driver
+    /// are all the same.
+    pub(super) fn server_shared_surface<T, H, F, B>(
+        transport: T,
+        handler: H,
+    ) -> core::result::Result<(), Error>
+    where
+        T: Transport,
+        T::Reader: TransportRead,
+        T::Writer: TransportWrite,
+        H: FnMut(http::Request<IncomingBody>) -> F,
+        F: core::future::Future<Output = http::Response<B>>,
+        B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let connection = nghttp2::http::serve_shared(transport, handler)?;
+        drop(connection);
+        Ok(())
+    }
+
+    /// The explicit-config no-copy server entry point, additive over
+    /// [`server_shared_surface`] exactly as `serve_with` is over `serve`.
+    pub(super) fn server_shared_with_config_surface<T, H, F, B>(
+        transport: T,
+        handler: H,
+        config: Config,
+    ) -> core::result::Result<(), Error>
+    where
+        T: Transport,
+        T::Reader: TransportRead,
+        T::Writer: TransportWrite,
+        H: FnMut(http::Request<IncomingBody>) -> F,
+        F: core::future::Future<Output = http::Response<B>>,
+        B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let connection = nghttp2::http::serve_shared_with(transport, handler, config)?;
         drop(connection);
         Ok(())
     }
@@ -568,10 +654,18 @@ fn the_asynchronous_surface_is_unchanged() {
     let _: fn(&nghttp2::http::testing::VectoredLog) -> usize =
         nghttp2::http::testing::VectoredLog::retries;
     let _: fn(&nghttp2::http::testing::VectoredLog) = nghttp2::http::testing::VectoredLog::reset;
+    let _: fn(&nghttp2::http::testing::VectoredLog) -> Vec<Vec<usize>> =
+        nghttp2::http::testing::VectoredLog::bases;
     let _: fn(&Duplex, Vec<usize>) = |duplex, caps| duplex.accept_at_most(caps);
     let _: fn() = asynchronous::config_surface;
     let _: fn(Duplex, nghttp2::http::Config) -> core::result::Result<(), nghttp2::http::Error> =
         asynchronous::client_with_config_surface::<Duplex, Empty>;
+    // The four no-copy entry points, pinned exactly as their copying counterparts are. They
+    // return the same pair and take the same arguments; only the body bound differs.
+    let _: fn(Duplex) -> core::result::Result<(), nghttp2::http::Error> =
+        asynchronous::client_shared_surface::<Duplex, Empty>;
+    let _: fn(Duplex, nghttp2::http::Config) -> core::result::Result<(), nghttp2::http::Error> =
+        asynchronous::client_shared_with_config_surface::<Duplex, Empty>;
     #[cfg(feature = "tokio")]
     {
         let _: fn(tokio::net::TcpStream) = asynchronous::tokio_transport_surface::<_>;
@@ -607,6 +701,29 @@ fn the_asynchronous_surface_is_unchanged() {
     drop(
         nghttp2::http::serve_with(top_level, answer, nghttp2::http::Config::default())
             .expect("serving"),
+    );
+
+    // The no-copy server entry points, reachable both generically and concretely, and both
+    // at the top of `http` and through the `server` module.
+    let (shared_generic, _peer) = nghttp2::http::testing::duplex(false);
+    asynchronous::server_shared_surface(shared_generic, answer).expect("serving");
+    let (shared_generic_cfg, _peer) = nghttp2::http::testing::duplex(false);
+    asynchronous::server_shared_with_config_surface(
+        shared_generic_cfg,
+        answer,
+        nghttp2::http::Config::default(),
+    )
+    .expect("serving");
+    let (shared_direct, _peer) = nghttp2::http::testing::duplex(false);
+    drop(nghttp2::http::serve_shared(shared_direct, answer).expect("serving"));
+    let (shared_configured, _peer) = nghttp2::http::testing::duplex(false);
+    drop(
+        nghttp2::http::serve_shared_with(
+            shared_configured,
+            answer,
+            nghttp2::http::Config::default(),
+        )
+        .expect("serving"),
     );
     let _: fn(nghttp2::http::testing::http_crate::Response<nghttp2::http::IncomingBody>) =
         asynchronous::response_surface;

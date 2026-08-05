@@ -761,10 +761,7 @@ impl<C> Session<C> {
     /// `read_body` dispatcher serves both, choosing the no-copy path once it sees the
     /// entry carries a [`SharedBodySource`]. libnghttp2 will invoke the registered send
     /// callback for each frame this source produces.
-    // No production caller until Phase 2 routes the connection entry points here; Phase 1
-    // reaches it only from tests.
     #[cfg(feature = "http")]
-    #[allow(dead_code)]
     fn provider_shared<T>(entry: core::ptr::NonNull<BodyEntry>) -> sys::nghttp2_data_provider2 {
         sys::nghttp2_data_provider2 {
             source: sys::nghttp2_data_source {
@@ -781,10 +778,7 @@ impl<C> Session<C> {
     /// buffer, and libnghttp2 serialises each frame's header only. To send trailers
     /// afterwards, the source must report
     /// [`SharedOutcome::EofWithTrailers`](crate::body::SharedOutcome::EofWithTrailers).
-    // Its only Phase-1 caller is a test; the connection entry points that call it in
-    // production arrive in Phase 2.
     #[cfg(feature = "http")]
-    #[allow(dead_code)]
     pub(crate) fn submit_request_with_shared_body(
         &mut self,
         headers: &[Header<'_>],
@@ -823,10 +817,7 @@ impl<C> Session<C> {
     /// The no-copy counterpart of
     /// [`submit_response_with_body`](Self::submit_response_with_body), with the same
     /// open-stream and single-response guards.
-    // Its only Phase-1 caller is a test; the connection entry points that call it in
-    // production arrive in Phase 2.
     #[cfg(feature = "http")]
-    #[allow(dead_code)]
     pub(crate) fn submit_response_with_shared_body(
         &mut self,
         stream: StreamId,

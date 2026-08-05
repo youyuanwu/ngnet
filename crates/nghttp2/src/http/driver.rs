@@ -34,7 +34,7 @@ use core::future::Future;
 use core::task::Poll;
 use std::collections::VecDeque;
 use std::error::Error as StdError;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use bytes::{Bytes, BytesMut};
 use http_body::Body;
@@ -42,10 +42,11 @@ use http_body::Body;
 use crate::settings::Setting;
 use crate::state::SendRecord;
 use crate::{
-    ErrorCode, FrameType, HeaderAction, HeaderCategory, Session, SessionBuilder, StreamId,
+    ErrorCode, FrameType, Header, HeaderAction, HeaderCategory, Session, SessionBuilder, StreamId,
 };
 
 use super::body::outgoing::Outgoing;
+use super::body::shared::SharedOutgoing;
 use super::config::Config;
 use super::error::{Error, ErrorKind, Result};
 use super::head;
@@ -630,9 +631,9 @@ where
         let mut coalesced = BytesMut::new();
         // The no-copy record sink, retained across passes exactly as the buffers above
         // are. `send_into` appends the header/payload records the send callback deposited,
-        // and `flush` drains it after every call. In this phase nothing constructs a shared
-        // body, so it stays empty; keeping it here makes the seam live and lets a later
-        // phase write its contents without touching this loop's shape.
+        // and `flush` drains it — in order, ahead of each call's block — after every call.
+        // A push-model connection never constructs a shared body, so on those it stays
+        // empty; a no-copy connection fills and drains it every pass.
         let mut send_records: Vec<SendRecord> = Vec::new();
 
         loop {
@@ -848,6 +849,144 @@ where
     let waker = Arc::new(StreamWaker::new(Arc::clone(shared), liveness));
     let source = Outgoing::new(body, Arc::clone(&waker), Arc::clone(shared));
     (source, waker)
+}
+
+/// Wraps a caller's body for the session as a *no-copy* source, with its resume waker.
+///
+/// The no-copy counterpart of [`outgoing_body`]: it builds a [`SharedOutgoing`] instead of
+/// an [`Outgoing`], so the body's own [`bytes::Bytes`] is handed to the session rather than
+/// copied into libnghttp2's serialisation buffer — the memset of that buffer and the
+/// source-side copy into it are both gone. The payload is still coalesced once into the
+/// driver's own buffer before the write, so it does not yet reach the transport uncopied;
+/// Phases 3 and 4 remove that remaining copy. The waker and liveness plumbing are
+/// identical, because deferral and resumption work the same way whichever kind of source
+/// is underneath.
+pub(crate) fn shared_outgoing_body<B>(
+    shared: &Arc<Shared>,
+    liveness: Weak<()>,
+    body: B,
+) -> (SharedOutgoing<B>, Arc<StreamWaker>)
+where
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    let waker = Arc::new(StreamWaker::new(Arc::clone(shared), liveness));
+    let source = SharedOutgoing::new(body, Arc::clone(&waker), Arc::clone(shared));
+    (source, waker)
+}
+
+/// How a connection submits the bodies it carries: by copying, or by handing them over.
+///
+/// A connection is wholly one or wholly the other — the choice is fixed when it is built,
+/// not per request (design decision D7 and FR-012) — so it is a type parameter on the
+/// role rather than a runtime branch. Both implementations are zero-sized; the trait
+/// carries no state, only the two submission acts that differ between the push and no-copy
+/// paths. Everything else a role does is identical whichever body plan it holds, which is
+/// why the plan reaches no further than these two methods.
+///
+/// This is entirely crate-internal: the roles that carry it are private, so widening a
+/// role from `Role<B>` to `Role<B, P>` is invisible to callers. The public opt-in is the
+/// four `*_shared*` entry points, each of which simply fixes `P` to [`SharedBodies`].
+pub(crate) trait BodyPlan<B>: Send + 'static
+where
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    /// Submits `body` as a request, returning the assigned stream and its resume waker.
+    fn submit_request(
+        shared: &Arc<Shared>,
+        session: &mut Session<Events>,
+        liveness: Weak<()>,
+        views: &[Header<'_>],
+        body: B,
+    ) -> Result<(StreamId, Arc<StreamWaker>)>;
+
+    /// Submits `body` as a response on an already-open stream, returning its resume waker.
+    fn submit_response(
+        shared: &Arc<Shared>,
+        session: &mut Session<Events>,
+        liveness: Weak<()>,
+        stream: StreamId,
+        views: &[Header<'_>],
+        body: B,
+    ) -> Result<Arc<StreamWaker>>;
+}
+
+/// The push body plan: each chunk is copied into libnghttp2's frame buffer.
+///
+/// The plan every connection uses today, and every one that does not opt in to no-copy.
+pub(crate) struct PushBodies;
+
+impl<B> BodyPlan<B> for PushBodies
+where
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    fn submit_request(
+        shared: &Arc<Shared>,
+        session: &mut Session<Events>,
+        liveness: Weak<()>,
+        views: &[Header<'_>],
+        body: B,
+    ) -> Result<(StreamId, Arc<StreamWaker>)> {
+        let (source, waker) = outgoing_body(shared, liveness, body);
+        let stream = session.submit_request_with_body(views, source)?;
+        Ok((stream, waker))
+    }
+
+    fn submit_response(
+        shared: &Arc<Shared>,
+        session: &mut Session<Events>,
+        liveness: Weak<()>,
+        stream: StreamId,
+        views: &[Header<'_>],
+        body: B,
+    ) -> Result<Arc<StreamWaker>> {
+        let (source, waker) = outgoing_body(shared, liveness, body);
+        session.submit_response_with_body(stream, views, source)?;
+        Ok(waker)
+    }
+}
+
+/// The no-copy body plan: each chunk is handed over as the caller's own [`bytes::Bytes`].
+///
+/// Bounded on `B::Data = Bytes`, which is what makes the hand-over possible — the payload
+/// libnghttp2 would otherwise copy is already a reference-counted buffer the crate can
+/// give away. This bound is why no-copy is a parallel set of entry points rather than a
+/// widening of the existing ones (design decision D1).
+pub(crate) struct SharedBodies;
+
+impl<B> BodyPlan<B> for SharedBodies
+where
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    fn submit_request(
+        shared: &Arc<Shared>,
+        session: &mut Session<Events>,
+        liveness: Weak<()>,
+        views: &[Header<'_>],
+        body: B,
+    ) -> Result<(StreamId, Arc<StreamWaker>)> {
+        let (source, waker) = shared_outgoing_body(shared, liveness, body);
+        let stream = session.submit_request_with_shared_body(views, source)?;
+        Ok((stream, waker))
+    }
+
+    fn submit_response(
+        shared: &Arc<Shared>,
+        session: &mut Session<Events>,
+        liveness: Weak<()>,
+        stream: StreamId,
+        views: &[Header<'_>],
+        body: B,
+    ) -> Result<Arc<StreamWaker>> {
+        let (source, waker) = shared_outgoing_body(shared, liveness, body);
+        session.submit_response_with_shared_body(stream, views, source)?;
+        Ok(waker)
+    }
 }
 
 /// Attaches a received trailer block to the message it belongs to.
@@ -1115,20 +1254,66 @@ async fn flush<W: TransportWrite>(
     out.clear();
 
     loop {
-        let block = session.send_into(events, send_records)?;
+        let block = match session.send_into(events, send_records) {
+            Ok(block) => block,
+            Err(error) => {
+                // `send_into` appends whatever the send callback recorded *before* it
+                // reports a failure, so records can be sitting in the sink on this path.
+                // Dropping them here is what keeps the drain-to-empty invariant true on
+                // the error exit as well as the success one: the payloads they hold are
+                // the caller's own `Bytes`, and releasing this crate's handle to them is
+                // exactly what a torn-down connection should do (design decision D3).
+                send_records.clear();
+                return Err(error.into());
+            }
+        };
 
-        // Records the send callback deposited during this call belong on the wire before
-        // the block the call returns. Draining after *every* call — the final one that
-        // returns `None` included — is required: libnghttp2's no-copy branch can deposit a
-        // record without contributing any octets to the returned block, so a record can
-        // ride along with a `None`. In this phase nothing constructs a shared body, so the
-        // sink is always empty and this drain is a no-op; a later phase writes the records,
-        // in order, at exactly this point.
-        debug_assert!(
-            send_records.is_empty(),
-            "no shared body exists in this phase, so the send callback cannot have recorded a frame"
-        );
-        send_records.clear();
+        // Records the send callback deposited during this call belong on the wire *before*
+        // the block the call returns, and after everything earlier calls produced. The
+        // first record of a pass is what tips the pass onto the coalescing path: anything
+        // a fast strategy has accumulated so far is flushed so it precedes the record,
+        // and from here the whole remainder of the pass — records and blocks alike — is
+        // appended to `out` in order. This reuses the existing fallback-to-coalescing
+        // machinery rather than inventing a second ordered-write path; a pass that
+        // produces a record degrades to one coalescing write, which is correct and no
+        // worse than what a large session block already costs. Phase 3 removes the copy by
+        // offering the records as regions instead of coalescing them.
+        //
+        // Draining after *every* call — the final one that returns `None` included — is
+        // required: libnghttp2's no-copy branch can deposit a record without contributing
+        // any octets to the returned block, so a record can ride along with a `None`.
+        if !send_records.is_empty() {
+            if !coalescing {
+                // Everything the vectored path has gathered so far precedes these records,
+                // so it goes out first, exactly as the trailing flush below does.
+                if !gathered.is_empty() {
+                    // Not `?`: a failing write must not carry the sink out of the pass
+                    // with it. The sink is retained across passes, so records left in it
+                    // here would be written at the head of some later pass, long after
+                    // the frames around them — and after libnghttp2 has already accounted
+                    // them as sent. Clearing is the right disposal because a write failure
+                    // tears the connection down; the payloads are the caller's own `Bytes`
+                    // and releasing this crate's handle is exactly what should happen.
+                    let written = match write_gathering(writer, gathered, &[]).await {
+                        Ok(written) => written,
+                        Err(error) => {
+                            send_records.clear();
+                            return Err(error);
+                        }
+                    };
+                    match written {
+                        Gathered::All => {}
+                        Gathered::Declined { done } => out.extend_from_slice(&gathered[done..]),
+                    }
+                    gathered.clear();
+                }
+                coalescing = true;
+            }
+            for record in send_records.drain(..) {
+                out.extend_from_slice(&record.header);
+                out.extend_from_slice(&record.payload);
+            }
+        }
 
         let Some(block) = block else { break };
 
@@ -1227,6 +1412,16 @@ async fn flush<W: TransportWrite>(
         }
         pending = returned.slice(written..);
     }
+
+    // The sink was drained after every `send_into` above — the final `None`-returning one
+    // included — so it is empty on the success path exactly as it is on the error path
+    // that returns early. This is the drain-to-empty invariant of D3, which is what makes
+    // it safe that libnghttp2's `want_write` knows nothing about the records: a record can
+    // never outlive the pass that produced it.
+    debug_assert!(
+        send_records.is_empty(),
+        "flush left records in the sink; they would outlive the pass and be lost"
+    );
     Ok(())
 }
 
