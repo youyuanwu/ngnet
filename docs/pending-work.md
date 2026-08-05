@@ -78,16 +78,20 @@ test, and no more.
   large. It reaches zero steady-state allocation *and* one write per pass: on eight
   multiplexed streams, 0 allocations and 1 write, against the borrowed path's 0 and 513.
   Measured, `ngrs-tokio` improved **-52% at N=8 and -59% at N=64**, reaching parity with
-  io_uring, and 1 MiB body throughput *rose* 9% rather than regressing. See
-  `docs/benchmarks.md`.
-- **True zero-copy DATA payloads are still open.** Gathering avoids the driver's copy, but
-  libnghttp2 still copies each body into its own serialisation buffer before we see it.
-  `NGHTTP2_DATA_FLAG_NO_COPY` with `nghttp2_send_data_callback` would eliminate that too, by
-  handing the 9-byte frame header and the payload over separately. It was scoped out of the
-  vectored work deliberately: it requires a send-data callback whose reentrancy interacts
-  with the existing bridge, and the measured gain from gathering alone already put this crate
-  ahead of hyper at 1 MiB. Worth revisiting only if profiling shows that remaining copy
-  dominating.
+  io_uring. Body uploads improved where a `HEADERS` block could be folded into the first DATA
+  frame's `writev` (-15% at 1 KiB, -14% at 64 KiB); at 1 MiB the effect is neutral, which is
+  what was wanted there — the goal at large bodies was to avoid the copy a coalescing path
+  would have imposed, not to gain. See `docs/benchmarks.md`.
+- **True zero-copy DATA payloads are still open, and are now the remaining copy.** Gathering
+  removed the driver's copy, but libnghttp2 still copies every body into its own serialisation
+  buffer before we ever see it — measurement confirms DATA reaches us as 16393-byte blocks,
+  i.e. the 9-byte frame header already joined to a copied 16384-byte payload.
+  `NGHTTP2_DATA_FLAG_NO_COPY` with `nghttp2_send_data_callback` would eliminate it, handing the
+  frame header and the payload over separately so the payload can go straight into a `writev`
+  region. It was scoped out of the vectored work deliberately: it requires a send-data callback
+  whose reentrancy interacts with the existing bridge, and gathering alone already brought this
+  crate level with hyper at 1 MiB. This is the obvious next lever if large-body throughput ever
+  needs to improve.
 - **The write-path asymmetry is unmeasured on a real NIC.** Benchmarks show tokio's borrowed
   zero-copy write cancelling io_uring's syscall advantage at 1 MiB bodies, over loopback. Whether
   that holds where real device interrupts exist is unknown, and loopback biases against
@@ -122,10 +126,12 @@ These are not gaps. They are decisions, recorded so they are not mistaken for ov
   kernel to own the buffer. Gathering was measured to dominate rather than trade — zero
   steady-state allocation *and* one write per pass — so there is no longer a knob-shaped
   question here for a readiness transport. What remains open is narrower: `VECTORED_THRESHOLD`
-  is 256 bytes, untuned, and deliberately so, because real block sizes are sharply bimodal
-  (at most ~74 bytes, or at least ~16 KiB) and any threshold between roughly 64 and 16384
-  partitions real traffic identically. A workload with a different frame-size distribution
-  would be the reason to revisit it.
+  is 256 bytes, untuned, and deliberately so. Dumping real block sizes shows the distribution
+  is sharply bimodal with nothing in between — control and `HEADERS` blocks at 9–73 bytes,
+  DATA blocks at 16392–16393 (a 16 KiB payload with its 9-byte header already joined) — so any
+  threshold between roughly 128 and 16384 partitions real traffic identically. `h2` picks the
+  same 256 for the same reason. A peer advertising a small `MAX_FRAME_SIZE`, or a workload of
+  many medium-sized frames, would be the reason to revisit it.
 
 ## Testing gaps worth closing eventually
 

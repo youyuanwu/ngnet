@@ -69,6 +69,17 @@ strategy and *is* how that strategy writes:
   `VECTORED_THRESHOLD` it emits `[accumulated, block]` as a two-region `writev` — the large
   block is never copied. One syscall per pass in the common case, zero allocation in steady
   state. Never more than two regions, so `IOV_MAX` is not a concern.
+
+  This does buffer, and the buffering is the point: small blocks are copied so that they cost
+  no syscall, while anything large enough to be worth its own syscall is never copied. It is
+  the same design `h2` uses, arrived at independently and landing on the same threshold —
+  `h2`'s `FramedWrite` keeps a `BytesMut`, copies frames below `CHAIN_THRESHOLD` (256 when the
+  transport reports `is_write_vectored`, 1024 when it does not), chains larger DATA payloads
+  uncopied, and hands the pair to `writev`. Two differences are worth knowing: `h2` preallocates
+  16 KiB per connection where this driver starts empty and grows to its steady-state high-water
+  mark, and `h2` tops the buffer up from the head of a chained payload when the accumulation is
+  smaller than the threshold, so its first region is never a runt. Neither difference has been
+  measured to matter here, and the second is a refinement this driver does not make.
 - `write_borrowed` returns `Some` to elect the **borrowed** path: the session's own blocks go
   out directly, several small writes per pass but zero allocation and zero copy.
 - Both returning `None` (the default) leaves the **coalesced** path: one write per pass,

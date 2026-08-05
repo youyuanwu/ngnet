@@ -188,21 +188,41 @@ and serve as drift controls.
 | Concurrent, N=1 | 25.16 µs | 25.68 µs | +2.1%, within drift |
 | Body 1 KiB | 52.33 µs (18.6 MiB/s) | 44.53 µs (21.9 MiB/s) | −14.9% |
 | Body 64 KiB | 165.05 µs (379 MiB/s) | 141.33 µs (**442 MiB/s**) | −14.4% |
-| Body 1 MiB | 2018.73 µs (495 MiB/s) | 1829.76 µs (**547 MiB/s**) | −9.4% |
+| Body 1 MiB | 2018.73 µs (495 MiB/s) | 1829.76 µs (547 MiB/s) | −9.4%, but see below — treat as neutral |
 
 In the same runs `ngrs-compio` measured 61.85 µs at N=8 and 379.83 µs at N=64, and
 `hyper-tokio` 67.78 µs and 391.27 µs — so **the tokio transport is now at parity with io_uring
 and slightly ahead of hyper**, having been 2.1× and 2.4× slower than compio at those points.
-At 1 MiB the ordering `hyper > borrowed tokio > coalescing compio` became
-`gathering tokio ≥ hyper > coalescing compio` (547, 531, 482 MiB/s in the same runs).
+At 1 MiB the three arms measured 547 (gathering tokio), 531 (hyper) and 482 (coalescing
+compio) MiB/s in the same runs — but see the caveat below before reading an ordering into the
+first two, which are within this arm's run-to-run spread of each other.
 
-The 1 MiB gain deserves an explanation, since gathering was adopted to *avoid a regression*
-there rather than to produce a gain. A 1 MiB body drains as roughly 64 DATA frames of 16 KiB;
-the borrowed path issued a separate `write(2)` for each 9-byte frame header *and* each
-payload. Gathering folds each header into the same `writev` as its payload, halving the
-syscall count on the body path too. That arm is also the noisiest in the suite (10.2% spread
-between the two baseline repetitions), so the honest claim is "no regression, and a gain of
-roughly 5–10%" rather than a precise figure.
+**Why the body arms move, and why the 1 MiB figure should not be believed.** The explanation
+first written here was wrong and is worth recording as such: it claimed libnghttp2 emits each
+9-byte DATA frame header as its own block, so that the borrowed path wrote header and payload
+separately and gathering halved the count. Dumping the actual block sizes falsifies it —
+libnghttp2 hands back the header *already joined* to its payload, as a single 16393-byte block
+(16384 + 9). There is no separate header write to fold.
+
+The real arithmetic follows from the block distribution, which is sharply bimodal: control and
+`HEADERS` blocks are ≤ ~73 bytes, DATA blocks are 16392–16393. Only the small ones accumulate,
+so what gathering saves on a body upload is the *`HEADERS` block*, folded into the first DATA
+frame's `writev`, and nothing else — every DATA block already exceeds the threshold and goes
+out as its own single-region call either way:
+
+| Body | Borrowed writes | Gathering writes | Reduction |
+| --- | --- | --- | --- |
+| 1 KiB | 2 | **1** | 50% |
+| 64 KiB | 5 | **4** | 20% |
+| 1 MiB | 65 | **64** | 1.5% |
+
+That matches the measured −14.9% and −14.4% at 1 KiB and 64 KiB. It does **not** explain
+−9.4% at 1 MiB, where only one syscall in sixty-five is saved. That arm is also the noisiest in
+the suite — 10.2% spread between the two baseline repetitions alone — so the honest reading is
+that **1 MiB is neutral, within noise**, which is exactly what gathering was adopted to achieve
+there. The goal at large bodies was to avoid the regression coalescing would have caused by
+copying, not to produce a gain, and a gain should not be claimed merely because the number came
+out that way.
 
 **Two arms first appeared to regress, and both were drift.** Serial latency showed +6.8% and
 empty-body +5.1% under a design that ran both baseline repetitions and then both branch
