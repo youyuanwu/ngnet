@@ -110,70 +110,67 @@ test, and no more.
   A shrink policy for `out` is defensible on footprint grounds; it is not needed for
   correctness, and retention is the same tradeoff the driver's other reused collections
   already accept.
-- **True zero-copy DATA payloads are still open, and are now the remaining copy — in fact two.**
-  Gathering removed the driver's copy, but every body byte is still touched twice before it
-  reaches a socket, both inside the read-body callback (`crates/nghttp2/src/callbacks.rs`):
-  libnghttp2 hands over an uninitialised frame buffer, which is `write_bytes(.., 0, length)`
-  zeroed in full — necessary today, both because forming a `&mut [u8]` over uninitialised
-  memory is undefined behaviour and because a body source must never observe another stream's
-  plaintext left in a reused buffer — and the source then copies the payload into it. So a
-  16 KiB DATA frame costs a 16 KiB memset plus a 16 KiB copy before the write even starts.
+- **Zero-copy DATA payloads are done, and what remains is the shape of the opt-in.**
+  `NGHTTP2_DATA_FLAG_NO_COPY` with `nghttp2_send_data_callback` is implemented. A connection
+  opened with `handshake_shared`/`serve_shared` (or their `_with` forms) hands its bodies over
+  instead of copying them: libnghttp2 never touches the frame payload buffer, so both the
+  memset and the source-side copy are gone, and the payload reaches the transport as the
+  caller's own `Bytes`. The push-model API is unchanged and remains the default.
 
-  `NGHTTP2_DATA_FLAG_NO_COPY` with `nghttp2_send_data_callback` would remove both, handing the
-  9-byte frame header and the payload over separately so the payload can go straight into a
-  `writev` region from the caller's own `Bytes`. **The costs are real and were the reason it
-  was scoped out:**
+  The six recorded obstacles resolved as follows. (1) The callback is indeed synchronous and
+  all-or-nothing, and is designed around rather than defeated: it *records* header and payload
+  and returns, and the driver writes after `mem_send2` returns. (2) `WOULDBLOCK` is indeed
+  unusable, and is never returned. (3) "Reports sent-before-wire" **dissolved** — the existing
+  copying path already accounts a frame as sent before the application writes its block, so
+  this was never a new concession. (4) `IOV_MAX` did return, and is handled by a retained
+  descriptor list capped at `MAX_REGIONS = 64` with a generalised partial-write retry. (5) The
+  no-`unsafe` boundary held: the callback records into a sink that the driver drains, which is
+  the new plumbing seam. (6) The API did change, additively — the opt-in is a parallel set of
+  entry points, and the no-copy source trait stayed crate-private.
 
-  1. **The callback is synchronous and all-or-nothing.** It is invoked from inside
-     `nghttp2_session_mem_send2` (`nghttp2_session.c:3043`, `session_call_send_data`), so
-     nothing inside it can `.await`. It must send the *complete* frame; the header is explicit
-     that a partial send is unrecoverable and leaves teardown as the only option.
-  2. **`WOULDBLOCK` is not usable as backpressure as things stand.** Returning it makes
-     `mem_send_internal` `return 0`, which `Session::send` maps to `Ok(None)` — indistinguishable
-     from "nothing left to send", so the driver would treat the pass as finished and park.
-  3. **So the only viable shape is "record, don't write":** copy the 9-byte header (it points
-     into libnghttp2's own buffer and *is* invalidated), clone the payload handle, append both
-     to a pending region list, return 0, and let the driver's `writev` do the writing after
-     `mem_send2` returns. That means reporting a frame as sent slightly before it is on the
-     wire, which is tolerable only because a transport error tears the connection down anyway.
-  4. **It reintroduces `IOV_MAX`.** The present design is capped at two regions, which is why
-     the limit is currently a non-concern; a pass full of no-copy DATA frames would produce
-     many, needing a cap and a generalised partial-`writev` retry.
-  5. **It crosses the no-`unsafe` boundary.** The callback is `extern "C"` and must live below
-     `src/http/`, while the region list it appends to belongs to the driver inside it — so this
-     needs a new plumbing seam rather than a local change.
-  6. **It changes public API.** `fill(&mut [u8])` is a push model; no-copy needs a source that
-     *hands out* bytes it already owns. Sources that genuinely generate bytes gain nothing, so
-     both paths would have to coexist.
+  **The completion transport now gathers.** `CompioIo` overrides an owned-region strategy whose
+  regions are owned `Bytes`, which satisfies compio's `IoVectoredBuf: 'static` bound and reaches
+  a real `IORING_OP_SENDMSG`. The structural reason it could not gather — that borrowed
+  `IoSlice`s can never be `'static` — was correctly diagnosed here, and handing bodies over is
+  what removed it.
 
-  **It would also unlock gathering for the completion transport, which is a second prize not
-  counted above.** `CompioIo` takes the coalescing path today and cannot do otherwise: compio's
-  vectored write is real — `TcpStream::write_vectored` reaches `IORING_OP_SENDMSG` with an
-  iovec array (`compio-net-0.12.2/src/tcp.rs:628`,
-  `compio-driver-0.12.4/src/sys/op/socket/iour.rs:159-171`) — but it is gated behind
-  `pub trait IoVectoredBuf: 'static` (`compio-buf-0.8.3/src/io_vec_buf.rs:12`). A completion
-  API must own its buffers, since the kernel writes from them after submission, and this
-  crate's `write_vectored` hands out borrowed `IoSlice`s that can never be `'static`. Owning
-  the large block would mean copying it, which is the coalescing path already taken, so there
-  is nothing to gain as things stand.
+  **Two claims in the original entry were wrong, and measurement is what caught them.**
 
-  No-copy changes that: the payload becomes the caller's own `Bytes` rather than a borrow of
-  libnghttp2's serialisation buffer, and compio implements `IoBuf for bytes::Bytes` with
-  `IoVectoredBuf` for `[T; N]`, so `[header, payload]` becomes a valid vectored buffer and a
-  genuine zero-copy `SENDMSG` becomes reachable on io_uring. That would need an owned-buffer
-  variant of the trait method alongside the borrowed one — a fourth strategy, and a real
-  addition to the transport surface, so it is a cost as well as a benefit.
+  1. *"Order 10% of a 1 MiB exchange, and nothing at all on small-body workloads."* The size
+     dependence is backwards. A 1 KiB body gains the **most** on the readiness transport
+     (−35.3%), because the memset zeroes `datamax` — up to 16 KiB — rather than the payload
+     length, so a 1 KiB body pays a full 16 KiB memset per frame.
+  2. *"On the completion transport the prize is larger."* It is much smaller: −4.07% at 1 MiB
+     against −30.6% for readiness. The reasoning assumed the completion side would also collect
+     the syscall collapse gathering gave the readiness side. It could not, because its
+     coalescing path already emitted one write per pass — there was no syscall prize left to
+     win, only the copy.
 
-  **Measure before building.** On the readiness transport the prize is one memset plus one copy
-  per body byte, which should matter only on large bodies — order 10% of a 1 MiB exchange on a
-  back-of-the-envelope memory-bandwidth estimate, and nothing at all on the small-body and
-  multiplexed workloads where this crate already sits at parity. On the completion transport
-  the prize is larger, because it is that same saving *plus* the syscall collapse the readiness
-  side already got from gathering, which `CompioIo` has never been able to take. A targeted
-  measurement of what fraction of a 1 MiB exchange is spent in the memset and the copy is the
-  cheap next step, and would decide whether any of the above is worth paying. Note that the two
-  prizes have different shapes: the readiness one is an incremental gain on a path already at
-  parity, the completion one closes a gap that is currently structural.
+  **The dominant mechanism was not the one that was costed.** The estimate priced copy removal,
+  but the readiness gain is mostly *write-count collapse*. Measured writes for one upload —
+  0 B `1→1`, 1 KiB `2→1`, 64 KiB `5→2`, 1 MiB `65→17` — track the measured gain and vanish
+  exactly where the ratio is 1. On the push path libnghttp2 returns one serialised block per
+  `mem_send2` call, so a large upload is one write per frame; handing the body over lets a
+  whole flow-control window's worth of frames ride in one gathering write. The batch is bounded
+  by the 64 KiB initial window, not by `MAX_REGIONS`, which is a guard rail rather than the
+  binding constraint. See `docs/benchmarks.md` for the numbers, the drift controls and the
+  method.
+
+  **What is actually still open:**
+
+  - **The completion result does not clear the drift bar.** −4.07% at 1 MiB is real in sign
+    across every clean replicate, but the untouched `compio-push` control arm moved 34.94% in
+    the same sessions, so by the stated criterion it is **not** a demonstrated win. It needs a
+    quieter machine and a pre-registered replicate count, not more argument.
+  - **The opt-in is per connection, not per body.** A caller who wants to hand over some bodies
+    and generate others on one connection cannot; they get the shared path for all of them, and
+    a source that genuinely generates bytes gains nothing from it. Making this per-body would
+    mean the two source models coexisting on one stream, which the current `BodyPlan` routing
+    deliberately does not do.
+  - **The opt-in is a separate entry point rather than a config flag**, which is a wider public
+    surface than a `Config` setting would have been. It is that way because the shared path
+    needs `B::Data = Bytes`, a bound the plain entry points do not carry and could not gain
+    without breaking callers.
 - **The write-path asymmetry is unmeasured on a real NIC.** Benchmarks show tokio's borrowed
   zero-copy write cancelling io_uring's syscall advantage at 1 MiB bodies, over loopback. Whether
   that holds where real device interrupts exist is unknown, and loopback biases against

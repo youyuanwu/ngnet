@@ -47,6 +47,10 @@ taskset -c 3 cargo bench -p nghttp2-bench --bench transport_concurrent_throughpu
 cargo bench -p nghttp2-bench --bench serial_latency
 cargo bench -p nghttp2-bench --bench concurrent_throughput
 cargo bench -p nghttp2-bench --bench body_throughput
+
+# The opt-in no-copy path against the push path: duplex, then real sockets.
+cargo bench -p nghttp2-bench --bench shared_body
+taskset -c 3 cargo bench -p nghttp2-bench --bench transport_shared_body
 ```
 
 Comparing against a saved baseline is the point of running these at all — a single run's
@@ -311,22 +315,92 @@ What survives from the original three-arm comparison:
 - **`ngrs-tokio` remains the fastest arm for a single empty-body round trip**, and gathering
   did not disturb that — at N=1 there is nothing to gather, so the path costs nothing.
 
+#### Handing bodies over, measured
+
+A connection built through the opt-in `handshake_shared`/`serve_shared` entry points hands its
+bodies to libnghttp2 as the caller's own `Bytes` rather than copying them into the frame
+buffer, and those frames serialise with `NGHTTP2_DATA_FLAG_NO_COPY`. Two new benchmark
+families measure it against the unchanged push path:
+
+- `benches/transport_shared_body.rs` — real loopback sockets, five arms: `compio-push`,
+  `compio-shared`, `tokio-push`, `tokio-shared`, `hyper-tokio` (carried untouched as a drift
+  control). Each shared arm is identical to its push twin but for the connection entry point.
+- `benches/shared_body.rs` — the duplex, three arms: `ngrs-push`, `ngrs-shared`, `hyper-tokio`.
+
+Arms are paired and adjacent within each size and sizes are the outer loop, so no arm runs to
+completion before its twin starts. The 0-byte point is a *mechanistic* control — with no body
+there is nothing to copy and nothing to gather, so the two arms cannot legitimately differ
+there — and, by a rule fixed before looking at the results, any replicate whose 0-byte paired
+delta exceeded ±5% was discarded whole. Three of ten socket replicates were excluded on that
+rule, leaving seven. `tests/fixtures_move_their_bytes.rs` asserts every arm echoes every size
+back at its exact length, so an arm cannot look faster by moving fewer bytes than its twin.
+
+Negative is faster. Real socket, seven clean replicates:
+
+| Body | `tokio` shared vs push | `compio` shared vs push |
+| --- | --- | --- |
+| 0 B | +1.0% (control) | −0.2% (control) |
+| 1 KiB | **−35.3%** | −0.9% |
+| 64 KiB | **−25.4%** | −3.3% |
+| 1 MiB | **−30.6%** | **−4.07%** |
+
+Drift controls over the same seven replicates: `hyper-tokio` (untouched) moved 5.05% at 0 B
+and 4.56% at 1 MiB; `tokio-push` (untouched) 4.33% and 7.22%; `compio-push` (untouched) 15.14%
+and **34.94%**. Duplex, three replicates: 1 KiB −9.2%, 64 KiB −9.7%, 1 MiB **−14.4%**, controls
+≤4.9%. The duplex 1 MiB figure lands almost exactly on the gate's pre-registered ceiling of
+14.98% of protocol CPU for that workload — a prediction made before the code existed,
+reproduced within half a point.
+
+**The dominant mechanism on the readiness path is write-count collapse, not copy removal.**
+The readiness gains are five times larger than the copy alone could explain, and that had to
+be accounted for rather than banked. Measured write counts for one upload, pinned by
+`http_shared_body.rs::handing_a_body_over_collapses_the_write_count_on_the_gathering_path`:
+0 B 1→1, 1 KiB 2→1, 64 KiB 5→2, 1 MiB 65→17. On the push path libnghttp2 returns one
+serialised block per `mem_send2` call — a DATA header joined to its 16 KiB payload — so a large
+upload is one write per frame; handing the body over turns each frame into two regions the
+driver gathers into a single write. The gain tracks that ratio and vanishes exactly at 0 B,
+where the ratio is 1. What bounds the batch at 1 MiB is the 64 KiB initial flow-control window,
+which admits about four 16 KiB frames per pass — **not** `MAX_REGIONS`, which is a guard rail
+here rather than the binding constraint.
+
+**SC-005 verdict: MET on the readiness transport, NOT MET on the completion transport.** The
+criterion requires the difference to exceed the movement of the drift controls in the same
+session.
+
+- **`tokio`, 1 MiB: MET.** −30.6%, consistent in sign and magnitude across all seven clean
+  replicates (−28.0% to −35.5%), against a largest control movement of 7.22%. It clears the bar
+  by more than four times, and the 0-byte control shows no effect exactly where the mechanism
+  predicts none.
+- **`compio`, 1 MiB: NOT MET.** The measured gain is −4.07%, but its own untouched control arm,
+  `compio-push`, moved **34.94%** across the same replicates, and by the criterion as written
+  4.07% does not clear that. This is reported as measured, not reworded into a win. The honest
+  qualification, which does not rescue the verdict: the *paired* delta is far steadier than that
+  spread — all seven replicates agree on sign and fall in a 2.8–5.4% band, as one expects if the
+  wander is a common-mode session effect hitting both arms together — but that is a weaker
+  statistical argument than SC-005 specifies. The completion transport gains far less because
+  its push path already coalesced a pass into one write, so it never had a syscall prize, only
+  the copy; and part of even that is spent minting frame headers the copying path got for free.
+
 ### Confounds, and which way each pushes
 
 Each is named with its direction, because a number without its bias is not evidence:
 
 - **The write-path asymmetry — was the dominant effect, and is now largely removed.** It is
-  kept here because it is the reason the arms ever diverged, and because it still applies to
-  the completion arm. The tokio transport now gathers (zero allocation, one `writev` per
-  pass); the completion transport structurally cannot borrow or gather a session block, since
-  the kernel must own the buffer for the duration, so it still coalesces and still pays a copy;
-  hyper coalesces by buffering. Before gathering, this **favoured the coalescing arms wherever
-  syscalls dominated** and accounted for the entire N=8/N=64 spread. With the tokio arm no
-  longer writing per block, what remains of the confound is the **copy** the completion arm
-  pays and the other two do not, which biases against compio on large bodies. That is not
-  permanent: the constraint is that a *session block* cannot be owned, and
-  `NGHTTP2_DATA_FLAG_NO_COPY` would make the payload the caller's own `Bytes` instead, which
-  compio can gather. See `docs/pending-work.md`.
+  kept here because it is the reason the arms ever diverged. The tokio transport now gathers
+  (zero allocation, one `writev` per pass); the completion transport still cannot borrow or
+  gather a *session block*, since the kernel must own the buffer for the duration, so a
+  push-model exchange through it coalesces and pays a copy; hyper coalesces by buffering.
+  Before gathering, this **favoured the coalescing arms wherever syscalls dominated** and
+  accounted for the entire N=8/N=64 spread. With the tokio arm no longer writing per block,
+  what remains of the confound is the **copy** the completion arm pays on pushed bodies and
+  the other two do not, which biases against compio on large bodies. That copy is no longer
+  structural: `NGHTTP2_DATA_FLAG_NO_COPY` is implemented, and a connection that hands its
+  bodies over makes the payload the caller's own `Bytes`, which even the completion transport
+  gathers as an owned region without copying (the owned-region strategy). What that buys,
+  measured, is in *Handing bodies over, measured* below — large on the readiness transport,
+  and honestly below this file's drift bar on the completion transport, because the completion
+  push path already coalesced a pass into one write, so there was never a syscall to save
+  there, only the copy.
 - **Loopback, not a network interface.** No real network latency, no device interrupts, no
   driver work — precisely the costs io_uring exists to amortise. This **biases against
   compio**; a real NIC would be expected to widen its lead rather than narrow it. Nothing

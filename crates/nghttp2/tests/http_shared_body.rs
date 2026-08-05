@@ -31,7 +31,9 @@ use nghttp2::http::testing::{
     failing_borrowed, failing_vectored, http_crate as http, scripted, serve,
 };
 use nghttp2::http::transport::{Transport, TransportWrite};
-use nghttp2::http::{Error as HttpError, IncomingBody, ResponseFuture, SendRequest};
+use nghttp2::http::{
+    Error as HttpError, IncomingBody, ResponseFuture, SendRequest, handshake, handshake_shared,
+};
 use nghttp2::{
     BytesBody, ErrorCode, FrameType, Header, HeaderAction, HeaderCategory, Session, SessionBuilder,
     StreamId,
@@ -1895,5 +1897,119 @@ fn a_no_copy_server_hands_its_response_body_back_intact() {
             expected,
             "a {len}-octet handed-over response body did not arrive intact",
         );
+    }
+}
+
+/// Uploads a body over a vectored duplex through the given entry point, and reports how many
+/// writes the client half performed.
+///
+/// A macro rather than a function because `handshake` and `handshake_shared` return distinct
+/// opaque connection futures, so the two cannot share one signature.
+///
+/// The two arms are identical but for the entry point, which is the same discipline the
+/// benchmark arms follow: whatever differs in the count is the body strategy.
+macro_rules! writes_for_upload {
+    ($body:expr, $handshake:ident) => {{
+        let (client_side, server_side) = duplex_vectored();
+        let counter = client_side.write_counter();
+
+        let (requests, connection) = $handshake::<_, Full>(client_side).expect("handshake");
+        let response = requests.send_request(upload("/writes", Full::new($body)));
+
+        let exchange = async {
+            let head = response.await.expect("a response");
+            assert_eq!(head.status(), http::StatusCode::OK);
+            for _ in 0..16 {
+                yield_now().await;
+            }
+            drop(requests);
+        };
+
+        let mut peer = ServerPeer::default();
+        block_on(alongside(
+            alongside(exchange, connection),
+            serve(server_side, server_peer(), &mut peer, answer_at_once),
+        ));
+
+        counter.get()
+    }};
+}
+
+/// Handing a body over collapses the write count on the gathering path, and that — not the
+/// copy it also removes — is the larger part of why the readiness benchmark arms move.
+///
+/// This test exists because the benchmark result was *too good*. Removing the memset and the
+/// source copy was measured, before any of this was built, to be worth at most about 5.8% of a
+/// real-socket 1 MiB exchange. The readiness arms moved five times that, and a gain larger than
+/// its stated mechanism is exactly the shape of a measurement artefact — so the mechanism had
+/// to be found or the result discarded.
+///
+/// It is real, and it is a second prize nobody had costed. On the push path libnghttp2 hands
+/// back one serialised block per `mem_send2` call, each a DATA frame header joined to its
+/// 16 KiB payload, so a large upload is one write per frame. Handing the body over turns each
+/// frame into two regions — a minted 9-byte header and the caller's own payload — which the
+/// driver accumulates into a single gathering write.
+///
+/// The measured counts, and the real-socket readiness gain each corresponds to:
+///
+/// | body | push writes | shared writes | ratio | measured `tokio-shared` gain |
+/// |------|-------------|---------------|-------|------------------------------|
+/// | 0 B     | 1  | 1  | 1.0x | none (+1.0%, inside drift) |
+/// | 1 KiB   | 2  | 1  | 2.0x | 35.3% |
+/// | 64 KiB  | 5  | 2  | 2.5x | 25.4% |
+/// | 1 MiB   | 65 | 17 | 3.8x | 30.6% |
+///
+/// The gain tracks the ratio and disappears exactly where the ratio is 1, which is what makes
+/// this the explanation rather than a coincidence. It also explains why the *completion*
+/// transport gains far less (about 4%): its push path already coalesced a whole pass into one
+/// write, so there was never a syscall prize there — only the copy, which is what the original
+/// estimate covered.
+///
+/// What bounds the batch at 1 MiB is *flow control*, not the region cap. The initial stream
+/// window is 64 KiB, so a pass emits about four 16 KiB frames — eight regions — before waiting
+/// for a `WINDOW_UPDATE`. That is comfortably under `MAX_REGIONS`, which is why the ratio is
+/// 3.8x rather than the `MAX_REGIONS / 2` a cap-bound batch would give. The cap is a guard
+/// rail here, not the binding constraint.
+///
+/// The assertions pin the ratios loosely and the 0 B control exactly: exact counts depend on
+/// framing and windowing details that are libnghttp2's business, but the *shape* — no change
+/// with no body, a growing collapse as the body grows — is the mechanism.
+#[test]
+fn handing_a_body_over_collapses_the_write_count_on_the_gathering_path() {
+    // With no body there is nothing to hand over and nothing to batch, so the two paths must
+    // agree exactly. This is the control: a difference here would mean everything below is
+    // measuring something other than body handling.
+    let empty_push = writes_for_upload!(Bytes::new(), handshake);
+    let empty_shared = writes_for_upload!(Bytes::new(), handshake_shared);
+    assert_eq!(
+        empty_push, empty_shared,
+        "with no body there is nothing to hand over, so both paths must write identically"
+    );
+
+    // Each larger body should collapse at least as much as the one below it.
+    let mut previous_ratio = 1.0;
+    for (size, least_ratio) in [(1024usize, 2.0), (64 * 1024, 2.0), (1024 * 1024, 3.0)] {
+        let body = Bytes::from(payload(size));
+        let push = writes_for_upload!(body.clone(), handshake);
+        let shared = writes_for_upload!(body.clone(), handshake_shared);
+
+        assert!(
+            shared < push,
+            "a {size}-byte body should need fewer gathering writes when handed over, but the \
+             shared path took {shared} against the push path's {push}"
+        );
+
+        let ratio = push as f64 / shared as f64;
+        assert!(
+            ratio >= least_ratio,
+            "a {size}-byte body should collapse the write count by at least {least_ratio}x, \
+             but {push} push writes became {shared} shared ones, only {ratio:.1}x"
+        );
+        assert!(
+            ratio >= previous_ratio,
+            "the collapse should not weaken as bodies grow: a {size}-byte body managed only \
+             {ratio:.1}x where a smaller one managed {previous_ratio:.1}x"
+        );
+        previous_ratio = ratio;
     }
 }

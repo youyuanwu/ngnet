@@ -51,7 +51,10 @@ use compio::runtime::Runtime as CompioRuntime;
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
 
 use nghttp2::http::transport::{CompioIo, TokioIo as NgHttpIo};
-use nghttp2::http::{Config, IncomingBody, SendRequest, handshake_with, serve_with};
+use nghttp2::http::{
+    Config, IncomingBody, SendRequest, handshake_shared_with, handshake_with, serve_shared_with,
+    serve_with,
+};
 
 use hyper::client::conn::http2 as hyper_client;
 use hyper::server::conn::http2 as hyper_server;
@@ -642,5 +645,145 @@ impl HyperSocket {
         while let Some(joined) = set.join_next().await {
             joined.expect("a request task");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The shared-body arms.
+//
+// Each of these stands up exactly the fixture above it, changing one thing: the connection
+// is opened with `handshake_shared_with` / `serve_shared_with` rather than the plain forms,
+// so bodies are handed over rather than copied. Same workload, same body type, same
+// transport, same runtime, same config — so a difference between an arm and its twin is the
+// body strategy or it is drift, and the unchanged arms measured in the same session are
+// what say which.
+//
+// They are deliberately near-duplicates of the push fixtures rather than a parameterised
+// abstraction: the whole point is that the two paths are independently constructed, so a
+// refactor cannot accidentally make an arm measure its own twin.
+// ---------------------------------------------------------------------------------------
+
+/// [`Ngrs`] over a duplex, opened on the shared-body path.
+pub struct NgrsShared {
+    handle: SendRequest<BenchBody>,
+}
+
+impl NgrsShared {
+    /// See [`Ngrs::establish`]. Differs only in the two entry points.
+    pub async fn establish() -> Self {
+        let (client_io, server_io) = duplex(DUPLEX_CAPACITY);
+
+        let server = serve_shared_with(NgHttpIo::new(server_io), ngrs_echo, ngrs_config())
+            .expect("a server connection");
+        tokio::spawn(server);
+
+        let (handle, connection) =
+            handshake_shared_with::<_, BenchBody>(NgHttpIo::new(client_io), ngrs_config())
+                .expect("a client connection");
+        tokio::spawn(connection);
+
+        Self { handle }
+    }
+
+    /// One request, awaited to its response head and then drained. See [`Ngrs::round_trip`].
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        let response = self
+            .handle
+            .send_request(request_for(body))
+            .await
+            .expect("a response head");
+        assert!(response.status().is_success());
+        drain(response.into_body()).await
+    }
+}
+
+/// [`TokioSocket`] over a real loopback socket, opened on the shared-body path.
+pub struct TokioSharedSocket {
+    handle: SendRequest<BenchBody>,
+}
+
+impl TokioSharedSocket {
+    /// See [`TokioSocket::establish`]. Differs only in the two entry points.
+    pub async fn establish() -> Self {
+        let (client_io, server_io) = tokio_socket_pair().await;
+
+        let server = serve_shared_with(NgHttpIo::new(server_io), ngrs_echo, ngrs_config())
+            .expect("a server connection");
+        tokio::spawn(server);
+
+        let (handle, connection) =
+            handshake_shared_with::<_, BenchBody>(NgHttpIo::new(client_io), ngrs_config())
+                .expect("a client connection");
+        tokio::spawn(connection);
+
+        Self { handle }
+    }
+
+    /// One request, awaited to its response head and then drained. See [`Ngrs::round_trip`].
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        let response = self
+            .handle
+            .send_request(request_for(body))
+            .await
+            .expect("a response head");
+        assert!(response.status().is_success());
+        drain(response.into_body()).await
+    }
+}
+
+/// [`CompioSocket`] over a real loopback socket, opened on the shared-body path.
+///
+/// This is the arm that was *expected* to gain most, and did not — which is why the expectation
+/// is recorded here rather than quietly dropped. The reasoning was that the completion push
+/// path pays a coalescing copy *as well as* the memset and the source copy, because compio's
+/// vectored write needs owned buffers and borrowed slices can never be `'static`; handing the
+/// body over makes the payload the caller's own `Bytes`, which is a valid owned region. All of
+/// that is true.
+///
+/// What it missed is that the coalescing path already gathered a whole pass into a single
+/// write, so this arm had no syscall collapse left to win — only the copy, and it gives part of
+/// that back minting frame headers. Measured, it gains *least*: about 4% at 1 MiB, against
+/// roughly 30% for the readiness arms, and that 4% does not clear the benchmark's own drift
+/// bar. See `docs/benchmarks.md`.
+pub struct CompioSharedSocket {
+    handle: SendRequest<BenchBody>,
+}
+
+impl CompioSharedSocket {
+    /// See [`CompioSocket::establish`]. Differs only in the two entry points.
+    pub async fn establish() -> Self {
+        let listener = CompioTcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding an ephemeral port");
+        let addr = listener.local_addr().expect("the bound address");
+
+        let client_io = CompioTcpStream::connect(addr)
+            .await
+            .expect("connecting to the server");
+        let (server_io, _peer) = listener.accept().await.expect("accepting the client");
+        compio_nodelay(&client_io);
+        compio_nodelay(&server_io);
+
+        let server = serve_shared_with(CompioIo::new(server_io), ngrs_echo, ngrs_config())
+            .expect("a server connection");
+        compio::runtime::spawn(server).detach();
+
+        let (handle, connection) =
+            handshake_shared_with::<_, BenchBody>(CompioIo::new(client_io), ngrs_config())
+                .expect("a client connection");
+        compio::runtime::spawn(connection).detach();
+
+        Self { handle }
+    }
+
+    /// One request, awaited to its response head and then drained. See [`Ngrs::round_trip`].
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        let response = self
+            .handle
+            .send_request(request_for(body))
+            .await
+            .expect("a response head");
+        assert!(response.status().is_success());
+        drain(response.into_body()).await
     }
 }

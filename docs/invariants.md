@@ -21,6 +21,7 @@ These assert properties of the *source*, not of runtime behaviour.
 | `the_async_subtree_contains_no_unsafe_at_all` | The async layer has none, anywhere. |
 | `no_test_needs_unsafe_to_use_the_api` | No test needs `unsafe` to *use* the crate. Exemptions are named individually, and `every_unsafe_exemption_is_still_earned` fails if one stops needing its exemption. |
 | `the_crate_declares_exactly_one_non_optional_dependency` | The sans-I/O claim is not quietly funded by a dependency. |
+| `the_frame_buffer_is_zeroed_only_on_the_copying_read_path` | The frame-buffer memset appears exactly once, and only inside `read_push_body`'s own body — proven by brace-bounded containment, not textual position. The no-copy shared read path hands nothing to a source and writes no payload into that buffer, so it must have no `write_bytes`; a second one, or one that migrated into the shared path, fails here. |
 
 The helpers have their own tests — `the_comment_stripper_actually_strips`,
 `the_unsafe_keyword_detector_distinguishes_identifiers`,
@@ -46,11 +47,13 @@ frames, not the one-off cost of standing a stream up.
 | `steady_state_send_allocates_nothing_on_the_borrowed_path` | Likewise for sending, on the borrowed write path. |
 | `steady_state_send_allocates_nothing_on_the_vectored_path` | Likewise on the gathering path — so gathering costs nothing the borrowed path did not. |
 | `steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path` | And still zero when eight streams are multiplexed, which is where the driver's own buffer would be tempted to grow. |
+| `steady_state_send_allocates_nothing_on_the_owned_region_path` | Likewise on the owned-region path — the completion transport's gathering strategy allocates nothing in steady state either. |
 | `the_read_buffer_pool_settles_to_a_fixed_size` | The pool reaches a high-water mark during warm-up and does not grow afterwards. |
 | `the_owned_write_path_coalesces_a_pass_into_one_write` | One write per pass, with more than one frame's worth of bytes — so the single write is not trivially single. |
 | `the_borrowed_write_path_writes_each_block_separately` | More than one write per pass on identical traffic, constant across passes. |
 | `the_vectored_write_path_coalesces_a_multiplexed_pass_into_one_write` | One write for a whole multiplexed pass — the coalesced path's write count at the borrowed path's allocation count, which is the entire claim of the strategy. |
 | `the_vectored_write_path_writes_once_per_large_block_and_no_more` | A large block still costs exactly one write, so gathering never degenerates into a write per region. |
+| `the_owned_region_write_path_coalesces_a_pass_into_one_write` | The owned-region (completion) path coalesces a push-model pass into one write — indistinguishable from the owned path here, since a payload only rides its own region once a body is handed over. |
 | `the_owned_write_path_reuses_its_coalescing_buffer` | The owned path reuses its coalescing buffer rather than rebuilding it per pass, so it too allocates nothing in steady state — it pays a copy, not an allocation. |
 | `waking_parked_handlers_allocates_nothing` | Waking parked server handlers repeatedly allocates nothing. |
 | `the_counter_notices_a_deliberate_allocation` | The measuring instrument works, guarding every test above against a false pass. |
