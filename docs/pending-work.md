@@ -171,6 +171,14 @@ test, and no more.
     surface than a `Config` setting would have been. It is that way because the shared path
     needs `B::Data = Bytes`, a bound the plain entry points do not carry and could not gain
     without breaking callers.
+  - **Two follow-ups were considered and deliberately deferred**, both because they are
+    conditional on experience the crate does not have yet:
+    - *A crate-provided enum body*, so one connection could carry both body kinds without the
+      caller hand-rolling the choice. Worth doing only if the whole-connection constraint above
+      proves awkward in practice, which needs callers to have used the shipped shape first.
+    - *Exposing the no-copy source trait to sans-I/O callers.* The trait is `pub(crate)` today.
+      Worth doing only if the driver-side design generalises cleanly, which is not yet known;
+      exporting it early would freeze a shape chosen for one consumer.
 - **The write-path asymmetry is unmeasured on a real NIC.** Benchmarks show tokio's borrowed
   zero-copy write cancelling io_uring's syscall advantage at 1 MiB bodies, over loopback. Whether
   that holds where real device interrupts exist is unknown, and loopback biases against
