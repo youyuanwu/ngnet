@@ -46,9 +46,9 @@ impl Settings {
 
     /// The largest field section this endpoint will accept, in bytes.
     ///
-    /// Values are clamped to the QUIC varint maximum. nghttp3 asserts that bound and
-    /// asserts are compiled out of a release build, where an over-large value would be
-    /// encoded into a corrupt SETTINGS frame instead.
+    /// Values are clamped to the QUIC varint maximum. nghttp3 checks that bound with an
+    /// `assert`, which is not something a safe API may rely on — see the note on
+    /// assertions in [`crate::Conn`].
     pub fn max_field_section_size(mut self, size: u64) -> Self {
         self.raw.max_field_section_size = size.min(MAX_VARINT);
         self

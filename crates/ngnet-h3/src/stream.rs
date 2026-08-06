@@ -1,9 +1,10 @@
 //! Stream identity.
 //!
 //! nghttp3 names streams by their QUIC wire identifier (RFC 9000 §2.1), and validates the
-//! ones it is given only with `assert` — which a release build compiles out. Passing a
+//! ones it is given only with `assert`, which is not an error report. Passing a
 //! bidirectional identifier where a unidirectional one is required, or one above the
-//! varint range, is therefore not an error in a release build but undefined behaviour.
+//! varint range, therefore aborts or corrupts state rather than failing — see the note
+//! on assertions in [`crate::Conn`].
 //!
 //! [`StreamId`] exists to make that unreachable. Its inner value is private and every API
 //! in this crate that names a stream takes a `StreamId`, so the range check happens once,
@@ -118,7 +119,7 @@ impl StreamId {
     /// Whether this stream is a request stream opened by the client.
     ///
     /// nghttp3 asserts this when a request is submitted and when it decides whether a
-    /// stream can carry peer data, and asserts are compiled out of a release build, so
+    /// stream can carry peer data, and an assert is not a check a safe API may rely on, so
     /// this crate checks it instead.
     pub(crate) const fn is_client_bidirectional(self) -> bool {
         matches!(self.directionality(), Directionality::Bidirectional)

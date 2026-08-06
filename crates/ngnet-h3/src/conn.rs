@@ -8,7 +8,9 @@ use crate::alloc::Allocator;
 use crate::body::BodySource;
 use crate::callbacks::{Bridge, BridgeGuard, BridgeSlot};
 use crate::error::{Error, ErrorCode, Result};
-use crate::handlers::{FieldAction, FieldSection, FieldToken, Handlers, StreamClosed};
+use crate::handlers::{
+    FieldAction, FieldSection, FieldToken, Handlers, PeerSettings, Shutdown, StreamClosed,
+};
 use crate::header::Header;
 use crate::send::SendGuard;
 use crate::settings::Settings;
@@ -193,6 +195,45 @@ impl<C> ConnBuilder<C> {
         self
     }
 
+    /// Called when the QUIC layer should send `STOP_SENDING` on a stream.
+    ///
+    /// nghttp3 will not read any more of what the peer is sending on that stream. Because
+    /// this crate owns no transport, acting on it is the caller's: without a
+    /// `STOP_SENDING`, the peer keeps sending bytes nothing will ever read.
+    pub fn on_stop_sending(
+        mut self,
+        handler: impl FnMut(&mut C, StreamId, ErrorCode) + Send + 'static,
+    ) -> Self {
+        self.handlers.stop_sending = Some(Box::new(handler));
+        self
+    }
+
+    /// Called when the QUIC layer should reset a stream.
+    ///
+    /// The sending-direction counterpart of [`ConnBuilder::on_stop_sending`].
+    pub fn on_reset_stream(
+        mut self,
+        handler: impl FnMut(&mut C, StreamId, ErrorCode) + Send + 'static,
+    ) -> Self {
+        self.handlers.reset_stream = Some(Box::new(handler));
+        self
+    }
+
+    /// Called when the peer begins a graceful shutdown.
+    pub fn on_shutdown(mut self, handler: impl FnMut(&mut C, Shutdown) + Send + 'static) -> Self {
+        self.handlers.shutdown = Some(Box::new(handler));
+        self
+    }
+
+    /// Called once the peer's settings have arrived.
+    pub fn on_peer_settings(
+        mut self,
+        handler: impl FnMut(&mut C, PeerSettings) + Send + 'static,
+    ) -> Self {
+        self.handlers.peer_settings = Some(Box::new(handler));
+        self
+    }
+
     /// Creates the connection.
     pub fn build(self) -> Result<Conn<C>> {
         Conn::new(self.role, self.settings, self.handlers)
@@ -213,6 +254,18 @@ impl<C> ConnBuilder<C> {
 /// behaviour, a connection latches those conditions and refuses all further work with
 /// [`crate::ErrorKind::ConnectionUnusable`]. Recoverable errors — a stream already in use,
 /// a role already bound, a connection that is closing — do not have that effect.
+///
+/// # A note on assertions
+///
+/// nghttp3 states a great many preconditions only with C `assert`, and this crate checks
+/// them itself before every affected call. That is not belt-and-braces. An assertion is
+/// not an error report: where it is compiled in, violating it aborts the process, and
+/// where `NDEBUG` is set it is not checked at all and the library carries on with corrupt
+/// state. The vendored build deliberately keeps assertions on in every profile — nghttp3's
+/// own `CMakeLists.txt` strips `-DNDEBUG` back out of the release configurations — so with
+/// this crate's default build the failure mode is the abort. A caller building against a
+/// stock nghttp3 gets the other one. Neither is something a safe API may hand to its
+/// caller, which is why every one of them is a typed error here instead.
 pub struct Conn<C> {
     raw: *mut sys::nghttp3_conn,
     role: Role,
@@ -228,6 +281,10 @@ pub struct Conn<C> {
     control: Option<StreamId>,
     qpack: Option<(StreamId, StreamId)>,
     last_timestamp: Option<Timestamp>,
+    /// The last value given to `set_max_client_streams_bidi`, which may never decrease.
+    max_client_streams_bidi: u64,
+    /// Whether `shutdown` has fixed the GOAWAY cut-off, which may never be raised again.
+    shutdown_started: bool,
     poison: Option<&'static str>,
     _context: PhantomData<fn(&mut C)>,
 }
@@ -263,6 +320,12 @@ impl<C> Conn<C> {
         callbacks.end_stream = Some(crate::callbacks::end_stream_cb::<C>);
         // `stream_close2` rather than the deprecated `stream_close`.
         callbacks.stream_close2 = Some(crate::callbacks::stream_close_cb::<C>);
+        callbacks.stop_sending = Some(crate::callbacks::stop_sending_cb::<C>);
+        callbacks.reset_stream = Some(crate::callbacks::reset_stream_cb::<C>);
+        callbacks.shutdown = Some(crate::callbacks::shutdown_cb::<C>);
+        // `recv_settings2` rather than the deprecated `recv_settings`, which the header
+        // states will not be told about settings added in future versions.
+        callbacks.recv_settings2 = Some(crate::callbacks::recv_settings_cb::<C>);
 
         // `rand` is deliberately left unset. nghttp3 uses it for one thing — the seed of
         // its internal stream map's hash — and when the callback is absent it uses a seed
@@ -309,6 +372,8 @@ impl<C> Conn<C> {
             control: None,
             qpack: None,
             last_timestamp: None,
+            max_client_streams_bidi: 0,
+            shutdown_started: false,
             poison: None,
             _context: PhantomData,
         })
@@ -382,8 +447,8 @@ impl<C> Conn<C> {
         self.require_unused(stream)?;
 
         // SAFETY: `raw` is live, and the identifier has been checked to be locally
-        // initiated and unidirectional -- which nghttp3 itself only asserts, so a release
-        // build would otherwise accept a wrong one and misbehave silently.
+        // initiated and unidirectional -- which nghttp3 itself only asserts, and an
+        // assertion reports nothing to a caller either way.
         let rv = unsafe { sys::nghttp3_conn_bind_control_stream(self.raw, stream.get()) };
         if rv != 0 {
             return Err(self.record(rv, "could not bind the control stream", false));
@@ -446,6 +511,20 @@ impl<C> Conn<C> {
         Ok(())
     }
 
+    /// Refuses anything that queues a control frame before the control stream exists.
+    ///
+    /// nghttp3 asserts `conn->tx.ctrl` and then writes through it, so without this a
+    /// connection that has not been bound yet would abort or dereference null.
+    fn require_control_bound(&self) -> Result<()> {
+        if self.control.is_none() {
+            return Err(Error::invalid_input(
+                "the control stream has not been bound; connection-level frames have \
+                 nowhere to go",
+            ));
+        }
+        Ok(())
+    }
+
     fn require_local_unidirectional(&self, stream: StreamId) -> Result<()> {
         if stream.is_local_unidirectional(self.role.initiator()) {
             return Ok(());
@@ -475,11 +554,11 @@ impl<C> Conn<C> {
 
     /// Whether this stream is one the peer could legitimately have sent on, given our role.
     ///
-    /// nghttp3 asserts this for a stream it already knows about, and asserts are compiled
-    /// out of a release build. The streams it already knows about are exactly the three
-    /// this endpoint bound, so passing one of our own connection-level streams here would
-    /// abort a debug build and, in a release build, parse the peer's bytes into our own
-    /// sending stream's state — letting an endpoint accept its own SETTINGS as the peer's.
+    /// nghttp3 asserts this for a stream it already knows about. The streams it already
+    /// knows about are exactly the three this endpoint bound, so passing one of our own
+    /// connection-level streams here would abort where the assertion is compiled in and,
+    /// where it is not, parse the peer's bytes into our own sending stream's state —
+    /// letting an endpoint accept its own SETTINGS as the peer's.
     fn is_peer_readable(&self, stream: StreamId) -> bool {
         if stream.is_client_bidirectional() {
             // Request streams are always client-initiated and readable by either side.
@@ -574,9 +653,9 @@ impl<C> Conn<C> {
                 "a request needs a client-initiated bidirectional stream",
             ));
         }
-        // nghttp3 asserts the QPACK encoder is bound before encoding a field section, and
-        // asserts are compiled out of a release build. FR-002 requires this be a typed
-        // error, so it is checked rather than left to abort.
+        // nghttp3 asserts the QPACK encoder is bound before encoding a field section.
+        // FR-002 requires this be a typed error, so it is checked rather than left to an
+        // assertion.
         self.require_bound()?;
         let reader = self.attach_body(stream, body)?;
 
@@ -696,7 +775,7 @@ impl<C> Conn<C> {
     /// Submits an informational (1xx) response, which precedes the real one.
     pub fn submit_info(&mut self, stream: StreamId, fields: &[Header<'_>]) -> Result<()> {
         self.check_usable()?;
-        // nghttp3 asserts both of these, and asserts are compiled out of a release build.
+        // nghttp3 asserts both of these, which is not a check a safe API may rely on.
         if self.role != Role::Server {
             return Err(Error::invalid_input(
                 "only a server sends informational responses",
@@ -820,12 +899,167 @@ impl<C> Conn<C> {
         Ok(())
     }
 
-    /// Whether the connection would currently write anything for a stream.
-    pub fn is_stream_writable(&self, stream: StreamId) -> bool {
-        // SAFETY: `raw` is live and the identifier is validated. `_2` takes a const
-        // pointer and is the current entry point; the unsuffixed one is deprecated.
+    /// Whether this stream would currently write anything.
+    ///
+    /// Fallible only because a poisoned connection may not be re-entered at all: nghttp3
+    /// documents that after the read or write path fails, calling anything but the
+    /// destructor is undefined behaviour, and that applies to a query as much as to a
+    /// mutation.
+    pub fn is_stream_writable(&self, stream: StreamId) -> Result<bool> {
+        self.check_usable()?;
+        // SAFETY: `raw` is live, the connection has not been poisoned, and the identifier
+        // is validated. `_2` takes a const pointer and is the current entry point; the
+        // unsuffixed one is deprecated.
         let writable = unsafe { sys::nghttp3_conn_is_stream_writable2(self.raw, stream.get()) };
-        writable != 0
+        Ok(writable != 0)
+    }
+
+    /// Tells the peer to stop opening new streams, without closing anything yet.
+    ///
+    /// The first half of a graceful shutdown. The peer sees it as [`Shutdown::Notice`]; a
+    /// couple of round trips later, [`Conn::shutdown`] fixes the cut-off.
+    ///
+    /// Refused once [`Conn::shutdown`] has been called. The identifier a GOAWAY carries
+    /// may only ever fall, and a notice carries the highest identifier there is, so
+    /// sending one after the real cut-off would raise it — which nghttp3 only asserts, and
+    /// which the peer must treat as a protocol error.
+    pub fn submit_shutdown_notice(&mut self) -> Result<()> {
+        self.check_usable()?;
+        self.require_control_bound()?;
+        if self.shutdown_started {
+            return Err(Error::invalid_input(
+                "the graceful shutdown has already fixed its cut-off; a notice now would \
+                 raise it again",
+            ));
+        }
+        // SAFETY: `raw` is live and the control stream is bound, which is the one
+        // condition nghttp3 asserts here — it queues the frame onto that stream without
+        // checking. The identifier this queues is the highest there is and no shutdown has
+        // been started, so nghttp3's monotonicity assertion holds. Fires no callback.
+        let rv = unsafe { sys::nghttp3_conn_submit_shutdown_notice(self.raw) };
+        if rv != 0 {
+            return Err(self.record(rv, "could not submit the shutdown notice", false));
+        }
+        Ok(())
+    }
+
+    /// Starts a graceful shutdown, after which new incoming streams are rejected.
+    ///
+    /// Streams already open are processed normally. [`Conn::is_drained`] reports when the
+    /// last of them has gone.
+    ///
+    /// May be called once. The identifier a GOAWAY carries may only ever fall, and a
+    /// server computes it from the highest request stream it has seen, so a second call
+    /// after another request arrived would raise it.
+    pub fn shutdown(&mut self) -> Result<()> {
+        self.check_usable()?;
+        self.require_control_bound()?;
+        if self.shutdown_started {
+            return Err(Error::invalid_input(
+                "the graceful shutdown has already been started, and its cut-off may not \
+                 be raised",
+            ));
+        }
+        // SAFETY: `raw` is live and the control stream is bound, which is what nghttp3
+        // asserts. This is the first shutdown, so the identifier it queues cannot exceed
+        // the one already recorded — the notice's, or the initial maximum if no notice was
+        // sent. Fires no callback.
+        let rv = unsafe { sys::nghttp3_conn_shutdown(self.raw) };
+        if rv != 0 {
+            return Err(self.record(rv, "could not start the graceful shutdown", false));
+        }
+        self.shutdown_started = true;
+        Ok(())
+    }
+
+    /// Whether a shutdown has been started and no peer-initiated stream remains.
+    ///
+    /// Server-only, and refused on a client: nghttp3 only asserts the role, and a client
+    /// that got past it would read another endpoint's bookkeeping. A client has no
+    /// peer-initiated request streams to wait for anyway.
+    ///
+    /// Also requires the GOAWAY frame to have been written, so a caller must keep sending
+    /// after [`Conn::shutdown`] rather than waiting for this first.
+    pub fn is_drained(&self) -> Result<bool> {
+        self.check_usable()?;
+        if self.role != Role::Server {
+            return Err(Error::invalid_input(
+                "only a server drains; a client has no peer-initiated streams to wait for",
+            ));
+        }
+        // SAFETY: `raw` is live and the role has been checked, which is the one condition
+        // nghttp3 asserts. `_2` takes a const pointer and is the current entry point; the
+        // unsuffixed one is deprecated.
+        let drained = unsafe { sys::nghttp3_conn_is_drained2(self.raw) };
+        Ok(drained != 0)
+    }
+
+    /// Tells the connection that a stream's read side was abruptly closed, so pending and
+    /// future inbound data for it should be discarded.
+    ///
+    /// Used after the QUIC layer sends `STOP_SENDING` or the stream is reset. Only
+    /// client-initiated bidirectional streams carry request data, and nghttp3 ignores
+    /// anything else, so this is a no-op for the rest.
+    pub fn shutdown_stream_read(&mut self, stream: StreamId) -> Result<()> {
+        self.check_usable()?;
+        // SAFETY: `raw` is live, and the identifier is in range -- which nghttp3 only
+        // asserts, which is not a check a safe API may rely on.
+        let rv = unsafe { sys::nghttp3_conn_shutdown_stream_read(self.raw, stream.get()) };
+        if rv != 0 {
+            return Err(self.record(rv, "could not shut down the stream's read side", false));
+        }
+        Ok(())
+    }
+
+    /// Prohibits any further writing to a stream.
+    ///
+    /// Like [`Conn::block_stream`] but permanent: [`Conn::unblock_stream`] will not undo
+    /// it. Use it when the QUIC layer has reset the stream, where blocking would leave the
+    /// connection waiting for a window that is never going to reopen.
+    pub fn shutdown_stream_write(&mut self, stream: StreamId) -> Result<()> {
+        self.check_usable()?;
+        // SAFETY: `raw` is live and the identifier is validated. Returns nothing: an
+        // unknown stream is simply ignored.
+        unsafe { sys::nghttp3_conn_shutdown_stream_write(self.raw, stream.get()) };
+        Ok(())
+    }
+
+    /// Tells the connection how many bidirectional streams the client may open in total.
+    ///
+    /// A resource hint, not enforcement: the actual limit is the QUIC layer's
+    /// `MAX_STREAMS`, and this only lets nghttp3 size its own bookkeeping to match.
+    ///
+    /// Server-only, and the value may never decrease. nghttp3 only asserts both, and a
+    /// decrease that got past the assertion would silently shrink a limit the peer has
+    /// already been told it may use.
+    pub fn set_max_client_streams_bidi(&mut self, max_streams: u64) -> Result<()> {
+        self.check_usable()?;
+        if self.role != Role::Server {
+            return Err(Error::invalid_input(
+                "only a server sets the client's stream limit",
+            ));
+        }
+        if max_streams < self.max_client_streams_bidi {
+            return Err(Error::invalid_input(
+                "the client's stream limit may only ever increase",
+            ));
+        }
+        self.max_client_streams_bidi = max_streams;
+        // SAFETY: `raw` is live, the role is checked and the value is non-decreasing,
+        // which are exactly the two conditions nghttp3 asserts.
+        unsafe { sys::nghttp3_conn_set_max_client_streams_bidi(self.raw, max_streams) };
+        Ok(())
+    }
+
+    /// Tells the connection how many concurrent streams the peer may have open.
+    ///
+    /// Another resource hint: it sizes the QPACK decoder's bookkeeping and enforces
+    /// nothing.
+    pub fn set_max_concurrent_streams(&mut self, max_concurrent: usize) -> Result<()> {
+        self.check_usable()?;
+        // SAFETY: `raw` is live. Returns nothing and has no preconditions.
+        unsafe { sys::nghttp3_conn_set_max_concurrent_streams(self.raw, max_concurrent) };
+        Ok(())
     }
 
     /// Runs `f` with a bridge installed, so callbacks can reach the caller's state.
@@ -845,6 +1079,7 @@ impl<C> Conn<C> {
             handlers: &mut self.handlers,
             bodies: &mut self.bodies,
             context,
+            role: self.role,
         };
         // SAFETY: `bridge` outlives the guard, and `C` matches what callbacks recover.
         let guard = unsafe { BridgeGuard::install(&self.slot, &mut bridge) };

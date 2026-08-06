@@ -648,7 +648,7 @@ fn a_deferred_body_resumes_without_losing_or_duplicating_a_byte() {
         "a deferred body must not produce an empty data frame"
     );
     assert!(
-        !client.conn.is_stream_writable(id(0)),
+        !client.conn.is_stream_writable(id(0)).expect("usable"),
         "a deferred stream is not writable until it is resumed"
     );
 
@@ -665,9 +665,9 @@ fn a_deferred_body_resumes_without_losing_or_duplicating_a_byte() {
 
 #[test]
 fn a_source_offering_nothing_without_ending_defers_rather_than_writing_an_empty_frame() {
-    // nghttp3 asserts that a callback returning no bytes has also signalled the end, and
-    // that assert is compiled out of a release build -- where it would instead write a
-    // zero-length data frame. This is the case that must never reach it.
+    // nghttp3 asserts that a callback returning no bytes has also signalled the end. An
+    // assertion aborts where it is compiled in and writes a zero-length data frame where
+    // it is not, so this is the case that must never reach it either way.
     let mut client = Side::new(Role::Client, Policy::eager());
     let mut server = Side::new(Role::Server, Policy::eager());
     let gate = Arc::new(AtomicBool::new(false));
@@ -689,7 +689,7 @@ fn a_source_offering_nothing_without_ending_defers_rather_than_writing_an_empty_
         !server.seen.chunks.contains_key(&0),
         "no data frame at all should have been written, not even an empty one"
     );
-    assert!(!client.conn.is_stream_writable(id(0)));
+    assert!(!client.conn.is_stream_writable(id(0)).expect("usable"));
 
     gate.store(true, Ordering::Relaxed);
     client.conn.resume_stream(id(0)).expect("resume");

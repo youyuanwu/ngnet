@@ -32,8 +32,11 @@ use core::ffi::c_void;
 
 use ngnet_h3_sys as sys;
 
+use crate::conn::Role;
 use crate::error::ErrorCode;
-use crate::handlers::{FieldAction, FieldSection, FieldToken, Handlers, StreamClosed};
+use crate::handlers::{
+    FieldAction, FieldSection, FieldToken, Handlers, PeerSettings, Shutdown, StreamClosed,
+};
 use crate::state::{BodyEnd, BodyRegistry, Handover};
 use crate::stream::StreamId;
 
@@ -72,6 +75,11 @@ pub(crate) struct Bridge<'a, C> {
     pub(crate) handlers: &'a mut Handlers<C>,
     pub(crate) bodies: &'a mut BodyRegistry,
     pub(crate) context: &'a mut C,
+    /// Which side this endpoint is.
+    ///
+    /// Carried because one callback -- graceful shutdown -- hands over an identifier whose
+    /// meaning depends on the role, and nghttp3 does not tell the callback which it is.
+    pub(crate) role: Role,
 }
 /// Installs a bridge into the slot for as long as it is alive.
 ///
@@ -184,6 +192,7 @@ mod tests {
                 handlers: &mut handlers,
                 bodies: &mut bodies,
                 context: &mut context,
+                role: Role::Client,
             };
             // SAFETY: `carried` outlives the guard, and `C` matches on recovery.
             let _guard = unsafe { BridgeGuard::install(&slot, &mut carried) };
@@ -453,9 +462,10 @@ pub(crate) unsafe extern "C" fn stream_close_cb<C>(
 ///   fits is held back and offered on the next call rather than dropped.
 /// * A zero-length vector is skipped without being queued, so one must never be handed
 ///   over — an element retained for it would wait forever for an acknowledgement.
-/// * `assert(datalen || EOF)` is compiled out of a release build, where returning no bytes
-///   without end-of-stream writes a zero-length DATA frame instead of deferring. So "the
-///   source has nothing right now" becomes `NGHTTP3_ERR_WOULDBLOCK`, never a zero return.
+/// * `assert(datalen || EOF)` is only an assertion, so it aborts where it is compiled in
+///   and lets a zero-length DATA frame be written where it is not. Neither is acceptable,
+///   so "the source has nothing right now" becomes `NGHTTP3_ERR_WOULDBLOCK`, never a zero
+///   return.
 pub(crate) unsafe extern "C" fn read_data_cb<C>(
     _conn: *mut sys::nghttp3_conn,
     stream_id: i64,
@@ -479,8 +489,13 @@ pub(crate) unsafe extern "C" fn read_data_cb<C>(
         return sys::NGHTTP3_ERR_CALLBACK_FAILURE as sys::nghttp3_ssize;
     };
 
-    if matches!(entry.begin_round(), Handover::Defer) {
-        return sys::NGHTTP3_ERR_WOULDBLOCK as sys::nghttp3_ssize;
+    match entry.begin_round() {
+        Handover::Defer => return sys::NGHTTP3_ERR_WOULDBLOCK as sys::nghttp3_ssize,
+        // nghttp3 has exactly one failure code for this callback and it is
+        // connection-fatal; the write path will poison the connection and drain the
+        // registry, which is what releases the buffers already handed over.
+        Handover::Fail => return sys::NGHTTP3_ERR_CALLBACK_FAILURE as sys::nghttp3_ssize,
+        Handover::Ready => {}
     }
 
     let mut filled = 0usize;
@@ -506,7 +521,7 @@ pub(crate) unsafe extern "C" fn read_data_cb<C>(
     let end = entry.end_reached();
     if filled == 0 && end.is_none() {
         // The source produced nothing and did not end. Returning zero here would write a
-        // zero-length DATA frame in a release build; deferring is what was meant.
+        // zero-length DATA frame where the assertion is absent; deferring is what was meant.
         return sys::NGHTTP3_ERR_WOULDBLOCK as sys::nghttp3_ssize;
     }
 
@@ -548,4 +563,158 @@ pub(crate) unsafe extern "C" fn acked_stream_data_cb<C>(
         entry.on_acked(datalen);
     }
     0
+}
+
+/// Asks the QUIC layer to send `STOP_SENDING` on a stream.
+///
+/// This is nghttp3 saying it will not read any more of what the peer is sending; the QUIC
+/// layer has to be told, because this crate owns no transport. A caller that ignores it
+/// leaves the peer sending bytes into a stream nothing will ever read.
+pub(crate) unsafe extern "C" fn stop_sending_cb<C>(
+    _conn: *mut sys::nghttp3_conn,
+    stream_id: i64,
+    app_error_code: u64,
+    conn_user_data: *mut c_void,
+    _stream_user_data: *mut c_void,
+) -> i32 {
+    // SAFETY: as above.
+    let Some(bridge) = (unsafe { bridge::<C>(conn_user_data) }) else {
+        return 0;
+    };
+    let Some(handler) = bridge.handlers.stop_sending.as_mut() else {
+        return 0;
+    };
+    let Ok(stream) = StreamId::new(stream_id) else {
+        return 0;
+    };
+    handler(bridge.context, stream, ErrorCode::new(app_error_code));
+    0
+}
+
+/// Asks the QUIC layer to reset a stream.
+///
+/// The counterpart of [`stop_sending_cb`] for the sending direction.
+pub(crate) unsafe extern "C" fn reset_stream_cb<C>(
+    _conn: *mut sys::nghttp3_conn,
+    stream_id: i64,
+    app_error_code: u64,
+    conn_user_data: *mut c_void,
+    _stream_user_data: *mut c_void,
+) -> i32 {
+    // SAFETY: as above.
+    let Some(bridge) = (unsafe { bridge::<C>(conn_user_data) }) else {
+        return 0;
+    };
+    let Some(handler) = bridge.handlers.reset_stream.as_mut() else {
+        return 0;
+    };
+    let Ok(stream) = StreamId::new(stream_id) else {
+        return 0;
+    };
+    handler(bridge.context, stream, ErrorCode::new(app_error_code));
+    0
+}
+
+/// Reports that the peer has begun a graceful shutdown.
+///
+/// The identifier's meaning depends on which side received it, and nghttp3 passes it
+/// through raw, so the role recorded on the bridge is what disambiguates it here.
+pub(crate) unsafe extern "C" fn shutdown_cb<C>(
+    _conn: *mut sys::nghttp3_conn,
+    id: i64,
+    conn_user_data: *mut c_void,
+) -> i32 {
+    // SAFETY: as above.
+    let Some(bridge) = (unsafe { bridge::<C>(conn_user_data) }) else {
+        return 0;
+    };
+    let role = bridge.role;
+    let Some(handler) = bridge.handlers.shutdown.as_mut() else {
+        return 0;
+    };
+    handler(bridge.context, classify_shutdown(role, id));
+    0
+}
+
+/// Turns the raw shutdown identifier into something that says what it means.
+fn classify_shutdown(role: Role, id: i64) -> Shutdown {
+    let raw = id as u64;
+    match role {
+        Role::Client if raw == sys::NGHTTP3_SHUTDOWN_NOTICE_STREAM_ID => Shutdown::Notice,
+        Role::Server if raw == sys::NGHTTP3_SHUTDOWN_NOTICE_PUSH_ID => Shutdown::Notice,
+        // A client is told the first stream identifier that will not be processed.
+        Role::Client => match StreamId::new(id) {
+            Ok(stream) => Shutdown::NoStreamsFrom(stream),
+            // Out of range is not something nghttp3 produces; reporting the raw value is
+            // better than dropping the event and leaving the caller thinking nothing
+            // happened.
+            Err(_) => Shutdown::NoPushesFrom(raw),
+        },
+        // A server is told a push identifier, which nghttp3 never generates because it
+        // does not implement server push.
+        Role::Server => Shutdown::NoPushesFrom(raw),
+    }
+}
+
+/// Delivers the peer's settings, copied out of the struct that carried them.
+pub(crate) unsafe extern "C" fn recv_settings_cb<C>(
+    _conn: *mut sys::nghttp3_conn,
+    settings: *const sys::nghttp3_proto_settings,
+    conn_user_data: *mut c_void,
+) -> i32 {
+    // SAFETY: as above.
+    let Some(bridge) = (unsafe { bridge::<C>(conn_user_data) }) else {
+        return 0;
+    };
+    let Some(handler) = bridge.handlers.peer_settings.as_mut() else {
+        return 0;
+    };
+    if settings.is_null() {
+        return 0;
+    }
+    // SAFETY: nghttp3 supplies a fully initialised struct that outlives this call, and
+    // every field is copied out before the handler runs.
+    let raw = unsafe { &*settings };
+    handler(
+        bridge.context,
+        PeerSettings {
+            max_field_section_size: raw.max_field_section_size,
+            qpack_max_dtable_capacity: raw.qpack_max_dtable_capacity as u64,
+            qpack_blocked_streams: raw.qpack_blocked_streams as u64,
+            enable_connect_protocol: raw.enable_connect_protocol != 0,
+            h3_datagram: raw.h3_datagram != 0,
+        },
+    );
+    0
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn a_client_reads_the_identifier_as_a_stream_cut_off() {
+        let notice = sys::NGHTTP3_SHUTDOWN_NOTICE_STREAM_ID as i64;
+        assert_eq!(classify_shutdown(Role::Client, notice), Shutdown::Notice);
+        assert_eq!(
+            classify_shutdown(Role::Client, 12),
+            Shutdown::NoStreamsFrom(StreamId::new(12).unwrap())
+        );
+    }
+
+    #[test]
+    fn a_server_reads_the_identifier_as_a_push_cut_off() {
+        let notice = sys::NGHTTP3_SHUTDOWN_NOTICE_PUSH_ID as i64;
+        assert_eq!(classify_shutdown(Role::Server, notice), Shutdown::Notice);
+        // The two notice constants differ, so a server must not mistake the client's for
+        // its own -- which is exactly what a role-blind implementation would do.
+        assert_ne!(
+            sys::NGHTTP3_SHUTDOWN_NOTICE_STREAM_ID,
+            sys::NGHTTP3_SHUTDOWN_NOTICE_PUSH_ID
+        );
+        assert_eq!(
+            classify_shutdown(Role::Server, sys::NGHTTP3_SHUTDOWN_NOTICE_STREAM_ID as i64),
+            Shutdown::NoPushesFrom(sys::NGHTTP3_SHUTDOWN_NOTICE_STREAM_ID)
+        );
+    }
 }

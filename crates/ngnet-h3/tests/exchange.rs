@@ -425,8 +425,8 @@ fn a_handler_mutates_state_it_never_captured() {
 
 #[test]
 fn submission_preconditions_are_checked_rather_than_asserted() {
-    // Every one of these is something nghttp3 checks only with `assert`, which a release
-    // build compiles out.
+    // Every one of these is something nghttp3 checks only with `assert`, which aborts or
+    // checks nothing depending on the build, and reports an error in neither.
     let mut client = observer(Role::Client);
     let mut server = observer(Role::Server);
 
@@ -453,7 +453,7 @@ fn submission_preconditions_are_checked_rather_than_asserted() {
 #[test]
 fn submitting_before_binding_is_a_typed_error_rather_than_an_abort() {
     // nghttp3 asserts the QPACK encoder is bound before it encodes a field section, so
-    // without this check a debug build aborts and a release build corrupts state.
+    // without this check the connection aborts or corrupts its state instead.
     let mut client = ConnBuilder::<Seen>::new(Role::Client).build().unwrap();
     let error = client
         .submit_request(id(0), &[Header::new(":method", "GET").unwrap()], None)

@@ -180,7 +180,7 @@ fn an_exchange_without_binding_is_a_typed_error() {
 fn connection_level_streams_must_be_local_and_unidirectional() {
     let mut conn = ConnBuilder::<()>::new(Role::Client).build().unwrap();
 
-    // Bidirectional: nghttp3 only asserts this, so a release build would accept it.
+    // Bidirectional: nghttp3 only asserts this, which is no use to a caller either way.
     let error = conn.bind_control_stream(id(0)).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
     assert!(error.to_string().contains("unidirectional"), "got: {error}");
@@ -381,10 +381,11 @@ fn the_struct_versions_this_crate_compiles_against_are_v4() {
 #[test]
 fn reading_a_locally_written_stream_is_rejected_rather_than_aborting() {
     // nghttp3 asserts that a stream it already knows can carry peer data, and asserts are
-    // compiled out of a release build. The streams it already knows are exactly the three
-    // bound below, so without a check here this aborts a debug build and, in a release
-    // build, parses the peer's bytes into our own sending stream -- letting an endpoint
-    // accept its own SETTINGS as though the peer had sent them.
+    // not a check a safe API may rely on. The streams it already knows are exactly the
+    // three bound below, so without a check here this aborts where the assertion is
+    // compiled in and, where it is not, parses the peer's bytes into our own sending
+    // stream -- letting an endpoint accept its own SETTINGS as though the peer had sent
+    // them.
     let mut client = client();
 
     for own in [CLIENT_CONTROL, CLIENT_QPACK_ENCODER, CLIENT_QPACK_DECODER] {

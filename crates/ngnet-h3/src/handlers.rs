@@ -99,6 +99,60 @@ pub struct StreamClosed {
 /// A handler invoked when a stream closes.
 type CloseHandler<C> = Box<dyn FnMut(&mut C, StreamId, StreamClosed) + Send>;
 
+/// A handler invoked with a stream and the application error code to use on it.
+type StreamCodeHandler<C> = Box<dyn FnMut(&mut C, StreamId, ErrorCode) + Send>;
+
+/// What the peer's graceful shutdown means for new work.
+///
+/// HTTP/3's GOAWAY carries one identifier whose meaning depends on which side received it,
+/// and nghttp3 passes it through unchanged. Collapsing the cases would lose the difference
+/// between "stop opening streams eventually" and "everything from here will be discarded".
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
+pub enum Shutdown {
+    /// The peer intends to shut down but has not yet fixed a cut-off.
+    ///
+    /// Requests already in flight will still be processed; new ones should stop.
+    Notice,
+    /// Nothing at or above this stream identifier will be processed.
+    ///
+    /// A client sees this. Anything it sent on such a stream can safely be retried on a
+    /// new connection.
+    NoStreamsFrom(StreamId),
+    /// A push-identifier cut-off, carried raw.
+    ///
+    /// A server receives a push identifier here rather than a stream identifier. nghttp3
+    /// does not implement server push, so this should not occur; it is surfaced rather
+    /// than dropped so a future library version cannot silently lose it.
+    NoPushesFrom(u64),
+}
+
+/// The peer's HTTP/3 settings, copied out of the frame that carried them.
+///
+/// Copied rather than borrowed, unlike field names and body chunks: this arrives once per
+/// connection and is small, so the borrow would buy nothing and would force every caller
+/// that wants to keep it to copy it anyway.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
+pub struct PeerSettings {
+    /// The largest field section the peer will accept, in bytes.
+    pub max_field_section_size: u64,
+    /// The QPACK dynamic table capacity the peer will accept.
+    pub qpack_max_dtable_capacity: u64,
+    /// How many streams the peer will allow to be blocked awaiting QPACK insertions.
+    pub qpack_blocked_streams: u64,
+    /// Whether the peer permits the extended CONNECT protocol.
+    pub enable_connect_protocol: bool,
+    /// Whether the peer supports HTTP/3 datagrams.
+    pub h3_datagram: bool,
+}
+
+/// A handler invoked when the peer's settings arrive.
+type SettingsHandler<C> = Box<dyn FnMut(&mut C, PeerSettings) + Send>;
+
+/// A handler invoked when the peer starts a graceful shutdown.
+type ShutdownHandler<C> = Box<dyn FnMut(&mut C, Shutdown) + Send>;
+
 /// The set of handlers a connection may call.
 ///
 /// Generic over the caller's state type `C`, which every handler receives by mutable
@@ -119,6 +173,14 @@ pub(crate) struct Handlers<C> {
     pub(crate) end_stream: Option<StreamHandler<C>>,
     /// A stream has closed.
     pub(crate) stream_close: Option<CloseHandler<C>>,
+    /// The QUIC layer should send STOP_SENDING on a stream.
+    pub(crate) stop_sending: Option<StreamCodeHandler<C>>,
+    /// The QUIC layer should reset a stream.
+    pub(crate) reset_stream: Option<StreamCodeHandler<C>>,
+    /// The peer has begun a graceful shutdown.
+    pub(crate) shutdown: Option<ShutdownHandler<C>>,
+    /// The peer's settings have arrived.
+    pub(crate) peer_settings: Option<SettingsHandler<C>>,
 }
 
 // Hand-written rather than derived: `#[derive(Default)]` would require `C: Default`, which
@@ -133,6 +195,10 @@ impl<C> Default for Handlers<C> {
             data: None,
             end_stream: None,
             stream_close: None,
+            stop_sending: None,
+            reset_stream: None,
+            shutdown: None,
+            peer_settings: None,
         }
     }
 }
@@ -147,6 +213,10 @@ impl<C> core::fmt::Debug for Handlers<C> {
             .field("data", &self.data.is_some())
             .field("end_stream", &self.end_stream.is_some())
             .field("stream_close", &self.stream_close.is_some())
+            .field("stop_sending", &self.stop_sending.is_some())
+            .field("reset_stream", &self.reset_stream.is_some())
+            .field("shutdown", &self.shutdown.is_some())
+            .field("peer_settings", &self.peer_settings.is_some())
             .finish()
     }
 }

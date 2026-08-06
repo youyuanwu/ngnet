@@ -62,6 +62,15 @@
 //! bytes acknowledged will hold every body buffer it ever sent until the connection is
 //! dropped.
 //!
+//! # Events you have to act on
+//!
+//! Four connection-level events are instructions to a QUIC layer this crate does not own,
+//! so ignoring them has consequences it cannot make up for. [`ConnBuilder::on_stop_sending`]
+//! and [`ConnBuilder::on_reset_stream`] ask for a stream to be stopped or reset — without
+//! them, the peer keeps sending bytes nothing will read. [`ConnBuilder::on_shutdown`]
+//! reports the peer beginning a graceful shutdown, and [`ConnBuilder::on_peer_settings`]
+//! delivers the peer's limits.
+//!
 //! # Errors and unusable connections
 //!
 //! Most failures are recoverable and say what went wrong. A few are not: nghttp3 documents
@@ -111,7 +120,7 @@ mod stream;
 pub use body::{BodyOutcome, BodySource, FixedBody, RetainedBytes};
 pub use conn::{Conn, ConnBuilder, FlowCredit, Role, Timestamp};
 pub use error::{ALL_NATIVE_CODES, Error, ErrorCode, ErrorKind, NativeCode, Result};
-pub use handlers::{FieldAction, FieldSection, FieldToken, StreamClosed};
+pub use handlers::{FieldAction, FieldSection, FieldToken, PeerSettings, Shutdown, StreamClosed};
 pub use header::Header;
 pub use send::SendGuard;
 pub use settings::Settings;
@@ -121,8 +130,8 @@ pub use stream::{Directionality, Initiator, StreamId};
 ///
 /// Everything nghttp3 exposes is reachable here, including capabilities the safe API does
 /// not yet cover. Using these items requires `unsafe` and upholding nghttp3's invariants
-/// yourself — including the ones it checks only with `assert`, and therefore not at all in
-/// a release build.
+/// yourself — including the ones it checks only with `assert`, which aborts where it is
+/// compiled in and checks nothing where it is not.
 pub mod raw {
     pub use ngnet_h3_sys::*;
 }

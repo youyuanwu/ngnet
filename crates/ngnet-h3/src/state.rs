@@ -61,6 +61,8 @@ pub(crate) struct BodyEntry {
 pub(crate) enum Handover {
     /// Nothing is available; the stream defers until it is resumed.
     Defer,
+    /// The source has given up, and the connection must fail.
+    Fail,
     /// Bytes and/or an end marker are available.
     Ready,
 }
@@ -87,6 +89,7 @@ impl BodyEntry {
         }
         let (pieces, end) = match self.source.next() {
             BodyOutcome::Defer => return Handover::Defer,
+            BodyOutcome::Fail => return Handover::Fail,
             BodyOutcome::Wrote(pieces) => (pieces, None),
             BodyOutcome::Eof(pieces) => (pieces, Some(BodyEnd::Stream)),
             BodyOutcome::EofWithTrailers(pieces) => (pieces, Some(BodyEnd::Trailers)),
@@ -323,6 +326,18 @@ mod tests {
         assert_eq!(entry.end_reached(), None, "one piece is still pending");
         hand_over(&mut entry);
         assert_eq!(entry.end_reached(), Some(BodyEnd::Stream));
+    }
+
+    #[test]
+    fn a_failing_source_reports_a_failure() {
+        struct Broken;
+        impl BodySource for Broken {
+            fn next(&mut self) -> BodyOutcome {
+                BodyOutcome::Fail
+            }
+        }
+        let mut entry = BodyEntry::new(Box::new(Broken));
+        assert!(matches!(entry.begin_round(), Handover::Fail));
     }
 
     #[test]

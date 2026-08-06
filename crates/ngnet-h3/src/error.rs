@@ -123,6 +123,12 @@ pub enum ErrorKind {
     ConnectionUnusable,
     /// Anything else, including conditions added by a future nghttp3.
     Internal,
+    /// A stream HTTP/3 requires to stay open for the connection's whole life was closed.
+    ///
+    /// Distinct from [`ErrorKind::Protocol`] because there is no recovering from it at the
+    /// stream level: the control or a QPACK stream is gone, so the connection itself has to
+    /// be closed with the code from [`Error::app_error_code`].
+    ClosedCriticalStream,
 }
 
 /// A failure from nghttp3, or from this crate's own validation.
@@ -147,8 +153,9 @@ impl Error {
     /// Builds an error for a precondition this crate checked itself.
     ///
     /// These exist because nghttp3 validates many preconditions only with `assert`, which
-    /// a release build compiles out. Checking them here is what keeps a safe API from
-    /// being able to reach undefined behaviour.
+    /// is not an error report. Checking them here is what keeps a safe API from being able
+    /// to abort or reach undefined behaviour — see the note on assertions in
+    /// [`crate::Conn`].
     ///
     /// `const` so that validating constructors such as [`StreamId::new`] can be `const`
     /// too, and a bad literal identifier fails to compile rather than at run time.
@@ -233,6 +240,12 @@ fn classify(code: NativeCode) -> ErrorKind {
         return ErrorKind::Internal;
     }
 
+    // Checked before the protocol group: closing a critical stream is a protocol
+    // violation, but one with no stream-level recovery, so it gets its own category.
+    if code.get() == sys::NGHTTP3_ERR_H3_CLOSED_CRITICAL_STREAM {
+        return ErrorKind::ClosedCriticalStream;
+    }
+
     match code.get() {
         // Conditions this crate's caller caused.
         sys::NGHTTP3_ERR_INVALID_ARGUMENT
@@ -254,7 +267,6 @@ fn classify(code: NativeCode) -> ErrorKind {
         | sys::NGHTTP3_ERR_H3_FRAME_ERROR
         | sys::NGHTTP3_ERR_H3_MISSING_SETTINGS
         | sys::NGHTTP3_ERR_H3_INTERNAL_ERROR
-        | sys::NGHTTP3_ERR_H3_CLOSED_CRITICAL_STREAM
         | sys::NGHTTP3_ERR_H3_GENERAL_PROTOCOL_ERROR
         | sys::NGHTTP3_ERR_H3_ID_ERROR
         | sys::NGHTTP3_ERR_H3_SETTINGS_ERROR

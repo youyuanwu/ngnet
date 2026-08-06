@@ -111,6 +111,17 @@ pub enum BodyOutcome {
     ///
     /// [`Conn::resume_stream`]: crate::Conn::resume_stream
     Defer,
+    /// The body cannot be produced, and the exchange must stop.
+    ///
+    /// **This fails the whole connection, not just the stream.** nghttp3 offers exactly
+    /// one way for a data callback to report failure, and it is connection-fatal; the
+    /// header carries a TODO for a per-stream variant that does not exist yet. The
+    /// connection is poisoned and every retained buffer released.
+    ///
+    /// A source that wants to abandon one stream without taking the connection with it
+    /// should end its body instead and have the caller reset the stream through its QUIC
+    /// layer, which is the only place a per-stream reset can come from.
+    Fail,
 }
 
 /// Supplies the bytes of an outgoing message body.
