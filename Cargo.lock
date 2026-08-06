@@ -873,6 +873,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ngnet-h3"
+version = "0.1.0"
+dependencies = [
+ "ngnet-h3-sys",
+]
+
+[[package]]
 name = "ngnet-h3-sys"
 version = "0.1.0"
 dependencies = [

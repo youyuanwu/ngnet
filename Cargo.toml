@@ -6,6 +6,7 @@ members = [
     "crates/ngnet-h2-tests",
     "crates/ngnet-h2-bench",
     "crates/ngnet-h3-sys",
+    "crates/ngnet-h3",
 ]
 
 [workspace.package]
@@ -48,6 +49,8 @@ hyper = { version = "1", features = ["client", "server", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 ngnet-h2 = { path = "crates/ngnet-h2" }
 ngnet-h2-sys = { path = "crates/ngnet-h2-sys" }
+ngnet-h3 = { path = "crates/ngnet-h3" }
+ngnet-h3-sys = { path = "crates/ngnet-h3-sys" }
 tokio = { version = "1", features = [
     "io-util",
     "macros",
