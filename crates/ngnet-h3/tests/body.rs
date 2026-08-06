@@ -893,6 +893,103 @@ fn a_failed_resubmission_does_not_release_the_body_already_in_flight() {
 }
 
 #[test]
+fn a_peer_shutdown_does_not_release_the_body_already_in_flight() {
+    // The second trigger for the same rollback bug, and the more dangerous one because its
+    // timing is the peer's: once a GOAWAY arrives, every submission is refused with
+    // CONN_CLOSING, recoverably. A rollback that freed whatever body the stream carried
+    // would therefore be reachable by a peer choosing when to shut down.
+    let mut client = Side::new(Role::Client, Policy::never_acknowledges());
+    let mut server = Side::new(Role::Server, Policy::never_acknowledges());
+    let (arc, retained) = shared(b"in flight when the peer said stop");
+
+    client
+        .conn
+        .submit_request(
+            id(0),
+            &request_fields("/in-flight"),
+            Some(Box::new(FixedBody::new(retained))),
+        )
+        .expect("the first submission");
+    pump(&mut client, &mut server, 1);
+    assert_eq!(client.conn.retained_body_buffers(), 1);
+
+    // The server begins a graceful shutdown, and the client hears about it.
+    server.conn.shutdown().expect("start the shutdown");
+    pump(&mut client, &mut server, 2);
+
+    let error = client
+        .conn
+        .submit_request(id(4), &request_fields("/too-late"), None)
+        .expect_err("the connection is closing");
+    assert!(
+        !error.is_fatal() && client.conn.is_usable(),
+        "a closing connection is still serviceable for what is already open"
+    );
+    assert_eq!(
+        client.conn.retained_body_buffers(),
+        1,
+        "the in-flight body must survive a submission the peer caused to fail"
+    );
+    assert_eq!(Arc::strong_count(&arc), 2);
+}
+
+#[test]
+fn a_failed_response_submission_releases_the_body_it_attached() {
+    // The other direction of the same rollback, on the server. Here the danger is
+    // reversed: a response can only fail on a stream nghttp3 does not know, so there is
+    // never a pre-existing body to protect -- but the body this call attached must still
+    // be released, or a rejected submission leaks it for the connection's life.
+    //
+    // That asymmetry is why the guard is `did this call attach`, rather than `does the
+    // stream already have one`: the request path needs the first property and the response
+    // path needs the second, and one predicate gives both.
+    let mut server = Side::new(Role::Server, Policy::never_acknowledges());
+    let (arc, retained) = shared(b"a response to a request that never came");
+
+    server
+        .conn
+        .bind_control_stream(id(3))
+        .expect_err("already bound by the harness");
+
+    let error = server
+        .conn
+        .submit_response(
+            id(0),
+            &[Header::new(":status", "200").unwrap()],
+            Some(Box::new(FixedBody::new(retained))),
+        )
+        .expect_err("no request ever arrived on that stream");
+    assert!(!error.is_fatal() && server.conn.is_usable());
+    assert_eq!(
+        server.conn.retained_body_buffers(),
+        0,
+        "the body this call attached must be released, not left behind"
+    );
+    assert_eq!(
+        Arc::strong_count(&arc),
+        1,
+        "and genuinely dropped, not merely unlinked"
+    );
+
+    // And the stream is not left half-registered: a later, legitimate response works.
+    let mut client = Side::new(Role::Client, Policy::never_acknowledges());
+    let mut server = Side::new(Role::Server, Policy::never_acknowledges());
+    client
+        .conn
+        .submit_request(id(0), &request_fields("/ask"), None)
+        .expect("submit request");
+    pump(&mut client, &mut server, 1);
+    server
+        .conn
+        .submit_response(
+            id(0),
+            &[Header::new(":status", "200").unwrap()],
+            Some(Box::new(FixedBody::new(b"fine".to_vec()))),
+        )
+        .expect("a real request can still be answered");
+}
+
+#[test]
 fn acknowledging_a_stream_after_closing_it_is_refused() {
     // Closing discards the stream's accounting along with its buffers, so there is nothing
     // left for a later acknowledgement to release. nghttp3 would accept it silently; this
