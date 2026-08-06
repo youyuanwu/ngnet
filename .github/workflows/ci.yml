@@ -33,16 +33,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Non-recursive on purpose. The vendored libraries declare nested submodules —
-          # mruby, neverbleed, munit and more — that only their own tests and tooling need,
-          # while this repository builds the libraries alone. `true` is the non-recursive
-          # form; `recursive` would fetch the lot.
-          #
-          # This is deliberately *not* `just submodules`, which additionally checks out
-          # nghttp3's `lib/sfparse`. Nothing in the workspace compiles nghttp3 yet, so the
-          # job does not need it; the day a `-sys` crate builds nghttp3, this step has to
-          # grow that checkout or the build will fail on a missing sfparse.
-          submodules: true
+          # No submodule work here: the correct set is not uniform across the two
+          # vendored libraries, and encoding it in two places would guarantee they drift.
+          # `just submodules` below is the single definition.
+          submodules: false
+
+      - uses: extractions/setup-just@v2
+
+      # nghttp2 wants no nested submodules; nghttp3 needs exactly one of its own
+      # (`lib/sfparse`, which is compiled into the library rather than into its tests).
+      # The justfile encodes that asymmetry, and `just submodules-status` prints what
+      # was actually checked out, which is the first thing worth seeing on a failure.
+      - name: Check out the submodules the build needs
+        run: |
+          just submodules
+          just submodules-status
 
       # Reads the channel and components from rust-toolchain.toml, so the pin lives in one
       # place and a contributor's local `cargo test` uses the same compiler this does.
