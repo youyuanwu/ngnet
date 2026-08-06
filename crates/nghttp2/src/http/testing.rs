@@ -127,6 +127,27 @@ pub struct Duplex {
     vectored: Arc<Mutex<VectoredRecord>>,
     limits: Arc<Mutex<VecDeque<usize>>>,
     decline_after: Arc<Mutex<Option<usize>>>,
+    elections: Arc<Mutex<ElectionRecord>>,
+}
+
+/// How often each write-strategy election was consulted, and the owned-region write taken.
+///
+/// The election probes are the driver's per-pass strategy choice, distinct from the writes
+/// that follow it: a test that wants to pin *precedence* — the vectored election is read
+/// first, the owned-region one only when it declines — or *once-per-pass* — the choice is
+/// read once a pass and never once per write — needs to count the consultations, not the
+/// writes. [`VectoredRecord`] already counts the writes; this counts the choosing.
+#[derive(Debug, Default)]
+struct ElectionRecord {
+    /// Times the vectored election was probed: one construct-and-drop `write_vectored(&[])`
+    /// per flush pass, so this is the pass count as the driver sees it.
+    vectored_probes: usize,
+    /// Times [`TransportWrite::gathers_owned_regions`] was read. Zero when the vectored
+    /// election took precedence, since the driver never consults it after vectored wins.
+    owned_region_elections: usize,
+    /// Times [`TransportWrite::write_regions`] actually ran — the owned-region *write*, not
+    /// its election. Retries within a pass count, since each is a real call to the transport.
+    region_writes: usize,
 }
 
 /// Which write strategy a [`Duplex`] half offers the driver.
@@ -140,6 +161,14 @@ enum WriteShape {
     Vectored,
     /// Overrides both fast paths, so the driver's precedence rule has something to decide.
     Both,
+    /// Overrides the owned-region path: the completion strategy, a gathering write over an
+    /// owned `Vec<Bytes>`. Payloads ride uncopied in the caller's own memory.
+    OwnedRegions,
+    /// Overrides the vectored path *and* the owned-region one, so the driver's precedence
+    /// rule — read the vectored election first, take the owned-region path only when it
+    /// declines — has something to arbitrate over a driven connection rather than only at the
+    /// trait surface.
+    VectoredAndOwnedRegions,
 }
 
 impl WriteShape {
@@ -148,7 +177,14 @@ impl WriteShape {
     }
 
     const fn offers_vectored(self) -> bool {
-        matches!(self, Self::Vectored | Self::Both)
+        matches!(
+            self,
+            Self::Vectored | Self::Both | Self::VectoredAndOwnedRegions
+        )
+    }
+
+    const fn offers_owned_regions(self) -> bool {
+        matches!(self, Self::OwnedRegions | Self::VectoredAndOwnedRegions)
     }
 }
 
@@ -157,6 +193,16 @@ impl WriteShape {
 struct VectoredRecord {
     /// The region lengths of each polled call, in order.
     calls: Vec<Vec<usize>>,
+    /// The base address of each region of each polled call, in the same shape as
+    /// [`calls`](Self::calls).
+    ///
+    /// Recorded so a test can ask *where* the octets a write gathered came from, not only
+    /// how many there were. Phase 2 records these addresses; the two-sided coverage
+    /// assertion that pins a caller's chunk to an untouched region is Phase 3's (design
+    /// decision D8). An address is only meaningful for the instant of the call that logged
+    /// it — the buffer behind it may be reused afterwards — so a reader must compare it
+    /// against ranges captured at the same time, never dereference it.
+    bases: Vec<Vec<usize>>,
     /// Every octet handed over, concatenated in the order it was offered.
     octets: Vec<u8>,
     /// Calls that re-offered the remainder of a short write, rather than new octets.
@@ -199,6 +245,31 @@ pub fn duplex_offering_both() -> (Duplex, Duplex) {
     pair(WriteShape::Both)
 }
 
+/// Creates a connected pair whose halves elect the owned-region (completion) write path.
+///
+/// A half made this way reports `gathers_owned_regions`, receives an owned `Vec<Bytes>` at
+/// each gathering write, and records it through the same [`VectoredLog`] the vectored shape
+/// uses — so the pointer-coverage assertion of design decision D8 sees the completion path
+/// too. It honours [`Duplex::accept_at_most`] the same way, so owned-region short writes are
+/// driven deterministically rather than hoped for.
+pub fn duplex_owned_regions() -> (Duplex, Duplex) {
+    pair(WriteShape::OwnedRegions)
+}
+
+/// Creates a connected pair offering **both** the vectored and the owned-region paths.
+///
+/// Separate from [`duplex_offering_both`] — which offers the *borrowed* and vectored paths —
+/// because the precedence this one arbitrates is the other pairing: a completion transport
+/// that owns its buffers yet also advertises the readiness vectored path. The driver's rule
+/// is that vectored is read first and the owned-region election consulted only when it
+/// declines, so a half made this way must have its regions carried by the vectored path and
+/// never see [`TransportWrite::write_regions`]. Watch which election the driver consulted, and
+/// how often, through [`Duplex::election_log`]; watch what the vectored path gathered through
+/// [`Duplex::vectored_log`].
+pub fn duplex_vectored_and_owned_regions() -> (Duplex, Duplex) {
+    pair(WriteShape::VectoredAndOwnedRegions)
+}
+
 fn pair(shape: WriteShape) -> (Duplex, Duplex) {
     let one = Arc::new(Mutex::new(Pipe::default()));
     let two = Arc::new(Mutex::new(Pipe::default()));
@@ -213,6 +284,7 @@ fn pair(shape: WriteShape) -> (Duplex, Duplex) {
             vectored: Arc::new(Mutex::new(VectoredRecord::default())),
             limits: Arc::new(Mutex::new(VecDeque::new())),
             decline_after: Arc::new(Mutex::new(None)),
+            elections: Arc::new(Mutex::new(ElectionRecord::default())),
         },
         Duplex {
             incoming: two,
@@ -223,6 +295,7 @@ fn pair(shape: WriteShape) -> (Duplex, Duplex) {
             vectored: Arc::new(Mutex::new(VectoredRecord::default())),
             limits: Arc::new(Mutex::new(VecDeque::new())),
             decline_after: Arc::new(Mutex::new(None)),
+            elections: Arc::new(Mutex::new(ElectionRecord::default())),
         },
     )
 }
@@ -258,11 +331,27 @@ impl Duplex {
 
     /// A handle that keeps observing the vectored writes after the transport is split.
     ///
-    /// Empty unless this half came from [`duplex_vectored`], since the other two shapes
-    /// never reach the vectored path.
+    /// Populated by the vectored shape, which logs each gathering call, by the borrowed
+    /// shape, which logs each uncopied `write_borrowed` as a single-region call, and by the
+    /// owned-region shape, which logs each `write_regions` call the same way the vectored one
+    /// does — so the pointer-coverage assertion can see all three. Empty on the owned shape,
+    /// which reaches no fast path and is coalesced through `write`.
     pub fn vectored_log(&self) -> VectoredLog {
         VectoredLog {
             record: Arc::clone(&self.vectored),
+        }
+    }
+
+    /// A handle that keeps observing the write-strategy elections after the transport is
+    /// split.
+    ///
+    /// [`Transport::split`] consumes the transport, so a test driving a connection can no
+    /// longer reach it — but which election the driver consulted, and how often, is exactly
+    /// what a precedence or once-per-pass assertion turns on. Taking a handle first is how
+    /// that stays observable. See [`ElectionLog`] for what each count means.
+    pub fn election_log(&self) -> ElectionLog {
+        ElectionLog {
+            record: Arc::clone(&self.elections),
         }
     }
 
@@ -312,6 +401,46 @@ pub struct VectoredLog {
     record: Arc<Mutex<VectoredRecord>>,
 }
 
+/// Which write-strategy elections a transport half was asked for, and how often.
+///
+/// Distinct from [`VectoredLog`], which records the *writes*: this records the *choosing*
+/// that precedes them. The two answer different questions — "what went on the wire" versus
+/// "which strategy the driver picked, and whether it picked once a pass" — so the counts live
+/// apart rather than being teased out of one log after the fact.
+#[derive(Debug, Clone)]
+pub struct ElectionLog {
+    record: Arc<Mutex<ElectionRecord>>,
+}
+
+impl ElectionLog {
+    /// Times the vectored election was probed — one construct-and-drop `write_vectored(&[])`
+    /// per flush pass, so this is the number of passes the driver ran, counted where it makes
+    /// its per-pass strategy choice rather than inferred from the writes that followed.
+    pub fn vectored_probes(&self) -> usize {
+        self.record.lock().expect("election record").vectored_probes
+    }
+
+    /// Times [`TransportWrite::gathers_owned_regions`] was read. Zero when the vectored
+    /// election took precedence, since the driver stops at the first election that offers
+    /// itself and never consults this one after vectored wins — which is what makes a count of
+    /// zero here, over a transport that advertises *both*, a proof of precedence rather than
+    /// of the owned-region path merely going unused.
+    pub fn owned_region_elections(&self) -> usize {
+        self.record
+            .lock()
+            .expect("election record")
+            .owned_region_elections
+    }
+
+    /// Times [`TransportWrite::write_regions`] actually ran — the owned-region *write*, retries
+    /// included. Zero alongside a positive [`vectored_probes`](ElectionLog::vectored_probes)
+    /// over a both-advertising transport says the vectored path carried the traffic and the
+    /// owned-region write was never taken.
+    pub fn region_writes(&self) -> usize {
+        self.record.lock().expect("election record").region_writes
+    }
+}
+
 impl VectoredLog {
     /// The region lengths of each polled call, in order.
     ///
@@ -335,6 +464,19 @@ impl VectoredLog {
     /// writes per pass can exclude retries without having to reconstruct which was which.
     pub fn retries(&self) -> usize {
         self.record.lock().expect("vectored record").retries
+    }
+
+    /// The base address of each region of each polled call, shaped like
+    /// [`calls`](VectoredLog::calls).
+    ///
+    /// Lets a test see *where* a gathered write's octets came from — the driver's own
+    /// coalescing buffer, or a caller's `Bytes` handed over uncopied. Phase 2 records these
+    /// so Phase 3 can assert that a no-copy chunk's address falls inside a region the
+    /// transport was offered and outside the driver's buffer; on its own an address here
+    /// proves nothing and must never be dereferenced, since the buffer behind it may have
+    /// been reused by the time it is read.
+    pub fn bases(&self) -> Vec<Vec<usize>> {
+        self.record.lock().expect("vectored record").bases.clone()
     }
 
     /// Forgets everything so far, so a test can measure one driver pass at a time.
@@ -432,6 +574,7 @@ pub struct DuplexWriter {
     vectored: Arc<Mutex<VectoredRecord>>,
     limits: Arc<Mutex<VecDeque<usize>>>,
     decline_after: Arc<Mutex<Option<usize>>>,
+    elections: Arc<Mutex<ElectionRecord>>,
 }
 
 impl Transport for Duplex {
@@ -451,6 +594,7 @@ impl Transport for Duplex {
                 vectored: self.vectored,
                 limits: self.limits,
                 decline_after: self.decline_after,
+                elections: self.elections,
             },
         )
     }
@@ -536,6 +680,18 @@ impl TransportWrite for DuplexWriter {
             return None;
         }
         *self.writes.lock().expect("write count") += 1;
+        // Record where these octets came from, exactly as the vectored path does, so the
+        // two-sided pointer-coverage assertion (design decision D8) can pin a handed-over
+        // payload to the caller's own memory on the borrowed strategy too — not only on the
+        // vectored one. One borrowed write is one region, so it is logged as a single-region
+        // call. The address is meaningful only for the instant of the call, as the vectored
+        // log's own note explains.
+        {
+            let mut record = self.vectored.lock().expect("vectored record");
+            record.calls.push(vec![data.len()]);
+            record.bases.push(vec![data.as_ptr() as usize]);
+            record.octets.extend_from_slice(data);
+        }
         notifying(&self.outgoing, |pipe| pipe.put(data));
         Some(core::future::ready(Ok(data.len())))
     }
@@ -544,6 +700,18 @@ impl TransportWrite for DuplexWriter {
         &'w mut self,
         regions: &'w [io::IoSlice<'w>],
     ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        if regions.is_empty() {
+            // The driver's per-pass vectored election: a construct-and-drop probe with no
+            // regions. Counted here — at the one place per pass it happens, and recognisable
+            // as the only call with no regions — so a test can pin that the election is read
+            // once a pass and not once per write, independent of the regions later offered.
+            // Counted before the `offers_vectored` gate so a declining shape's probe still
+            // registers as a pass, which is what makes this the pass count for any shape.
+            self.elections
+                .lock()
+                .expect("election record")
+                .vectored_probes += 1;
+        }
         if !self.shape.offers_vectored() {
             return None;
         }
@@ -572,6 +740,76 @@ impl TransportWrite for DuplexWriter {
             record: Arc::clone(&self.vectored),
             limits: Arc::clone(&self.limits),
         })
+    }
+
+    fn gathers_owned_regions(&self) -> bool {
+        // The completion election, fixed at construction exactly as the readiness ones are.
+        // Only the owned-region shapes advertise it; every other shape leaves the default
+        // `false` in place, so the driver never offers them a `Vec<Bytes>`. Counting each read
+        // — through interior mutability, since the trait takes `&self` — lets a test see
+        // whether the driver consulted this election at all: over a transport that also offers
+        // the vectored path, a count of zero is proof the vectored election took precedence.
+        self.elections
+            .lock()
+            .expect("election record")
+            .owned_region_elections += 1;
+        self.shape.offers_owned_regions()
+    }
+
+    fn write_regions(
+        &mut self,
+        regions: Vec<Bytes>,
+    ) -> impl Future<Output = (io::Result<usize>, Vec<Bytes>)> {
+        // The owned counterpart of `DuplexVectoredWrite::poll`. It runs eagerly rather than
+        // as an inert future because there is nothing to probe: the election is a plain bool,
+        // so the driver never constructs one of these speculatively. The logging, cap
+        // handling, and retry accounting mirror the vectored path so one `VectoredLog` covers
+        // both — see that path for why each piece is shaped the way it is.
+        //
+        // The owned-region *write* is counted apart from its election: retries included, since
+        // each is a real call the transport served, which is what lets a test show the write
+        // ran more often than the once-per-pass election that chose it.
+        self.elections
+            .lock()
+            .expect("election record")
+            .region_writes += 1;
+        let offered: usize = regions.iter().map(Bytes::len).sum();
+        let cap = self
+            .limits
+            .lock()
+            .expect("write limits")
+            .pop_front()
+            .unwrap_or(offered);
+        let accepted = cap.min(offered);
+
+        let mut record = self.vectored.lock().expect("vectored record");
+        if record.last_was_short {
+            record.retries += 1;
+        } else {
+            *self.writes.lock().expect("write count") += 1;
+        }
+        record.calls.push(regions.iter().map(Bytes::len).collect());
+        record.bases.push(
+            regions
+                .iter()
+                .map(|region| region.as_ptr() as usize)
+                .collect(),
+        );
+        record.last_was_short = accepted < offered;
+
+        let mut remaining = accepted;
+        for region in &regions {
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(region.len());
+            record.octets.extend_from_slice(&region[..take]);
+            notifying(&self.outgoing, |pipe| pipe.put(&region[..take]));
+            remaining -= take;
+        }
+        drop(record);
+
+        core::future::ready((Ok(accepted), regions))
     }
 }
 
@@ -611,6 +849,12 @@ impl Future for DuplexVectoredWrite<'_> {
         record
             .calls
             .push(me.regions.iter().map(|region| region.len()).collect());
+        record.bases.push(
+            me.regions
+                .iter()
+                .map(|region| region.as_ptr() as usize)
+                .collect(),
+        );
         record.last_was_short = accepted < offered;
 
         let mut remaining = accepted;
@@ -648,7 +892,41 @@ pub struct Failing {
 /// `on_read` chooses the direction that breaks, since a socket may fail either way and the
 /// two reach the driver through different paths.
 pub fn failing(after: usize, on_read: bool) -> (Failing, Duplex) {
-    let (one, two) = duplex(false);
+    over(duplex(false), after, on_read)
+}
+
+/// A [`Failing`] whose unbroken half elects the **vectored** write path, and its peer.
+///
+/// Separate from [`failing`] rather than another argument to it, for the same reason
+/// [`duplex_vectored`] is separate from [`duplex`]: the shape a transport advertises is a
+/// property of the transport, so it belongs in the constructor's name, not in a boolean
+/// threaded through every call site. It exists because [`failing`] alone can only break the
+/// owned/coalescing path — the fast paths run through the driver's `flush_regions`, which
+/// `failing` never reaches — so a transport that fails *while* electing the vectored strategy
+/// is the only way to drive a transport error through that code. Observe what it gathered
+/// through [`Failing::vectored_log`].
+pub fn failing_vectored(after: usize, on_read: bool) -> (Failing, Duplex) {
+    over(duplex_vectored(), after, on_read)
+}
+
+/// A [`Failing`] whose unbroken half elects the **borrowed** (zero-copy) write path, and its
+/// peer.
+///
+/// The borrowed counterpart to [`failing_vectored`], and separate from [`failing`] for the
+/// same reason: the borrowed strategy also runs through `flush_regions`, so a transport that
+/// fails while lending the borrowed path is the second way — beside the vectored one — to
+/// drive a transport error through that code. Where the vectored path fails on one gathered
+/// write of many regions, the borrowed path writes one region per call, so a failure lands on
+/// a single named region; [`Failing::vectored_log`] records each as a single-region write.
+pub fn failing_borrowed(after: usize, on_read: bool) -> (Failing, Duplex) {
+    over(duplex(true), after, on_read)
+}
+
+/// Builds a [`Failing`] over the already-made duplex pair, arming the first half.
+///
+/// The three `failing*` constructors differ only in which strategy their duplex advertises,
+/// so the countdown wiring lives here once rather than being repeated three times.
+fn over((one, two): (Duplex, Duplex), after: usize, on_read: bool) -> (Failing, Duplex) {
     (
         Failing {
             inner: one,
@@ -657,6 +935,21 @@ pub fn failing(after: usize, on_read: bool) -> (Failing, Duplex) {
         },
         two,
     )
+}
+
+impl Failing {
+    /// A handle that keeps observing the unbroken half's vectored writes after the transport
+    /// is split.
+    ///
+    /// [`Transport::split`] consumes the transport, so a test driving a failing connection
+    /// must take this before handing the transport to the driver. Populated exactly as
+    /// [`Duplex::vectored_log`] is — by the vectored shape logging each gathering call and the
+    /// borrowed shape logging each uncopied write as a single region — which is how a test can
+    /// prove the failing write really was carrying payload regions rather than a bare
+    /// handshake block.
+    pub fn vectored_log(&self) -> VectoredLog {
+        self.inner.vectored_log()
+    }
 }
 
 /// The reading half of a [`Failing`].
@@ -745,6 +1038,47 @@ impl TransportWrite for FailingWriter {
                 (result, buf)
             }
         }
+    }
+
+    fn write_borrowed<'w>(
+        &'w mut self,
+        data: &'w [u8],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        // Election passes straight through: whether the borrowed path is offered is the inner
+        // duplex's shape to decide, so `None` from it is `None` here and the driver takes
+        // another path. Note that the inner duplex performs a borrowed write *at
+        // construction* and returns a ready future — long-standing behaviour the driver
+        // accommodates by never probing this election speculatively, unlike the vectored one.
+        // So it is only the countdown that is deferred into the returned future here, and the
+        // reason is narrower than on the vectored path: it keeps the accounting in one place
+        // across both, so a countdown reads the same number of operations either way.
+        let countdown = Arc::clone(&self.countdown);
+        let armed = self.armed;
+        let inner = self.inner.write_borrowed(data)?;
+        Some(async move {
+            let failed = spent(&countdown, armed);
+            let written = inner.await;
+            if failed { Err(broken()) } else { written }
+        })
+    }
+
+    fn write_vectored<'w>(
+        &'w mut self,
+        regions: &'w [io::IoSlice<'w>],
+    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
+        // As with the borrowed path, the election is the inner duplex's to make and the
+        // countdown is spent only when the write is actually performed. This matters more
+        // here: the driver probes the vectored election by building this future with an empty
+        // region list and dropping it unpolled, so spending at construction would charge an
+        // operation for a write that never happened and shift the failure onto the wrong one.
+        let countdown = Arc::clone(&self.countdown);
+        let armed = self.armed;
+        let inner = self.inner.write_vectored(regions)?;
+        Some(async move {
+            let failed = spent(&countdown, armed);
+            let written = inner.await;
+            if failed { Err(broken()) } else { written }
+        })
     }
 }
 

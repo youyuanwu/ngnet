@@ -261,3 +261,155 @@ fn a_buffering_transport_that_gathers_still_completes_an_exchange() {
          proved nothing the test above had not",
     );
 }
+
+// ----- the same obligation, on the owned-region path -----
+
+/// A buffering transport that elects the *owned-region* (completion) write path.
+///
+/// The gathering transport above reaches `commit` through `write_vectored`; the completion
+/// strategy reaches it through `write_regions`, a different call sequence again. A driver
+/// that flushed after the readiness paths but forgot the owned-region one would pass both
+/// tests above while stranding every completion pass, so the obligation is restated a third
+/// time against a transport that gathers owned regions. Defined here for the same reason
+/// `GatheringBuffer` is — one point, one file, and the public surface stays as
+/// `compat_surface.rs` pins it.
+struct GatheringRegionBuffer {
+    inner: Duplex,
+    /// Owned-region calls actually made, shared with the test so it can tell whether the
+    /// completion path it means to exercise was taken at all.
+    gathered: Rc<Cell<usize>>,
+}
+
+struct GatheringRegionBufferWriter {
+    inner: DuplexWriter,
+    /// Octets written but not yet handed to the peer — the user-space buffer a `BufWriter`
+    /// would keep.
+    buffer: Vec<u8>,
+    gathered: Rc<Cell<usize>>,
+}
+
+impl Transport for GatheringRegionBuffer {
+    type Reader = DuplexReader;
+    type Writer = GatheringRegionBufferWriter;
+
+    fn split(self) -> (Self::Reader, Self::Writer) {
+        let (reader, writer) = self.inner.split();
+        (
+            reader,
+            GatheringRegionBufferWriter {
+                inner: writer,
+                buffer: Vec::new(),
+                gathered: self.gathered,
+            },
+        )
+    }
+}
+
+impl TransportWrite for GatheringRegionBufferWriter {
+    fn write(
+        &mut self,
+        buf: bytes::Bytes,
+    ) -> impl Future<Output = (io::Result<usize>, bytes::Bytes)> {
+        self.buffer.extend_from_slice(&buf);
+        let written = buf.len();
+        core::future::ready((Ok(written), buf))
+    }
+
+    fn gathers_owned_regions(&self) -> bool {
+        // The completion election. A plain predicate the driver reads once per pass — unlike
+        // the vectored one, there is no unpolled future to build, so buffering here is safe.
+        true
+    }
+
+    fn write_regions(
+        &mut self,
+        regions: Vec<bytes::Bytes>,
+    ) -> impl Future<Output = (io::Result<usize>, Vec<bytes::Bytes>)> {
+        self.gathered.set(self.gathered.get() + 1);
+        let mut written = 0;
+        for region in &regions {
+            self.buffer.extend_from_slice(region);
+            written += region.len();
+        }
+        core::future::ready((Ok(written), regions))
+    }
+
+    async fn commit(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let data = core::mem::take(&mut self.buffer);
+        let (result, _buf) = self.inner.write(bytes::Bytes::from(data)).await;
+        result.map(|_| ())
+    }
+}
+
+#[test]
+fn a_buffering_transport_that_gathers_owned_regions_still_completes_an_exchange() {
+    // The same exchange, over a transport that elects the completion path and buffers until
+    // `commit`. `handshake_shared` is required: only a shared body reaches the owned-region
+    // strategy, and `Full` is a shared body whose data is `Bytes`. The budget turns "the
+    // driver stopped committing after an owned-region pass" into a failure, not a hung suite.
+    let (client_transport, server_transport) = duplex(false);
+    let gathered = Rc::new(Cell::new(0usize));
+    let client_transport = GatheringRegionBuffer {
+        inner: client_transport,
+        gathered: Rc::clone(&gathered),
+    };
+
+    let (requests, connection) =
+        nghttp2::http::handshake_shared::<_, Full>(client_transport).expect("handshake");
+
+    let serving = server::serve(server_transport, |request: http::Request<IncomingBody>| {
+        drop(request.into_body());
+        async move {
+            http::Response::builder()
+                .status(200)
+                .header("x-answered", "yes")
+                .body(Full::new(&b"gathered"[..]))
+                .expect("a response")
+        }
+    })
+    .expect("serving");
+
+    let exchange = async {
+        let response = requests
+            .send_request(
+                http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri("http://example.test/regions")
+                    // Larger than one frame so the pass carries several DATA frames, each a
+                    // header region plus a payload region: a genuinely multi-region write.
+                    .body(Full::new(vec![b'x'; 4096]))
+                    .expect("a request"),
+            )
+            .await
+            .expect("a response");
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-answered")
+                .and_then(|value| value.to_str().ok()),
+            Some("yes"),
+            "the response did not round-trip through the owned-region transport",
+        );
+        drop(requests);
+    };
+
+    let outcome = block_on(within_budget(
+        alongside(alongside(exchange, connection), serving),
+        200_000,
+    ));
+
+    assert!(
+        outcome.is_some(),
+        "the exchange never completed: an owned-region pass left behind a buffer nobody \
+         flushed",
+    );
+    assert!(
+        gathered.get() > 0,
+        "no owned-region call was ever made, so this exercised some other path and proved \
+         nothing about the completion strategy's commit obligation",
+    );
+}

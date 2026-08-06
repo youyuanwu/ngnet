@@ -300,7 +300,8 @@ mod asynchronous {
     };
     use nghttp2::http::{
         Config, Error, ErrorKind, IncomingBody, ResponseFuture, SendRequest, Transport,
-        TransportRead, TransportWrite, handshake, handshake_with,
+        TransportRead, TransportWrite, handshake, handshake_shared, handshake_shared_with,
+        handshake_with,
     };
 
     /// The connection configuration, pinned as a `Copy` builder with conservative
@@ -420,6 +421,47 @@ mod asynchronous {
         Ok(())
     }
 
+    /// The no-copy client entry point, pinned as returning exactly the pair `handshake`
+    /// does.
+    ///
+    /// The whole promise being pinned is that opting in to no-copy costs a caller nothing
+    /// in the surface: the handle is the same `SendRequest<B>`, the driver the same
+    /// `Connection`, the request the same `http::Request`. The only visible difference is
+    /// the bound — `B::Data` must be `Bytes` — which is why this is a separate function
+    /// from [`client_surface`] rather than a change to it.
+    pub(super) fn client_shared_surface<T, B>(transport: T) -> core::result::Result<(), Error>
+    where
+        T: Transport,
+        T::Reader: TransportRead,
+        T::Writer: TransportWrite,
+        B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let (requests, connection): (SendRequest<B>, nghttp2::http::Connection<_>) =
+            handshake_shared::<T, B>(transport)?;
+        drop((requests, connection));
+        Ok(())
+    }
+
+    /// The explicit-config no-copy client entry point, additive over
+    /// [`client_shared_surface`] exactly as `handshake_with` is over `handshake`.
+    pub(super) fn client_shared_with_config_surface<T, B>(
+        transport: T,
+        config: Config,
+    ) -> core::result::Result<(), Error>
+    where
+        T: Transport,
+        T::Reader: TransportRead,
+        T::Writer: TransportWrite,
+        B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let (requests, connection): (SendRequest<B>, nghttp2::http::Connection<_>) =
+            handshake_shared_with::<T, B>(transport, config)?;
+        drop((requests, connection));
+        Ok(())
+    }
+
     /// The server entry point, pinned the same way as the client's.
     ///
     /// A handler is an ordinary `FnMut` returning an ordinary future; nothing here is a
@@ -464,6 +506,50 @@ mod asynchronous {
         Ok(())
     }
 
+    /// The no-copy server entry point, pinned as returning exactly what `serve` does.
+    ///
+    /// As with the client, the only visible difference from [`server_surface`] is the
+    /// bound `B::Data = Bytes`; the handler, its request, its response type and the driver
+    /// are all the same.
+    pub(super) fn server_shared_surface<T, H, F, B>(
+        transport: T,
+        handler: H,
+    ) -> core::result::Result<(), Error>
+    where
+        T: Transport,
+        T::Reader: TransportRead,
+        T::Writer: TransportWrite,
+        H: FnMut(http::Request<IncomingBody>) -> F,
+        F: core::future::Future<Output = http::Response<B>>,
+        B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let connection = nghttp2::http::serve_shared(transport, handler)?;
+        drop(connection);
+        Ok(())
+    }
+
+    /// The explicit-config no-copy server entry point, additive over
+    /// [`server_shared_surface`] exactly as `serve_with` is over `serve`.
+    pub(super) fn server_shared_with_config_surface<T, H, F, B>(
+        transport: T,
+        handler: H,
+        config: Config,
+    ) -> core::result::Result<(), Error>
+    where
+        T: Transport,
+        T::Reader: TransportRead,
+        T::Writer: TransportWrite,
+        H: FnMut(http::Request<IncomingBody>) -> F,
+        F: core::future::Future<Output = http::Response<B>>,
+        B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let connection = nghttp2::http::serve_shared_with(transport, handler, config)?;
+        drop(connection);
+        Ok(())
+    }
+
     /// The ready-made tokio transport, when the feature that provides it is on.
     ///
     /// Feature-gated surface is still surface: a caller who enabled it is entitled to the
@@ -502,13 +588,17 @@ mod asynchronous {
         drop((reader, writer));
     }
 
-    /// The writing half's contract, pinned by the shape of its three overridable points.
+    /// The writing half's contract, pinned by the shape of its overridable points.
     ///
     /// Each fast path is a *single* override: `write_borrowed` and `write_vectored` each
     /// return an `Option` of a future, so the decision (`Some`/`None`) and the write are one
-    /// method — a separate boolean flag would be a different, breakable, surface. `commit`
-    /// returns a future of `()`. All are pinned as signatures rather than fn pointers
-    /// because a return-position `impl Future` has no nameable type.
+    /// method — a separate boolean flag would be a different, breakable, surface. The
+    /// owned-region path is the deliberate exception: its election (`gathers_owned_regions`,
+    /// a plain `bool`) is split from its write (`write_regions`, which takes an owned
+    /// `Vec<Bytes>` and hands it back), because a late `None` there would consume and lose
+    /// owned buffers that a borrowed slice can afford to drop. `commit` returns a future of
+    /// `()`. All are pinned as signatures rather than fn pointers because a return-position
+    /// `impl Future` has no nameable type.
     pub(super) fn write_half_surface<W: TransportWrite>() {
         fn borrowed_is_one_optional_future<W: TransportWrite>(writer: &mut W, data: &[u8]) {
             fn assert_optional_future<F: core::future::Future<Output = std::io::Result<usize>>>(
@@ -527,12 +617,29 @@ mod asynchronous {
             }
             assert_optional_future(writer.write_vectored(regions));
         }
+        fn owned_region_election_is_a_bool<W: TransportWrite>(writer: &W) {
+            let _: bool = writer.gathers_owned_regions();
+        }
+        fn write_regions_takes_and_returns_owned_regions<W: TransportWrite>(
+            writer: &mut W,
+            regions: Vec<bytes::Bytes>,
+        ) {
+            fn assert_future<
+                F: core::future::Future<Output = (std::io::Result<usize>, Vec<bytes::Bytes>)>,
+            >(
+                _: F,
+            ) {
+            }
+            assert_future(writer.write_regions(regions));
+        }
         fn commit_returns_a_result_future<W: TransportWrite>(writer: &mut W) {
             fn assert_future<F: core::future::Future<Output = std::io::Result<()>>>(_: F) {}
             assert_future(writer.commit());
         }
         let _ = borrowed_is_one_optional_future::<W>;
         let _ = vectored_is_one_optional_future::<W>;
+        let _ = owned_region_election_is_a_bool::<W>;
+        let _ = write_regions_takes_and_returns_owned_regions::<W>;
         let _ = commit_returns_a_result_future::<W>;
     }
 
@@ -552,13 +659,28 @@ fn the_asynchronous_surface_is_unchanged() {
         asynchronous::client_surface::<Duplex, Empty>;
     let _: fn(&nghttp2::http::IncomingBody) = asynchronous::incoming_body_surface;
     let _: fn(&nghttp2::http::Cancelled) = asynchronous::cancelled_surface;
-    // The writing half's three overridable points, pinned generically so the shape holds for
-    // every transport, not only the ready-made tokio one.
+    // The writing half's overridable points — `write_vectored`, `write_borrowed`, `commit`,
+    // and the owned-region pair `gathers_owned_regions`/`write_regions` — pinned generically
+    // so the shape holds for every transport, not only the ready-made tokio one.
     asynchronous::write_half_surface::<nghttp2::http::testing::DuplexWriter>();
     // The vectored testing transport and its observation handle. Hidden from the docs but
     // still public, and integration tests are separate crates that can reach nothing else.
     let _: fn() -> (Duplex, Duplex) = nghttp2::http::testing::duplex_vectored;
     let _: fn() -> (Duplex, Duplex) = nghttp2::http::testing::duplex_offering_both;
+    // The completion-shaped transport: it elects the owned-region path, taking ownership of a
+    // list of `Bytes` rather than borrowing slices.
+    let _: fn() -> (Duplex, Duplex) = nghttp2::http::testing::duplex_owned_regions;
+    // The transport that advertises the vectored and owned-region paths at once, and the
+    // election handle a precedence or once-per-pass assertion reads. Added beside the duplex
+    // constructors they sit with; hidden from the docs like the rest of `testing`, but public.
+    let _: fn() -> (Duplex, Duplex) = nghttp2::http::testing::duplex_vectored_and_owned_regions;
+    let _: fn(&Duplex) -> nghttp2::http::testing::ElectionLog = Duplex::election_log;
+    let _: fn(&nghttp2::http::testing::ElectionLog) -> usize =
+        nghttp2::http::testing::ElectionLog::vectored_probes;
+    let _: fn(&nghttp2::http::testing::ElectionLog) -> usize =
+        nghttp2::http::testing::ElectionLog::owned_region_elections;
+    let _: fn(&nghttp2::http::testing::ElectionLog) -> usize =
+        nghttp2::http::testing::ElectionLog::region_writes;
     let _: fn(&Duplex, usize) = Duplex::decline_vectored_after;
     let _: fn(&Duplex) -> nghttp2::http::testing::VectoredLog = Duplex::vectored_log;
     let _: fn(&nghttp2::http::testing::VectoredLog) -> Vec<Vec<usize>> =
@@ -568,10 +690,28 @@ fn the_asynchronous_surface_is_unchanged() {
     let _: fn(&nghttp2::http::testing::VectoredLog) -> usize =
         nghttp2::http::testing::VectoredLog::retries;
     let _: fn(&nghttp2::http::testing::VectoredLog) = nghttp2::http::testing::VectoredLog::reset;
+    let _: fn(&nghttp2::http::testing::VectoredLog) -> Vec<Vec<usize>> =
+        nghttp2::http::testing::VectoredLog::bases;
     let _: fn(&Duplex, Vec<usize>) = |duplex, caps| duplex.accept_at_most(caps);
+    // The failing transport's two readiness-strategy constructors and its log handle, added
+    // so a transport error can be driven through the vectored and borrowed fast paths. Hidden
+    // from the docs like the rest of `testing`, but public, so pinned here beside the duplex
+    // constructors they mirror.
+    let _: fn(usize, bool) -> (nghttp2::http::testing::Failing, Duplex) =
+        nghttp2::http::testing::failing_vectored;
+    let _: fn(usize, bool) -> (nghttp2::http::testing::Failing, Duplex) =
+        nghttp2::http::testing::failing_borrowed;
+    let _: fn(&nghttp2::http::testing::Failing) -> nghttp2::http::testing::VectoredLog =
+        nghttp2::http::testing::Failing::vectored_log;
     let _: fn() = asynchronous::config_surface;
     let _: fn(Duplex, nghttp2::http::Config) -> core::result::Result<(), nghttp2::http::Error> =
         asynchronous::client_with_config_surface::<Duplex, Empty>;
+    // The four no-copy entry points, pinned exactly as their copying counterparts are. They
+    // return the same pair and take the same arguments; only the body bound differs.
+    let _: fn(Duplex) -> core::result::Result<(), nghttp2::http::Error> =
+        asynchronous::client_shared_surface::<Duplex, Empty>;
+    let _: fn(Duplex, nghttp2::http::Config) -> core::result::Result<(), nghttp2::http::Error> =
+        asynchronous::client_shared_with_config_surface::<Duplex, Empty>;
     #[cfg(feature = "tokio")]
     {
         let _: fn(tokio::net::TcpStream) = asynchronous::tokio_transport_surface::<_>;
@@ -607,6 +747,40 @@ fn the_asynchronous_surface_is_unchanged() {
     drop(
         nghttp2::http::serve_with(top_level, answer, nghttp2::http::Config::default())
             .expect("serving"),
+    );
+
+    // The no-copy server entry points, reachable both generically and concretely, and both
+    // at the top of `http` and through the `server` module.
+    let (shared_generic, _peer) = nghttp2::http::testing::duplex(false);
+    asynchronous::server_shared_surface(shared_generic, answer).expect("serving");
+    let (shared_generic_cfg, _peer) = nghttp2::http::testing::duplex(false);
+    asynchronous::server_shared_with_config_surface(
+        shared_generic_cfg,
+        answer,
+        nghttp2::http::Config::default(),
+    )
+    .expect("serving");
+    let (shared_direct, _peer) = nghttp2::http::testing::duplex(false);
+    drop(nghttp2::http::serve_shared(shared_direct, answer).expect("serving"));
+    let (shared_qualified, _peer) = nghttp2::http::testing::duplex(false);
+    drop(nghttp2::http::server::serve_shared(shared_qualified, answer).expect("serving"));
+    let (shared_configured, _peer) = nghttp2::http::testing::duplex(false);
+    drop(
+        nghttp2::http::serve_shared_with(
+            shared_configured,
+            answer,
+            nghttp2::http::Config::default(),
+        )
+        .expect("serving"),
+    );
+    let (shared_qualified_cfg, _peer) = nghttp2::http::testing::duplex(false);
+    drop(
+        nghttp2::http::server::serve_shared_with(
+            shared_qualified_cfg,
+            answer,
+            nghttp2::http::Config::default(),
+        )
+        .expect("serving"),
     );
     let _: fn(nghttp2::http::testing::http_crate::Response<nghttp2::http::IncomingBody>) =
         asynchronous::response_surface;

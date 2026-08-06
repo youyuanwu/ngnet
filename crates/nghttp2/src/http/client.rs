@@ -24,11 +24,13 @@
 //! ```
 
 use core::future::Future;
+use core::marker::PhantomData;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::error::Error as StdError;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use http_body::Body;
 
 use std::sync::Weak;
@@ -36,7 +38,7 @@ use std::sync::Weak;
 use super::body::{Direction, IncomingBody};
 use super::config::Config;
 use super::connection::Connection;
-use super::driver::{self, DriverGuard, Events, Role, Signals};
+use super::driver::{self, BodyPlan, DriverGuard, Events, PushBodies, Role, SharedBodies, Signals};
 use super::error::{Error, ErrorKind, Result};
 use super::head;
 use super::shared::{Command, HandleToken, Incoming, Queue, Registry, Shared, Slot};
@@ -85,6 +87,75 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
+    handshake_planned::<T, B, PushBodies>(transport, config)
+}
+
+/// Starts a client connection whose request bodies are handed over uncopied.
+///
+/// The no-copy counterpart of [`handshake`]. Identical in every respect a caller can see —
+/// the same handle, the same driver, the same `http::Request`/`http::Response` types —
+/// except that the request body's octets travel to the transport without being copied into
+/// libnghttp2's serialisation buffer. That is possible only when the body's `Data` is
+/// [`bytes::Bytes`], which the crate can hand over rather than copy, so this entry point
+/// bounds `B::Data = Bytes` where [`handshake`] does not.
+///
+/// The choice is whole-connection: every request on a connection started here hands its
+/// body over, and a caller who needs both kinds on one connection supplies a body that is
+/// itself a choice between them (its `Data` is still `Bytes`). See [`handshake`] for the
+/// shape of what is returned and how the two objects must be run together.
+///
+/// # Errors
+///
+/// Fails only if the underlying session cannot be created.
+pub fn handshake_shared<T, B>(
+    transport: T,
+) -> Result<(SendRequest<B>, Connection<impl Future<Output = Result<()>>>)>
+where
+    T: Transport,
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    handshake_shared_with(transport, Config::default())
+}
+
+/// Starts a no-copy client connection with an explicit [`Config`].
+///
+/// The no-copy counterpart of [`handshake_with`], and additive over [`handshake_shared`]
+/// in exactly the way [`handshake_with`] is over [`handshake`]: it takes a [`Config`] by
+/// value and returns the same pair.
+///
+/// # Errors
+///
+/// Fails only if the underlying session cannot be created.
+pub fn handshake_shared_with<T, B>(
+    transport: T,
+    config: Config,
+) -> Result<(SendRequest<B>, Connection<impl Future<Output = Result<()>>>)>
+where
+    T: Transport,
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    handshake_planned::<T, B, SharedBodies>(transport, config)
+}
+
+/// The shared body of the four public client entry points, parameterised by body plan.
+///
+/// The plain and `_shared` forms differ only in which [`BodyPlan`] they fix and the bound
+/// that plan needs, so the connection wiring lives here once rather than four times. `P`
+/// never escapes: the handle, the driver and every returned type are the same whichever
+/// plan is chosen.
+fn handshake_planned<T, B, P>(
+    transport: T,
+    config: Config,
+) -> Result<(SendRequest<B>, Connection<impl Future<Output = Result<()>>>)>
+where
+    T: Transport,
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    P: BodyPlan<B>,
+{
     let session = driver::client_session(&config)?;
 
     let shared = Arc::new(Shared::default());
@@ -95,11 +166,12 @@ where
     let guard = DriverGuard::new(
         Arc::clone(&shared),
         Arc::clone(&registry),
-        ClientRole {
+        ClientRole::<B, P> {
             shared: Arc::clone(&shared),
             queue: Arc::clone(&queue),
             registry: Arc::clone(&registry),
             handles: Arc::downgrade(&token),
+            plan: PhantomData,
         },
     );
 
@@ -125,19 +197,23 @@ where
 ///
 /// Requests arrive from handles rather than from the wire, and a completed header block is
 /// an answer rather than a job.
-struct ClientRole<B> {
+struct ClientRole<B, P> {
     shared: Arc<Shared>,
     queue: Arc<Queue<B>>,
     registry: Arc<Registry>,
     /// Weak, so the last handle going away is what tells the driver no more can come.
     handles: Weak<HandleToken>,
+    /// Names the body plan this connection was built with. Zero-sized; it selects the
+    /// submission path in [`submit`](ClientRole::submit) and nothing else.
+    plan: PhantomData<fn() -> P>,
 }
 
-impl<B> ClientRole<B>
+impl<B, P> ClientRole<B, P>
 where
     B: Body + Send + 'static,
     B::Data: Send,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    P: BodyPlan<B>,
 {
     /// Submits one request, linking its stream to the slot that will answer it.
     fn submit(
@@ -160,9 +236,16 @@ where
         let stream = if body.is_end_stream() {
             session.submit_request(&views)?
         } else {
-            let (source, waker) =
-                driver::outgoing_body(&self.shared, Arc::downgrade(&liveness), body);
-            let stream = session.submit_request_with_body(&views, source)?;
+            // The body plan chooses whether these octets are copied or handed over; the
+            // rest of the submission — binding the waker, linking the slot — is the same
+            // either way.
+            let (stream, waker) = P::submit_request(
+                &self.shared,
+                session,
+                Arc::downgrade(&liveness),
+                &views,
+                body,
+            )?;
             // The identifier only exists now. Nothing can have consulted the body yet —
             // that happens inside `Session::send` — so no wake can have been lost.
             waker.bind(stream.get());
@@ -182,11 +265,12 @@ where
     }
 }
 
-impl<B> Role for ClientRole<B>
+impl<B, P> Role for ClientRole<B, P>
 where
     B: Body + Send + 'static,
     B::Data: Send,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    P: BodyPlan<B>,
 {
     fn advance(&mut self, session: &mut Session<Events>) -> Result<()> {
         for command in self.queue.drain() {

@@ -85,30 +85,56 @@
 //! IOCP) needs and a readiness API (tokio, `futures-io`) satisfies with no copy.
 //!
 //! One decision is the writer's, and it is not free either way.
-//! [`TransportWrite::write_borrowed`] and [`TransportWrite::write_vectored`] choose how the
-//! session is drained, and each is a single override point on purpose: overriding neither —
+//! [`TransportWrite::write_borrowed`], [`TransportWrite::write_vectored`] and
+//! [`TransportWrite::gathers_owned_regions`] choose how the session is drained, and each is a
+//! single override point on purpose: overriding none —
 //! the default — has the driver coalesce a whole pass into one owned buffer and issue a
-//! single [`write`](TransportWrite::write), which is one syscall per pass but allocates and
+//! single [`write`](TransportWrite::write), which is one syscall per pass but
 //! copies every outgoing octet, every pass. `write_borrowed` returning `Some(future)` hands
-//! each of the session's own blocks over directly: **zero** allocation and zero copy, but
-//! one write per block, which is the dominant cost when a pass is dozens of tiny multiplexed
-//! blocks. `write_vectored` returning `Some(future)` gathers those small blocks into a
-//! buffer the driver reuses and hands the socket that buffer alongside any large block, in
-//! one `writev` — few syscalls, no copy of large payloads, and still zero steady-state
-//! allocation. It takes precedence where both are overridden. Because each method carries
-//! both the choice and the write, an adapter cannot advertise a fast path without providing
-//! it, nor provide it without the driver taking it.
+//! each of the session's own regions over directly: **zero** allocation and zero copy, but
+//! one write per block — and *two* per handed-over payload, since its frame header and its
+//! octets are separate regions — which is the dominant cost when a pass is dozens of tiny
+//! multiplexed blocks. `write_vectored` returning `Some(future)`
+//! gathers those small blocks into a buffer the driver reuses and hands the socket that
+//! buffer alongside any large block and any handed-over payload, in one `writev` — few
+//! syscalls, no copy of large payloads, and still zero steady-state allocation.
+//!
+//! `gathers_owned_regions` returning `true` is the same bargain for a *completion* transport,
+//! which cannot lend the kernel a borrowed slice at all — the kernel writes from the buffers
+//! after submission, so they must be owned. The driver instead builds a list of owned
+//! [`bytes::Bytes`] and passes it to [`TransportWrite::write_regions`], which takes ownership
+//! and returns the list so the allocation can be reused: every session-produced block is
+//! copied into a driver buffer there, with no size threshold, because a block borrowed from
+//! the session cannot be owned without a copy — but each handed-over payload rides as its own
+//! region in the caller's own memory, uncopied. That is the whole reason a completion
+//! transport can gather at all, and it is available only for handed-over bodies; a
+//! push-model body's `DATA` was never the caller's to hand over, so it is copied like any
+//! other block.
+//!
+//! Precedence among the four, highest first: vectored, owned-region, borrowed, owned. The
+//! vectored and borrowed elections carry both the choice and the write in one call — an
+//! `Option`-returning method that gathers when it returns `Some` — so for those two an
+//! adapter cannot advertise a fast path without providing it, nor provide it without the
+//! driver taking it. The owned-region path is the deliberate exception: its election
+//! ([`TransportWrite::gathers_owned_regions`], a plain predicate) is *split* from its write
+//! ([`TransportWrite::write_regions`]). It has to be. A late `None` from a method already
+//! handed the owned `Vec<Bytes>` would consume the regions and lose them, where a declined
+//! borrowed slice can simply be dropped; ownership is the difference, and it is why the two
+//! idioms are not the same shape.
 //!
 //! What the session's block lifetime forecloses is narrower than it first looks. Asking for
 //! the next block invalidates the last, and [`Session::send`](crate::Session::send) enforces
 //! that by borrowing the session for as long as the block lives — so several *session
 //! blocks* can never be gathered with each other. But one block can be gathered with memory
-//! the driver already owns, and that is enough: it is exactly what the vectored path does.
-//! A readiness-based transport overrides these, which is why the `TokioIo`
-//! adapter behind the `tokio` feature does; a completion API leaves them at their defaults
-//! and maps onto the owned methods with no adapter code to speak of — its `read`/`write`
-//! already take and return the buffer — as `crates/nghttp2-tests/tests/http_compio.rs`
-//! demonstrates against a real one.
+//! the driver already owns — its accumulation buffer, and the handed-over payloads it holds
+//! as lifetime-free descriptors — and that is enough: it is exactly what the vectored path
+//! does. A readiness-based transport overrides the borrowed and vectored methods, which is
+//! why the `TokioIo` adapter behind the `tokio` feature does. A completion transport cannot
+//! use either — both lend the kernel a borrowed slice — so it leaves them at their defaults
+//! and overrides the owned-region pair instead, which is what the shipped `CompioIo` adapter
+//! does (`transport/compio.rs`); before handed-over bodies existed it had no fast path at all
+//! and fell back to the plain owned `write`. `crates/nghttp2-tests/tests/http_compio.rs`
+//! demonstrates both against a real io_uring socket.
 //!
 //! The other obligation is [`TransportWrite::commit`]: the driver calls it after draining a
 //! pass and before it waits on the peer, so a transport that buffers its writes — a
@@ -130,11 +156,13 @@ pub mod transport;
 mod waker;
 
 pub use body::IncomingBody;
-pub use client::{ResponseFuture, SendRequest, handshake, handshake_with};
+pub use client::{
+    ResponseFuture, SendRequest, handshake, handshake_shared, handshake_shared_with, handshake_with,
+};
 pub use config::Config;
 pub use connection::Connection;
 pub use error::{Error, ErrorKind, Result};
-pub use server::{Cancelled, serve, serve_with};
+pub use server::{Cancelled, serve, serve_shared, serve_shared_with, serve_with};
 pub use transport::{Transport, TransportRead, TransportWrite};
 
 #[doc(hidden)]

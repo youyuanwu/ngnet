@@ -66,10 +66,73 @@ pub trait BodySource: Send {
     /// failure and terminates the stream rather than being forwarded, since acting on it
     /// would read past the buffer.
     ///
-    /// `buf` is cleared before each call, so reading from it yields zeros rather than
-    /// anything left by an earlier frame. There is nothing useful to read; it is an
-    /// output buffer.
+    /// On the push path `buf` is cleared before each call, so reading from it yields
+    /// zeros rather than anything left by an earlier frame. There is nothing useful to
+    /// read; it is an output buffer. (The no-copy `SharedBodySource` path hands over
+    /// octets it already owns and is never given a buffer to clear.)
     fn fill(&mut self, buf: &mut [u8]) -> BodyOutcome;
+}
+
+/// What a no-copy body source produced for one `DATA` frame.
+///
+/// The no-copy counterpart of [`BodyOutcome`]: instead of writing into a buffer the
+/// session offers, a [`SharedBodySource`] hands back reference-counted octets it already
+/// owns, which libnghttp2 serialises as a no-copy `DATA` frame — only the nine-octet
+/// header is written, and the payload travels to the transport untouched.
+///
+/// Each chunk must not exceed the `limit` the source was given. An overlong chunk is a
+/// source failure that terminates the stream rather than being forwarded, exactly as an
+/// over-long count from [`BodySource::fill`] is treated on the push path: acting on it
+/// would claim a frame length libnghttp2 never agreed to.
+#[cfg(feature = "http")]
+#[derive(Debug)]
+pub(crate) enum SharedOutcome {
+    /// Handed over these octets; more will follow.
+    Wrote(bytes::Bytes),
+    /// Handed over these octets, and that is the whole body.
+    Eof(bytes::Bytes),
+    /// Handed over these octets, and trailers will follow.
+    ///
+    /// Keeps the stream open for a trailing header block, as
+    /// [`BodyOutcome::EofWithTrailers`] does on the push path. The octets may be empty,
+    /// which emits a lone end-of-body `DATA` frame ahead of the trailers.
+    EofWithTrailers(bytes::Bytes),
+    /// Nothing is available yet. Suspends the stream until it is resumed, exactly as
+    /// [`BodyOutcome::Defer`] does; no chunk is staged and no frame is emitted.
+    Defer,
+    /// Abandon the message. The stream is reset and the error is reported to the
+    /// stream-close handler.
+    Fail(BodyError),
+}
+
+/// Produces the payload of an outgoing message as octets it already owns.
+///
+/// The no-copy counterpart of [`BodySource`]. Where a [`BodySource`] writes into a buffer
+/// the session provides, a `SharedBodySource` hands back a [`bytes::Bytes`] the caller
+/// already holds, so the payload is never copied into libnghttp2's serialisation buffer.
+///
+/// Implementations are owned by the session once submitted, and dropped when the stream
+/// closes. A source is never asked for more octets after its stream has closed.
+///
+/// This is an internal adapter interface — the public opt-in is the connection entry
+/// point, not this trait — which is why it is `pub(crate)`.
+#[cfg(feature = "http")]
+pub(crate) trait SharedBodySource: Send {
+    /// Hands over up to `limit` octets of body.
+    ///
+    /// The returned chunk's length must not exceed `limit`. A longer one is treated as a
+    /// source failure and terminates the stream rather than being forwarded, since
+    /// libnghttp2 was told the frame is exactly the returned length and reading past it
+    /// would corrupt the framing.
+    ///
+    /// Returning [`SharedOutcome::Wrote`] with an empty chunk is permitted, but it is not
+    /// free and it is not a way of saying "nothing yet": libnghttp2 emits a zero-length
+    /// `DATA` frame for it — nine octets of header on the wire, and a header-only record —
+    /// and then asks again, so a source that keeps doing it spins while producing traffic.
+    /// Prefer [`SharedOutcome::Eof`] when there is nothing left, and
+    /// [`SharedOutcome::Defer`] when there is nothing left *yet*; `Defer` stages no chunk
+    /// and emits no frame, which is what "nothing yet" should cost.
+    fn take(&mut self, limit: usize) -> SharedOutcome;
 }
 
 /// A body already held in memory.

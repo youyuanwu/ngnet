@@ -128,6 +128,14 @@ and runtime fit rather than on throughput. See
 [`docs/benchmarks.md`](docs/benchmarks.md), which gives the numbers, the mechanism and the
 confounds that bound what they license.
 
+For bodies you already hold as [`bytes::Bytes`](https://docs.rs/bytes), an opt-in set of
+entry points — `handshake_shared`, `serve_shared`, and their `_with` forms — hands the
+payload to libnghttp2 without copying it (`NGHTTP2_DATA_FLAG_NO_COPY`). The choice is per
+connection, the push-model API is unchanged, and the payoff is honest rather than uniform: on
+the readiness transport a 1 MiB upload runs about 30% faster, mostly by collapsing the write
+count; on the completion transport the gain is small and does not clear the benchmark's own
+drift bar. [`docs/benchmarks.md`](docs/benchmarks.md) reports both.
+
 ### When to disable the feature
 
 `http` is additive but not free: it pulls in `http`, `http-body` and `bytes`. Turn it off

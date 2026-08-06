@@ -118,9 +118,68 @@ async fn ask<T: Transport>(transport: T, path: &str, payload: &'static [u8]) -> 
     received
 }
 
-// ---------------------------------------------------------------------------
-// Real sockets
-// ---------------------------------------------------------------------------
+/// The no-copy counterpart of [`ask`], reaching the server through
+/// [`handshake_shared`](nghttp2::http::handshake_shared) so the request body is handed over
+/// uncopied. The calling code is otherwise identical, which is the point: opting in changes
+/// the entry point and nothing else a caller writes.
+async fn ask_shared<T: Transport>(
+    transport: T,
+    path: &str,
+    payload: &'static [u8],
+) -> Fallible<Vec<u8>> {
+    let (requests, connection) = nghttp2::http::handshake_shared::<T, Full>(transport)?;
+
+    let response = requests.send_request(
+        http::Request::builder()
+            .method(http::Method::POST)
+            .uri(format!("http://example.test{path}"))
+            .body(Full::new(payload))?,
+    );
+
+    let exchange = async {
+        let response = response.await?;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let received = drain(response.into_body()).await?;
+        drop(requests);
+        Ok::<_, Box<dyn StdError + Send + Sync>>(received)
+    };
+
+    let (received, _connection) = tokio::join!(exchange, connection);
+    received
+}
+
+#[tokio::test]
+async fn a_no_copy_exchange_crosses_a_real_socket_intact() {
+    // Both ends opt in to the no-copy path — the server through `serve_shared`, the client
+    // through `handshake_shared` — and a body several times the initial flow-control window
+    // is echoed back over a real kernel socket. Nothing about the exchange a caller can see
+    // differs from the copying version; what is proven here is that the handed-over payload
+    // survives a real round trip byte for byte, window grants and all.
+    tokio::time::timeout(PATIENCE, async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binding");
+        let addr = listener.local_addr().expect("an address");
+
+        tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accepting");
+            let _ = server::serve_shared(TokioIo::new(stream), echo)
+                .expect("serving")
+                .await;
+        });
+
+        static PAYLOAD: std::sync::LazyLock<Vec<u8>> =
+            std::sync::LazyLock::new(|| (0..256 * 1024).map(|i| (i % 251) as u8).collect());
+
+        let stream = TcpStream::connect(addr).await.expect("connecting");
+        let received = ask_shared(TokioIo::new(stream), "/echo", &PAYLOAD)
+            .await
+            .expect("a no-copy exchange");
+
+        assert_eq!(received.len(), PAYLOAD.len());
+        assert_eq!(received, *PAYLOAD);
+    })
+    .await
+    .expect("the exchange stalled");
+}
 
 #[tokio::test]
 async fn a_request_and_response_cross_a_real_socket() {

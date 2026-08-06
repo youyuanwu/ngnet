@@ -19,23 +19,37 @@
 //! Shaping the traits the other way round would have made this transport impossible rather
 //! than merely slower.
 //!
-//! # Why neither fast write path is taken
+//! # The one fast write path a completion runtime can take
 //!
 //! [`TransportWrite::write_borrowed`] returns `None` here, which is the default. This is not
 //! a missing optimisation: a completion runtime cannot lend the kernel a borrowed slice,
-//! because the operation outlives the call that started it. The owned coalescing path is the
-//! only correct one, and a reader who knows the tokio transport returns `Some` should not
-//! read this absence as an oversight.
+//! because the operation outlives the call that started it, so the tokio transport's
+//! borrowed path has no counterpart on this side.
 //!
-//! [`TransportWrite::write_vectored`] is declined for the same underlying reason, which is
-//! worth stating because compio *does* support gathering writes and does issue a real one to
-//! the kernel — `TcpStream::write_vectored` reaches `IORING_OP_SENDMSG` with an iovec array.
-//! What blocks it here is ownership, not capability: compio's `IoVectoredBuf` is bound by
-//! `'static`, since the kernel writes from the buffers after submission, while this trait
-//! hands out borrowed `IoSlice`s. Owning the session's blocks would mean copying them, which
-//! is the coalescing path already taken, so electing the vectored path here would buy
-//! nothing. Should libnghttp2's no-copy DATA facility ever be adopted, the payload would
-//! become caller-owned `Bytes` and this calculus would change; see `docs/pending-work.md`.
+//! [`TransportWrite::write_vectored`] is declined for the same reason. compio *does* support
+//! gathering writes and does issue a real one to the kernel — `TcpStream::write_vectored`
+//! reaches `IORING_OP_SENDMSG` with an iovec array — but its `IoVectoredBuf` is bound by
+//! `'static`, since the kernel writes from the buffers after submission, while
+//! `write_vectored` hands out borrowed `IoSlice`s that can never be `'static`. What blocks
+//! that path is ownership, not capability.
+//!
+//! Ownership is exactly what the *owned-region* strategy provides, and this transport takes
+//! it. [`TransportWrite::gathers_owned_regions`] returns `true`, and
+//! [`TransportWrite::write_regions`] hands compio a `Vec<Bytes>` by value. This became
+//! possible when the crate adopted libnghttp2's no-copy `DATA` facility: a handed-over
+//! payload is now caller-owned [`Bytes`] rather than a borrow of libnghttp2's serialisation
+//! buffer, and compio satisfies its `'static` ownership requirement directly — `Bytes`
+//! implements compio's `IoBuf` and `Vec<T: IoBuf>` implements `IoVectoredBuf`, so a growable
+//! list of payloads and driver-minted headers is a valid vectored buffer. `write_vectored`
+//! takes the buffer by value and returns it inside compio's `BufResult`, so moving the list
+//! in and taking it back out is the exact shape the API expects: the completion runtime now
+//! issues a genuine gathering write for a no-copy body rather than coalescing it into an
+//! intermediate buffer, and the payload is never copied. The blocks the session itself
+//! produces are still copied — every one of them, since unlike the vectored path there is no
+//! size threshold here: a block borrowed from the session cannot be owned without a copy. On
+//! a handed-over body those blocks are the control and `HEADERS` frames rather than the
+//! payload, which is the whole point; a *push-model* body on this transport still has its
+//! `DATA` copied, because its octets were never the caller's to hand over.
 //!
 //! [`TransportWrite::commit`] is likewise left as its no-op default. A completion write is
 //! committed when it completes — there is no buffering layer between this and the kernel of
@@ -150,7 +164,24 @@ impl<W: AsyncWrite> TransportWrite for CompioWriter<W> {
         (result, buf)
     }
 
-    // `write_borrowed`, `write_vectored` and `commit` are deliberately left at their
-    // defaults; see the module documentation for why none is available to a completion
-    // runtime.
+    fn gathers_owned_regions(&self) -> bool {
+        // A completion runtime owns its buffers, which is exactly what the owned-region
+        // strategy requires and what lets this transport issue a genuine gathering write for
+        // a no-copy body. See the module documentation for why this is the one fast path a
+        // completion transport can take, and why the vectored one is not.
+        true
+    }
+
+    async fn write_regions(&mut self, regions: Vec<Bytes>) -> (std::io::Result<usize>, Vec<Bytes>) {
+        // `Vec<Bytes>` is a compio `IoVectoredBuf` (`Vec<T: IoBuf>`, `Bytes: IoBuf`), so this
+        // is a real `writev` reaching `IORING_OP_SENDMSG`, not an emulation. compio takes the
+        // list by value and returns it inside `BufResult`, which is precisely the ownership
+        // round-trip the trait asks for: the driver gets its allocation back to reuse.
+        let BufResult(result, regions) = self.half.write_vectored(regions).await;
+        (result, regions)
+    }
+
+    // `write_borrowed` and `commit` are deliberately left at their defaults; see the module
+    // documentation for why a completion runtime cannot lend a borrowed slice and has nothing
+    // to flush.
 }

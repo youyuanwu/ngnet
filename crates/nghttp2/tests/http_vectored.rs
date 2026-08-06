@@ -39,9 +39,9 @@ use core::task::{Context, Poll, Waker};
 
 use nghttp2::http::testing::{
     Duplex, DuplexReader, Full, bytes_crate as bytes, duplex, duplex_offering_both,
-    duplex_vectored, http_crate as http,
+    duplex_owned_regions, duplex_vectored, http_crate as http,
 };
-use nghttp2::http::transport::{Transport, TransportRead};
+use nghttp2::http::transport::{Transport, TransportRead, TransportWrite};
 
 use bytes::BytesMut;
 
@@ -51,6 +51,12 @@ use bytes::BytesMut;
 /// test failure if the two ever drift, which is the right outcome — a threshold that moved
 /// without anyone revisiting these cases is a threshold that moved by accident.
 const THRESHOLD: usize = 256;
+
+/// The driver's ceiling on descriptors held for one gathering write, restated here for the
+/// same reason as [`THRESHOLD`]: an internal tuning constant, not public API, that a test
+/// should fail loudly against if it ever drifts. A gathering write materialises at most
+/// `MAX_REGIONS + 1` `IoSlice`s — the retained descriptor list plus one live session block.
+const MAX_REGIONS: usize = 64;
 
 /// The nine-octet frame header every `DATA` frame carries.
 const FRAME_HEADER: usize = 9;
@@ -109,6 +115,8 @@ enum Shape {
     Vectored,
     /// Both fast paths, so the driver's precedence rule has something to decide.
     Both,
+    /// The owned-region (completion) path: a gathering write over an owned `Vec<Bytes>`.
+    OwnedRegions,
 }
 
 impl Shape {
@@ -117,6 +125,7 @@ impl Shape {
             Self::Owned => duplex(false),
             Self::Vectored => duplex_vectored(),
             Self::Both => duplex_offering_both(),
+            Self::OwnedRegions => duplex_owned_regions(),
         }
     }
 }
@@ -132,6 +141,15 @@ struct Run {
     decline_after: Option<usize>,
     /// How many times the connection is polled.
     passes: usize,
+    /// Whether the body is handed over (`handshake_shared`) rather than copied
+    /// (`handshake`). The shared path frames each `DATA` as a record the driver offers as
+    /// its own regions, which is what grows a gathering write past two regions.
+    shared: bool,
+    /// Raw octets written to the peer half before the connection is polled, letting a run
+    /// hand the client crafted inbound frames — a large `SETTINGS`/`WINDOW_UPDATE` pair, so
+    /// the flow-control window admits a whole body in one pass and the region list is driven
+    /// past `MAX_REGIONS`. Empty for the silent-peer runs that are the norm here.
+    prelude: Vec<u8>,
 }
 
 impl Run {
@@ -142,6 +160,8 @@ impl Run {
             caps: Vec::new(),
             decline_after: None,
             passes: 1,
+            shared: false,
+            prelude: Vec::new(),
         }
     }
 
@@ -157,6 +177,16 @@ impl Run {
 
     fn passes(mut self, passes: usize) -> Self {
         self.passes = passes;
+        self
+    }
+
+    fn shared(mut self) -> Self {
+        self.shared = true;
+        self
+    }
+
+    fn prelude(mut self, prelude: Vec<u8>) -> Self {
+        self.prelude = prelude;
         self
     }
 }
@@ -190,31 +220,39 @@ fn observe(run: Run) -> Observed {
     }
     // Split rather than dropped: a dropped writing half closes the pipe, and a closed pipe
     // is a peer that hung up, which ends the connection before the pass under test.
-    let (mut peer_reader, _peer_writer) = server_side.split();
+    let (mut peer_reader, mut peer_writer) = server_side.split();
 
-    let (requests, connection) =
-        nghttp2::http::handshake::<_, Full>(client_side).expect("handshake");
-    let response = requests.send_request(
-        http::Request::builder()
-            .method(http::Method::POST)
-            .uri("http://example.test/vectored")
-            .body(Full::new(vec![b'x'; run.body]))
-            .expect("building a request"),
-    );
+    // Hand the client any crafted inbound the run supplies before it is polled. The duplex
+    // performs the write synchronously as the future is built, so the returned ready future
+    // can simply be dropped; the octets are in the client's inbound pipe by the time the
+    // first poll reads them.
+    if !run.prelude.is_empty() {
+        drop(peer_writer.write(bytes::Bytes::from(run.prelude.clone())));
+    }
+
+    let request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri("http://example.test/vectored")
+        .body(Full::new(vec![b'x'; run.body]))
+        .expect("building a request");
 
     let waker = Waker::from(Arc::new(Flag(AtomicBool::new(false))));
-    let mut connection = core::pin::pin!(connection);
-    let mut response = core::pin::pin!(response);
 
-    let mut outcome = None;
-    for _ in 0..run.passes {
-        if outcome.is_none() {
-            if let Poll::Ready(result) = step(connection.as_mut(), &waker) {
-                outcome = Some(result);
-            }
-        }
-        let _ = step(response.as_mut(), &waker);
-    }
+    // The push and no-copy entry points return the same handle and the same response future;
+    // only the connection future's concrete type differs, so the polling loop is shared and
+    // the branch is only which one to build. `requests` is held to the end of each branch —
+    // dropping it would close the request half before the pass under test.
+    let outcome = if run.shared {
+        let (requests, connection) =
+            nghttp2::http::handshake_shared::<_, Full>(client_side).expect("handshake");
+        let response = requests.send_request(request);
+        run_passes(connection, response, run.passes, &waker)
+    } else {
+        let (requests, connection) =
+            nghttp2::http::handshake::<_, Full>(client_side).expect("handshake");
+        let response = requests.send_request(request);
+        run_passes(connection, response, run.passes, &waker)
+    };
 
     Observed {
         calls: log.calls(),
@@ -222,6 +260,33 @@ fn observe(run: Run) -> Observed {
         peer: drain(&mut peer_reader, &waker),
         outcome,
     }
+}
+
+/// Steps the connection and its response future by hand for `passes` polls, returning the
+/// connection's verdict if it reached one.
+///
+/// Generic over the connection future so the same loop drives both the copying and the
+/// handed-over entry points; the response is stepped alongside so a completed response is
+/// collected rather than left to strand the stream, but its value is not of interest here.
+fn run_passes(
+    connection: impl Future<Output = Result<(), nghttp2::http::Error>>,
+    response: nghttp2::http::ResponseFuture,
+    passes: usize,
+    waker: &Waker,
+) -> Option<Result<(), nghttp2::http::Error>> {
+    let mut connection = core::pin::pin!(connection);
+    let mut response = core::pin::pin!(response);
+
+    let mut outcome = None;
+    for _ in 0..passes {
+        if outcome.is_none() {
+            if let Poll::Ready(result) = step(connection.as_mut(), waker) {
+                outcome = Some(result);
+            }
+        }
+        let _ = step(response.as_mut(), waker);
+    }
+    outcome
 }
 
 /// The single write a pass of only sub-threshold blocks costs.
@@ -411,10 +476,27 @@ fn every_ordering_puts_the_same_octets_on_the_wire_as_coalescing_would() {
 }
 
 #[test]
-fn no_call_is_ever_offered_more_than_two_regions_or_an_empty_one() {
-    // SC-011. The invariant that makes the whole design safe: a gathering write needs one
-    // live session block beside memory the driver already owns, never two blocks, so two
-    // regions is the ceiling however the pass divides.
+fn no_call_is_offered_an_empty_region_or_more_than_its_path_permits() {
+    // SC-003 / SC-009. Two facts, one universal and one path-specific. The name says "its
+    // path permits" rather than a number because the two paths now have different ceilings:
+    // two regions on the push path, `MAX_REGIONS + 1` on the shared one, as set out below.
+    //
+    // Universal: no call is ever offered an empty region. A zero-length `IoSlice` is legal
+    // to write but is a region counted for nothing, and the trait's contract promises never
+    // to produce one however the pass divides or a short write lands.
+    //
+    // Path-specific ceiling: the *push* path — a body copied into libnghttp2's buffer —
+    // still gathers at most two regions, one live session block beside memory the driver
+    // already owns, never two blocks. Phase 3 leaves that path untouched, so the original
+    // two-region cap is retained and asserted here exactly as before.
+    //
+    // The no-copy (shared) path is what Phase 3 changed: each `DATA` frame becomes a record
+    // the driver offers as its own region rather than copying, so one pass can gather many
+    // regions. Its ceiling is not two but `MAX_REGIONS + 1` — the retained descriptor list
+    // plus one live block — and that bound, not the push path's, is what the shared branch
+    // below asserts. Retargeting this case rather than deleting it keeps the empty-region
+    // guarantee under test on both paths while recording that the two-region cap is now a
+    // property of the push path alone.
     for body in [
         SMALL_BODY,
         THRESHOLD - FRAME_HEADER,
@@ -423,22 +505,341 @@ fn no_call_is_ever_offered_more_than_two_regions_or_an_empty_one() {
         WINDOW_FILLING_BODY,
     ] {
         for caps in [vec![], vec![1], vec![74], vec![3, 17, 1, 20_000]] {
-            let observed = observe(Run::new(Shape::Vectored, body).caps(caps.clone()).passes(4));
-            for regions in &observed.calls {
+            let pushed = observe(Run::new(Shape::Vectored, body).caps(caps.clone()).passes(4));
+            for regions in &pushed.calls {
                 assert!(
                     (1..=2).contains(&regions.len()),
-                    "body {body}, caps {caps:?}: a call was offered {} regions, saw {:?}",
+                    "push path, body {body}, caps {caps:?}: a call was offered {} regions, saw {:?}",
                     regions.len(),
-                    observed.calls,
+                    pushed.calls,
                 );
                 assert!(
                     regions.iter().all(|&len| len > 0),
-                    "body {body}, caps {caps:?}: a call was offered an empty region, saw {:?}",
-                    observed.calls,
+                    "push path, body {body}, caps {caps:?}: a call was offered an empty region, saw {:?}",
+                    pushed.calls,
+                );
+            }
+
+            let shared = observe(
+                Run::new(Shape::Vectored, body)
+                    .caps(caps.clone())
+                    .passes(4)
+                    .shared(),
+            );
+            for regions in &shared.calls {
+                assert!(
+                    (1..=MAX_REGIONS + 1).contains(&regions.len()),
+                    "shared path, body {body}, caps {caps:?}: a call was offered {} regions, saw {:?}",
+                    regions.len(),
+                    shared.calls,
+                );
+                assert!(
+                    regions.iter().all(|&len| len > 0),
+                    "shared path, body {body}, caps {caps:?}: a call was offered an empty region, saw {:?}",
+                    shared.calls,
                 );
             }
         }
     }
+}
+
+/// Builds one raw HTTP/2 frame: the nine-octet header — length, type, flags, stream id —
+/// followed by the payload. Used only to hand the client crafted inbound; the client's own
+/// output is produced by the session, never fabricated here.
+fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let len = payload.len();
+    let mut out = Vec::with_capacity(9 + len);
+    out.push((len >> 16) as u8);
+    out.push((len >> 8) as u8);
+    out.push(len as u8);
+    out.push(kind);
+    out.push(flags);
+    out.extend_from_slice(&(stream & 0x7fff_ffff).to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// A `SETTINGS` frame advertising `INITIAL_WINDOW_SIZE`, which opens the client's per-stream
+/// send window so a stream can carry far more than the 65535-octet default in one pass.
+fn settings_initial_window(size: u32) -> Vec<u8> {
+    const INITIAL_WINDOW_SIZE_ID: u16 = 0x0004;
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&INITIAL_WINDOW_SIZE_ID.to_be_bytes());
+    payload.extend_from_slice(&size.to_be_bytes());
+    frame(0x04, 0, 0, &payload)
+}
+
+/// A connection-level `WINDOW_UPDATE`, which opens the client's connection send window —
+/// the second of the two windows a body must fit inside, and the one `SETTINGS` cannot move.
+fn window_update(increment: u32) -> Vec<u8> {
+    frame(0x08, 0, 0, &(increment & 0x7fff_ffff).to_be_bytes())
+}
+
+/// A body several times larger than a full region list can name at once: at 16384 octets a
+/// `DATA` frame, this is roughly ninety frames, so ninety records, so a hundred and eighty
+/// payload-and-header regions — comfortably past `MAX_REGIONS` even after the list is flushed
+/// and refilled.
+const REGION_CAP_BODY: usize = 1_500_000;
+
+#[test]
+fn a_pass_driven_past_the_region_cap_holds_the_bound_and_stays_correct() {
+    // SC-009 / D6. The region list is capped at `MAX_REGIONS` descriptors so it can be
+    // materialised into a fixed stack array; a `send_into` call that frames more `DATA` than
+    // the cap admits must flush the full list mid-pass and carry on, never overrun the array.
+    // Reaching that path needs a pass that emits far more than the sixty-five-region ceiling,
+    // which the silent-peer default cannot do — its window admits only the 65535-octet
+    // default, four or so frames. So the peer is handed a crafted `SETTINGS`/`WINDOW_UPDATE`
+    // pair that opens both send windows wide, and a body large enough to fill them: the whole
+    // 1.5 MB then leaves in one pass, driving the list past the cap several times over.
+    let mut prelude = settings_initial_window(0x7fff_ffff);
+    prelude.extend(window_update(0x0080_0000));
+
+    let vectored = observe(
+        Run::new(Shape::Vectored, REGION_CAP_BODY)
+            .shared()
+            .prelude(prelude.clone())
+            .passes(16),
+    );
+    // The same workload coalesced, as the independent oracle for what should reach the peer:
+    // the owned path copies every octet, so its flat wire is libnghttp2's own serialisation
+    // with no gathering decision of the driver's in it.
+    let owned = observe(
+        Run::new(Shape::Owned, REGION_CAP_BODY)
+            .shared()
+            .prelude(prelude)
+            .passes(16),
+    );
+
+    for regions in &vectored.calls {
+        assert!(
+            regions.len() <= MAX_REGIONS + 1,
+            "a call was offered {} regions, past the {} ceiling; the mid-pass flush failed to \
+             bound the list, saw lengths {:?}",
+            regions.len(),
+            MAX_REGIONS + 1,
+            vectored.calls.iter().map(Vec::len).collect::<Vec<_>>(),
+        );
+        assert!(
+            regions.iter().all(|&len| len > 0),
+            "a call was offered an empty region, saw {regions:?}",
+        );
+    }
+
+    let widest = vectored
+        .calls
+        .iter()
+        .map(Vec::len)
+        .max()
+        .expect("the pass performed at least one gathering write");
+    assert!(
+        widest >= MAX_REGIONS,
+        "the widest call held only {widest} regions, so the list never reached the cap and the \
+         mid-pass flush was never exercised; the window or body is too small",
+    );
+
+    assert_eq!(
+        vectored.peer, owned.peer,
+        "driving the list past the cap changed the octets the peer received",
+    );
+    assert!(
+        !vectored.peer.is_empty(),
+        "the body never left, so the comparison proved nothing",
+    );
+}
+
+#[test]
+fn a_partial_acceptor_across_a_multi_region_write_drops_and_duplicates_nothing() {
+    // SC-009 on the no-copy path. The push tests above cut a two-region write on every
+    // interesting boundary; this does the same to a write of *many* regions, the shape only
+    // the shared path produces. A handed-over body frames several `DATA` records, so one
+    // gathering write carries a run of alternating header and payload regions; the caps chop
+    // the transport's acceptance at awkward points — inside a payload, exactly on a region
+    // boundary, one octet short of the whole — and the retry-and-resume path must put every
+    // octet on the wire once, in order, matching what the coalescing path would have sent.
+    let unlimited = observe(Run::new(Shape::Vectored, BOUNDARY_BODY).shared().passes(8));
+    assert!(
+        unlimited.calls.iter().any(|regions| regions.len() > 2),
+        "the workload never produced a multi-region write, so nothing multi-region was tested, \
+         saw {:?}",
+        unlimited.calls,
+    );
+    let first_call: usize = unlimited.calls[0].iter().sum();
+    let head = unlimited.calls[0][0];
+
+    // The oracle: the same handed-over body over the coalescing transport, which copies the
+    // lot into one owned write. Its octets are what a partial acceptor must reproduce.
+    let coalesced = observe(Run::new(Shape::Owned, BOUNDARY_BODY).shared().passes(8));
+
+    for caps in [
+        vec![1],
+        vec![head],
+        vec![head - 1],
+        vec![first_call - 1],
+        vec![1, head, 7, first_call - 1, 3],
+        vec![head, 1, MAX_FRAME, 5],
+    ] {
+        let observed = observe(
+            Run::new(Shape::Vectored, BOUNDARY_BODY)
+                .shared()
+                .caps(caps.clone())
+                .passes(8),
+        );
+        assert_eq!(
+            observed.peer, coalesced.peer,
+            "caps {caps:?} changed the octets the peer received on the multi-region path",
+        );
+        assert!(
+            observed.outcome.is_none(),
+            "caps {caps:?} ended the connection: {:?}",
+            observed.outcome.as_ref().map(Result::is_err),
+        );
+    }
+}
+
+#[test]
+fn an_owned_region_pass_driven_past_the_region_cap_holds_the_bound_and_stays_correct() {
+    // SC-003 / D6 on the completion path. FR-007's region bound is transport-independent, so
+    // the owned-region strategy caps its `Vec<Bytes>` exactly as the vectored path caps its
+    // descriptor list: a `send_into` call that frames more `DATA` than the cap admits flushes
+    // the full list mid-pass and carries on. The bound is tighter here — the whole list is
+    // owned, so there is no separate live block riding beside it, and the ceiling is
+    // `MAX_REGIONS` rather than `MAX_REGIONS + 1`. Reaching the path needs the same crafted
+    // window-opening prelude and 1.5 MB body the vectored cap test uses.
+    let mut prelude = settings_initial_window(0x7fff_ffff);
+    prelude.extend(window_update(0x0080_0000));
+
+    let owned_regions = observe(
+        Run::new(Shape::OwnedRegions, REGION_CAP_BODY)
+            .shared()
+            .prelude(prelude.clone())
+            .passes(16),
+    );
+    // The coalescing path as the independent oracle: it copies every octet, so its flat wire
+    // is libnghttp2's own serialisation with no gathering decision of the driver's in it.
+    let owned = observe(
+        Run::new(Shape::Owned, REGION_CAP_BODY)
+            .shared()
+            .prelude(prelude)
+            .passes(16),
+    );
+
+    for regions in &owned_regions.calls {
+        assert!(
+            regions.len() <= MAX_REGIONS,
+            "a call was offered {} regions, past the {MAX_REGIONS} ceiling; the mid-pass \
+             flush failed to bound the list, saw lengths {:?}",
+            regions.len(),
+            owned_regions.calls.iter().map(Vec::len).collect::<Vec<_>>(),
+        );
+        assert!(
+            regions.iter().all(|&len| len > 0),
+            "a call was offered an empty region, saw {regions:?}",
+        );
+    }
+
+    let widest = owned_regions
+        .calls
+        .iter()
+        .map(Vec::len)
+        .max()
+        .expect("the pass performed at least one gathering write");
+    assert!(
+        widest >= MAX_REGIONS - 1,
+        "the widest call held only {widest} regions, so the list never approached the cap and \
+         the mid-pass flush was never exercised; the window or body is too small",
+    );
+
+    assert_eq!(
+        owned_regions.peer, owned.peer,
+        "driving the owned-region list past the cap changed the octets the peer received",
+    );
+    assert!(
+        !owned_regions.peer.is_empty(),
+        "the body never left, so the comparison proved nothing",
+    );
+}
+
+#[test]
+fn an_owned_region_partial_acceptor_drops_and_duplicates_nothing() {
+    // SC-009 on the completion path. A handed-over body frames several `DATA` records, so one
+    // owned-region write carries a run of alternating header and payload regions; the caps
+    // chop the transport's acceptance at awkward points — inside a payload, exactly on a
+    // region boundary, one octet short of the whole. The retry-and-resume path drops the
+    // fully written regions from the front and `Bytes::advance`s the first partial one (both
+    // free, since `Bytes` is a view), and must put every octet on the wire once, in order,
+    // matching what the coalescing path would have sent.
+    let unlimited = observe(
+        Run::new(Shape::OwnedRegions, BOUNDARY_BODY)
+            .shared()
+            .passes(8),
+    );
+    assert!(
+        unlimited.calls.iter().any(|regions| regions.len() > 2),
+        "the workload never produced a multi-region write, so nothing multi-region was tested, \
+         saw {:?}",
+        unlimited.calls,
+    );
+    // Every region offered is non-empty and the per-call count stays within the cap — the
+    // invariants the resume path must preserve across a short write, checked here so a cap
+    // that quietly dropped or duplicated a region would fail on shape before octets.
+    for regions in &unlimited.calls {
+        assert!(
+            (1..=MAX_REGIONS).contains(&regions.len()) && regions.iter().all(|&len| len > 0),
+            "a call was offered {} regions or an empty one, saw {:?}",
+            regions.len(),
+            unlimited.calls,
+        );
+    }
+    let first_call: usize = unlimited.calls[0].iter().sum();
+    let head = unlimited.calls[0][0];
+
+    // The oracle: the same handed-over body over the coalescing transport, which copies the
+    // lot into one owned write. Its octets are what a partial acceptor must reproduce.
+    let coalesced = observe(Run::new(Shape::Owned, BOUNDARY_BODY).shared().passes(8));
+
+    for caps in [
+        vec![1],
+        vec![head],
+        vec![head - 1],
+        vec![first_call - 1],
+        vec![1, head, 7, first_call - 1, 3],
+        vec![head, 1, MAX_FRAME, 5],
+    ] {
+        let observed = observe(
+            Run::new(Shape::OwnedRegions, BOUNDARY_BODY)
+                .shared()
+                .caps(caps.clone())
+                .passes(8),
+        );
+        assert_eq!(
+            observed.peer, coalesced.peer,
+            "caps {caps:?} changed the octets the peer received on the owned-region path",
+        );
+        assert!(
+            observed.outcome.is_none(),
+            "caps {caps:?} ended the connection: {:?}",
+            observed.outcome.as_ref().map(Result::is_err),
+        );
+    }
+}
+
+#[test]
+fn an_owned_region_transport_accepting_nothing_fails_the_connection_rather_than_spinning() {
+    // SC-013 on the completion path. A successful write of zero octets is a transport that
+    // will never make progress; the owned-region path must turn it into a `Transport` error
+    // exactly as the vectored and borrowed paths do, rather than spin re-offering the list.
+    let observed = observe(
+        Run::new(Shape::OwnedRegions, MAX_FRAME)
+            .shared()
+            .caps([0])
+            .passes(2),
+    );
+
+    let outcome = observed
+        .outcome
+        .expect("the connection must end rather than spin on a transport accepting nothing");
+    let error = outcome.expect_err("accepting no octets is a failure, not a clean close");
+    assert_eq!(error.kind(), nghttp2::http::ErrorKind::Transport);
 }
 
 #[test]
@@ -513,7 +914,7 @@ fn an_arbitrary_prefix_acceptor_still_delivers_every_octet_in_order() {
 
 #[test]
 fn a_transport_accepting_nothing_fails_the_connection_rather_than_spinning() {
-    // SC-010. A successful write of zero octets is a transport that will never make
+    // SC-013. A successful write of zero octets is a transport that will never make
     // progress; treating it as anything but an error is an infinite loop, and the two
     // pre-existing drain paths already guard it the same way.
     let observed = observe(Run::new(Shape::Vectored, MAX_FRAME).caps([0]).passes(2));

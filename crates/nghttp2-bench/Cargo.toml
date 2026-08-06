@@ -61,3 +61,11 @@ harness = false
 [[bench]]
 name = "transport_body_throughput"
 harness = false
+
+[[bench]]
+name = "shared_body"
+harness = false
+
+[[bench]]
+name = "transport_shared_body"
+harness = false

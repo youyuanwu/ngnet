@@ -47,7 +47,7 @@ use bytes::Bytes;
 use compio::net::{TcpListener, TcpStream};
 use core::future::Future;
 use http_body::{Body, Frame};
-use nghttp2::http::transport::CompioIo;
+use nghttp2::http::transport::{CompioIo, Transport, TransportWrite};
 use nghttp2::http::{IncomingBody, server};
 
 /// A body already held in memory.
@@ -169,7 +169,127 @@ fn an_exchange_completes_over_the_shipped_compio_transport() {
     });
 }
 
-/// Polls two futures on one task, finishing when the first completes.
+/// The same exchange over the *handed-over* entry point, so the completion transport takes
+/// its owned-region write path on a real io_uring socket rather than the coalescing one.
+///
+/// `handshake_shared` frames each `DATA` as a record the driver offers as an owned region,
+/// so a body spanning several frames drives a genuine multi-region `write_regions` — which on
+/// this transport reaches `TcpStream::write_vectored`, an `IORING_OP_SENDMSG`. The body is
+/// therefore several frames long: a single-frame body would gather one payload region and
+/// prove nothing a coalesced write would not.
+///
+/// # What the echo assertion does and does not prove
+///
+/// The echo alone is *not* evidence that the gathering path ran. An earlier version of this
+/// test asserted only the echo while its documentation claimed the path taken was the
+/// gathering one, and that claim was false: flipping
+/// [`TransportWrite::gathers_owned_regions`] to `false` on the shipped transport sends every
+/// octet down the coalescing fallback and the echo is still correct — verified by mutation,
+/// which passed this test *and the entire workspace suite* unchanged.
+///
+/// The path is pinned in two independent halves, neither sufficient alone:
+///
+/// 1. **The shipped transport advertises the path** —
+///    `the_shipped_compio_transport_elects_the_owned_region_path` below.
+/// 2. **The driver honours the advertisement** — pinned in memory by
+///    `http_transport.rs::a_transport_can_elect_the_owned_region_path` (the transport-side
+///    contract) and `the_owned_region_election_is_read_once_a_pass_not_once_a_write` (the
+///    driver actually electing it), the latter mutation-verified.
+///
+/// Together those give what the echo cannot: this exchange really did leave through
+/// `write_regions`. The echo remains worth asserting for a different reason — it is what
+/// catches a region dropped, reordered or duplicated by the gathering write itself.
+#[test]
+fn a_shared_body_exchange_gathers_over_the_shipped_compio_transport() {
+    let runtime = compio::runtime::Runtime::new().expect("compio needs io_uring to start");
+
+    runtime.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binding");
+        let addr = listener.local_addr().expect("an address");
+
+        let serving = compio::runtime::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accepting");
+            let _ = server::serve(CompioIo::new(stream), echo)
+                .expect("serving")
+                .await;
+        });
+
+        let stream = TcpStream::connect(addr).await.expect("connecting");
+        // Handed over rather than copied: this is the entry point that reaches the
+        // owned-region strategy, and the whole point of the exercise.
+        let (requests, connection) =
+            nghttp2::http::handshake_shared::<_, Full>(CompioIo::new(stream)).expect("handshake");
+
+        // Several frames' worth, so the gathering write carries a run of header and payload
+        // regions rather than a single coalesced one. The payload is a recognisable pattern
+        // so a dropped or reordered region would corrupt the echo rather than pass silently.
+        let body: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        let expected = body.clone();
+
+        let response = requests.send_request(
+            http::Request::builder()
+                .method(http::Method::POST)
+                .uri("http://example.test/echo")
+                .body(Full::new(body))
+                .expect("a request"),
+        );
+
+        let exchange = async {
+            let response = response.await.expect("a response");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let received = drain(response.into_body()).await;
+            drop(requests);
+            received
+        };
+
+        let received = alongside(exchange, connection).await;
+        assert_eq!(
+            received, expected,
+            "the handed-over body did not round-trip intact over the gathering write path",
+        );
+        serving.detach();
+    });
+}
+
+/// The shipped completion transport must advertise the owned-region strategy.
+///
+/// This is half one of the two-part argument documented on
+/// `a_shared_body_exchange_gathers_over_the_shipped_compio_transport`, and it exists because
+/// that test cannot supply it: an exchange over the coalescing fallback echoes just as
+/// correctly as one over the gathering write, so no end-to-end assertion on a real socket can
+/// tell the two apart. Before this test existed, flipping
+/// [`TransportWrite::gathers_owned_regions`] to `false` in `transport/compio.rs` left the
+/// whole workspace suite green — the entire completion fast path could have regressed to
+/// copying every octet without a single failure.
+///
+/// The election is a plain predicate rather than a fallible call precisely so it can be
+/// asserted like this, which is design decision D5: an `Option`-returning `write_regions`
+/// that declined *after* being handed the owned `Vec<Bytes>` would consume and lose the
+/// regions, so the choice is split from the write. That split is what makes the property
+/// observable here without a socket write.
+#[test]
+fn the_shipped_compio_transport_elects_the_owned_region_path() {
+    let runtime = compio::runtime::Runtime::new().expect("compio needs io_uring to start");
+
+    runtime.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binding");
+        let addr = listener.local_addr().expect("an address");
+        let accepting = compio::runtime::spawn(async move { listener.accept().await });
+
+        let stream = TcpStream::connect(addr).await.expect("connecting");
+        let (_reader, writer) = CompioIo::new(stream).split();
+
+        assert!(
+            writer.gathers_owned_regions(),
+            "the shipped compio transport must elect the owned-region path; without it every \
+             handed-over body is coalesced into a fresh buffer and the copy this work exists \
+             to remove comes straight back, silently and with every test still passing",
+        );
+
+        accepting.detach();
+    });
+}
+
 ///
 /// Written out rather than taken from a combinator crate: this file exists to show what a
 /// caller needs, and needing a third crate to run two futures alongside each other would be

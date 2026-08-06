@@ -38,14 +38,15 @@
 //!
 //! # How a pass gets drained
 //!
-//! [`TransportWrite`] offers two optional overrides, and between them they select one of
-//! three strategies for turning a pass of session output into writes.
+//! [`TransportWrite`] offers three optional overrides, and between them they select one of
+//! four strategies for turning a pass of session output into writes.
 //!
 //! | elected by | strategy | writes per pass | driver-side copy |
 //! | --- | --- | --- | --- |
 //! | neither (default) | owned | one | every octet, every pass |
-//! | [`write_borrowed`](TransportWrite::write_borrowed) | borrowed | one per block | none |
-//! | [`write_vectored`](TransportWrite::write_vectored) | vectored | one, plus one per large block | none of the large blocks |
+//! | [`write_borrowed`](TransportWrite::write_borrowed) | borrowed | one per region | none |
+//! | [`write_vectored`](TransportWrite::write_vectored) | vectored | one per large block and per region-cap flush, plus at most one for the remainder | none |
+//! | [`gathers_owned_regions`](TransportWrite::gathers_owned_regions) | owned-region | one per region-cap flush, plus one for the remainder | every session block, never the payload |
 //!
 //! The vectored strategy exists because the first two are each wrong for half of the
 //! traffic: under multiplexing a pass is dozens of tiny blocks, where one write per block
@@ -53,9 +54,26 @@
 //! copying them all to save three syscalls is the dominant cost. Gathering small blocks
 //! into a buffer the driver owns while handing large ones to the socket uncopied gets both.
 //!
-//! `write_vectored` takes precedence where both are overridden. Neither election is a
-//! separate flag: each is expressed by returning `Some(future)` from the method that also
-//! performs the write, so an implementation cannot claim a path it does not supply.
+//! The owned-region strategy is the vectored one for a *completion* transport, which cannot
+//! lend the kernel a borrowed [`IoSlice`](std::io::IoSlice): the kernel writes from the
+//! buffers after submission, so they must be owned. It gathers a pass into a list of owned
+//! [`Bytes`] instead — the session's blocks coalesced into a driver buffer, every one of
+//! them, since a borrowed block cannot be owned without a copy, and each handed-over payload
+//! as its own uncopied region — and hands the whole list to
+//! [`write_regions`](TransportWrite::write_regions), which reaches a single `writev`. The
+//! payload is never copied; the session's own blocks all are, with no size threshold,
+//! because a block borrowed from the session cannot be owned without one.
+//!
+//! Precedence among the four, highest first: vectored, owned-region, borrowed, owned. The
+//! two gathering strategies are for disjoint populations — vectored lends borrowed slices, so
+//! only a readiness transport elects it; owned-region owns its buffers, so only a completion
+//! transport elects it — and a transport advertising both is served the vectored one, which
+//! need not mint an owned `Bytes` per frame header. `write_borrowed` and `write_vectored`
+//! carry both the choice and the write in one method, so an implementation cannot claim a
+//! path it does not supply. The owned-region election is deliberately *split* from its
+//! write, for a reason [`write_regions`](TransportWrite::write_regions) documents: a late
+//! `None` from a combined election would consume and lose owned regions, which is
+//! unrecoverable in a way a borrowed slice's loss is not.
 
 use core::future::Future;
 
@@ -213,10 +231,13 @@ pub trait TransportWrite {
     /// exactly as `writev` would. The return is the number of octets accepted across the
     /// whole sequence; a short write is normal and the driver re-offers what remains.
     ///
-    /// This library's driver never offers more than two regions, because that is all the
-    /// block lifetime permits: one live session block beside the driver's own accumulated
-    /// octets. The contract itself imposes no count, so an implementation should not assume
-    /// two. No region is ever empty.
+    /// This library's driver offers at most `MAX_REGIONS + 1` regions, currently 65: a
+    /// gathering write's descriptor list is capped at `MAX_REGIONS`, and one live session
+    /// block may ride as its trailing region. A pass carrying no handed-over payloads offers
+    /// at most two — one accumulated run beside one live block, which is all the block
+    /// lifetime permits — and only records grow the list beyond that. The contract itself
+    /// imposes no count, so an implementation should not assume any particular one. No region
+    /// is ever empty.
     ///
     /// # How the election is read
     ///
@@ -267,6 +288,81 @@ pub trait TransportWrite {
     ) -> Option<impl Future<Output = std::io::Result<usize>> + 'w> {
         let _ = regions;
         None::<core::future::Ready<std::io::Result<usize>>>
+    }
+
+    /// Whether this writer can take ownership of a list of regions and write them as one
+    /// gathering operation.
+    ///
+    /// This is the election half of the *owned-region* strategy — the completion-transport
+    /// counterpart of [`write_vectored`](TransportWrite::write_vectored). A completion API
+    /// hands the kernel its buffers and gets them back only when the operation finishes, so
+    /// it cannot lend the borrowed [`IoSlice`](std::io::IoSlice)s the vectored path deals in;
+    /// but it *can* gather a list of owned [`Bytes`], which is what
+    /// [`write_regions`](TransportWrite::write_regions) writes. The default is `false`: a
+    /// transport that has not overridden this does not gather owned regions and is served one
+    /// of the other three strategies.
+    ///
+    /// # How the election is read
+    ///
+    /// The driver calls this once per pass and holds the answer for the rest of it. The
+    /// decision must be a fixed property of the transport, independent of what regions it
+    /// will later be offered — the driver may not have gathered any when it asks. It takes
+    /// precedence over the borrowed and owned strategies but yields to the vectored one: a
+    /// transport overriding both `write_vectored` and this gets the vectored path, which need
+    /// not mint an owned `Bytes` per frame header. In practice the two never overlap, because
+    /// the borrowed-slice vectored path and the owned-region path suit disjoint runtimes.
+    ///
+    /// # Why the election is split from the write
+    ///
+    /// Unlike the borrowed and vectored paths, whose election *is* the returned future, this
+    /// decision is a separate method from [`write_regions`](TransportWrite::write_regions).
+    /// The reason is ownership. Folding the two — an `Option`-returning `write_regions` that
+    /// elected by returning `Some` — would let a later call return `None` after the driver
+    /// had already handed it the regions, consuming and losing them. `write_vectored`'s
+    /// contract tolerates exactly that for *borrowed* slices, because the driver still holds
+    /// the octets behind them and can re-offer them by coalescing. Owned regions have no such
+    /// backstop: once moved in, a lost `Vec<Bytes>` is gone. Splitting the election out makes
+    /// that unrepresentable — the decision is taken before any regions are built, and
+    /// `write_regions` always returns the list it was given.
+    fn gathers_owned_regions(&self) -> bool {
+        false
+    }
+
+    /// Writes an owned list of regions as one gathering operation, returning the list so the
+    /// driver can reuse its allocation.
+    ///
+    /// Never called unless [`gathers_owned_regions`](TransportWrite::gathers_owned_regions)
+    /// returned `true`; the default here is therefore unreachable by contract, and exists
+    /// only to keep the trait additive — every transport that predates this method compiles
+    /// untouched, declining the path through the default election above. The default reports
+    /// [`ErrorKind::Unsupported`](std::io::ErrorKind::Unsupported) and hands the regions back
+    /// intact.
+    ///
+    /// # What the regions are
+    ///
+    /// A sequence of owned octet runs to be written **in order**, as one operation, exactly
+    /// as `writev` would — the session's blocks coalesced into driver-owned buffers (all of
+    /// them: unlike the vectored path there is no size threshold, because a block borrowed
+    /// from the session cannot be owned without a copy), and each handed-over payload as its
+    /// own region in the caller's own memory,
+    /// uncopied. No region is ever empty, and the list holds at most the driver's region cap
+    /// (currently `MAX_REGIONS`, 64). Ownership passes **in and back out**: the return is the
+    /// number of octets accepted across the whole sequence together with the list itself, so
+    /// the driver reuses one growable allocation across passes rather than building a fresh
+    /// one each time.
+    ///
+    /// # Short writes
+    ///
+    /// The accepted count may be less than the total. A short write is normal; the driver
+    /// drops the fully written regions from the front of the list it gets back and advances
+    /// the first partial one — both free, since [`Bytes`] is a view — then offers the
+    /// remainder again. As on every other strategy, an accepted write of zero octets is an
+    /// error rather than something to spin on.
+    fn write_regions(
+        &mut self,
+        regions: Vec<Bytes>,
+    ) -> impl Future<Output = (std::io::Result<usize>, Vec<Bytes>)> {
+        async move { (Err(std::io::ErrorKind::Unsupported.into()), regions) }
     }
 
     /// Commits everything written so far to the peer-visible byte stream.

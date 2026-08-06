@@ -11,6 +11,7 @@
 
 pub(crate) mod incoming;
 pub(crate) mod outgoing;
+pub(crate) mod shared;
 
 pub(crate) use incoming::Direction;
 pub use incoming::IncomingBody;
