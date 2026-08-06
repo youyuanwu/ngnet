@@ -54,7 +54,7 @@ fn drain(conn: &mut Conn<()>) -> HashMap<i64, Vec<u8>> {
     // reached would leave every assertion below checking truncated data.
     let mut drained = false;
     for _ in 0..64 {
-        let Some(send) = conn.writev_stream().expect("collect data to send") else {
+        let Some(send) = conn.writev_stream(&mut ()).expect("collect data to send") else {
             drained = true;
             break;
         };
@@ -159,7 +159,9 @@ fn an_exchange_without_binding_is_a_typed_error() {
     let mut conn = ConnBuilder::<()>::new(Role::Client).build().unwrap();
     assert!(!conn.is_bound());
 
-    let error = conn.writev_stream().expect_err("must refuse to send");
+    let error = conn
+        .writev_stream(&mut ())
+        .expect_err("must refuse to send");
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
     assert!(
         error.to_string().contains("control stream"),
@@ -169,7 +171,7 @@ fn an_exchange_without_binding_is_a_typed_error() {
     // Binding only the control stream is still not enough.
     conn.bind_control_stream(id(CLIENT_CONTROL)).unwrap();
     let error = conn
-        .writev_stream()
+        .writev_stream(&mut ())
         .expect_err("QPACK streams still missing");
     assert!(error.to_string().contains("QPACK"), "got: {error}");
 }
@@ -207,7 +209,7 @@ fn a_role_cannot_be_bound_twice_and_doing_so_does_not_poison() {
     // The whole point: the connection is still fully usable afterwards.
     assert!(conn.is_usable());
     assert!(
-        conn.writev_stream().unwrap().is_some(),
+        conn.writev_stream(&mut ()).unwrap().is_some(),
         "the connection should still have its preface to send"
     );
 }
@@ -270,14 +272,20 @@ fn a_backwards_timestamp_is_rejected() {
 #[test]
 fn committing_more_than_was_offered_is_rejected() {
     let mut client = client();
-    let send = client.writev_stream().unwrap().expect("preface to send");
+    let send = client
+        .writev_stream(&mut ())
+        .unwrap()
+        .expect("preface to send");
     let offered = send.len();
 
     let error = send.commit(offered + 1).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
 
     // The transaction was refused, so the same bytes are still on offer.
-    let send = client.writev_stream().unwrap().expect("still on offer");
+    let send = client
+        .writev_stream(&mut ())
+        .unwrap()
+        .expect("still on offer");
     assert_eq!(send.len(), offered);
 }
 
@@ -285,12 +293,15 @@ fn committing_more_than_was_offered_is_rejected() {
 fn abandoning_a_transaction_re_offers_the_same_bytes() {
     let mut client = client();
 
-    let send = client.writev_stream().unwrap().expect("preface to send");
+    let send = client
+        .writev_stream(&mut ())
+        .unwrap()
+        .expect("preface to send");
     let stream = send.stream();
     let offered: Vec<u8> = send.slices().iter().flat_map(|s| s.to_vec()).collect();
     send.abandon();
 
-    let send = client.writev_stream().unwrap().expect("re-offered");
+    let send = client.writev_stream(&mut ()).unwrap().expect("re-offered");
     assert_eq!(send.stream(), stream);
     let again: Vec<u8> = send.slices().iter().flat_map(|s| s.to_vec()).collect();
     assert_eq!(again, offered, "abandoning must not consume anything");
@@ -300,13 +311,16 @@ fn abandoning_a_transaction_re_offers_the_same_bytes() {
 fn a_partial_commit_re_offers_only_the_remainder() {
     let mut client = client();
 
-    let send = client.writev_stream().unwrap().expect("preface to send");
+    let send = client
+        .writev_stream(&mut ())
+        .unwrap()
+        .expect("preface to send");
     let stream = send.stream();
     let whole: Vec<u8> = send.slices().iter().flat_map(|s| s.to_vec()).collect();
     assert!(whole.len() > 2, "need something to split");
     send.commit(1).expect("accept a single byte");
 
-    let send = client.writev_stream().unwrap().expect("remainder");
+    let send = client.writev_stream(&mut ()).unwrap().expect("remainder");
     assert_eq!(send.stream(), stream);
     let rest: Vec<u8> = send.slices().iter().flat_map(|s| s.to_vec()).collect();
     assert_eq!(
@@ -322,11 +336,11 @@ fn a_connection_can_be_moved_after_construction() {
     // a `Conn` field would dangle here, and nothing would say so.
     let conn = client();
     let mut moved = Box::new(conn);
-    assert!(moved.writev_stream().unwrap().is_some());
+    assert!(moved.writev_stream(&mut ()).unwrap().is_some());
 
     let mut moved_again = *moved;
     assert!(moved_again.is_usable());
-    assert!(moved_again.writev_stream().unwrap().is_some());
+    assert!(moved_again.writev_stream(&mut ()).unwrap().is_some());
 }
 
 #[test]
@@ -419,7 +433,7 @@ fn a_fatal_failure_poisons_the_connection_and_drop_still_succeeds() {
     // be undefined behaviour.
     assert!(!server.is_usable());
     for kind in [
-        server.writev_stream().err().map(|e| e.kind()),
+        server.writev_stream(&mut ()).err().map(|e| e.kind()),
         server
             .read_stream(
                 id(CLIENT_CONTROL),
@@ -431,7 +445,7 @@ fn a_fatal_failure_poisons_the_connection_and_drop_still_succeeds() {
             .err()
             .map(|e| e.kind()),
         server
-            .add_ack_offset(id(SERVER_CONTROL), 1)
+            .add_ack_offset(id(SERVER_CONTROL), 1, &mut ())
             .err()
             .map(|e| e.kind()),
         server

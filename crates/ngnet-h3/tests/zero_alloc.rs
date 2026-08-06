@@ -13,7 +13,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use ngnet_h3::{Conn, ConnBuilder, FieldAction, Header, Role, StreamId, Timestamp};
+use ngnet_h3::{Conn, ConnBuilder, FieldAction, FixedBody, Header, Role, StreamId, Timestamp};
 
 thread_local! {
     /// Allocations observed while armed.
@@ -102,20 +102,22 @@ fn request_bytes() -> Vec<(i64, Vec<u8>)> {
         .submit_request(
             id(0),
             &[
-                Header::new(":method", "GET").unwrap(),
+                Header::new(":method", "POST").unwrap(),
                 Header::new(":scheme", "https").unwrap(),
                 Header::new(":path", "/allocation").unwrap(),
                 Header::new(":authority", "example.test").unwrap(),
                 Header::new("accept", "text/plain").unwrap(),
                 Header::new("user-agent", "ngnet-h3").unwrap(),
             ],
-            None,
+            // A body as well as fields: inbound chunks arrive through a different callback
+            // as a raw pointer and length, so they are a separate opportunity to allocate.
+            Some(Box::new(FixedBody::new(vec![0xa5u8; 4096]))),
         )
         .unwrap();
 
     let mut out: Vec<(i64, Vec<u8>)> = Vec::new();
     for _ in 0..64 {
-        let Some(send) = client.writev_stream().unwrap() else {
+        let Some(send) = client.writev_stream(&mut ()).unwrap() else {
             break;
         };
         let stream = send.stream().get();
@@ -181,6 +183,11 @@ fn delivering_a_request_allocates_nothing_in_the_wrapper() {
         "no fields were delivered, so this measured nothing"
     );
     assert!(counts.name_bytes > 0 && counts.value_bytes > 0);
+    assert_eq!(
+        counts.body_bytes, 4096,
+        "the whole body should have been delivered, or the body half of this measures \
+         nothing"
+    );
     assert_eq!(
         allocations, 0,
         "receiving allocated {allocations} times in the wrapper; inbound names, values and \

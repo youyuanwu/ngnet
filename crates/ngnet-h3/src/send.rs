@@ -89,7 +89,7 @@ pub struct SendGuard<'a, C> {
 }
 
 impl<'a, C> SendGuard<'a, C> {
-    pub(crate) fn acquire(conn: &'a mut Conn<C>) -> Result<Option<Self>> {
+    pub(crate) fn acquire(conn: &'a mut Conn<C>, context: &mut C) -> Result<Option<Self>> {
         conn.require_ready_to_send()?;
 
         let mut vectors = [sys::nghttp3_vec {
@@ -99,19 +99,23 @@ impl<'a, C> SendGuard<'a, C> {
         let mut stream_id: i64 = -1;
         let mut fin: i32 = 0;
 
-        let raw = conn.raw();
-        // SAFETY: `raw` is live, and `vectors` is a valid array of `MAX_VECTORS` entries
-        // that outlives the call. nghttp3 writes the stream id and fin flag through the
-        // out-pointers before it does anything else.
-        let count = unsafe {
-            sys::nghttp3_conn_writev_stream(
-                raw,
-                &mut stream_id,
-                &mut fin,
-                vectors.as_mut_ptr(),
-                vectors.len(),
-            )
-        };
+        // A bridge is installed for the duration of the call and no longer: collecting
+        // bytes pulls from outgoing body sources through the data callback, but committing
+        // afterwards fires nothing, so the guard itself does not hold the caller's state.
+        let count = conn.with_context(context, |raw| {
+            // SAFETY: `raw` is live, and `vectors` is a valid array of `MAX_VECTORS`
+            // entries that outlives the call. nghttp3 writes the stream id and fin flag
+            // through the out-pointers before it does anything else.
+            unsafe {
+                sys::nghttp3_conn_writev_stream(
+                    raw,
+                    &mut stream_id,
+                    &mut fin,
+                    vectors.as_mut_ptr(),
+                    vectors.len(),
+                )
+            }
+        });
 
         if count < 0 {
             let code = i32::try_from(count).unwrap_or(sys::NGHTTP3_ERR_FATAL);
@@ -220,6 +224,9 @@ impl<'a, C> SendGuard<'a, C> {
         if rv != 0 {
             return Err(conn.record_recoverable(rv, "could not record the bytes written"));
         }
+        // Recorded only after nghttp3 accepted it, so a failed commit cannot raise the
+        // ceiling that bounds-checks acknowledgement.
+        conn.record_committed(stream, accepted);
         Ok(())
     }
 

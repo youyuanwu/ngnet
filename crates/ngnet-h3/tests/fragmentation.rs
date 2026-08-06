@@ -91,7 +91,7 @@ fn request_bytes() -> Vec<(i64, Vec<u8>)> {
 
     let mut out: Vec<(i64, Vec<u8>)> = Vec::new();
     for _ in 0..64 {
-        let Some(send) = client.writev_stream().unwrap() else {
+        let Some(send) = client.writev_stream(&mut ()).unwrap() else {
             break;
         };
         let stream = send.stream().get();

@@ -34,6 +34,7 @@ use ngnet_h3_sys as sys;
 
 use crate::error::ErrorCode;
 use crate::handlers::{FieldAction, FieldSection, FieldToken, Handlers, StreamClosed};
+use crate::state::{BodyEnd, BodyRegistry, Handover};
 use crate::stream::StreamId;
 
 /// The stable indirection nghttp3 is given at construction.
@@ -69,6 +70,7 @@ unsafe impl Send for BridgeSlot {}
 /// which is what lets handlers mutate application state that was never captured.
 pub(crate) struct Bridge<'a, C> {
     pub(crate) handlers: &'a mut Handlers<C>,
+    pub(crate) bodies: &'a mut BodyRegistry,
     pub(crate) context: &'a mut C,
 }
 /// Installs a bridge into the slot for as long as it is alive.
@@ -177,8 +179,10 @@ mod tests {
         let mut context = 7u32;
 
         {
+            let mut bodies = crate::state::BodyRegistry::default();
             let mut carried = Bridge {
                 handlers: &mut handlers,
+                bodies: &mut bodies,
                 context: &mut context,
             };
             // SAFETY: `carried` outlives the guard, and `C` matches on recovery.
@@ -399,6 +403,11 @@ pub(crate) unsafe extern "C" fn end_stream_cb<C>(
 }
 
 /// Reports that a stream has closed, with the application error code it closed with.
+///
+/// This is the single detach point on the close path: the stream's body and send offsets
+/// are dropped here, releasing any buffers still held for it. nghttp3 deletes the stream —
+/// and with it the queue of pointers into those buffers — immediately after this returns,
+/// so releasing here cannot leave it pointing at freed memory.
 pub(crate) unsafe extern "C" fn stream_close_cb<C>(
     _conn: *mut sys::nghttp3_conn,
     flags: u32,
@@ -412,10 +421,14 @@ pub(crate) unsafe extern "C" fn stream_close_cb<C>(
     let Some(bridge) = (unsafe { bridge::<C>(conn_user_data) }) else {
         return 0;
     };
-    let Some(handler) = bridge.handlers.stream_close.as_mut() else {
+    let Ok(stream) = StreamId::new(stream_id) else {
         return 0;
     };
-    let Ok(stream) = StreamId::new(stream_id) else {
+    // Before the handler, so that a handler which panics cannot skip the release, and so
+    // that a handler observing the connection sees a stream that is already gone.
+    bridge.bodies.forget(stream);
+
+    let Some(handler) = bridge.handlers.stream_close.as_mut() else {
         return 0;
     };
     handler(
@@ -428,5 +441,111 @@ pub(crate) unsafe extern "C" fn stream_close_cb<C>(
                 .then(|| ErrorCode::new(tx_app_error_code)),
         },
     );
+    0
+}
+
+/// Asks a body source for the next vectors of an outgoing message body.
+///
+/// The rules encoded here are read from `lib/nghttp3_stream.c:602-700`, and none of them
+/// are stated by the header:
+///
+/// * nghttp3 offers a fixed array of eight vectors. Anything a source produces beyond what
+///   fits is held back and offered on the next call rather than dropped.
+/// * A zero-length vector is skipped without being queued, so one must never be handed
+///   over — an element retained for it would wait forever for an acknowledgement.
+/// * `assert(datalen || EOF)` is compiled out of a release build, where returning no bytes
+///   without end-of-stream writes a zero-length DATA frame instead of deferring. So "the
+///   source has nothing right now" becomes `NGHTTP3_ERR_WOULDBLOCK`, never a zero return.
+pub(crate) unsafe extern "C" fn read_data_cb<C>(
+    _conn: *mut sys::nghttp3_conn,
+    stream_id: i64,
+    vec: *mut sys::nghttp3_vec,
+    veccnt: usize,
+    pflags: *mut u32,
+    conn_user_data: *mut c_void,
+    _stream_user_data: *mut c_void,
+) -> sys::nghttp3_ssize {
+    // A data reader is only ever installed alongside a registry entry, and this callback
+    // only fires from the write path, which always installs a bridge. Anything else means
+    // this crate's own invariants are broken, so failing the connection is right.
+    // SAFETY: `conn_user_data` is the slot installed at construction, and `C` matches.
+    let Some(bridge) = (unsafe { bridge::<C>(conn_user_data) }) else {
+        return sys::NGHTTP3_ERR_CALLBACK_FAILURE as sys::nghttp3_ssize;
+    };
+    let Ok(stream) = StreamId::new(stream_id) else {
+        return sys::NGHTTP3_ERR_CALLBACK_FAILURE as sys::nghttp3_ssize;
+    };
+    let Some(entry) = bridge.bodies.entry_mut(stream) else {
+        return sys::NGHTTP3_ERR_CALLBACK_FAILURE as sys::nghttp3_ssize;
+    };
+
+    if matches!(entry.begin_round(), Handover::Defer) {
+        return sys::NGHTTP3_ERR_WOULDBLOCK as sys::nghttp3_ssize;
+    }
+
+    let mut filled = 0usize;
+    while filled < veccnt {
+        let Some(piece) = entry.take_piece() else {
+            break;
+        };
+        debug_assert!(!piece.is_empty());
+        let bytes = piece.as_slice();
+        // SAFETY: `vec` is an array of at least `veccnt` entries supplied by nghttp3 for
+        // this call, and `filled` is below `veccnt`.
+        unsafe {
+            (*vec.add(filled)).base = bytes.as_ptr().cast_mut();
+            (*vec.add(filled)).len = bytes.len();
+        }
+        // Retained *after* its address has been handed over, and before returning, so the
+        // allocation behind that address outlives the write. `RetainedBytes` is an `Arc`,
+        // so moving the handle into the queue does not move the bytes.
+        entry.retain(piece);
+        filled += 1;
+    }
+
+    let end = entry.end_reached();
+    if filled == 0 && end.is_none() {
+        // The source produced nothing and did not end. Returning zero here would write a
+        // zero-length DATA frame in a release build; deferring is what was meant.
+        return sys::NGHTTP3_ERR_WOULDBLOCK as sys::nghttp3_ssize;
+    }
+
+    let flags = match end {
+        None => sys::NGHTTP3_DATA_FLAG_NONE,
+        Some(BodyEnd::Stream) => sys::NGHTTP3_DATA_FLAG_EOF,
+        // The body ends but the stream must stay open, or the trailing field section
+        // would have nowhere to go.
+        Some(BodyEnd::Trailers) => {
+            sys::NGHTTP3_DATA_FLAG_EOF | sys::NGHTTP3_DATA_FLAG_NO_END_STREAM
+        }
+    };
+    // SAFETY: nghttp3 always supplies a valid pointer for the flags out-parameter.
+    unsafe { *pflags = flags };
+
+    filled as sys::nghttp3_ssize
+}
+
+/// Reports that the peer has acknowledged more of a stream's application-owned bytes.
+///
+/// `datalen` is a delta rather than a cumulative offset, and covers only the buffers this
+/// crate supplied — nghttp3 skips its own serialisation buffers when reporting. That is
+/// what lets the retain queue be drained by simple subtraction.
+pub(crate) unsafe extern "C" fn acked_stream_data_cb<C>(
+    _conn: *mut sys::nghttp3_conn,
+    stream_id: i64,
+    datalen: u64,
+    conn_user_data: *mut c_void,
+    _stream_user_data: *mut c_void,
+) -> i32 {
+    // SAFETY: as above.
+    let Some(bridge) = (unsafe { bridge::<C>(conn_user_data) }) else {
+        return 0;
+    };
+    let Ok(stream) = StreamId::new(stream_id) else {
+        return 0;
+    };
+    if let Some(entry) = bridge.bodies.entry_mut(stream) {
+        entry.on_acked(datalen);
+    }
     0
 }

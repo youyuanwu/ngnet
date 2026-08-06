@@ -29,7 +29,7 @@
 //! conn.bind_qpack_streams(StreamId::new(6)?, StreamId::new(10)?)?;
 //!
 //! // Ask what to send, write it, then say how much the transport took.
-//! while let Some(send) = conn.writev_stream()? {
+//! while let Some(send) = conn.writev_stream(&mut ())? {
 //!     let accepted = write_to_quic(send.stream(), send.slices(), send.fin());
 //!     send.commit(accepted)?;
 //! }
@@ -51,6 +51,16 @@
 //! [`Conn::read_stream`] is consumed; there is never a remainder to re-present. What comes
 //! back is how much QUIC flow-control credit you may now extend, which deliberately
 //! excludes body payload — see [`FlowCredit`].
+//!
+//! # Outgoing bodies are borrowed, not copied
+//!
+//! nghttp3 has no copying data source. A [`BodySource`] hands over [`RetainedBytes`], and
+//! the bytes behind them are read again on every write until the peer acknowledges them.
+//! This crate holds those buffers for exactly as long as that, which means **reporting
+//! acknowledgement through [`Conn::add_ack_offset`] is required, not an optimisation**: it
+//! is the only thing that releases them. A caller that reports bytes written but never
+//! bytes acknowledged will hold every body buffer it ever sent until the connection is
+//! dropped.
 //!
 //! # Errors and unusable connections
 //!
@@ -95,6 +105,7 @@ mod settings;
 mod body;
 mod handlers;
 mod header;
+mod state;
 mod stream;
 
 pub use body::{BodyOutcome, BodySource, FixedBody, RetainedBytes};

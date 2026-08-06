@@ -6,10 +6,10 @@
 //! asserted, and that many exchanges can be in flight at once without their fields being
 //! confused.
 //!
-//! Trailer *delivery* is not proven here and cannot be: a message with no body source ends
-//! its stream at the header section, so there is nothing for a trailer to follow. What is
-//! proven is that submitting one in that state is refused, and refused recoverably. The
-//! receiving side's ability to tell a trailer from a header waits on bodies existing.
+//! Trailer *delivery* is not proven here: a message with no body source ends its stream at
+//! the header section, so there is nothing for a trailer to follow. What is proven is that
+//! submitting one in that state is refused, and refused recoverably. Delivery is proven in
+//! `body.rs`, where a body keeps the stream open long enough for trailers to follow it.
 
 use std::collections::HashMap;
 
@@ -103,7 +103,7 @@ fn observer(role: Role) -> Conn<Seen> {
 fn pump(a: &mut Conn<Seen>, a_state: &mut Seen, b: &mut Conn<Seen>, b_state: &mut Seen, now: u64) {
     let mut settled = false;
     for _ in 0..256 {
-        let moved = transfer(a, b, b_state, now) | transfer(b, a, a_state, now);
+        let moved = transfer(a, a_state, b, b_state, now) | transfer(b, b_state, a, a_state, now);
         if !moved {
             settled = true;
             break;
@@ -116,8 +116,17 @@ fn pump(a: &mut Conn<Seen>, a_state: &mut Seen, b: &mut Conn<Seen>, b_state: &mu
 }
 
 /// Drains one offer from `from` and delivers it to `to`. Returns whether anything moved.
-fn transfer(from: &mut Conn<Seen>, to: &mut Conn<Seen>, to_state: &mut Seen, now: u64) -> bool {
-    let Some(send) = from.writev_stream().expect("collect data to send") else {
+fn transfer(
+    from: &mut Conn<Seen>,
+    from_state: &mut Seen,
+    to: &mut Conn<Seen>,
+    to_state: &mut Seen,
+    now: u64,
+) -> bool {
+    let Some(send) = from
+        .writev_stream(from_state)
+        .expect("collect data to send")
+    else {
         return false;
     };
     let stream = send.stream();
@@ -125,6 +134,13 @@ fn transfer(from: &mut Conn<Seen>, to: &mut Conn<Seen>, to_state: &mut Seen, now
     let bytes: Vec<u8> = send.slices().iter().flat_map(|s| s.to_vec()).collect();
     let taken = bytes.len();
     send.commit(taken).expect("commit");
+
+    // Reported straight away, because it is the only thing that releases retained body
+    // buffers and a test that never reported it would hold every one of them.
+    if taken > 0 {
+        from.add_ack_offset(stream, taken as u64, from_state)
+            .expect("report acknowledgement");
+    }
 
     if taken > 0 || fin {
         to.read_stream(stream, &bytes, fin, Timestamp::from_nanos(now), to_state)
@@ -383,7 +399,7 @@ fn a_handler_mutates_state_it_never_captured() {
 
     let mut names: Vec<String> = Vec::new();
     for _ in 0..64 {
-        let Some(send) = client.writev_stream().unwrap() else {
+        let Some(send) = client.writev_stream(&mut client_seen).unwrap() else {
             break;
         };
         let stream = send.stream();
@@ -486,7 +502,7 @@ fn stream_close_is_reported_with_both_directions() {
         .unwrap();
 
     for _ in 0..64 {
-        let Some(send) = client.writev_stream().unwrap() else {
+        let Some(send) = client.writev_stream(&mut client_seen).unwrap() else {
             break;
         };
         let stream = send.stream();
@@ -528,25 +544,116 @@ fn stream_close_is_reported_with_both_directions() {
 }
 
 #[test]
-fn submitting_a_body_is_refused_explicitly_rather_than_ignored() {
-    // Bodies arrive in the next phase. Accepting one silently would let a caller conclude
-    // it had been sent.
+fn ten_concurrent_exchanges_with_bodies_attribute_every_chunk() {
+    // The header-only version above proves fields are not crossed between streams. Body
+    // chunks arrive through a different callback with no framing of their own, so they
+    // need their own proof.
     let mut client = observer(Role::Client);
+    let mut server = observer(Role::Server);
+    let mut client_seen = Seen::default();
+    let mut server_seen = Seen::default();
+
+    let streams: Vec<i64> = (0..10).map(|n| n * 4).collect();
+    // Distinct lengths as well as distinct contents, so a body attributed to the wrong
+    // stream cannot coincidentally match.
+    let payload = |stream: i64| -> Vec<u8> { vec![stream as u8; 100 + stream as usize] };
+
+    for &stream in &streams {
+        let path = format!("/body/{stream}");
+        client
+            .submit_request(
+                id(stream),
+                &[
+                    Header::new(":method", "POST").unwrap(),
+                    Header::new(":scheme", "https").unwrap(),
+                    Header::new(":path", &path).unwrap(),
+                    Header::new(":authority", "example.test").unwrap(),
+                ],
+                Some(Box::new(FixedBody::new(payload(stream)))),
+            )
+            .unwrap_or_else(|e| panic!("submit on stream {stream}: {e}"));
+    }
+    pump(
+        &mut client,
+        &mut client_seen,
+        &mut server,
+        &mut server_seen,
+        1,
+    );
+
+    for &stream in &streams {
+        let expected = format!("/body/{stream}");
+        assert_eq!(
+            server_seen.named(stream, b":path"),
+            Some(expected.as_bytes()),
+            "stream {stream} got the wrong path"
+        );
+        assert_eq!(
+            server_seen.body.get(&stream).map(Vec::as_slice),
+            Some(payload(stream).as_slice()),
+            "stream {stream} got the wrong body, so chunks were crossed between streams"
+        );
+    }
+    assert_eq!(
+        client.retained_body_buffers(),
+        0,
+        "every buffer was acknowledged, so none should still be held"
+    );
+
+    for &stream in &streams {
+        server
+            .submit_response(
+                id(stream),
+                &[Header::new(":status", "200").unwrap()],
+                Some(Box::new(FixedBody::new(payload(stream + 1)))),
+            )
+            .unwrap();
+    }
+    pump(
+        &mut client,
+        &mut client_seen,
+        &mut server,
+        &mut server_seen,
+        2,
+    );
+
+    for &stream in &streams {
+        assert_eq!(
+            client_seen.body.get(&stream).map(Vec::as_slice),
+            Some(payload(stream + 1).as_slice())
+        );
+    }
+    assert_eq!(server.retained_body_buffers(), 0);
+}
+
+#[test]
+fn a_second_body_on_one_stream_is_refused() {
+    // A memory-safety guard rather than tidiness: replacing the entry would drop the
+    // first body's retained buffers while nghttp3 still held pointers into them.
+    let mut client = observer(Role::Client);
+    let fields = [
+        Header::new(":method", "POST").unwrap(),
+        Header::new(":scheme", "https").unwrap(),
+        Header::new(":path", "/upload").unwrap(),
+        Header::new(":authority", "example.test").unwrap(),
+    ];
+    client
+        .submit_request(
+            id(0),
+            &fields,
+            Some(Box::new(FixedBody::new(b"payload".to_vec()))),
+        )
+        .expect("the first body");
+
     let error = client
         .submit_request(
             id(0),
-            &[
-                Header::new(":method", "POST").unwrap(),
-                Header::new(":scheme", "https").unwrap(),
-                Header::new(":path", "/upload").unwrap(),
-                Header::new(":authority", "example.test").unwrap(),
-            ],
-            Some(Box::new(FixedBody::new(b"payload".to_vec()))),
+            &fields,
+            Some(Box::new(FixedBody::new(b"again".to_vec()))),
         )
-        .expect_err("bodies are not supported yet");
+        .expect_err("a stream carries at most one body");
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
-    assert!(error.to_string().contains("not supported"), "got: {error}");
-    assert!(client.is_usable());
+    assert!(client.is_usable(), "a caller mistake is not fatal");
 }
 
 #[test]

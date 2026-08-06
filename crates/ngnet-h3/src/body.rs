@@ -1,10 +1,5 @@
 //! Outgoing message bodies.
 //!
-//! The trait and outcome type live here from the phase that defines the submission
-//! signatures, so those signatures are final before the machinery that drives them exists.
-//! Submitting a body is currently refused with a typed error rather than silently
-//! ignored — see [`Conn::submit_request`].
-//!
 //! # Why there is no copying variant
 //!
 //! nghttp2 offers a body source that writes into a buffer the library owns. nghttp3 has no
@@ -15,7 +10,14 @@
 //! out the same allocation across several calls, so the buffers must be shareable rather
 //! than owned by one vector each.
 //!
-//! [`Conn::submit_request`]: crate::Conn::submit_request
+//! # The release contract
+//!
+//! Buffers handed over are held until [`Conn::add_ack_offset`] says the peer acknowledged
+//! them, and are released then, on stream close, or when the connection is dropped —
+//! nothing else releases them. In particular, reporting bytes *written* does not: nghttp3
+//! reaches its release accounting only from the acknowledgement entry point.
+//!
+//! [`Conn::add_ack_offset`]: crate::Conn::add_ack_offset
 
 use std::sync::Arc;
 
@@ -114,11 +116,20 @@ pub enum BodyOutcome {
 /// Supplies the bytes of an outgoing message body.
 ///
 /// `Send` because a connection is, and a source is stored inside one.
+///
+/// A source is never asked for more once it has reported an end, so `next` does not have
+/// to be idempotent past that point.
 pub trait BodySource: Send {
     /// Asks for the next piece of the body.
     ///
-    /// May return at most eight buffers per call: that is the size of the array nghttp3
-    /// offers, and anything beyond it would be silently dropped.
+    /// Any number of buffers may be returned. nghttp3 takes at most eight per call, so a
+    /// surplus is held back and offered to it on the following call rather than dropped.
+    /// Empty buffers are discarded: nghttp3 skips zero-length vectors without queueing
+    /// them, so one could never be reported acknowledged.
+    ///
+    /// Returning [`BodyOutcome::Wrote`] with nothing in it is treated as
+    /// [`BodyOutcome::Defer`], because the alternative — telling nghttp3 there are zero
+    /// bytes and the body has not ended — makes it write an empty data frame.
     fn next(&mut self) -> BodyOutcome;
 }
 

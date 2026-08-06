@@ -12,6 +12,7 @@ use crate::handlers::{FieldAction, FieldSection, FieldToken, Handlers, StreamClo
 use crate::header::Header;
 use crate::send::SendGuard;
 use crate::settings::Settings;
+use crate::state::BodyRegistry;
 use crate::stream::{Directionality, Initiator, StreamId};
 
 /// Which side of the connection this endpoint is.
@@ -223,6 +224,7 @@ pub struct Conn<C> {
     slot: Box<BridgeSlot>,
 
     handlers: Handlers<C>,
+    bodies: BodyRegistry,
     control: Option<StreamId>,
     qpack: Option<(StreamId, StreamId)>,
     last_timestamp: Option<Timestamp>,
@@ -257,6 +259,7 @@ impl<C> Conn<C> {
         callbacks.recv_trailer = Some(crate::callbacks::recv_trailer_cb::<C>);
         callbacks.end_trailers = Some(crate::callbacks::end_trailers_cb::<C>);
         callbacks.recv_data = Some(crate::callbacks::recv_data_cb::<C>);
+        callbacks.acked_stream_data = Some(crate::callbacks::acked_stream_data_cb::<C>);
         callbacks.end_stream = Some(crate::callbacks::end_stream_cb::<C>);
         // `stream_close2` rather than the deprecated `stream_close`.
         callbacks.stream_close2 = Some(crate::callbacks::stream_close_cb::<C>);
@@ -302,6 +305,7 @@ impl<C> Conn<C> {
             allocator,
             slot,
             handlers,
+            bodies: BodyRegistry::default(),
             control: None,
             qpack: None,
             last_timestamp: None,
@@ -344,10 +348,17 @@ impl<C> Conn<C> {
     /// almost any entry point. Everything else stays recoverable, which is what keeps a
     /// second bind, or a submission onto a closing connection, from killing a connection
     /// that is otherwise perfectly serviceable.
+    ///
+    /// Poisoning also releases every retained outgoing buffer. A write that fails partway
+    /// can queue a prefix of a body's vectors and abandon the rest, so acknowledgements
+    /// for them can never arrive; holding the buffers for an acknowledgement that will not
+    /// come would be a leak for the connection's remaining lifetime. Nothing will read
+    /// them again either, because no further call but the destructor is permitted.
     fn record(&mut self, code: i32, context: &'static str, path_is_fatal: bool) -> Error {
         let error = Error::native(code, context);
         if path_is_fatal || error.is_fatal() {
             self.poison.get_or_insert(context);
+            self.bodies.clear();
         }
         error
     }
@@ -540,11 +551,12 @@ impl<C> Conn<C> {
 
     /// Submits a request on a client-initiated bidirectional stream.
     ///
-    /// Header-only for now: bodies arrive with the next phase, and submitting one is
-    /// refused rather than silently ignored.
-    ///
     /// The caller opens the QUIC stream and chooses its identifier, which is why this
     /// takes one rather than returning it.
+    ///
+    /// With no body, the request ends the sending direction of the stream at its header
+    /// section. With one, the body's bytes are pulled from the source as the transport
+    /// takes them, and are held until [`Conn::add_ack_offset`] reports them acknowledged.
     pub fn submit_request(
         &mut self,
         stream: StreamId,
@@ -552,7 +564,6 @@ impl<C> Conn<C> {
         body: Option<Box<dyn BodySource>>,
     ) -> Result<()> {
         self.check_usable()?;
-        reject_body(body)?;
         if self.role != Role::Client {
             return Err(Error::invalid_input(
                 "only a client submits requests; a server submits responses",
@@ -567,28 +578,36 @@ impl<C> Conn<C> {
         // asserts are compiled out of a release build. FR-002 requires this be a typed
         // error, so it is checked rather than left to abort.
         self.require_bound()?;
+        let reader = self.attach_body(stream, body)?;
 
         let nva: Vec<sys::nghttp3_nv> = fields.iter().map(Header::as_nv).collect();
         // SAFETY: `raw` is live; the role, stream shape and binding state have all been
-        // checked; and the field array plus everything it points at outlives the call,
-        // which is all nghttp3 needs because no no-copy flag is set.
+        // checked; the field array plus everything it points at outlives the call, which
+        // is all nghttp3 needs because no no-copy flag is set; and the data reader is
+        // copied into the queued frame by value, so a local is enough.
         let rv = unsafe {
             sys::nghttp3_conn_submit_request(
                 self.raw,
                 stream.get(),
                 nva.as_ptr(),
                 nva.len(),
-                core::ptr::null(),
+                reader
+                    .as_ref()
+                    .map_or(core::ptr::null(), |reader| reader as *const _),
                 core::ptr::null_mut(),
             )
         };
         if rv != 0 {
+            // The body was never handed to nghttp3, so nothing points into its buffers.
+            self.bodies.detach(stream);
             return Err(self.record(rv, "could not submit the request", false));
         }
         Ok(())
     }
 
     /// Submits a response on the stream its request arrived on.
+    ///
+    /// The body behaves as it does for [`Conn::submit_request`].
     pub fn submit_response(
         &mut self,
         stream: StreamId,
@@ -596,7 +615,6 @@ impl<C> Conn<C> {
         body: Option<Box<dyn BodySource>>,
     ) -> Result<()> {
         self.check_usable()?;
-        reject_body(body)?;
         if self.role != Role::Server {
             return Err(Error::invalid_input(
                 "only a server submits responses; a client submits requests",
@@ -608,6 +626,7 @@ impl<C> Conn<C> {
             ));
         }
         self.require_bound()?;
+        let reader = self.attach_body(stream, body)?;
 
         let nva: Vec<sys::nghttp3_nv> = fields.iter().map(Header::as_nv).collect();
         // SAFETY: as `submit_request`.
@@ -617,13 +636,35 @@ impl<C> Conn<C> {
                 stream.get(),
                 nva.as_ptr(),
                 nva.len(),
-                core::ptr::null(),
+                reader
+                    .as_ref()
+                    .map_or(core::ptr::null(), |reader| reader as *const _),
             )
         };
         if rv != 0 {
+            self.bodies.detach(stream);
             return Err(self.record(rv, "could not submit the response", false));
         }
         Ok(())
+    }
+
+    /// Takes ownership of an outgoing body and builds the data reader that reaches it.
+    ///
+    /// The body is found again by stream identifier through the installed bridge rather
+    /// than through nghttp3's stream user data, which `submit_response` has no parameter
+    /// for at all — so the two submission paths work the same way.
+    fn attach_body(
+        &mut self,
+        stream: StreamId,
+        body: Option<Box<dyn BodySource>>,
+    ) -> Result<Option<sys::nghttp3_data_reader>> {
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        self.bodies.attach(stream, body)?;
+        Ok(Some(sys::nghttp3_data_reader {
+            read_data: Some(crate::callbacks::read_data_cb::<C>),
+        }))
     }
 
     /// Submits a trailing field section, which ends the stream.
@@ -707,20 +748,36 @@ impl<C> Conn<C> {
     /// the connection and exposes the bytes to write; the caller must report how many the
     /// transport accepted through [`SendGuard::commit`] before the connection will offer
     /// anything further.
-    pub fn writev_stream(&mut self) -> Result<Option<SendGuard<'_, C>>> {
+    ///
+    /// Takes the caller's state because collecting bytes can pull from an outgoing body
+    /// source, and a body source belongs to the caller.
+    pub fn writev_stream(&mut self, context: &mut C) -> Result<Option<SendGuard<'_, C>>> {
         self.check_usable()?;
-        SendGuard::acquire(self)
+        SendGuard::acquire(self, context)
     }
 
     /// Tells the connection that `n` more bytes on a stream have been acknowledged by the
     /// peer, and the buffers holding them may be released.
     ///
-    /// Reporting acknowledgement is not optional: it is the only thing that releases
-    /// retained outgoing buffers.
-    pub fn add_ack_offset(&mut self, stream: StreamId, n: u64) -> Result<()> {
+    /// **Reporting acknowledgement is not optional.** It is the only thing that releases
+    /// retained outgoing buffers: nghttp3 reaches its release accounting from here and
+    /// from nowhere else, so a caller that never reports acknowledgement holds every body
+    /// buffer it ever sent for the life of the connection. Reporting bytes written is not
+    /// a substitute.
+    ///
+    /// `n` is a delta, matching the QUIC layer's own view of newly acknowledged bytes, and
+    /// counts every byte written on the stream rather than only body payload. Reporting
+    /// more than was ever committed is refused, because nghttp3 would then release a
+    /// buffer it has not yet written and still points at.
+    pub fn add_ack_offset(&mut self, stream: StreamId, n: u64, context: &mut C) -> Result<()> {
         self.check_usable()?;
-        // SAFETY: `raw` is live and the identifier is validated.
-        let rv = unsafe { sys::nghttp3_conn_add_ack_offset(self.raw, stream.get(), n) };
+        self.bodies.record_acked(stream, n)?;
+        let rv = self.with_context(context, |raw| {
+            // SAFETY: `raw` is live, the identifier is validated, and `n` has been checked
+            // against what was actually written. This fires the acknowledgement callback,
+            // so a bridge is installed for it.
+            unsafe { sys::nghttp3_conn_add_ack_offset(raw, stream.get(), n) }
+        });
         if rv != 0 {
             return Err(self.record(rv, "could not record acknowledged bytes", false));
         }
@@ -776,15 +833,17 @@ impl<C> Conn<C> {
     /// The closure receives the raw connection pointer rather than `&mut self`, because
     /// the bridge already holds a mutable borrow of the handlers; handing out a second
     /// borrow of the whole connection would alias it.
-    fn with_context<R>(
+    pub(crate) fn with_context<R>(
         &mut self,
         context: &mut C,
         f: impl FnOnce(*mut sys::nghttp3_conn) -> R,
     ) -> R {
         let raw = self.raw;
-        // Disjoint field borrows: the bridge takes the handlers, the guard takes the slot.
+        // Disjoint field borrows: the bridge takes the handlers and the body registry,
+        // the guard takes the slot.
         let mut bridge = Bridge {
             handlers: &mut self.handlers,
+            bodies: &mut self.bodies,
             context,
         };
         // SAFETY: `bridge` outlives the guard, and `C` matches what callbacks recover.
@@ -796,6 +855,20 @@ impl<C> Conn<C> {
 
     pub(crate) fn raw(&mut self) -> *mut sys::nghttp3_conn {
         self.raw
+    }
+
+    /// Records bytes the transport accepted, so acknowledgement can be bounds-checked.
+    pub(crate) fn record_committed(&mut self, stream: StreamId, n: usize) {
+        self.bodies.record_committed(stream, n);
+    }
+
+    /// Outgoing body buffers still held across all streams.
+    ///
+    /// Exposed for tests, which use it to prove that acknowledgement — and nothing else —
+    /// releases them.
+    #[doc(hidden)]
+    pub fn retained_body_buffers(&self) -> usize {
+        self.bodies.retained_buffers()
     }
 
     pub(crate) fn record_send_failure(&mut self, code: i32, context: &'static str) -> Error {
@@ -822,6 +895,13 @@ impl<C> Drop for Conn<C> {
         unsafe { sys::nghttp3_conn_del(self.raw) };
         self.raw = core::ptr::null_mut();
 
+        // Only now are the outgoing body buffers released. Doing it here rather than
+        // leaving it to field-drop order is what makes the ordering explicit: until the
+        // connection is deleted, its send queues still hold pointers into them. Releasing
+        // them at all is mandatory rather than tidy — `delete_outq` frees only the buffers
+        // nghttp3 allocated itself and deliberately leaves application-owned ones alone.
+        self.bodies.clear();
+
         debug_assert_eq!(
             self.allocator.state().live_blocks(),
             0,
@@ -837,19 +917,5 @@ impl<C> core::fmt::Debug for Conn<C> {
             .field("bound", &self.is_bound())
             .field("usable", &self.is_usable())
             .finish_non_exhaustive()
-    }
-}
-
-/// Refuses a body until the phase that can drive one.
-///
-/// Explicit rather than silent so the boundary cannot be mistaken for working behaviour:
-/// a caller that attaches a body and sees the request succeed would reasonably conclude
-/// the body was sent.
-fn reject_body(body: Option<Box<dyn BodySource>>) -> Result<()> {
-    match body {
-        None => Ok(()),
-        Some(_) => Err(Error::invalid_input(
-            "outgoing message bodies are not supported yet",
-        )),
     }
 }
