@@ -61,7 +61,7 @@ jobs:
         run: cargo test --workspace
 
       - name: Test (sans-I/O core alone)
-        run: cargo test -p nghttp2 --no-default-features
+        run: cargo test -p ngnet-h2 --no-default-features
 
       # `--all-targets` reaches benchmarks and examples as well as tests, which is half of
       # what keeps the benchmark crate from rotting.
@@ -69,10 +69,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Clippy (default features)
-        run: cargo clippy -p nghttp2 --all-targets -- -D warnings
+        run: cargo clippy -p ngnet-h2 --all-targets -- -D warnings
 
       - name: Clippy (sans-I/O core alone)
-        run: cargo clippy -p nghttp2 --no-default-features --all-targets -- -D warnings
+        run: cargo clippy -p ngnet-h2 --no-default-features --all-targets -- -D warnings
 
       # Four configurations rather than one, because of a bug this repository actually
       # shipped: a doc link to an item behind the `tokio` feature passed `--all-features`
@@ -83,7 +83,7 @@ jobs:
         run: |
           for features in "" "--no-default-features" "--all-features" "--features tokio" "--features completion"; do
             echo "::group::cargo doc ${features:-(default)}"
-            cargo doc --no-deps -p nghttp2 $features
+            cargo doc --no-deps -p ngnet-h2 $features
             echo "::endgroup::"
           done
 
@@ -96,11 +96,11 @@ jobs:
       # that has io_uring, which is to say on this runner and on any developer's machine.
       - name: The completion transport compiles no readiness backend
         run: |
-          if cargo tree -p nghttp2 --features completion -e features \
+          if cargo tree -p ngnet-h2 --features completion -e features \
                | grep -q 'compio-driver feature "polling"'; then
             echo "::error::compio's polling feature reached the build, which restores the"
             echo "::error::fusion driver and its silent fallback to epoll. Find who enabled"
-            echo "::error::it with: cargo tree -p nghttp2 --features completion -e features"
+            echo "::error::it with: cargo tree -p ngnet-h2 --features completion -e features"
             exit 1
           fi
           echo "no readiness backend in the completion build"

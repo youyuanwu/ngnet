@@ -1,0 +1,71 @@
+[package]
+name = "ngnet-h2-bench"
+version = "0.1.0"
+description = "Criterion benchmarks comparing the ngnet-h2 async HTTP/2 stack against hyper, and completion I/O against readiness I/O"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# This crate exists so the comparison against a third-party HTTP/2 stack lives outside
+# `ngnet-h2`, which takes exactly one dependency and no dev-dependencies. Everything the
+# benches need is declared in the workspace and pulled in here, never there.
+[dependencies]
+# The `tokio` feature supplies this crate's own `TokioIo` transport adapter; `completion`
+# supplies `CompioIo`, the io_uring transport the second benchmark family measures. Both
+# adapters ship in `ngnet-h2`; this crate only enables them.
+ngnet-h2 = { workspace = true, features = ["tokio", "completion"] }
+tokio.workspace = true
+# The completion runtime under test. Its `criterion` feature adds the `AsyncExecutor` impl
+# for compio's `Runtime`, so `b.to_async(&compio_runtime)` drives it exactly as the tokio
+# benches drive a tokio runtime.
+compio = { workspace = true, features = ["criterion"] }
+
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+# `harness = false` on each bench hands the whole `main` to Criterion rather than to
+# libtest, which is what lets Criterion time and report the iterations itself.
+[[bench]]
+name = "serial_latency"
+harness = false
+
+[[bench]]
+name = "concurrent_throughput"
+harness = false
+
+[[bench]]
+name = "body_throughput"
+harness = false
+
+# The real-socket family. Same three measures as above, over a real loopback TCP connection,
+# with three arms: `CompioSocket` (ngnet-h2 on io_uring), `TokioSocket` (ngnet-h2 on epoll) and
+# `HyperSocket` (hyper on epoll). Read pairwise — the first two isolate the I/O model, the
+# last two isolate the HTTP/2 stack.
+[[bench]]
+name = "transport_serial_latency"
+harness = false
+
+[[bench]]
+name = "transport_concurrent_throughput"
+harness = false
+
+[[bench]]
+name = "transport_body_throughput"
+harness = false
+
+[[bench]]
+name = "shared_body"
+harness = false
+
+[[bench]]
+name = "transport_shared_body"
+harness = false

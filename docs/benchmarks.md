@@ -1,6 +1,6 @@
 # Benchmarks
 
-`crates/nghttp2-bench` holds two [Criterion](https://bheisler.github.io/criterion.rs/)
+`crates/ngnet-h2-bench` holds two [Criterion](https://bheisler.github.io/criterion.rs/)
 benchmark families, which answer different questions and must not be read as one:
 
 - **The duplex family** — this stack against [hyper](https://hyper.rs), both on tokio over a
@@ -13,7 +13,7 @@ Between them they fill in the whole matrix of stack against I/O model:
 
 | | duplex (no kernel) | tokio (epoll) | compio (io_uring) |
 | --- | --- | --- | --- |
-| **`nghttp2`** | `ngrs` | `ngrs-tokio` | `ngrs-compio` |
+| **`ngnet-h2`** | `ngrs` | `ngrs-tokio` | `ngrs-compio` |
 | **hyper** | `hyper` | `hyper-tokio` | n/a — hyper has no completion transport |
 
 The empty cell is not an omission: hyper's connection types are built on tokio's
@@ -30,27 +30,27 @@ In both families, latency comes from Criterion's per-iteration timing, and throu
 derived by putting a known number of requests or bytes in each iteration and declaring it
 with `Throughput::Elements` / `Throughput::Bytes`.
 
-The crate is `publish = false` and lives outside `nghttp2` for the same reason
-`nghttp2-tests` does: the wrapper takes exactly one dependency and no dev-dependencies, so
+The crate is `publish = false` and lives outside `ngnet-h2` for the same reason
+`ngnet-h2-tests` does: the wrapper takes exactly one dependency and no dev-dependencies, so
 anything needing a third-party stack — here, hyper — belongs in a crate of its own.
 
 ## Running
 
 ```sh
 # Everything. The real-socket benches need the completion feature and a host with io_uring.
-cargo bench -p nghttp2-bench
+cargo bench -p ngnet-h2-bench
 
 # The three-arm real-socket comparison, on one pinned core so the numbers are comparable.
-taskset -c 3 cargo bench -p nghttp2-bench --bench transport_concurrent_throughput
+taskset -c 3 cargo bench -p ngnet-h2-bench --bench transport_concurrent_throughput
 
 # One at a time.
-cargo bench -p nghttp2-bench --bench serial_latency
-cargo bench -p nghttp2-bench --bench concurrent_throughput
-cargo bench -p nghttp2-bench --bench body_throughput
+cargo bench -p ngnet-h2-bench --bench serial_latency
+cargo bench -p ngnet-h2-bench --bench concurrent_throughput
+cargo bench -p ngnet-h2-bench --bench body_throughput
 
 # The opt-in no-copy path against the push path: duplex, then real sockets.
-cargo bench -p nghttp2-bench --bench shared_body
-taskset -c 3 cargo bench -p nghttp2-bench --bench transport_shared_body
+cargo bench -p ngnet-h2-bench --bench shared_body
+taskset -c 3 cargo bench -p ngnet-h2-bench --bench transport_shared_body
 ```
 
 Comparing against a saved baseline is the point of running these at all — a single run's
@@ -59,17 +59,17 @@ same machine says a great deal:
 
 ```sh
 # Record a baseline before a change.
-cargo bench -p nghttp2-bench -- --save-baseline before
+cargo bench -p ngnet-h2-bench -- --save-baseline before
 
 # After the change, compare against it. Criterion reports the delta and whether it clears
 # the noise threshold.
-cargo bench -p nghttp2-bench -- --baseline before
+cargo bench -p ngnet-h2-bench -- --baseline before
 ```
 
 Pin to one core and keep the machine otherwise idle, or the delta will be buried:
 
 ```sh
-taskset -c 2 cargo bench -p nghttp2-bench -- --baseline before
+taskset -c 2 cargo bench -p ngnet-h2-bench -- --baseline before
 ```
 
 ## The duplex benches: this stack against hyper
@@ -285,7 +285,7 @@ rather than treated as a proxy for time.
 
 #### Allocation, counted rather than timed
 
-From `crates/nghttp2/tests/http_zero_alloc.rs`, exact counts per driver pass in steady state:
+From `crates/ngnet-h2/tests/http_zero_alloc.rs`, exact counts per driver pass in steady state:
 
 | Strategy | Single upload | 8 multiplexed streams |
 | --- | --- | --- |
@@ -462,7 +462,7 @@ Read them as a measure of **protocol, wrapper and syscall CPU work**, and nothin
 
 ## Matched, and unmatched, configuration
 
-Both stacks are pinned to libnghttp2's defaults, since `nghttp2`'s async layer advertises
+Both stacks are pinned to libnghttp2's defaults, since `ngnet-h2`'s async layer advertises
 only two settings of its own and leaves the rest at those defaults (`config.rs`,
 `driver.rs`). hyper's builders default to much larger windows and header limits, so its
 builders are dialled back to match. The flow-control windows matter most: a mismatched
