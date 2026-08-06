@@ -5,9 +5,11 @@ use core::marker::PhantomData;
 use ngnet_h3_sys as sys;
 
 use crate::alloc::Allocator;
+use crate::body::BodySource;
 use crate::callbacks::{Bridge, BridgeGuard, BridgeSlot};
-use crate::error::{Error, Result};
-use crate::handlers::Handlers;
+use crate::error::{Error, ErrorCode, Result};
+use crate::handlers::{FieldAction, FieldSection, FieldToken, Handlers, StreamClosed};
+use crate::header::Header;
 use crate::send::SendGuard;
 use crate::settings::Settings;
 use crate::stream::{Directionality, Initiator, StreamId};
@@ -123,6 +125,73 @@ impl<C> ConnBuilder<C> {
         self
     }
 
+    /// Called when a field section starts.
+    pub fn on_section_begin(
+        mut self,
+        handler: impl FnMut(&mut C, StreamId, FieldSection) + Send + 'static,
+    ) -> Self {
+        self.handlers.section_begin = Some(Box::new(handler));
+        self
+    }
+
+    /// Called for each received field, with its name and value borrowed for the call.
+    ///
+    /// The slices point into nghttp3's own buffers and are valid only until the handler
+    /// returns, which is what makes receiving allocation-free: copy what you need.
+    pub fn on_field(
+        mut self,
+        handler: impl FnMut(
+            &mut C,
+            StreamId,
+            FieldSection,
+            Option<FieldToken>,
+            &[u8],
+            &[u8],
+        ) -> FieldAction
+        + Send
+        + 'static,
+    ) -> Self {
+        self.handlers.field = Some(Box::new(handler));
+        self
+    }
+
+    /// Called when a field section ends.
+    pub fn on_section_end(
+        mut self,
+        handler: impl FnMut(&mut C, StreamId, FieldSection) + Send + 'static,
+    ) -> Self {
+        self.handlers.section_end = Some(Box::new(handler));
+        self
+    }
+
+    /// Called for each chunk of received body bytes, borrowed for the call.
+    ///
+    /// The chunk's length is not included in the credit returned by
+    /// [`Conn::read_stream`]; extending flow control for body bytes is the caller's to do
+    /// once it has handled them.
+    pub fn on_data(
+        mut self,
+        handler: impl FnMut(&mut C, StreamId, &[u8]) + Send + 'static,
+    ) -> Self {
+        self.handlers.data = Some(Box::new(handler));
+        self
+    }
+
+    /// Called when the peer finishes sending on a stream.
+    pub fn on_end_stream(mut self, handler: impl FnMut(&mut C, StreamId) + Send + 'static) -> Self {
+        self.handlers.end_stream = Some(Box::new(handler));
+        self
+    }
+
+    /// Called when a stream closes, with the application error code it closed with.
+    pub fn on_stream_close(
+        mut self,
+        handler: impl FnMut(&mut C, StreamId, StreamClosed) + Send + 'static,
+    ) -> Self {
+        self.handlers.stream_close = Some(Box::new(handler));
+        self
+    }
+
     /// Creates the connection.
     pub fn build(self) -> Result<Conn<C>> {
         Conn::new(self.role, self.settings, self.handlers)
@@ -181,6 +250,16 @@ impl<C> Conn<C> {
         // indeterminate.
         let mut callbacks: sys::nghttp3_callbacks = unsafe { core::mem::zeroed() };
         callbacks.deferred_consume = Some(crate::callbacks::deferred_consume_cb::<C>);
+        callbacks.begin_headers = Some(crate::callbacks::begin_headers_cb::<C>);
+        callbacks.recv_header = Some(crate::callbacks::recv_header_cb::<C>);
+        callbacks.end_headers = Some(crate::callbacks::end_headers_cb::<C>);
+        callbacks.begin_trailers = Some(crate::callbacks::begin_trailers_cb::<C>);
+        callbacks.recv_trailer = Some(crate::callbacks::recv_trailer_cb::<C>);
+        callbacks.end_trailers = Some(crate::callbacks::end_trailers_cb::<C>);
+        callbacks.recv_data = Some(crate::callbacks::recv_data_cb::<C>);
+        callbacks.end_stream = Some(crate::callbacks::end_stream_cb::<C>);
+        // `stream_close2` rather than the deprecated `stream_close`.
+        callbacks.stream_close2 = Some(crate::callbacks::stream_close_cb::<C>);
 
         // `rand` is deliberately left unset. nghttp3 uses it for one thing — the seed of
         // its internal stream map's hash — and when the callback is absent it uses a seed
@@ -459,6 +538,169 @@ impl<C> Conn<C> {
         Ok(FlowCredit(consumed as u64))
     }
 
+    /// Submits a request on a client-initiated bidirectional stream.
+    ///
+    /// Header-only for now: bodies arrive with the next phase, and submitting one is
+    /// refused rather than silently ignored.
+    ///
+    /// The caller opens the QUIC stream and chooses its identifier, which is why this
+    /// takes one rather than returning it.
+    pub fn submit_request(
+        &mut self,
+        stream: StreamId,
+        fields: &[Header<'_>],
+        body: Option<Box<dyn BodySource>>,
+    ) -> Result<()> {
+        self.check_usable()?;
+        reject_body(body)?;
+        if self.role != Role::Client {
+            return Err(Error::invalid_input(
+                "only a client submits requests; a server submits responses",
+            ));
+        }
+        if !stream.is_client_bidirectional() {
+            return Err(Error::invalid_input(
+                "a request needs a client-initiated bidirectional stream",
+            ));
+        }
+        // nghttp3 asserts the QPACK encoder is bound before encoding a field section, and
+        // asserts are compiled out of a release build. FR-002 requires this be a typed
+        // error, so it is checked rather than left to abort.
+        self.require_bound()?;
+
+        let nva: Vec<sys::nghttp3_nv> = fields.iter().map(Header::as_nv).collect();
+        // SAFETY: `raw` is live; the role, stream shape and binding state have all been
+        // checked; and the field array plus everything it points at outlives the call,
+        // which is all nghttp3 needs because no no-copy flag is set.
+        let rv = unsafe {
+            sys::nghttp3_conn_submit_request(
+                self.raw,
+                stream.get(),
+                nva.as_ptr(),
+                nva.len(),
+                core::ptr::null(),
+                core::ptr::null_mut(),
+            )
+        };
+        if rv != 0 {
+            return Err(self.record(rv, "could not submit the request", false));
+        }
+        Ok(())
+    }
+
+    /// Submits a response on the stream its request arrived on.
+    pub fn submit_response(
+        &mut self,
+        stream: StreamId,
+        fields: &[Header<'_>],
+        body: Option<Box<dyn BodySource>>,
+    ) -> Result<()> {
+        self.check_usable()?;
+        reject_body(body)?;
+        if self.role != Role::Server {
+            return Err(Error::invalid_input(
+                "only a server submits responses; a client submits requests",
+            ));
+        }
+        if !stream.is_client_bidirectional() {
+            return Err(Error::invalid_input(
+                "a response belongs on the client-initiated stream its request arrived on",
+            ));
+        }
+        self.require_bound()?;
+
+        let nva: Vec<sys::nghttp3_nv> = fields.iter().map(Header::as_nv).collect();
+        // SAFETY: as `submit_request`.
+        let rv = unsafe {
+            sys::nghttp3_conn_submit_response(
+                self.raw,
+                stream.get(),
+                nva.as_ptr(),
+                nva.len(),
+                core::ptr::null(),
+            )
+        };
+        if rv != 0 {
+            return Err(self.record(rv, "could not submit the response", false));
+        }
+        Ok(())
+    }
+
+    /// Submits a trailing field section, which ends the stream.
+    pub fn submit_trailers(&mut self, stream: StreamId, fields: &[Header<'_>]) -> Result<()> {
+        self.check_usable()?;
+        // Without this, a connection-level stream would be accepted: nghttp3 registers the
+        // control and QPACK streams in the same map, so `find_stream` succeeds for them and
+        // the trailers would be scheduled onto a critical stream, with the end-of-stream
+        // flag set on it.
+        if !stream.is_client_bidirectional() {
+            return Err(Error::invalid_input(
+                "trailers belong on a client-initiated bidirectional stream, not a \
+                 connection-level one",
+            ));
+        }
+        self.require_bound()?;
+
+        let nva: Vec<sys::nghttp3_nv> = fields.iter().map(Header::as_nv).collect();
+        // SAFETY: as `submit_request`.
+        let rv = unsafe {
+            sys::nghttp3_conn_submit_trailers(self.raw, stream.get(), nva.as_ptr(), nva.len())
+        };
+        if rv != 0 {
+            return Err(self.record(rv, "could not submit the trailers", false));
+        }
+        Ok(())
+    }
+
+    /// Submits an informational (1xx) response, which precedes the real one.
+    pub fn submit_info(&mut self, stream: StreamId, fields: &[Header<'_>]) -> Result<()> {
+        self.check_usable()?;
+        // nghttp3 asserts both of these, and asserts are compiled out of a release build.
+        if self.role != Role::Server {
+            return Err(Error::invalid_input(
+                "only a server sends informational responses",
+            ));
+        }
+        if !stream.is_client_bidirectional() {
+            return Err(Error::invalid_input(
+                "an informational response belongs on the request's own stream",
+            ));
+        }
+        self.require_bound()?;
+
+        let nva: Vec<sys::nghttp3_nv> = fields.iter().map(Header::as_nv).collect();
+        // SAFETY: as `submit_response`.
+        let rv = unsafe {
+            sys::nghttp3_conn_submit_info(self.raw, stream.get(), nva.as_ptr(), nva.len())
+        };
+        if rv != 0 {
+            return Err(self.record(rv, "could not submit the informational response", false));
+        }
+        Ok(())
+    }
+
+    /// Tells the connection a stream has closed.
+    ///
+    /// The application error code is the one the QUIC layer saw. `0x0100`
+    /// (`H3_NO_ERROR`) is the code for an ordinary close.
+    pub fn close_stream(
+        &mut self,
+        stream: StreamId,
+        code: ErrorCode,
+        context: &mut C,
+    ) -> Result<()> {
+        self.check_usable()?;
+        let rv = self.with_context(context, |raw| {
+            // SAFETY: `raw` is live and the identifier is validated. This fires the
+            // stream-close handler, so a bridge is installed for it.
+            unsafe { sys::nghttp3_conn_close_stream(raw, stream.get(), code.get()) }
+        });
+        if rv != 0 {
+            return Err(self.record(rv, "could not close the stream", false));
+        }
+        Ok(())
+    }
+
     /// Asks what to send next.
     ///
     /// Returns `None` when there is nothing to send. Otherwise the returned guard borrows
@@ -595,5 +837,19 @@ impl<C> core::fmt::Debug for Conn<C> {
             .field("bound", &self.is_bound())
             .field("usable", &self.is_usable())
             .finish_non_exhaustive()
+    }
+}
+
+/// Refuses a body until the phase that can drive one.
+///
+/// Explicit rather than silent so the boundary cannot be mistaken for working behaviour:
+/// a caller that attaches a body and sees the request succeed would reasonably conclude
+/// the body was sent.
+fn reject_body(body: Option<Box<dyn BodySource>>) -> Result<()> {
+    match body {
+        None => Ok(()),
+        Some(_) => Err(Error::invalid_input(
+            "outgoing message bodies are not supported yet",
+        )),
     }
 }

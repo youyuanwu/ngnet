@@ -32,7 +32,8 @@ use core::ffi::c_void;
 
 use ngnet_h3_sys as sys;
 
-use crate::handlers::Handlers;
+use crate::error::ErrorCode;
+use crate::handlers::{FieldAction, FieldSection, FieldToken, Handlers, StreamClosed};
 use crate::stream::StreamId;
 
 /// The stable indirection nghttp3 is given at construction.
@@ -70,7 +71,6 @@ pub(crate) struct Bridge<'a, C> {
     pub(crate) handlers: &'a mut Handlers<C>,
     pub(crate) context: &'a mut C,
 }
-
 /// Installs a bridge into the slot for as long as it is alive.
 ///
 /// Clearing on drop rather than after the call is what makes a panic safe: the slot is
@@ -207,4 +207,226 @@ mod tests {
             "the slot must be stable across moves, or a moved Conn would dangle"
         );
     }
+}
+
+/// Borrows the bytes an `nghttp3_rcbuf` holds, for the duration of one call.
+///
+/// Inbound field names and values arrive as reference-counted buffers rather than as a
+/// pointer and a length -- a real difference from nghttp2, whose equivalent callback hands
+/// over raw slices. The reference count is deliberately *not* incremented: the bytes are
+/// valid for the callback's duration, which is all a borrowing handler needs, and taking a
+/// reference would turn every delivered field into an allocation the caller must release.
+///
+/// # Safety
+///
+/// `buf` must be a buffer nghttp3 supplied to the callback currently running.
+unsafe fn rcbuf_bytes<'a>(buf: *mut sys::nghttp3_rcbuf) -> &'a [u8] {
+    if buf.is_null() {
+        return &[];
+    }
+    // SAFETY: the caller guarantees this is a live buffer from the running callback.
+    let vec = unsafe { sys::nghttp3_rcbuf_get_buf(buf) };
+    if vec.base.is_null() || vec.len == 0 {
+        return &[];
+    }
+    // SAFETY: nghttp3 guarantees the buffer is readable for `len` bytes and outlives the
+    // callback, and the returned lifetime is confined to it by the caller.
+    unsafe { core::slice::from_raw_parts(vec.base, vec.len) }
+}
+
+/// Turns a handler's decision into the integer nghttp3 expects.
+fn field_action_code(action: FieldAction) -> i32 {
+    match action {
+        FieldAction::Continue => 0,
+        // nghttp3 has no per-stream "reject this section" code the way nghttp2 does, so a
+        // handler that wants to stop reads the remaining fields and resets the stream
+        // itself. Failing here would take the whole connection down for one bad field.
+        FieldAction::Stop => 0,
+    }
+}
+
+macro_rules! section_boundary_cb {
+    ($name:ident, $slot:ident, $kind:expr) => {
+        pub(crate) unsafe extern "C" fn $name<C>(
+            _conn: *mut sys::nghttp3_conn,
+            stream_id: i64,
+            conn_user_data: *mut c_void,
+            _stream_user_data: *mut c_void,
+        ) -> i32 {
+            // SAFETY: `conn_user_data` is the slot installed at construction, and `C`
+            // matches the connection's own parameter.
+            let Some(bridge) = (unsafe { bridge::<C>(conn_user_data) }) else {
+                return 0;
+            };
+            let Some(handler) = bridge.handlers.$slot.as_mut() else {
+                return 0;
+            };
+            let Ok(stream) = StreamId::new(stream_id) else {
+                return 0;
+            };
+            handler(bridge.context, stream, $kind);
+            0
+        }
+    };
+}
+
+section_boundary_cb!(begin_headers_cb, section_begin, FieldSection::Headers);
+section_boundary_cb!(begin_trailers_cb, section_begin, FieldSection::Trailers);
+
+/// The end-of-section callbacks carry an extra `fin` flag that the begin ones do not, so
+/// they cannot share the macro above.
+macro_rules! section_end_cb {
+    ($name:ident, $kind:expr) => {
+        pub(crate) unsafe extern "C" fn $name<C>(
+            _conn: *mut sys::nghttp3_conn,
+            stream_id: i64,
+            _fin: i32,
+            conn_user_data: *mut c_void,
+            _stream_user_data: *mut c_void,
+        ) -> i32 {
+            // SAFETY: `conn_user_data` is the slot installed at construction, and `C`
+            // matches the connection's own parameter.
+            let Some(bridge) = (unsafe { bridge::<C>(conn_user_data) }) else {
+                return 0;
+            };
+            let Some(handler) = bridge.handlers.section_end.as_mut() else {
+                return 0;
+            };
+            let Ok(stream) = StreamId::new(stream_id) else {
+                return 0;
+            };
+            handler(bridge.context, stream, $kind);
+            0
+        }
+    };
+}
+
+section_end_cb!(end_headers_cb, FieldSection::Headers);
+section_end_cb!(end_trailers_cb, FieldSection::Trailers);
+
+macro_rules! field_cb {
+    ($name:ident, $kind:expr) => {
+        pub(crate) unsafe extern "C" fn $name<C>(
+            _conn: *mut sys::nghttp3_conn,
+            stream_id: i64,
+            token: i32,
+            name: *mut sys::nghttp3_rcbuf,
+            value: *mut sys::nghttp3_rcbuf,
+            _flags: u8,
+            conn_user_data: *mut c_void,
+            _stream_user_data: *mut c_void,
+        ) -> i32 {
+            // SAFETY: as above.
+            let Some(bridge) = (unsafe { bridge::<C>(conn_user_data) }) else {
+                return 0;
+            };
+            let Some(handler) = bridge.handlers.field.as_mut() else {
+                return 0;
+            };
+            let Ok(stream) = StreamId::new(stream_id) else {
+                return 0;
+            };
+            // SAFETY: both buffers belong to the callback currently running, and the
+            // borrows end when the handler returns.
+            let (name, value) = unsafe { (rcbuf_bytes(name), rcbuf_bytes(value)) };
+            field_action_code(handler(
+                bridge.context,
+                stream,
+                $kind,
+                FieldToken::from_raw(token),
+                name,
+                value,
+            ))
+        }
+    };
+}
+
+field_cb!(recv_header_cb, FieldSection::Headers);
+field_cb!(recv_trailer_cb, FieldSection::Trailers);
+
+/// Delivers a chunk of body bytes.
+///
+/// Unlike field names and values, these arrive as a plain pointer and length, so the two
+/// cannot share a conversion.
+pub(crate) unsafe extern "C" fn recv_data_cb<C>(
+    _conn: *mut sys::nghttp3_conn,
+    stream_id: i64,
+    data: *const u8,
+    datalen: usize,
+    conn_user_data: *mut c_void,
+    _stream_user_data: *mut c_void,
+) -> i32 {
+    // SAFETY: as above.
+    let Some(bridge) = (unsafe { bridge::<C>(conn_user_data) }) else {
+        return 0;
+    };
+    let Some(handler) = bridge.handlers.data.as_mut() else {
+        return 0;
+    };
+    let Ok(stream) = StreamId::new(stream_id) else {
+        return 0;
+    };
+    let chunk = if data.is_null() || datalen == 0 {
+        &[][..]
+    } else {
+        // SAFETY: nghttp3 guarantees `data` is readable for `datalen` bytes for the
+        // duration of this call, and the borrow ends when the handler returns.
+        unsafe { core::slice::from_raw_parts(data, datalen) }
+    };
+    handler(bridge.context, stream, chunk);
+    0
+}
+
+/// Reports that the peer has finished sending on a stream.
+pub(crate) unsafe extern "C" fn end_stream_cb<C>(
+    _conn: *mut sys::nghttp3_conn,
+    stream_id: i64,
+    conn_user_data: *mut c_void,
+    _stream_user_data: *mut c_void,
+) -> i32 {
+    // SAFETY: as above.
+    let Some(bridge) = (unsafe { bridge::<C>(conn_user_data) }) else {
+        return 0;
+    };
+    let Some(handler) = bridge.handlers.end_stream.as_mut() else {
+        return 0;
+    };
+    let Ok(stream) = StreamId::new(stream_id) else {
+        return 0;
+    };
+    handler(bridge.context, stream);
+    0
+}
+
+/// Reports that a stream has closed, with the application error code it closed with.
+pub(crate) unsafe extern "C" fn stream_close_cb<C>(
+    _conn: *mut sys::nghttp3_conn,
+    flags: u32,
+    stream_id: i64,
+    rx_app_error_code: u64,
+    tx_app_error_code: u64,
+    conn_user_data: *mut c_void,
+    _stream_user_data: *mut c_void,
+) -> i32 {
+    // SAFETY: as above.
+    let Some(bridge) = (unsafe { bridge::<C>(conn_user_data) }) else {
+        return 0;
+    };
+    let Some(handler) = bridge.handlers.stream_close.as_mut() else {
+        return 0;
+    };
+    let Ok(stream) = StreamId::new(stream_id) else {
+        return 0;
+    };
+    handler(
+        bridge.context,
+        stream,
+        StreamClosed {
+            receiving: (flags & sys::NGHTTP3_STREAM_CLOSE_FLAG_RX_APP_ERROR_CODE_SET != 0)
+                .then(|| ErrorCode::new(rx_app_error_code)),
+            sending: (flags & sys::NGHTTP3_STREAM_CLOSE_FLAG_TX_APP_ERROR_CODE_SET != 0)
+                .then(|| ErrorCode::new(tx_app_error_code)),
+        },
+    );
+    0
 }

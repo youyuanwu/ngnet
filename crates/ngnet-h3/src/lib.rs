@@ -92,11 +92,16 @@ mod send;
 #[allow(unsafe_code)]
 mod settings;
 
+mod body;
 mod handlers;
+mod header;
 mod stream;
 
+pub use body::{BodyOutcome, BodySource, FixedBody, RetainedBytes};
 pub use conn::{Conn, ConnBuilder, FlowCredit, Role, Timestamp};
 pub use error::{ALL_NATIVE_CODES, Error, ErrorCode, ErrorKind, NativeCode, Result};
+pub use handlers::{FieldAction, FieldSection, FieldToken, StreamClosed};
+pub use header::Header;
 pub use send::SendGuard;
 pub use settings::Settings;
 pub use stream::{Directionality, Initiator, StreamId};
