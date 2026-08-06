@@ -35,6 +35,21 @@ use ngnet_h3::{
 ///
 /// If one of these gains a variant this stops compiling, which is the intended alarm
 /// rather than a nuisance: a downstream caller's `match` would have stopped compiling too.
+/// The stream-closure shapes, each named so a rename breaks the build.
+fn stream_closure_shapes() {
+    let clean: StreamClosed = StreamClosed::clean();
+    let reset: StreamClosed = StreamClosed::reset_by_peer(ErrorCode::new(0x010c));
+    let stopped: StreamClosed = StreamClosed::stopped_by_peer(ErrorCode::new(0x010b));
+    let _: bool = clean.is_clean();
+    let _: Option<ErrorCode> = reset.receiving;
+    let _: Option<ErrorCode> = stopped.sending;
+    let _: String = format!("{clean:?}");
+    let _: StreamClosed = StreamClosed {
+        receiving: None,
+        sending: None,
+    };
+}
+
 fn closed_enumerations_are_still_closed(
     role: Role,
     initiator: Initiator,
@@ -274,6 +289,8 @@ fn connection_surface() -> Result<()> {
     }
 
     conn.add_ack_offset(control, 0, &mut state)?;
+    let _: bool = conn.has_deferred_credit();
+    let _: Vec<(StreamId, u64)> = conn.take_deferred_credit();
     conn.block_stream(request)?;
     conn.unblock_stream(request)?;
     conn.resume_stream(request)?;
@@ -309,7 +326,19 @@ fn server_message_surface(server: &mut Conn<u32>, stream: StreamId, state: &mut 
     )?;
     server.submit_info(stream, &[Header::new(":status", "103")?])?;
     server.submit_trailers(stream, &[Header::new("x-trailer", "v")?])?;
-    server.close_stream(stream, ErrorCode::new(0x0100), state)?;
+    server.close_stream(stream, state)?;
+    server.close_stream_with(stream, StreamClosed::clean(), state)?;
+    server.close_stream_with(
+        stream,
+        StreamClosed::reset_by_peer(ErrorCode::new(0x010c)),
+        state,
+    )?;
+    server.close_stream_with(
+        stream,
+        StreamClosed::stopped_by_peer(ErrorCode::new(0x010c)),
+        state,
+    )?;
+    let _: bool = StreamClosed::clean().is_clean();
     Ok(())
 }
 
@@ -337,6 +366,7 @@ fn the_public_surface_still_has_the_shape_it_promised() {
         FieldSection::Headers,
     );
     open_enumerations_stay_open(ErrorKind::Internal, Shutdown::Notice, BodyOutcome::Defer);
+    stream_closure_shapes();
     stream_identifiers().expect("identifiers");
     header_fields().expect("fields");
     error_surface(Header::new("Bad-Name", "v").expect_err("an invalid field name"));

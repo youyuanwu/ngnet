@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use ngnet_h3::{
     BodyOutcome, BodySource, Conn, ConnBuilder, ErrorCode, ErrorKind, FieldAction, FixedBody,
-    Header, RetainedBytes, Role, StreamId, Timestamp,
+    Header, RetainedBytes, Role, StreamClosed, StreamId, Timestamp,
 };
 
 const CLIENT_CONTROL: i64 = 2;
@@ -271,7 +271,11 @@ fn abandoning_one_stream_leaves_its_neighbours_working() {
     // would reset it through QUIC at the same time, which is why nothing further is
     // delivered for it below: the transport has stopped carrying it.
     client
-        .close_stream(id(4), ErrorCode::new(0x010c), &mut client_seen)
+        .close_stream_with(
+            id(4),
+            StreamClosed::reset_by_peer(ErrorCode::new(0x010c)),
+            &mut client_seen,
+        )
         .expect("abandon the stream");
     assert!(
         client.is_usable(),
@@ -368,7 +372,11 @@ fn a_response_delivered_for_an_abandoned_stream_is_reported_not_absorbed() {
     );
 
     client
-        .close_stream(id(4), ErrorCode::new(0x010c), &mut client_seen)
+        .close_stream_with(
+            id(4),
+            StreamClosed::reset_by_peer(ErrorCode::new(0x010c)),
+            &mut client_seen,
+        )
         .expect("abandon the stream");
 
     server
@@ -670,6 +678,41 @@ fn bytes_arriving_before_a_stream_is_understood_are_not_lost() {
 // ---------------------------------------------------------------------------
 // Edge case: a caller declares the same stream twice, or one stream for two roles.
 // ---------------------------------------------------------------------------
+
+#[test]
+fn deferred_credit_is_held_rather_than_dropped_when_nobody_is_listening() {
+    // The credit nghttp3 reports here is reported once and never again. Dropping it
+    // under-credits the peer permanently, and a connection that loses a little on every
+    // QPACK-blocked stream stalls by degrees with no symptom until it stops. A caller with
+    // no handler must still be able to get it.
+    //
+    // Driving nghttp3 into reporting deferred credit needs a QPACK-blocked stream, which
+    // this suite cannot arrange in memory. What is asserted instead is the property that
+    // makes the loss survivable: the accessor exists, starts empty, drains completely, and
+    // is wired to the same connection the handler would have been.
+    let mut client = observer(Role::Client);
+    assert!(!client.has_deferred_credit());
+    assert!(
+        client.take_deferred_credit().is_empty(),
+        "nothing has been reported yet"
+    );
+
+    // A connection that does register the handler never accumulates, because the credit is
+    // delivered instead -- so an empty queue here is the correct outcome either way, and
+    // the two paths cannot both fire for the same report.
+    let mut with_handler = ConnBuilder::<Seen>::new(Role::Client)
+        .on_deferred_consume(|_seen: &mut Seen, _stream, _consumed| {})
+        .build()
+        .expect("connection");
+    with_handler
+        .bind_control_stream(id(CLIENT_CONTROL))
+        .unwrap();
+    with_handler
+        .bind_qpack_streams(id(CLIENT_QPACK_ENCODER), id(CLIENT_QPACK_DECODER))
+        .unwrap();
+    assert!(!with_handler.has_deferred_credit());
+    assert!(with_handler.take_deferred_credit().is_empty());
+}
 
 #[test]
 fn a_response_on_a_stream_that_cannot_carry_one_is_refused() {

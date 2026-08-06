@@ -28,13 +28,13 @@
 //! conn.bind_control_stream(StreamId::new(2)?)?;
 //! conn.bind_qpack_streams(StreamId::new(6)?, StreamId::new(10)?)?;
 //!
-//! // The whole send loop. Every line of it earns its place; see below.
+//! // The send half of a driver. Every line of it earns its place; see below.
 //! while let Some(send) = conn.writev_stream(&mut ())? {
 //!     let stream = send.stream();
 //!     let offered = send.len();
 //!     let fin = send.fin();
 //!
-//!     let accepted = write_to_quic(stream, send.slices(), fin);
+//!     let accepted = write_to_quic(stream, send.slices());
 //!     send.commit(accepted)?;                       // required even when accepted is 0
 //!
 //!     if accepted > 0 && transport_copied_the_bytes() {
@@ -42,15 +42,18 @@
 //!     }
 //!     if accepted < offered {
 //!         conn.block_stream(stream)?;               // else this stream starves the rest
+//!     } else if fin {
+//!         finish_quic_stream(stream);               // only once every byte before it went
 //!     }
 //! }
 //! # Ok(())
 //! # }
-//! # fn write_to_quic(_: ngnet_h3::StreamId, _: &[std::io::IoSlice<'_>], _: bool) -> usize { 0 }
+//! # fn write_to_quic(_: ngnet_h3::StreamId, _: &[std::io::IoSlice<'_>]) -> usize { 0 }
+//! # fn finish_quic_stream(_: ngnet_h3::StreamId) {}
 //! # fn transport_copied_the_bytes() -> bool { true }
 //! ```
 //!
-//! Four things there are not decoration:
+//! Five things there are not decoration:
 //!
 //! - **`commit` is not optional**, even with nothing on offer. A stream can end with an
 //!   empty final write, and skipping that commit stalls the connection permanently.
@@ -62,11 +65,31 @@
 //! - **`block_stream` on a short write.** The connection offers the highest-priority
 //!   writable stream and goes on offering the same one until it has nothing left for it, so
 //!   without this a stream whose window is exhausted is re-offered ahead of every other one
-//!   forever. Clear it with `unblock_stream` when the transport says the stream is writable
-//!   again. This is a different thing from a body source having nothing to give, which the
-//!   source signals itself and which `resume_stream` clears.
-//! - **`close_stream` when a stream is done in both directions.** It is what releases the
-//!   stream's body buffers and its send accounting; until then they are held.
+//!   forever. Clear it with [`Conn::unblock_stream`] when the transport says the stream is
+//!   writable again. This is a different thing from a body source having nothing to give,
+//!   which the source signals itself and which [`Conn::resume_stream`] clears.
+//! - **The end of a stream travels with its last byte, not with the offer.** `fin` says
+//!   this offer ends the stream *if all of it goes out*; finishing the QUIC stream after a
+//!   short write truncates the message.
+//! - **[`Conn::close_stream`] once a stream is done in both directions.** It is what
+//!   releases the stream's body buffers and its send accounting; until then they are held.
+//!
+//! # What a whole driver also needs
+//!
+//! The loop above is the send half. A working client additionally has to:
+//!
+//! - submit something — [`Conn::submit_request`], and [`Conn::submit_trailers`] after a
+//!   body that asked to be followed by one;
+//! - feed inbound bytes and the end-of-stream marker to [`Conn::read_stream`], and extend
+//!   QUIC flow control by the [`FlowCredit`] it returns;
+//! - credit body bytes itself, since [`FlowCredit`] excludes them, and credit whatever
+//!   arrives late through [`ConnBuilder::on_deferred_consume`] — see [`FlowCredit`] for why
+//!   there are three sources rather than one;
+//! - act on [`ConnBuilder::on_stop_sending`] and [`ConnBuilder::on_reset_stream`], which
+//!   are instructions to the QUIC layer rather than information.
+//!
+//! `ngnet-h3-tests` in this repository is a complete worked example: a few hundred lines
+//! joining this crate to quinn, including the parts that are easy to get wrong.
 //!
 //! # Two contracts worth knowing before you start
 //!

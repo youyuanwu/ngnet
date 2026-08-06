@@ -14,7 +14,7 @@ use crate::handlers::{
 use crate::header::Header;
 use crate::send::SendGuard;
 use crate::settings::Settings;
-use crate::state::BodyRegistry;
+use crate::state::{BodyRegistry, Deliveries};
 use crate::stream::{Directionality, Initiator, StreamId};
 
 /// Which side of the connection this endpoint is.
@@ -147,6 +147,9 @@ impl<C> ConnBuilder<C> {
     ///
     /// The slices point into nghttp3's own buffers and are valid only until the handler
     /// returns, which is what makes receiving allocation-free: copy what you need.
+    ///
+    /// Returning [`FieldAction::Stop`] stops the handler being called again for the rest
+    /// of that section on that stream.
     pub fn on_field(
         mut self,
         handler: impl FnMut(
@@ -290,6 +293,7 @@ pub struct Conn<C> {
 
     handlers: Handlers<C>,
     bodies: BodyRegistry,
+    deliveries: Deliveries,
     control: Option<StreamId>,
     qpack: Option<(StreamId, StreamId)>,
     last_timestamp: Option<Timestamp>,
@@ -381,6 +385,7 @@ impl<C> Conn<C> {
             slot,
             handlers,
             bodies: BodyRegistry::default(),
+            deliveries: Deliveries::default(),
             control: None,
             qpack: None,
             last_timestamp: None,
@@ -834,39 +839,30 @@ impl<C> Conn<C> {
         Ok(())
     }
 
-    /// Tells the connection a stream has closed, with one code for both directions.
+    /// Tells the connection a stream has closed cleanly, with no application error in
+    /// either direction.
     ///
-    /// The application error code is the one the QUIC layer saw. `0x0100`
-    /// (`H3_NO_ERROR`) is the code for an ordinary close.
+    /// This is the ordinary case: a request and its response both finished, and nothing was
+    /// reset. The close handler sees `None` in both directions, which is what `None` means.
     ///
-    /// Both directions are reported as carrying that code, because that is what nghttp3's
-    /// single-code entry point does — so the [`StreamClosed`] the close handler receives
-    /// will have `Some` in both fields even for a clean close. Use
-    /// [`Conn::close_stream_with`] when the two directions ended differently, which is the
-    /// usual case once resets are involved.
-    pub fn close_stream(
-        &mut self,
-        stream: StreamId,
-        code: ErrorCode,
-        context: &mut C,
-    ) -> Result<()> {
-        self.close_stream_with(
-            stream,
-            StreamClosed {
-                receiving: Some(code),
-                sending: Some(code),
-            },
-            context,
-        )
+    /// Closing is not optional bookkeeping — it is what releases the stream's body buffers
+    /// and its send accounting. A connection that never closes a completed stream holds
+    /// both until it is dropped.
+    ///
+    /// Use [`Conn::close_stream_with`] when a direction really did carry an application
+    /// error, which is the usual case once resets are involved.
+    pub fn close_stream(&mut self, stream: StreamId, context: &mut C) -> Result<()> {
+        self.close_stream_with(stream, StreamClosed::clean(), context)
     }
 
     /// Tells the connection a stream has closed, reporting each direction separately.
     ///
     /// `None` means that direction ended cleanly rather than with an application error,
     /// and it is a distinct thing to say: nghttp3 signals the difference with a flag rather
-    /// than by the code's value, so a zero would not carry it. This is the shape a QUIC
-    /// layer actually has — the peer may have reset its sending direction while ours ended
-    /// normally, or the other way round — and it is the shape the close handler reports,
+    /// than by the code's value, so a zero would not carry it — `H3_NO_ERROR` is a code you
+    /// put in a `RESET_STREAM`, not something a stream that merely finished carries. This
+    /// is the shape a QUIC layer actually has, the peer having perhaps reset its sending
+    /// direction while ours ended normally, and it is the shape the close handler reports,
     /// so what a caller says and what it later observes use one type.
     pub fn close_stream_with(
         &mut self,
@@ -1161,6 +1157,7 @@ impl<C> Conn<C> {
         let mut bridge = Bridge {
             handlers: &mut self.handlers,
             bodies: &mut self.bodies,
+            deliveries: &mut self.deliveries,
             context,
             role: self.role,
         };
@@ -1178,6 +1175,26 @@ impl<C> Conn<C> {
     /// Records bytes the transport accepted, so acknowledgement can be bounds-checked.
     pub(crate) fn record_committed(&mut self, stream: StreamId, n: usize) {
         self.bodies.record_committed(stream, n);
+    }
+
+    /// Takes flow-control credit that arrived with no handler registered to receive it.
+    ///
+    /// Only ever non-empty when [`ConnBuilder::on_deferred_consume`] was not used. That
+    /// credit is reported by nghttp3 exactly once, so it is held here rather than dropped:
+    /// discarding it under-credits the peer permanently, and a connection that loses a
+    /// little on every QPACK-blocked stream stalls by degrees with no symptom until it
+    /// stops. Draining this — or registering the handler — is how that is avoided; doing
+    /// neither is the bug this exists to make survivable.
+    ///
+    /// Each entry is a stream and the number of bytes of QUIC flow-control credit that may
+    /// now be extended for it, in ascending stream order. Taking leaves nothing behind.
+    pub fn take_deferred_credit(&mut self) -> Vec<(StreamId, u64)> {
+        self.deliveries.take_credit()
+    }
+
+    /// Whether any credit is waiting to be taken.
+    pub fn has_deferred_credit(&self) -> bool {
+        self.deliveries.has_credit()
     }
 
     /// Outgoing body buffers still held across all streams.

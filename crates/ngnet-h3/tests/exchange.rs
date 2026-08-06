@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use ngnet_h3::{
     Conn, ConnBuilder, ErrorCode, ErrorKind, FieldAction, FieldSection, FixedBody, Header, Role,
-    StreamId, Timestamp,
+    StreamClosed, StreamId, Timestamp,
 };
 
 const CLIENT_CONTROL: i64 = 2;
@@ -27,6 +27,61 @@ const SERVER_QPACK_DECODER: i64 = 11;
 
 fn id(raw: i64) -> StreamId {
     StreamId::new(raw).expect("literal is a valid stream id")
+}
+
+/// Moves everything a client wants to send into a server that watches closures.
+fn deliver_all(
+    client: &mut Conn<Seen>,
+    client_seen: &mut Seen,
+    server: &mut Conn<Closed>,
+    closed: &mut Closed,
+) {
+    let mut drained = false;
+    for _ in 0..64 {
+        let Some(send) = client.writev_stream(client_seen).unwrap() else {
+            drained = true;
+            break;
+        };
+        let stream = send.stream();
+        let fin = send.fin();
+        let bytes: Vec<u8> = send.slices().iter().flat_map(|s| s.to_vec()).collect();
+        let taken = bytes.len();
+        send.commit(taken).unwrap();
+        if taken == 0 && !fin {
+            drained = true;
+            break;
+        }
+        server
+            .read_stream(stream, &bytes, fin, Timestamp::from_nanos(1), closed)
+            .unwrap();
+    }
+    assert!(drained, "the client never stopped producing bytes");
+}
+
+/// Stream closures a handler observed, as `(stream, receiving, sending)`.
+#[derive(Default)]
+struct Closed {
+    seen: Vec<(i64, Option<u64>, Option<u64>)>,
+}
+
+fn close_observer(role: Role) -> Conn<Closed> {
+    let mut conn = ConnBuilder::<Closed>::new(role)
+        .on_stream_close(|state: &mut Closed, stream, closed| {
+            state.seen.push((
+                stream.get(),
+                closed.receiving.map(|c| c.get()),
+                closed.sending.map(|c| c.get()),
+            ));
+        })
+        .build()
+        .expect("connection");
+    let (control, encoder, decoder) = match role {
+        Role::Client => (CLIENT_CONTROL, CLIENT_QPACK_ENCODER, CLIENT_QPACK_DECODER),
+        Role::Server => (SERVER_CONTROL, SERVER_QPACK_ENCODER, SERVER_QPACK_DECODER),
+    };
+    conn.bind_control_stream(id(control)).unwrap();
+    conn.bind_qpack_streams(id(encoder), id(decoder)).unwrap();
+    conn
 }
 
 /// A field observed by a handler, copied out of the borrowed slices.
@@ -468,27 +523,90 @@ fn submitting_before_binding_is_a_typed_error_rather_than_an_abort() {
 }
 
 #[test]
-fn stream_close_is_reported_with_both_directions() {
+fn stopping_a_section_stops_the_handler_being_called_for_it() {
+    // `FieldAction::Stop` has to do something, or it is a word for nothing. It cannot
+    // cancel the section in nghttp3 -- QPACK is stateful, so the remaining fields must
+    // still be parsed -- but it can stop them being handed over, and the next section
+    // starts fresh.
     #[derive(Default)]
-    struct Closed {
-        seen: Vec<(i64, Option<u64>, Option<u64>)>,
+    struct Picky {
+        seen: Vec<(i64, FieldSection, Vec<u8>)>,
+        stop_after: usize,
     }
 
-    let mut server = ConnBuilder::<Closed>::new(Role::Server)
-        .on_stream_close(|state: &mut Closed, stream, closed| {
-            state.seen.push((
-                stream.get(),
-                closed.receiving.map(|c| c.get()),
-                closed.sending.map(|c| c.get()),
-            ));
+    let mut server = ConnBuilder::<Picky>::new(Role::Server)
+        .on_field(|state: &mut Picky, stream, section, _token, name, _value| {
+            state.seen.push((stream.get(), section, name.to_vec()));
+            if state.seen.len() >= state.stop_after {
+                FieldAction::Stop
+            } else {
+                FieldAction::Continue
+            }
         })
         .build()
-        .unwrap();
+        .expect("connection");
     server.bind_control_stream(id(SERVER_CONTROL)).unwrap();
     server
         .bind_qpack_streams(id(SERVER_QPACK_ENCODER), id(SERVER_QPACK_DECODER))
         .unwrap();
 
+    let mut picky = Picky {
+        seen: Vec::new(),
+        stop_after: 2,
+    };
+    let mut client = observer(Role::Client);
+    let mut client_seen = Seen::default();
+
+    client
+        .submit_request(
+            id(0),
+            &[
+                Header::new(":method", "GET").unwrap(),
+                Header::new(":scheme", "https").unwrap(),
+                Header::new(":path", "/picky").unwrap(),
+                Header::new(":authority", "example.test").unwrap(),
+                Header::new("x-one", "1").unwrap(),
+                Header::new("x-two", "2").unwrap(),
+                Header::new("x-three", "3").unwrap(),
+            ],
+            None,
+        )
+        .unwrap();
+
+    let mut drained = false;
+    for _ in 0..64 {
+        let Some(send) = client.writev_stream(&mut client_seen).unwrap() else {
+            drained = true;
+            break;
+        };
+        let stream = send.stream();
+        let fin = send.fin();
+        let bytes: Vec<u8> = send.slices().iter().flat_map(|s| s.to_vec()).collect();
+        let taken = bytes.len();
+        send.commit(taken).unwrap();
+        if taken == 0 && !fin {
+            drained = true;
+            break;
+        }
+        server
+            .read_stream(stream, &bytes, fin, Timestamp::from_nanos(1), &mut picky)
+            .unwrap();
+    }
+    assert!(drained, "the client never stopped producing bytes");
+
+    assert_eq!(
+        picky.seen.len(),
+        2,
+        "seven fields were sent and the handler said stop after two, so it must have been \
+         called exactly twice: {:?}",
+        picky.seen
+    );
+    assert!(server.is_usable(), "stopping is not an error");
+}
+
+#[test]
+fn a_clean_close_reports_no_error_in_either_direction() {
+    let mut server = close_observer(Role::Server);
     let mut client = observer(Role::Client);
     let mut client_seen = Seen::default();
     let mut closed = Closed::default();
@@ -531,8 +649,14 @@ fn stream_close_is_reported_with_both_directions() {
     // Closing fires the handler through the same bridge the read path uses -- and closing
     // is the only call in this crate that installs one around a callback that is not a
     // read, which is worth exercising rather than assuming.
+    //
+    // A stream that simply finished carried no application error, and that is a distinct
+    // thing to say: `H3_NO_ERROR` is a code you put in a RESET_STREAM, not something a
+    // completed stream carries. nghttp3 signals the difference with a flag rather than
+    // with a zero code, so collapsing the two would make a clean close indistinguishable
+    // from one that was reset with H3_NO_ERROR.
     server
-        .close_stream(id(0), ErrorCode::new(0x0100), &mut closed)
+        .close_stream(id(0), &mut closed)
         .expect("close the request stream");
 
     let (stream, receiving, sending) = closed
@@ -541,15 +665,77 @@ fn stream_close_is_reported_with_both_directions() {
         .copied()
         .expect("the close handler should have been called");
     assert_eq!(stream, 0);
-    // Closing with an explicit code reports it on both directions, each with its flag set.
-    // The options are still the right model: nghttp3 signals "this direction carried no
-    // error" with a clear flag rather than with a zero code, so collapsing them would make
-    // a clean close indistinguishable from one closed with H3_NO_ERROR.
-    assert_eq!(receiving, Some(0x0100));
-    assert_eq!(sending, Some(0x0100));
+    assert_eq!(
+        receiving, None,
+        "nothing reset the peer's sending direction"
+    );
+    assert_eq!(sending, None, "nothing stopped ours");
 
     assert!(server.is_usable());
     drop(server);
+}
+
+#[test]
+fn each_direction_of_a_close_is_reported_on_its_own() {
+    // The asymmetric cases, which are the ones a real QUIC layer produces: the peer resets
+    // its sending direction while ours ends normally, or stops ours while theirs is fine.
+    // A single-code close cannot express either, and a caller that could not tell them
+    // apart would retry a request over an error that never happened in that direction.
+    let cases: [(StreamClosed, Option<u64>, Option<u64>); 3] = [
+        (StreamClosed::clean(), None, None),
+        (
+            StreamClosed::reset_by_peer(ErrorCode::new(0x010c)),
+            Some(0x010c),
+            None,
+        ),
+        (
+            StreamClosed::stopped_by_peer(ErrorCode::new(0x010b)),
+            None,
+            Some(0x010b),
+        ),
+    ];
+
+    for (reported, want_receiving, want_sending) in cases {
+        let mut client = observer(Role::Client);
+        let mut client_seen = Seen::default();
+        let mut server = close_observer(Role::Server);
+        let mut closed = Closed::default();
+
+        client
+            .submit_request(
+                id(0),
+                &[
+                    Header::new(":method", "GET").unwrap(),
+                    Header::new(":scheme", "https").unwrap(),
+                    Header::new(":path", "/directional").unwrap(),
+                    Header::new(":authority", "example.test").unwrap(),
+                ],
+                None,
+            )
+            .unwrap();
+        deliver_all(&mut client, &mut client_seen, &mut server, &mut closed);
+
+        server
+            .close_stream_with(id(0), reported, &mut closed)
+            .expect("close the request stream");
+
+        let (stream, receiving, sending) = closed
+            .seen
+            .first()
+            .copied()
+            .expect("the close handler should have been called");
+        assert_eq!(stream, 0);
+        assert_eq!(
+            receiving, want_receiving,
+            "receiving direction, for {reported:?}"
+        );
+        assert_eq!(sending, want_sending, "sending direction, for {reported:?}");
+        assert_eq!(
+            reported.is_clean(),
+            receiving.is_none() && sending.is_none(),
+            "what was reported and what was observed must agree, for {reported:?}"
+        );
+    }
 }
 
 #[test]

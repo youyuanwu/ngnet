@@ -25,12 +25,14 @@ pub enum FieldSection {
 pub enum FieldAction {
     /// Keep delivering fields.
     Continue,
-    /// Stop caring about this message.
+    /// Stop delivering fields from this section.
     ///
-    /// nghttp3 has no code meaning "abandon this field section", so this does not cancel
-    /// anything by itself: remaining fields are still delivered, and a caller that wants
-    /// the exchange to stop resets the stream through its QUIC layer. It exists so intent
-    /// is expressible without a handler having to return a value it does not mean.
+    /// The handler is not called again for the rest of this section on this stream; the
+    /// next section starts fresh. nghttp3 has no code meaning "abandon this field
+    /// section", so the remaining fields are still parsed — QPACK is stateful and skipping
+    /// them would desynchronise the decoder — but they are not handed over. A caller that
+    /// wants the exchange itself to stop resets the stream through its QUIC layer, which
+    /// is the only place a reset can come from.
     Stop,
 }
 
@@ -94,6 +96,37 @@ pub struct StreamClosed {
     /// The code this endpoint's sending direction was stopped with, or `None` if it was
     /// not stopped.
     pub sending: Option<ErrorCode>,
+}
+
+impl StreamClosed {
+    /// A stream that ended with no application error in either direction.
+    pub const fn clean() -> Self {
+        Self {
+            receiving: None,
+            sending: None,
+        }
+    }
+
+    /// A stream where only the peer's sending direction carried an error.
+    pub const fn reset_by_peer(code: ErrorCode) -> Self {
+        Self {
+            receiving: Some(code),
+            sending: None,
+        }
+    }
+
+    /// A stream where only this endpoint's sending direction was stopped.
+    pub const fn stopped_by_peer(code: ErrorCode) -> Self {
+        Self {
+            receiving: None,
+            sending: Some(code),
+        }
+    }
+
+    /// Whether neither direction carried an application error.
+    pub const fn is_clean(self) -> bool {
+        self.receiving.is_none() && self.sending.is_none()
+    }
 }
 
 /// A handler invoked when a stream closes.

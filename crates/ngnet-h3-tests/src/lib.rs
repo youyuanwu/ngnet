@@ -461,11 +461,11 @@ impl Driver {
             })
             .collect();
         for stream in ready {
-            self.conn.close_stream(
-                StreamId::new(stream)?,
-                ErrorCode::new(u64::from(H3_NO_ERROR)),
-                &mut self.inbox,
-            )?;
+            // Clean: both directions finished on their own, and no application error was
+            // involved. Reporting `H3_NO_ERROR` in both directions instead would tell the
+            // handler an error occurred that never did.
+            self.conn
+                .close_stream(StreamId::new(stream)?, &mut self.inbox)?;
             self.closed.push(stream);
         }
         Ok(())

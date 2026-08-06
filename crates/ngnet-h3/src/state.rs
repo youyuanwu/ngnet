@@ -153,6 +153,69 @@ struct Offsets {
     acked: u64,
 }
 
+/// Flow-control credit that arrived with no handler to receive it, and field sections a
+/// handler asked to stop hearing about.
+///
+/// Both exist because a callback fires whether or not the caller wanted it. Dropping the
+/// credit would under-credit the peer permanently; ignoring the request to stop would make
+/// [`crate::FieldAction::Stop`] a word for nothing.
+#[derive(Default)]
+pub(crate) struct Deliveries {
+    /// Credit reported while no deferred-consume handler was registered, by stream.
+    unclaimed_credit: HashMap<StreamId, u64>,
+    /// Sections a field handler asked to stop being told about, until the section ends.
+    silenced: HashMap<StreamId, u8>,
+}
+
+impl Deliveries {
+    /// Records credit nobody was listening for.
+    pub(crate) fn hold_credit(&mut self, stream: StreamId, consumed: u64) {
+        let held = self.unclaimed_credit.entry(stream).or_default();
+        *held = held.saturating_add(consumed);
+    }
+
+    /// Takes everything held, leaving nothing behind.
+    pub(crate) fn take_credit(&mut self) -> Vec<(StreamId, u64)> {
+        let mut taken: Vec<(StreamId, u64)> = self.unclaimed_credit.drain().collect();
+        // Sorted so a caller sees a stable order rather than the hash map's.
+        taken.sort_unstable_by_key(|(stream, _)| stream.get());
+        taken
+    }
+
+    /// Whether anything is being held.
+    pub(crate) fn has_credit(&self) -> bool {
+        !self.unclaimed_credit.is_empty()
+    }
+
+    /// Stops delivering fields of `section` on `stream` until that section ends.
+    pub(crate) fn silence(&mut self, stream: StreamId, section: u8) {
+        *self.silenced.entry(stream).or_default() |= section;
+    }
+
+    /// Whether fields of `section` on `stream` are currently silenced.
+    pub(crate) fn is_silenced(&self, stream: StreamId, section: u8) -> bool {
+        self.silenced
+            .get(&stream)
+            .is_some_and(|mask| mask & section != 0)
+    }
+
+    /// Clears the silence for a section that has ended.
+    pub(crate) fn unsilence(&mut self, stream: StreamId, section: u8) {
+        if let Some(mask) = self.silenced.get_mut(&stream) {
+            *mask &= !section;
+            if *mask == 0 {
+                self.silenced.remove(&stream);
+            }
+        }
+    }
+
+    /// Forgets everything about a stream that has closed.
+    pub(crate) fn forget(&mut self, stream: StreamId) {
+        self.unclaimed_credit.remove(&stream);
+        self.silenced.remove(&stream);
+    }
+}
+
 /// Outgoing bodies and send offsets, keyed by stream.
 ///
 /// The offsets live here rather than on the connection because they are bounded and pruned
@@ -386,6 +449,62 @@ mod tests {
             .record_acked(stream, 0)
             .expect("nothing is always fine");
         assert!(registry.record_acked(stream, 1).is_err());
+    }
+
+    #[test]
+    fn held_credit_accumulates_and_drains_completely() {
+        let mut deliveries = Deliveries::default();
+        let one = StreamId::new(0).unwrap();
+        let two = StreamId::new(4).unwrap();
+        assert!(!deliveries.has_credit());
+
+        deliveries.hold_credit(two, 5);
+        deliveries.hold_credit(one, 3);
+        deliveries.hold_credit(one, 4);
+        assert!(deliveries.has_credit());
+
+        // Ascending stream order, and summed per stream rather than reported piecemeal.
+        assert_eq!(deliveries.take_credit(), vec![(one, 7), (two, 5)]);
+        assert!(
+            !deliveries.has_credit(),
+            "taking must leave nothing behind, or the next take double-counts"
+        );
+        assert!(deliveries.take_credit().is_empty());
+    }
+
+    #[test]
+    fn silence_covers_one_section_of_one_stream() {
+        const HEADERS: u8 = 1;
+        const TRAILERS: u8 = 2;
+        let mut deliveries = Deliveries::default();
+        let one = StreamId::new(0).unwrap();
+        let two = StreamId::new(4).unwrap();
+
+        deliveries.silence(one, HEADERS);
+        assert!(deliveries.is_silenced(one, HEADERS));
+        assert!(
+            !deliveries.is_silenced(one, TRAILERS),
+            "the trailing section is a separate decision"
+        );
+        assert!(
+            !deliveries.is_silenced(two, HEADERS),
+            "and so is another stream"
+        );
+
+        deliveries.unsilence(one, HEADERS);
+        assert!(!deliveries.is_silenced(one, HEADERS));
+    }
+
+    #[test]
+    fn a_closed_stream_holds_nothing() {
+        let mut deliveries = Deliveries::default();
+        let stream = StreamId::new(0).unwrap();
+        deliveries.hold_credit(stream, 9);
+        deliveries.silence(stream, 1);
+
+        deliveries.forget(stream);
+        assert!(!deliveries.has_credit());
+        assert!(!deliveries.is_silenced(stream, 1));
     }
 
     #[test]

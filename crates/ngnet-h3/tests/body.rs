@@ -762,7 +762,7 @@ fn closing_a_stream_releases_a_body_that_was_never_acknowledged() {
 
     client
         .conn
-        .close_stream(id(0), ngnet_h3::ErrorCode::new(0x0100), &mut client.seen)
+        .close_stream(id(0), &mut client.seen)
         .expect("close the stream");
 
     assert_eq!(client.conn.retained_body_buffers(), 0);
@@ -920,7 +920,7 @@ fn acknowledging_a_stream_after_closing_it_is_refused() {
 
     client
         .conn
-        .close_stream(id(0), ngnet_h3::ErrorCode::new(0x0100), &mut client.seen)
+        .close_stream(id(0), &mut client.seen)
         .expect("close");
 
     let error = client

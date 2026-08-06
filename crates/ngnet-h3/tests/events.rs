@@ -436,11 +436,7 @@ fn closing_a_critical_stream_is_a_distinct_kind_of_error() {
     let mut client = client();
 
     let error = client
-        .close_stream(
-            id(CLIENT_CONTROL),
-            ErrorCode::new(0x0100),
-            &mut Seen::default(),
-        )
+        .close_stream(id(CLIENT_CONTROL), &mut Seen::default())
         .expect_err("the control stream may not be closed");
     assert_eq!(error.kind(), ErrorKind::ClosedCriticalStream);
     assert!(
@@ -455,7 +451,7 @@ fn closing_a_critical_stream_is_a_distinct_kind_of_error() {
     for stream in [CLIENT_QPACK_ENCODER, CLIENT_QPACK_DECODER] {
         assert_eq!(
             client
-                .close_stream(id(stream), ErrorCode::new(0x0100), &mut Seen::default())
+                .close_stream(id(stream), &mut Seen::default())
                 .map(|()| ErrorKind::Internal)
                 .unwrap_err()
                 .kind(),

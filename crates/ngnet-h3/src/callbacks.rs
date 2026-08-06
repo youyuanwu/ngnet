@@ -37,7 +37,7 @@ use crate::error::ErrorCode;
 use crate::handlers::{
     FieldAction, FieldSection, FieldToken, Handlers, PeerSettings, Shutdown, StreamClosed,
 };
-use crate::state::{BodyEnd, BodyRegistry, Handover};
+use crate::state::{BodyEnd, BodyRegistry, Deliveries, Handover};
 use crate::stream::StreamId;
 
 /// The stable indirection nghttp3 is given at construction.
@@ -74,6 +74,8 @@ unsafe impl Send for BridgeSlot {}
 pub(crate) struct Bridge<'a, C> {
     pub(crate) handlers: &'a mut Handlers<C>,
     pub(crate) bodies: &'a mut BodyRegistry,
+    /// Credit and field sections that a missing or opinionated handler would otherwise lose.
+    pub(crate) deliveries: &'a mut Deliveries,
     pub(crate) context: &'a mut C,
     /// Which side this endpoint is.
     ///
@@ -149,15 +151,19 @@ pub(crate) unsafe extern "C" fn deferred_consume_cb<C>(
     let Some(bridge) = (unsafe { bridge::<C>(conn_user_data) }) else {
         return 0;
     };
-    let Some(handler) = bridge.handlers.deferred_consume.as_mut() else {
-        return 0;
-    };
     let Ok(stream) = StreamId::new(stream_id) else {
         // nghttp3 will not produce an out-of-range identifier; ignoring it is preferable
         // to failing the connection over something the peer cannot have caused.
         return 0;
     };
-    handler(bridge.context, stream, consumed as u64);
+    match bridge.handlers.deferred_consume.as_mut() {
+        Some(handler) => handler(bridge.context, stream, consumed as u64),
+        // Held rather than dropped. This credit is reported once and never again, so
+        // discarding it under-credits the peer permanently and stalls a long-lived
+        // connection by degrees -- a failure with no symptom until it is the only symptom.
+        // `Conn::take_deferred_credit` is how a caller without a handler collects it.
+        None => bridge.deliveries.hold_credit(stream, consumed as u64),
+    }
     0
 }
 
@@ -188,9 +194,11 @@ mod tests {
 
         {
             let mut bodies = crate::state::BodyRegistry::default();
+            let mut deliveries = crate::state::Deliveries::default();
             let mut carried = Bridge {
                 handlers: &mut handlers,
                 bodies: &mut bodies,
+                deliveries: &mut deliveries,
                 context: &mut context,
                 role: Role::Client,
             };
@@ -247,15 +255,25 @@ unsafe fn rcbuf_bytes<'a>(buf: *mut sys::nghttp3_rcbuf) -> &'a [u8] {
     unsafe { core::slice::from_raw_parts(vec.base, vec.len) }
 }
 
-/// Turns a handler's decision into the integer nghttp3 expects.
-fn field_action_code(action: FieldAction) -> i32 {
-    match action {
-        FieldAction::Continue => 0,
-        // nghttp3 has no per-stream "reject this section" code the way nghttp2 does, so a
-        // handler that wants to stop reads the remaining fields and resets the stream
-        // itself. Failing here would take the whole connection down for one bad field.
-        FieldAction::Stop => 0,
+/// Bit for the leading field section, in the silence mask.
+const SECTION_HEADERS: u8 = 1;
+/// Bit for the trailing field section.
+const SECTION_TRAILERS: u8 = 2;
+
+fn section_bit(section: FieldSection) -> u8 {
+    match section {
+        FieldSection::Headers => SECTION_HEADERS,
+        FieldSection::Trailers => SECTION_TRAILERS,
     }
+}
+
+/// Turns a handler's decision into the integer nghttp3 expects.
+/// Both decisions return zero to nghttp3, which has no per-section reject code the way
+/// nghttp2 does. The difference between them is honoured here instead: `Stop` silences the
+/// rest of that section, so the handler is not called again for fields it has said it does
+/// not want. Failing the call instead would take the whole connection down over one field.
+fn field_action_code(_action: FieldAction) -> i32 {
+    0
 }
 
 macro_rules! section_boundary_cb {
@@ -302,10 +320,13 @@ macro_rules! section_end_cb {
             let Some(bridge) = (unsafe { bridge::<C>(conn_user_data) }) else {
                 return 0;
             };
-            let Some(handler) = bridge.handlers.section_end.as_mut() else {
+            let Ok(stream) = StreamId::new(stream_id) else {
                 return 0;
             };
-            let Ok(stream) = StreamId::new(stream_id) else {
+            // Cleared before the handler and regardless of whether there is one: the
+            // silence covers one section, and the next section starts fresh.
+            bridge.deliveries.unsilence(stream, section_bit($kind));
+            let Some(handler) = bridge.handlers.section_end.as_mut() else {
                 return 0;
             };
             handler(bridge.context, stream, $kind);
@@ -333,23 +354,31 @@ macro_rules! field_cb {
             let Some(bridge) = (unsafe { bridge::<C>(conn_user_data) }) else {
                 return 0;
             };
-            let Some(handler) = bridge.handlers.field.as_mut() else {
+            let Ok(stream) = StreamId::new(stream_id) else {
                 return 0;
             };
-            let Ok(stream) = StreamId::new(stream_id) else {
+            // A handler that already said `Stop` for this section is not asked again.
+            if bridge.deliveries.is_silenced(stream, section_bit($kind)) {
+                return 0;
+            }
+            let Some(handler) = bridge.handlers.field.as_mut() else {
                 return 0;
             };
             // SAFETY: both buffers belong to the callback currently running, and the
             // borrows end when the handler returns.
             let (name, value) = unsafe { (rcbuf_bytes(name), rcbuf_bytes(value)) };
-            field_action_code(handler(
+            let action = handler(
                 bridge.context,
                 stream,
                 $kind,
                 FieldToken::from_raw(token),
                 name,
                 value,
-            ))
+            );
+            if action == FieldAction::Stop {
+                bridge.deliveries.silence(stream, section_bit($kind));
+            }
+            field_action_code(action)
         }
     };
 }
@@ -436,6 +465,7 @@ pub(crate) unsafe extern "C" fn stream_close_cb<C>(
     // Before the handler, so that a handler which panics cannot skip the release, and so
     // that a handler observing the connection sees a stream that is already gone.
     bridge.bodies.forget(stream);
+    bridge.deliveries.forget(stream);
 
     let Some(handler) = bridge.handlers.stream_close.as_mut() else {
         return 0;
