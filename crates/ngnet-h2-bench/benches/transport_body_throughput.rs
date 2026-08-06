@@ -3,8 +3,8 @@
 //! iteration moves `size` bytes up and `size` back; throughput is normalised to one body's
 //! worth. The sweep reuses the duplex family's points so the two are comparable in shape.
 //!
-//! Three arms, read pairwise: `ngrs-compio` against `ngrs-tokio` isolates the I/O model,
-//! `ngrs-tokio` against `hyper-tokio` isolates the HTTP/2 stack, and `ngrs-compio` against
+//! Three arms, read pairwise: `ngnet-h2-compio` against `ngnet-h2-tokio` isolates the I/O model,
+//! `ngnet-h2-tokio` against `hyper-tokio` isolates the HTTP/2 stack, and `ngnet-h2-compio` against
 //! `hyper-tokio` varies both.
 //!
 //! This is where the write-path asymmetry named in `docs/benchmarks.md` bites hardest: the two
@@ -46,13 +46,13 @@ fn transport_body_throughput(c: &mut Criterion) {
         }
         let payload = body_of(size);
 
-        group.bench_with_input(BenchmarkId::new("ngrs-compio", size), &size, |b, _| {
+        group.bench_with_input(BenchmarkId::new("ngnet-h2-compio", size), &size, |b, _| {
             let payload = payload.clone();
             b.to_async(&compio)
                 .iter(|| async { black_box(compio_socket.round_trip(payload.clone()).await) });
         });
 
-        group.bench_with_input(BenchmarkId::new("ngrs-tokio", size), &size, |b, _| {
+        group.bench_with_input(BenchmarkId::new("ngnet-h2-tokio", size), &size, |b, _| {
             let payload = payload.clone();
             b.to_async(&tokio)
                 .iter(|| async { black_box(tokio_socket.round_trip(payload.clone()).await) });

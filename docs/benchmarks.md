@@ -13,7 +13,7 @@ Between them they fill in the whole matrix of stack against I/O model:
 
 | | duplex (no kernel) | tokio (epoll) | compio (io_uring) |
 | --- | --- | --- | --- |
-| **`ngnet-h2`** | `ngrs` | `ngrs-tokio` | `ngrs-compio` |
+| **`ngnet-h2`** | `ngnet-h2` | `ngnet-h2-tokio` | `ngnet-h2-compio` |
 | **hyper** | `hyper` | `hyper-tokio` | n/a — hyper has no completion transport |
 
 The empty cell is not an omission: hyper's connection types are built on tokio's
@@ -23,8 +23,8 @@ descriptor, so no completion runtime can attach to one at all. That is precisely
 second family uses real sockets.
 
 **Only compare within a column, or within a row.** The two families measure different units
-of work, so `ngrs` and `ngrs-tokio` are not two measurements of one thing and the duplex
-numbers cannot be used to chain a comparison across to the socket ones.
+of work, so `ngnet-h2` and `ngnet-h2-tokio` are not two measurements of one thing and the
+duplex numbers cannot be used to chain a comparison across to the socket ones.
 
 In both families, latency comes from Criterion's per-iteration timing, and throughput is
 derived by putting a known number of requests or bytes in each iteration and declaring it
@@ -98,18 +98,18 @@ run the same workload over a real loopback TCP connection with three arms:
 
 | Arm | Stack | I/O model |
 | --- | --- | --- |
-| `ngrs-compio` | this crate | compio, io_uring (completion) |
-| `ngrs-tokio` | this crate | tokio, epoll (readiness) |
+| `ngnet-h2-compio` | this crate | compio, io_uring (completion) |
+| `ngnet-h2-tokio` | this crate | tokio, epoll (readiness) |
 | `hyper-tokio` | hyper | tokio, epoll (readiness) |
 
 **Read them pairwise, never as a ranking.** Each pair isolates something different, and only
 two of the three pairs isolate anything at all:
 
-- **`ngrs-compio` against `ngrs-tokio`** — same stack, different I/O model. This is the
+- **`ngnet-h2-compio` against `ngnet-h2-tokio`** — same stack, different I/O model. This is the
   completion-against-readiness question.
-- **`ngrs-tokio` against `hyper-tokio`** — same I/O model, different stack. This is the
+- **`ngnet-h2-tokio` against `hyper-tokio`** — same I/O model, different stack. This is the
   duplex family's question asked again with the kernel put back.
-- **`ngrs-compio` against `hyper-tokio`** — *both* differ. It is the honest end-to-end "the
+- **`ngnet-h2-compio` against `hyper-tokio`** — *both* differ. It is the honest end-to-end "the
   fastest configuration here against the reference implementation" number, and nothing in it
   can be attributed to either axis alone.
 
@@ -132,10 +132,10 @@ is only ever reported after the fact teaches nothing about how its conclusion wa
 #### The three-arm comparison, before gathering existed
 
 Medians on one pinned core (`taskset -c 3`), backend confirmed `IoUring`, reproduced across
-two independent runs. `ngrs-tokio` here elects the **borrowed** write path, which is what
+two independent runs. `ngnet-h2-tokio` here elects the **borrowed** write path, which is what
 `main` did at the time:
 
-| Measure | `ngrs-compio` | `ngrs-tokio` (borrowed) | `hyper-tokio` |
+| Measure | `ngnet-h2-compio` | `ngnet-h2-tokio` (borrowed) | `hyper-tokio` |
 | --- | --- | --- | --- |
 | Serial latency, empty body | 26.2 µs | **23.9 µs** | 26.1 µs |
 | Concurrent, N=1 | 33–36 Kelem/s | **37–39 Kelem/s** | 36 Kelem/s |
@@ -161,7 +161,7 @@ duplex, dominant over a socket, and growing with the number of multiplexed strea
 each stream adds blocks to the pass.
 
 This was confirmed directly rather than inferred. Flipping *only* `TokioWriter::write_borrowed`
-to return `None`, changing nothing else, moved `ngrs-tokio` by **+95% at N=8 and +128% at
+to return `None`, changing nothing else, moved `ngnet-h2-tokio` by **+95% at N=8 and +128% at
 N=64** (to ~152 Kelem/s), putting it level with compio and ahead of hyper.
 
 #### What that framing got wrong, and the gathering path
@@ -182,10 +182,10 @@ out as the second region of a two-region `writev`, never copied.
 
 `main` @ `c8dd79c` against the gathering branch, `taskset -c 3`, benchmarks pre-built so
 compilation never contends with measurement, two repetitions per side, run-to-run spread under
-2.5% on the concurrency arms. Only `ngrs-tokio` changed; the other two arms are unchanged code
-and serve as drift controls.
+2.5% on the concurrency arms. Only `ngnet-h2-tokio` changed; the other two arms are unchanged
+code and serve as drift controls.
 
-| Measure | `ngrs-tokio` before (borrowed) | `ngrs-tokio` after (gathering) | change |
+| Measure | `ngnet-h2-tokio` before (borrowed) | `ngnet-h2-tokio` after (gathering) | change |
 | --- | --- | --- | --- |
 | Concurrent, N=8 | 129.05 µs (62.0 Kelem/s) | 61.63 µs (**129.8 Kelem/s**) | **−52.2%** |
 | Concurrent, N=64 | 937.32 µs (68.3 Kelem/s) | 385.51 µs (**166.0 Kelem/s**) | **−58.9%** |
@@ -194,7 +194,7 @@ and serve as drift controls.
 | Body 64 KiB | 165.05 µs (379 MiB/s) | 141.33 µs (**442 MiB/s**) | −14.4% |
 | Body 1 MiB | 2018.73 µs (495 MiB/s) | 1829.76 µs (547 MiB/s) | −9.4%, but see below — treat as neutral |
 
-In the same runs `ngrs-compio` measured 61.85 µs at N=8 and 379.83 µs at N=64, and
+In the same runs `ngnet-h2-compio` measured 61.85 µs at N=8 and 379.83 µs at N=64, and
 `hyper-tokio` 67.78 µs and 391.27 µs — so **the tokio transport is now at parity with io_uring
 and slightly ahead of hyper**, having been 2.1× and 2.4× slower than compio at those points.
 At 1 MiB the three arms measured 547 (gathering tokio), 531 (hyper) and 482 (coalescing
@@ -240,7 +240,7 @@ Neither regression survives. The lesson is recorded rather than the first number
 A/B designs are not trustworthy on this machine, and unchanged arms are the cheapest available
 control.**
 
-`ngrs-compio`, which does not implement `write_vectored`, moved −0.2% (N=8), −0.7% (N=64),
+`ngnet-h2-compio`, which does not implement `write_vectored`, moved −0.2% (N=8), −0.7% (N=64),
 +0.9% (serial) and +0.2% (1 MiB) — inert, as required.
 
 #### Reusing the coalescing buffer, measured
@@ -249,7 +249,7 @@ Removing the owned path's per-pass allocation was measured separately, since `Co
 only shipped transport that takes that path. Against a saved baseline, `taskset -c 3`, with the
 two unchanged arms as drift controls:
 
-| Body | `ngrs-compio` (changed) | `ngrs-tokio` (control) | `hyper-tokio` (control) |
+| Body | `ngnet-h2-compio` (changed) | `ngnet-h2-tokio` (control) | `hyper-tokio` (control) |
 | --- | --- | --- | --- |
 | 0 B | −5.9% | +2.0% | −0.9% |
 | 1 KiB | −5.8% | +7.1% | −1.2% |
@@ -261,10 +261,11 @@ held within ±1.2% — the quietest conditions obtained for any measurement in t
 why this run is quoted rather than an average. A second run agreed on direction for compio but
 was noisier throughout.
 
-`ngrs-tokio` reads slightly positive here and that was investigated rather than waved through,
-since a regression on the default transport would matter more than the gain. It does not
-reproduce: on `transport_concurrent_throughput`, the workload that exercises the gathering path
-hardest, the same build measured −5.1%, −0.2% and +1.2% at N=1/8/64 against a control that had
+`ngnet-h2-tokio` reads slightly positive here and that was investigated rather than waved
+through, since a regression on the default transport would matter more than the gain. It
+does not reproduce: on `transport_concurrent_throughput`, the workload that exercises the
+gathering path hardest, the same build measured −5.1%, −0.2% and +1.2% at N=1/8/64 against
+a control that had
 itself moved −3.1% to −5.0%. A cost that appears in one benchmark family and not the other,
 with no mechanism to explain it, is drift.
 
@@ -312,8 +313,9 @@ What survives from the original three-arm comparison:
   merely a coalescing artefact.
 - **The empty-body row remains a near-tie across all three**, the reassuring control: with
   almost no I/O to do, three stacks and two I/O models converge, as they should.
-- **`ngrs-tokio` remains the fastest arm for a single empty-body round trip**, and gathering
-  did not disturb that — at N=1 there is nothing to gather, so the path costs nothing.
+- **`ngnet-h2-tokio` remains the fastest arm for a single empty-body round trip**, and
+  gathering did not disturb that — at N=1 there is nothing to gather, so the path costs
+  nothing.
 
 #### Handing bodies over, measured
 
@@ -325,7 +327,8 @@ families measure it against the unchanged push path:
 - `benches/transport_shared_body.rs` — real loopback sockets, five arms: `compio-push`,
   `compio-shared`, `tokio-push`, `tokio-shared`, `hyper-tokio` (carried untouched as a drift
   control). Each shared arm is identical to its push twin but for the connection entry point.
-- `benches/shared_body.rs` — the duplex, three arms: `ngrs-push`, `ngrs-shared`, `hyper-tokio`.
+- `benches/shared_body.rs` — the duplex, three arms: `ngnet-h2-push`, `ngnet-h2-shared`,
+  `hyper-tokio`.
 
 Arms are paired and adjacent within each size and sizes are the outer loop, so a twin pair sits
 as close together in time as Criterion allows and no arm runs to completion across every size
@@ -423,7 +426,7 @@ Each is named with its direction, because a number without its bias is not evide
   work-stealing. All arms are held to one worker thread and one pinned core, which is as
   close as they can be brought, but the runtime and the I/O model are not separable in the
   compio arm — a residual scheduler difference is inseparably mixed into every compio number
-  above. The two tokio arms share a runtime type, so the `ngrs-tokio`/`hyper-tokio` pair is
+  above. The two tokio arms share a runtime type, so the `ngnet-h2-tokio`/`hyper-tokio` pair is
   free of this one, which is another reason that pair carries most of the weight here.
 
 Controlled rather than merely disclosed: `TCP_NODELAY` is set explicitly on all six endpoints
@@ -486,13 +489,13 @@ What could **not** be matched:
   Until the gathering path existed, the tokio adapter wrote each session block separately —
   zero-copy and zero-alloc but several syscalls per pass — and this was **the** unmatched
   setting that mattered more than everything matched, accounting for the whole
-  `ngrs-tokio`/`hyper-tokio` concurrency gap. It is now largely matched in effect if not in
+  `ngnet-h2-tokio`/`hyper-tokio` concurrency gap. It is now largely matched in effect if not in
   mechanism: this crate emits one `writev` per pass where hyper emits one buffered `write`,
   and hyper still chains large payloads uncopied much as gathering does. The residual
   difference is a threshold (`VECTORED_THRESHOLD` = 256 here, `CHAIN_THRESHOLD` = 256 in `h2`
   when vectored). Note that `tokio::io::duplex` also reports `is_write_vectored() == true`, so
-  the duplex family exercises the gathering path too — its `ngrs` arm is not measuring the old
-  per-block behaviour.
+  the duplex family exercises the gathering path too — its `ngnet-h2` arm is not measuring the
+  old per-block behaviour.
 - **Optimistic stream opening.** hyper's `initial_max_send_streams` lets it open streams
   before the peer's `SETTINGS` arrives; this crate waits. This only affects the first round
   trip, so on a persistent connection it is noise.

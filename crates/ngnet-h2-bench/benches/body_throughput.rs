@@ -11,7 +11,7 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use ngnet_h2_bench::{Hyper, Ngrs, body_of, current_thread_runtime};
+use ngnet_h2_bench::{Hyper, NgnetH2, body_of, current_thread_runtime};
 
 /// 0 B exercises the headers-only path; the rest climb until the initial window and the
 /// buffer pool dominate.
@@ -19,7 +19,7 @@ const SIZES: [usize; 4] = [0, 1024, 64 * 1024, 1024 * 1024];
 
 fn body_throughput(c: &mut Criterion) {
     let runtime = current_thread_runtime();
-    let ngrs = runtime.block_on(Ngrs::establish());
+    let ngnet_h2 = runtime.block_on(NgnetH2::establish());
     let hyper = runtime.block_on(Hyper::establish());
 
     let mut group = c.benchmark_group("body_throughput");
@@ -33,10 +33,10 @@ fn body_throughput(c: &mut Criterion) {
         }
         let payload = body_of(size);
 
-        group.bench_with_input(BenchmarkId::new("ngrs", size), &size, |b, _| {
+        group.bench_with_input(BenchmarkId::new("ngnet-h2", size), &size, |b, _| {
             let payload = payload.clone();
             b.to_async(&runtime)
-                .iter(|| async { black_box(ngrs.round_trip(payload.clone()).await) });
+                .iter(|| async { black_box(ngnet_h2.round_trip(payload.clone()).await) });
         });
 
         group.bench_with_input(BenchmarkId::new("hyper", size), &size, |b, _| {

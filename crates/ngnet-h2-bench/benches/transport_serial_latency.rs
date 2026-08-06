@@ -1,8 +1,8 @@
 //! Serial latency on a real socket: one request in flight at a time on a persistent
-//! connection, empty body. Three arms, to be read pairwise — `ngrs-compio` against
-//! `ngrs-tokio` isolates the I/O model (completion against readiness, same stack);
-//! `ngrs-tokio` against `hyper-tokio` isolates the HTTP/2 stack (this crate against the
-//! reference implementation, same I/O); `ngrs-compio` against `hyper-tokio` varies both and
+//! connection, empty body. Three arms, to be read pairwise — `ngnet-h2-compio` against
+//! `ngnet-h2-tokio` isolates the I/O model (completion against readiness, same stack);
+//! `ngnet-h2-tokio` against `hyper-tokio` isolates the HTTP/2 stack (this crate against the
+//! reference implementation, same I/O); `ngnet-h2-compio` against `hyper-tokio` varies both and
 //! is attributable to neither.
 //!
 //! Empty body, so what is timed is the per-request round trip through the kernel and back,
@@ -38,12 +38,12 @@ fn transport_serial_latency(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("transport_serial_latency");
 
-    group.bench_function("ngrs-compio", |b| {
+    group.bench_function("ngnet-h2-compio", |b| {
         b.to_async(&compio)
             .iter(|| async { black_box(compio_socket.round_trip(Bytes::new()).await) });
     });
 
-    group.bench_function("ngrs-tokio", |b| {
+    group.bench_function("ngnet-h2-tokio", |b| {
         b.to_async(&tokio)
             .iter(|| async { black_box(tokio_socket.round_trip(Bytes::new()).await) });
     });

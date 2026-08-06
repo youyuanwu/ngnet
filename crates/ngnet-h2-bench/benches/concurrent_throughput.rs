@@ -10,21 +10,21 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use ngnet_h2_bench::{Hyper, Ngrs, current_thread_runtime, multi_thread_runtime};
+use ngnet_h2_bench::{Hyper, NgnetH2, current_thread_runtime, multi_thread_runtime};
 
 const CONCURRENCY: [usize; 3] = [1, 8, 64];
 
 fn concurrent_throughput(c: &mut Criterion) {
     let runtime = current_thread_runtime();
-    let ngrs = runtime.block_on(Ngrs::establish());
+    let ngnet_h2 = runtime.block_on(NgnetH2::establish());
     let hyper = runtime.block_on(Hyper::establish());
 
     let mut group = c.benchmark_group("concurrent_throughput");
     for n in CONCURRENCY {
         group.throughput(Throughput::Elements(n as u64));
 
-        group.bench_with_input(BenchmarkId::new("ngrs", n), &n, |b, &n| {
-            b.to_async(&runtime).iter(|| ngrs.concurrent(n));
+        group.bench_with_input(BenchmarkId::new("ngnet-h2", n), &n, |b, &n| {
+            b.to_async(&runtime).iter(|| ngnet_h2.concurrent(n));
         });
 
         group.bench_with_input(BenchmarkId::new("hyper", n), &n, |b, &n| {
@@ -36,15 +36,15 @@ fn concurrent_throughput(c: &mut Criterion) {
 
 fn concurrent_throughput_multi_thread(c: &mut Criterion) {
     let runtime = multi_thread_runtime(4);
-    let ngrs = runtime.block_on(Ngrs::establish());
+    let ngnet_h2 = runtime.block_on(NgnetH2::establish());
     let hyper = runtime.block_on(Hyper::establish());
 
     let mut group = c.benchmark_group("concurrent_throughput_multi_thread");
     for n in CONCURRENCY {
         group.throughput(Throughput::Elements(n as u64));
 
-        group.bench_with_input(BenchmarkId::new("ngrs", n), &n, |b, &n| {
-            b.to_async(&runtime).iter(|| ngrs.concurrent(n));
+        group.bench_with_input(BenchmarkId::new("ngnet-h2", n), &n, |b, &n| {
+            b.to_async(&runtime).iter(|| ngnet_h2.concurrent(n));
         });
 
         group.bench_with_input(BenchmarkId::new("hyper", n), &n, |b, &n| {

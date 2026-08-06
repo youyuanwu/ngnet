@@ -11,7 +11,7 @@
 use bytes::Bytes;
 
 use ngnet_h2_bench::{
-    CompioSharedSocket, CompioSocket, Hyper, Ngrs, NgrsShared, TokioSharedSocket, TokioSocket,
+    CompioSharedSocket, CompioSocket, Hyper, NgnetH2, NgnetH2Shared, TokioSharedSocket, TokioSocket,
     body_of, compio_runtime, current_thread_runtime,
 };
 
@@ -42,10 +42,10 @@ macro_rules! echoes_whole {
     };
 }
 
-echoes_whole!(ngrs_push_echoes_whole, Ngrs, current_thread_runtime());
+echoes_whole!(ngnet_h2_push_echoes_whole, NgnetH2, current_thread_runtime());
 echoes_whole!(
-    ngrs_shared_echoes_whole,
-    NgrsShared,
+    ngnet_h2_shared_echoes_whole,
+    NgnetH2Shared,
     current_thread_runtime()
 );
 echoes_whole!(hyper_echoes_whole, Hyper, current_thread_runtime());

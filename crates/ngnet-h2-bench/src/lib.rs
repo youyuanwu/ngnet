@@ -101,7 +101,7 @@ const WORKLOAD_URI: &str = "http://bench.local/bench";
 
 /// The [`Config`] both `ngnet-h2` ends run with — the defaults, stated explicitly so the
 /// matching against hyper is visible in one place.
-pub fn ngrs_config() -> Config {
+pub fn ngnet_h2_config() -> Config {
     Config::default()
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
         .max_header_list_size(MAX_HEADER_LIST_SIZE)
@@ -204,7 +204,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// The `ngnet-h2` server handler: drain the request body, echo it back.
-async fn ngrs_echo(request: http::Request<IncomingBody>) -> http::Response<BenchBody> {
+async fn ngnet_h2_echo(request: http::Request<IncomingBody>) -> http::Response<BenchBody> {
     let body = collect(request.into_body()).await;
     response_for(body)
 }
@@ -212,22 +212,22 @@ async fn ngrs_echo(request: http::Request<IncomingBody>) -> http::Response<Bench
 /// A live `ngnet-h2` client connected to a live `ngnet-h2` server over one duplex, with both
 /// drivers already spawned. Handing back only the request handle keeps the drivers running
 /// for the fixture's whole life.
-pub struct Ngrs {
+pub struct NgnetH2 {
     handle: SendRequest<BenchBody>,
 }
 
-impl Ngrs {
+impl NgnetH2 {
     /// Stands the connection up. Call this *outside* the measured closure — establishing it
     /// is setup, not the thing under test.
     pub async fn establish() -> Self {
         let (client_io, server_io) = duplex(DUPLEX_CAPACITY);
 
-        let server = serve_with(NgHttpIo::new(server_io), ngrs_echo, ngrs_config())
+        let server = serve_with(NgHttpIo::new(server_io), ngnet_h2_echo, ngnet_h2_config())
             .expect("a server connection");
         tokio::spawn(server);
 
         let (handle, connection) =
-            handshake_with::<_, BenchBody>(NgHttpIo::new(client_io), ngrs_config())
+            handshake_with::<_, BenchBody>(NgHttpIo::new(client_io), ngnet_h2_config())
                 .expect("a client connection");
         tokio::spawn(connection);
 
@@ -271,7 +271,7 @@ impl Ngrs {
 // ---------------------------------------------------------------------------
 
 /// The hyper server handler: drain the request body, echo it back. The mirror of
-/// [`ngrs_echo`], differing only in the body type hyper hands it and the `Result` its
+/// [`ngnet_h2_echo`], differing only in the body type hyper hands it and the `Result` its
 /// `Service` signature requires.
 async fn hyper_echo(
     request: http::Request<hyper::body::Incoming>,
@@ -317,7 +317,7 @@ fn hyper_client_builder() -> hyper_client::Builder<TokioExecutor> {
 }
 
 /// A live hyper client connected to a live hyper server over one duplex, with both drivers
-/// already spawned. The mirror of [`Ngrs`], down to the same workload and the same drain.
+/// already spawned. The mirror of [`NgnetH2`], down to the same workload and the same drain.
 pub struct Hyper {
     sender: hyper_client::SendRequest<BenchBody>,
 }
@@ -346,7 +346,7 @@ impl Hyper {
         Self { sender }
     }
 
-    /// One request, awaited to its response head and then drained. See [`Ngrs::round_trip`].
+    /// One request, awaited to its response head and then drained. See [`NgnetH2::round_trip`].
     pub async fn round_trip(&self, body: Bytes) -> usize {
         let mut sender = self.sender.clone();
         let response = sender
@@ -357,7 +357,7 @@ impl Hyper {
         drain(response.into_body()).await
     }
 
-    /// `n` concurrent requests on the one connection. See [`Ngrs::concurrent`].
+    /// `n` concurrent requests on the one connection. See [`NgnetH2::concurrent`].
     pub async fn concurrent(&self, n: usize) {
         let mut set = JoinSet::new();
         for _ in 0..n {
@@ -471,19 +471,19 @@ impl TokioSocket {
     pub async fn establish() -> Self {
         let (client_io, server_io) = tokio_socket_pair().await;
 
-        let server = serve_with(NgHttpIo::new(server_io), ngrs_echo, ngrs_config())
+        let server = serve_with(NgHttpIo::new(server_io), ngnet_h2_echo, ngnet_h2_config())
             .expect("a server connection");
         tokio::spawn(server);
 
         let (handle, connection) =
-            handshake_with::<_, BenchBody>(NgHttpIo::new(client_io), ngrs_config())
+            handshake_with::<_, BenchBody>(NgHttpIo::new(client_io), ngnet_h2_config())
                 .expect("a client connection");
         tokio::spawn(connection);
 
         Self { handle }
     }
 
-    /// One request, awaited to its response head and then drained. See [`Ngrs::round_trip`].
+    /// One request, awaited to its response head and then drained. See [`NgnetH2::round_trip`].
     pub async fn round_trip(&self, body: Bytes) -> usize {
         let response = self
             .handle
@@ -494,7 +494,7 @@ impl TokioSocket {
         drain(response.into_body()).await
     }
 
-    /// `n` concurrent requests on the one connection. See [`Ngrs::concurrent`].
+    /// `n` concurrent requests on the one connection. See [`NgnetH2::concurrent`].
     pub async fn concurrent(&self, n: usize) {
         let mut set = JoinSet::new();
         for _ in 0..n {
@@ -538,19 +538,19 @@ impl CompioSocket {
         compio_nodelay(&client_io);
         compio_nodelay(&server_io);
 
-        let server = serve_with(CompioIo::new(server_io), ngrs_echo, ngrs_config())
+        let server = serve_with(CompioIo::new(server_io), ngnet_h2_echo, ngnet_h2_config())
             .expect("a server connection");
         compio::runtime::spawn(server).detach();
 
         let (handle, connection) =
-            handshake_with::<_, BenchBody>(CompioIo::new(client_io), ngrs_config())
+            handshake_with::<_, BenchBody>(CompioIo::new(client_io), ngnet_h2_config())
                 .expect("a client connection");
         compio::runtime::spawn(connection).detach();
 
         Self { handle }
     }
 
-    /// One request, awaited to its response head and then drained. See [`Ngrs::round_trip`].
+    /// One request, awaited to its response head and then drained. See [`NgnetH2::round_trip`].
     pub async fn round_trip(&self, body: Bytes) -> usize {
         let response = self
             .handle
@@ -562,7 +562,7 @@ impl CompioSocket {
     }
 
     /// `n` concurrent requests on the one connection, spawned so all `n` are in flight before
-    /// any is awaited — the compio equivalent of [`Ngrs::concurrent`]. compio's tasks carry no
+    /// any is awaited — the compio equivalent of [`NgnetH2::concurrent`]. compio's tasks carry no
     /// `Send` bound, which is the property a thread-per-core runtime needs.
     pub async fn concurrent(&self, n: usize) {
         let mut handles = Vec::with_capacity(n);
@@ -618,7 +618,7 @@ impl HyperSocket {
         Self { sender }
     }
 
-    /// One request, awaited to its response head and then drained. See [`Ngrs::round_trip`].
+    /// One request, awaited to its response head and then drained. See [`NgnetH2::round_trip`].
     pub async fn round_trip(&self, body: Bytes) -> usize {
         let mut sender = self.sender.clone();
         let response = sender
@@ -629,7 +629,7 @@ impl HyperSocket {
         drain(response.into_body()).await
     }
 
-    /// `n` concurrent requests on the one connection. See [`Ngrs::concurrent`].
+    /// `n` concurrent requests on the one connection. See [`NgnetH2::concurrent`].
     pub async fn concurrent(&self, n: usize) {
         let mut set = JoinSet::new();
         for _ in 0..n {
@@ -663,29 +663,29 @@ impl HyperSocket {
 // refactor cannot accidentally make an arm measure its own twin.
 // ---------------------------------------------------------------------------------------
 
-/// [`Ngrs`] over a duplex, opened on the shared-body path.
-pub struct NgrsShared {
+/// [`NgnetH2`] over a duplex, opened on the shared-body path.
+pub struct NgnetH2Shared {
     handle: SendRequest<BenchBody>,
 }
 
-impl NgrsShared {
-    /// See [`Ngrs::establish`]. Differs only in the two entry points.
+impl NgnetH2Shared {
+    /// See [`NgnetH2::establish`]. Differs only in the two entry points.
     pub async fn establish() -> Self {
         let (client_io, server_io) = duplex(DUPLEX_CAPACITY);
 
-        let server = serve_shared_with(NgHttpIo::new(server_io), ngrs_echo, ngrs_config())
+        let server = serve_shared_with(NgHttpIo::new(server_io), ngnet_h2_echo, ngnet_h2_config())
             .expect("a server connection");
         tokio::spawn(server);
 
         let (handle, connection) =
-            handshake_shared_with::<_, BenchBody>(NgHttpIo::new(client_io), ngrs_config())
+            handshake_shared_with::<_, BenchBody>(NgHttpIo::new(client_io), ngnet_h2_config())
                 .expect("a client connection");
         tokio::spawn(connection);
 
         Self { handle }
     }
 
-    /// One request, awaited to its response head and then drained. See [`Ngrs::round_trip`].
+    /// One request, awaited to its response head and then drained. See [`NgnetH2::round_trip`].
     pub async fn round_trip(&self, body: Bytes) -> usize {
         let response = self
             .handle
@@ -707,19 +707,19 @@ impl TokioSharedSocket {
     pub async fn establish() -> Self {
         let (client_io, server_io) = tokio_socket_pair().await;
 
-        let server = serve_shared_with(NgHttpIo::new(server_io), ngrs_echo, ngrs_config())
+        let server = serve_shared_with(NgHttpIo::new(server_io), ngnet_h2_echo, ngnet_h2_config())
             .expect("a server connection");
         tokio::spawn(server);
 
         let (handle, connection) =
-            handshake_shared_with::<_, BenchBody>(NgHttpIo::new(client_io), ngrs_config())
+            handshake_shared_with::<_, BenchBody>(NgHttpIo::new(client_io), ngnet_h2_config())
                 .expect("a client connection");
         tokio::spawn(connection);
 
         Self { handle }
     }
 
-    /// One request, awaited to its response head and then drained. See [`Ngrs::round_trip`].
+    /// One request, awaited to its response head and then drained. See [`NgnetH2::round_trip`].
     pub async fn round_trip(&self, body: Bytes) -> usize {
         let response = self
             .handle
@@ -764,19 +764,19 @@ impl CompioSharedSocket {
         compio_nodelay(&client_io);
         compio_nodelay(&server_io);
 
-        let server = serve_shared_with(CompioIo::new(server_io), ngrs_echo, ngrs_config())
+        let server = serve_shared_with(CompioIo::new(server_io), ngnet_h2_echo, ngnet_h2_config())
             .expect("a server connection");
         compio::runtime::spawn(server).detach();
 
         let (handle, connection) =
-            handshake_shared_with::<_, BenchBody>(CompioIo::new(client_io), ngrs_config())
+            handshake_shared_with::<_, BenchBody>(CompioIo::new(client_io), ngnet_h2_config())
                 .expect("a client connection");
         compio::runtime::spawn(connection).detach();
 
         Self { handle }
     }
 
-    /// One request, awaited to its response head and then drained. See [`Ngrs::round_trip`].
+    /// One request, awaited to its response head and then drained. See [`NgnetH2::round_trip`].
     pub async fn round_trip(&self, body: Bytes) -> usize {
         let response = self
             .handle

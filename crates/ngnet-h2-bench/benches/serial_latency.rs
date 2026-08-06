@@ -11,18 +11,18 @@ use std::hint::black_box;
 use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use ngnet_h2_bench::{Hyper, Ngrs, current_thread_runtime};
+use ngnet_h2_bench::{Hyper, NgnetH2, current_thread_runtime};
 
 fn serial_latency(c: &mut Criterion) {
     let runtime = current_thread_runtime();
-    let ngrs = runtime.block_on(Ngrs::establish());
+    let ngnet_h2 = runtime.block_on(NgnetH2::establish());
     let hyper = runtime.block_on(Hyper::establish());
 
     let mut group = c.benchmark_group("serial_latency");
 
-    group.bench_function("ngrs", |b| {
+    group.bench_function("ngnet-h2", |b| {
         b.to_async(&runtime)
-            .iter(|| async { black_box(ngrs.round_trip(Bytes::new()).await) });
+            .iter(|| async { black_box(ngnet_h2.round_trip(Bytes::new()).await) });
     });
 
     group.bench_function("hyper", |b| {

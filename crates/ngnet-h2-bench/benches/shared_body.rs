@@ -16,7 +16,7 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use ngnet_h2_bench::{Hyper, Ngrs, NgrsShared, body_of, current_thread_runtime};
+use ngnet_h2_bench::{Hyper, NgnetH2, NgnetH2Shared, body_of, current_thread_runtime};
 
 /// The same sweep as the socket family, so the two are comparable in shape. 0 B is the
 /// mechanistic control: with no body there is nothing for the shared path to avoid copying.
@@ -24,8 +24,8 @@ const SIZES: [usize; 4] = [0, 1024, 64 * 1024, 1024 * 1024];
 
 fn shared_body(c: &mut Criterion) {
     let runtime = current_thread_runtime();
-    let push = runtime.block_on(Ngrs::establish());
-    let shared = runtime.block_on(NgrsShared::establish());
+    let push = runtime.block_on(NgnetH2::establish());
+    let shared = runtime.block_on(NgnetH2Shared::establish());
     let hyper = runtime.block_on(Hyper::establish());
 
     let mut group = c.benchmark_group("shared_body");
@@ -37,13 +37,13 @@ fn shared_body(c: &mut Criterion) {
         }
         let payload = body_of(size);
 
-        group.bench_with_input(BenchmarkId::new("ngrs-push", size), &size, |b, _| {
+        group.bench_with_input(BenchmarkId::new("ngnet-h2-push", size), &size, |b, _| {
             let payload = payload.clone();
             b.to_async(&runtime)
                 .iter(|| async { black_box(push.round_trip(payload.clone()).await) });
         });
 
-        group.bench_with_input(BenchmarkId::new("ngrs-shared", size), &size, |b, _| {
+        group.bench_with_input(BenchmarkId::new("ngnet-h2-shared", size), &size, |b, _| {
             let payload = payload.clone();
             b.to_async(&runtime)
                 .iter(|| async { black_box(shared.round_trip(payload.clone()).await) });
