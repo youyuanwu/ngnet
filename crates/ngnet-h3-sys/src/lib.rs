@@ -16,5 +16,9 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(rustdoc::broken_intra_doc_links)]
+// nghttp3's own doxygen comments cite RFCs as bare URLs, and bindgen carries them through
+// verbatim. Rewriting generated documentation to satisfy a lint would mean post-processing
+// the bindings, which is a far worse trade than allowing the lint here.
+#![allow(rustdoc::bare_urls)]
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));

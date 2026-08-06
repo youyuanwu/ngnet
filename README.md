@@ -1,7 +1,8 @@
 # ngnet
 
-Rust bindings for [nghttp2](https://nghttp2.org), targeting cleartext HTTP/2
-(**h2c**).
+Safe Rust bindings for the nghttp2 family: [nghttp2](https://nghttp2.org) for
+cleartext HTTP/2 (**h2c**), and [nghttp3](https://nghttp2.org/nghttp3/) for
+HTTP/3 framing and QPACK.
 
 Design notes, the invariants the test suite pins, and the tracked backlog live in
 [`docs/`](docs/).
@@ -13,6 +14,37 @@ Design notes, the invariants the test suite pins, and the tracked backlog live i
 | [`ngnet-h2`](crates/ngnet-h2) | Safe, sans-I/O API driving a client or server connection, the caller owning the transport — plus an optional asynchronous `http`/`http-body` client and server built on it (default `http` feature). |
 | [`ngnet-h2-sys`](crates/ngnet-h2-sys) | Raw FFI bindings. Builds libnghttp2 from source and generates bindings with `bindgen`. |
 | [`ngnet-h2-tests`](crates/ngnet-h2-tests) | Not published. Drives `ngnet-h2` over a real async transport, so the wrapper needs no runtime dependency of its own. |
+| [`ngnet-h3`](crates/ngnet-h3) | Safe, sans-I/O API driving an HTTP/3 client or server connection over QUIC streams the caller owns. No asynchronous layer, and no QUIC or TLS of its own. |
+| [`ngnet-h3-sys`](crates/ngnet-h3-sys) | Raw FFI bindings. Builds libnghttp3 from source and generates bindings with `bindgen`. |
+| [`ngnet-h3-tests`](crates/ngnet-h3-tests) | Not published. Drives `ngnet-h3` over a real QUIC connection using [quinn](https://github.com/quinn-rs/quinn), so the wrapper needs no transport dependency of its own. |
+
+### HTTP/3, and what it deliberately is not
+
+`ngnet-h3` is the sans-I/O core and nothing above it. It owns no socket, no
+runtime and no QUIC implementation: you open the QUIC streams, tell the
+connection which of them carry control and QPACK data, and move bytes in and out.
+That boundary is where nghttp3 itself draws the line — nghttp3 depends on no QUIC
+transport and on no TLS library, and neither does this crate.
+
+So there is no asynchronous `http`/`http-body` layer here, as there is for
+HTTP/2, and no bundled QUIC or TLS. Those are choices rather than omissions: this
+crate is what such a layer would be built on. Server push is absent because
+nghttp3 does not implement it.
+
+## Building
+
+Both vendored libraries are git submodules, and they do **not** want the same
+checkout: nghttp2 needs no nested submodules, while nghttp3 compiles
+`lib/sfparse` — a submodule of its own — directly into the library. A plain
+`--recursive` clone is wrong for one and a plain shallow clone is wrong for the
+other, so the correct set is defined once, in the `justfile`:
+
+```sh
+just submodules         # check out exactly what the build needs
+just submodules-status  # report what is actually checked out
+```
+
+Building also needs `cmake` and libclang, which `bindgen` uses.
 
 ## Usage
 
@@ -49,8 +81,9 @@ directly.
 See the [crate documentation](crates/ngnet-h2/src/lib.rs) for a complete worked
 example and for the guarantees the type system enforces.
 
-Cleartext only: TLS and ALPN are the caller's concern, and server push, HTTP/3
-and stream priorities are out of scope.
+Cleartext only for HTTP/2: TLS and ALPN are the caller's concern, and server
+push and stream priorities are out of scope. HTTP/3 is a separate family of
+crates, described above.
 
 ### Running it over a real socket
 
@@ -153,11 +186,12 @@ This repo vendors two upstream C libraries as git submodules:
 | Submodule | Tag | Purpose |
 | --- | --- | --- |
 | [`deps/nghttp2`](https://github.com/nghttp2/nghttp2) | `v1.70.0` | HTTP/2, behind `ngnet-h2-sys`. |
-| [`deps/nghttp3`](https://github.com/ngtcp2/nghttp3) | `v1.18.0` | HTTP/3 (RFC 9114) framing and QPACK (RFC 9204). Vendored ahead of the bindings that will use it; nothing in the workspace builds it yet. |
+| [`deps/nghttp3`](https://github.com/ngtcp2/nghttp3) | `v1.18.0` | HTTP/3 (RFC 9114) framing and QPACK (RFC 9204), behind `ngnet-h3-sys`. |
 
 `nghttp3` depends on no QUIC transport and on no TLS library — it is a state
-machine over stream bytes, and choosing a QUIC implementation (ngtcp2 or
-otherwise) is a decision this repo has not taken.
+machine over stream bytes — and neither does `ngnet-h3`. Choosing a QUIC
+implementation is left to the caller; the integration tests happen to use quinn,
+and that choice reaches no crate but `ngnet-h3-tests`.
 
 ## Minimum submodule checkout
 
