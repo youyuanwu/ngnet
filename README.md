@@ -148,42 +148,74 @@ ngnet-h2 = { version = "*", default-features = false }
 
 ## Dependencies
 
-This repo vendors [nghttp2](https://github.com/nghttp2/nghttp2) at tag
-`v1.70.0` as a git submodule under `deps/nghttp2`.
+This repo vendors two upstream C libraries as git submodules:
+
+| Submodule | Tag | Purpose |
+| --- | --- | --- |
+| [`deps/nghttp2`](https://github.com/nghttp2/nghttp2) | `v1.70.0` | HTTP/2, behind `ngnet-h2-sys`. |
+| [`deps/nghttp3`](https://github.com/ngtcp2/nghttp3) | `v1.18.0` | HTTP/3 (RFC 9114) framing and QPACK (RFC 9204). Vendored ahead of the bindings that will use it; nothing in the workspace builds it yet. |
+
+`nghttp3` depends on no QUIC transport and on no TLS library — it is a state
+machine over stream bytes, and choosing a QUIC implementation (ngtcp2 or
+otherwise) is a decision this repo has not taken.
 
 ## Minimum submodule checkout
 
-`nghttp2` declares its own nested submodules (mruby, neverbleed, munit,
-urlparse) that are **not** required here. They are only used by `nghttpx`,
-`nghttp`, `h2load`, the examples and the upstream test suite — none of which we
-build. To fetch only the top-level `deps/nghttp2` submodule and skip the nested
-ones, do a **non-recursive** checkout.
+Both libraries declare nested submodules that only their own tests, tooling and
+example applications need, so a `--recursive` checkout fetches a great deal this
+repo never compiles:
 
-### Fresh clone
+| Nested submodule | Needed here? |
+| --- | --- |
+| `nghttp2/third-party/{mruby,neverbleed,urlparse}`, `nghttp2/tests/munit` | No — `nghttpx`, `nghttp`, `h2load` and the upstream test suite only. |
+| `nghttp3/tests/munit` | No — upstream test suite only. |
+| `nghttp3/lib/sfparse` | **Yes** — the structured-field parser is part of the library, not its tests. `nghttp3` does not compile without it. |
+
+That last row is the trap: "clone non-recursively" is correct for `nghttp2` and
+quietly wrong for `nghttp3`. The [`justfile`](justfile) encodes the right set, so
+it does not have to be remembered:
+
+```sh
+just submodules
+```
+
+### By hand
 
 ```sh
 # Clone without any submodules...
 git clone https://github.com/youyuanwu/ngnet.git
 cd ngnet
 
-# ...then init/update only the top-level submodule (non-recursive).
-git submodule update --init deps/nghttp2
+# ...then init the two top-level submodules (non-recursive)...
+git submodule update --init deps/nghttp2 deps/nghttp3
+
+# ...plus the one nested submodule that nghttp3's own sources require.
+git -C deps/nghttp3 submodule update --init lib/sfparse
 ```
 
-### Existing clone
+The same two commands update an existing clone.
 
-```sh
-git submodule update --init deps/nghttp2
-```
-
-> Do **not** pass `--recursive`. That would pull in nghttp2's nested
-> submodules, which this repo does not need.
+> Do **not** pass `--recursive` at the top level. That would pull in every
+> nested submodule in the table above, rather than the single one this repo
+> needs.
 
 ### Optional: save bandwidth with a shallow checkout
 
 ```sh
-git submodule update --init --depth 1 deps/nghttp2
+just submodules depth=1
 ```
+
+which is `git submodule update --init --depth 1 …` for each of the above.
+
+### Checking what you have
+
+```sh
+just submodules-status
+```
+
+A leading `-` means "not checked out" and `+` means "at a different commit than
+this repo records" — the two states that turn into confusing build failures
+rather than obvious ones.
 
 ## Building
 

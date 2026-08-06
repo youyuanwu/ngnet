@@ -33,10 +33,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Non-recursive on purpose. nghttp2 declares nested submodules — mruby,
-          # neverbleed, munit and more — that only its own tests and tooling need, while
-          # this repository builds the library alone. `true` is the non-recursive form and
-          # matches the minimum checkout the README documents; `recursive` would fetch the lot.
+          # Non-recursive on purpose. The vendored libraries declare nested submodules —
+          # mruby, neverbleed, munit and more — that only their own tests and tooling need,
+          # while this repository builds the libraries alone. `true` is the non-recursive
+          # form; `recursive` would fetch the lot.
+          #
+          # This is deliberately *not* `just submodules`, which additionally checks out
+          # nghttp3's `lib/sfparse`. Nothing in the workspace compiles nghttp3 yet, so the
+          # job does not need it; the day a `-sys` crate builds nghttp3, this step has to
+          # grow that checkout or the build will fail on a missing sfparse.
           submodules: true
 
       # Reads the channel and components from rust-toolchain.toml, so the pin lives in one
