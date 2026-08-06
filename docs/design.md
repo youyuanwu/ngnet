@@ -7,11 +7,11 @@ failed.
 ## Layering
 
 ```
-nghttp2-sys      raw FFI; builds libnghttp2 from deps/nghttp2
+ngnet-h2-sys      raw FFI; builds libnghttp2 from deps/nghttp2
    ↑
-nghttp2          sans-I/O state machine  ── feature "http" ──▶  async HTTP/2 API
+ngnet-h2          sans-I/O state machine  ── feature "http" ──▶  async HTTP/2 API
    ↑                (src/*.rs)                                    (src/http/)
-nghttp2-tests    unpublished; real runtimes, real sockets, third-party clients
+ngnet-h2-tests    unpublished; real runtimes, real sockets, third-party clients
 ```
 
 The split is load-bearing rather than tidy. The sans-I/O layer never opens a socket, blocks,
@@ -267,9 +267,9 @@ the claim, not the one-off cost of standing a stream up.
 ## Constraints that shape contributions
 
 - MSRV **1.85**, edition **2024**. Let-chains are a 1.88 feature and are **forbidden**.
-- `nghttp2` takes **no dev-dependencies** and exactly one non-optional dependency, both
+- `ngnet-h2` takes **no dev-dependencies** and exactly one non-optional dependency, both
   enforced by `tests/invariants.rs`. Test scaffolding lives in `src/http/testing.rs` as
-  `#[doc(hidden)] pub`; anything needing third-party crates belongs in `nghttp2-tests`.
+  `#[doc(hidden)] pub`; anything needing third-party crates belongs in `ngnet-h2-tests`.
 - No `unsafe` under `src/http/`.
 - Verification must cover the **feature matrix**, not just `--all-features`. A doc link to a
   `tokio`-gated item once passed `--all-features` and broke every other configuration.

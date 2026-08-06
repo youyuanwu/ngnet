@@ -71,7 +71,7 @@ frames, not the one-off cost of standing a stream up.
   inconsistently do not compile.
 - **A compile-fail doctest** on `Connection` — discarding the driver is an error, because a
   connection that compiles and never sends a byte is the trap the type exists to prevent.
-- **A negative `Send` assertion** in `nghttp2-tests` — a connection over a non-`Send`
+- **A negative `Send` assertion** in `ngnet-h2-tests` — a connection over a non-`Send`
   transport is genuinely not `Send`. Running it on a `LocalSet` proves nothing on its own,
   since `spawn_local` accepts `Send` futures too.
 
@@ -87,15 +87,15 @@ to CI, add it here too** — this list and that workflow are meant to say the sa
 ```sh
 cargo test --workspace --all-features
 cargo test --workspace
-cargo test -p nghttp2 --no-default-features
-cargo test -p nghttp2-tests --features completion
+cargo test -p ngnet-h2 --no-default-features
+cargo test -p ngnet-h2-tests --features completion
 
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo clippy -p nghttp2 --all-targets -- -D warnings
-cargo clippy -p nghttp2 --no-default-features --all-targets -- -D warnings
+cargo clippy -p ngnet-h2 --all-targets -- -D warnings
+cargo clippy -p ngnet-h2 --no-default-features --all-targets -- -D warnings
 
 for f in "" "--no-default-features" "--all-features" "--features tokio" "--features completion"; do
-  RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p nghttp2 $f
+  RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-h2 $f
 done
 
 # Runs each benchmark once without timing it. Benchmarks are not part of `cargo test`, so
@@ -103,7 +103,7 @@ done
 cargo bench --workspace -- --test
 ```
 
-Run `touch crates/nghttp2/src/lib.rs` before a final run so no stale incremental artefact
+Run `touch crates/ngnet-h2/src/lib.rs` before a final run so no stale incremental artefact
 flatters the result.
 
 CI additionally checks a property no source file carries: that the completion transport's
@@ -114,7 +114,7 @@ assertion in the compio test only fires where io_uring is genuinely absent, whic
 of CI or of most developer machines — this is the check that catches it where io_uring exists.
 
 ```sh
-cargo tree -p nghttp2 --features completion -e features | grep 'compio-driver feature "polling"'
+cargo tree -p ngnet-h2 --features completion -e features | grep 'compio-driver feature "polling"'
 ```
 
 Two things CI deliberately does not do, both explained in the workflow: no repository-wide

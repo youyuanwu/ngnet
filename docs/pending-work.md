@@ -77,7 +77,7 @@ test, and no more.
   buffer and emits `[accumulated, large_block]` as a two-region `writev`, copying nothing
   large. It reaches zero steady-state allocation *and* one write per pass: on eight
   multiplexed streams, 0 allocations and 1 write, against the borrowed path's 0 and 513.
-  Measured, `ngrs-tokio` improved **-52% at N=8 and -59% at N=64**, reaching parity with
+  Measured, `ngnet-h2-tokio` improved **-52% at N=8 and -59% at N=64**, reaching parity with
   io_uring. Body uploads improved where a `HEADERS` block could be folded into the first DATA
   frame's `writev` (-15% at 1 KiB, -14% at 64 KiB); at 1 MiB the effect is neutral, which is
   what was wanted there — the goal at large bodies was to avoid the copy a coalescing path

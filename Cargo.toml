@@ -1,16 +1,16 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/nghttp2",
-    "crates/nghttp2-sys",
-    "crates/nghttp2-tests",
-    "crates/nghttp2-bench",
+    "crates/ngnet-h2",
+    "crates/ngnet-h2-sys",
+    "crates/ngnet-h2-tests",
+    "crates/ngnet-h2-bench",
 ]
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/youyuanwu/ngrs"
+repository = "https://github.com/youyuanwu/ngnet"
 rust-version = "1.85"
 
 # Every dependency in the workspace is declared here and referenced with
@@ -45,8 +45,8 @@ hyper = { version = "1", features = ["client", "server", "http2"] }
 # Only for the tokio glue the bench needs: `TokioExecutor` for hyper's http2 spawns and its
 # own `TokioIo` stream adapter. Distinct from this crate's `TokioIo`; the bench aliases both.
 hyper-util = { version = "0.1", features = ["tokio"] }
-nghttp2 = { path = "crates/nghttp2" }
-nghttp2-sys = { path = "crates/nghttp2-sys" }
+ngnet-h2 = { path = "crates/ngnet-h2" }
+ngnet-h2-sys = { path = "crates/ngnet-h2-sys" }
 tokio = { version = "1", features = [
     "io-util",
     "macros",

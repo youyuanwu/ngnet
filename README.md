@@ -1,4 +1,4 @@
-# ngrs
+# ngnet
 
 Rust bindings for [nghttp2](https://nghttp2.org), targeting cleartext HTTP/2
 (**h2c**).
@@ -10,13 +10,13 @@ Design notes, the invariants the test suite pins, and the tracked backlog live i
 
 | Crate | Description |
 | --- | --- |
-| [`nghttp2`](crates/nghttp2) | Safe, sans-I/O API driving a client or server connection, the caller owning the transport — plus an optional asynchronous `http`/`http-body` client and server built on it (default `http` feature). |
-| [`nghttp2-sys`](crates/nghttp2-sys) | Raw FFI bindings. Builds libnghttp2 from source and generates bindings with `bindgen`. |
-| [`nghttp2-tests`](crates/nghttp2-tests) | Not published. Drives `nghttp2` over a real async transport, so the wrapper needs no runtime dependency of its own. |
+| [`ngnet-h2`](crates/ngnet-h2) | Safe, sans-I/O API driving a client or server connection, the caller owning the transport — plus an optional asynchronous `http`/`http-body` client and server built on it (default `http` feature). |
+| [`ngnet-h2-sys`](crates/ngnet-h2-sys) | Raw FFI bindings. Builds libnghttp2 from source and generates bindings with `bindgen`. |
+| [`ngnet-h2-tests`](crates/ngnet-h2-tests) | Not published. Drives `ngnet-h2` over a real async transport, so the wrapper needs no runtime dependency of its own. |
 
 ## Usage
 
-`nghttp2` performs no I/O. It never opens a socket, never blocks and creates no
+`ngnet-h2` performs no I/O. It never opens a socket, never blocks and creates no
 threads: you hand it the bytes you read from wherever your data came from, and
 it hands back the bytes to write. That makes it usable from blocking code, from
 any async runtime, and from tests that wire a client to a server entirely in
@@ -46,7 +46,7 @@ for the duration of the call, so receiving allocates nothing in the wrapper. You
 is passed in at call time rather than captured, so handlers can mutate it
 directly.
 
-See the [crate documentation](crates/nghttp2/src/lib.rs) for a complete worked
+See the [crate documentation](crates/ngnet-h2/src/lib.rs) for a complete worked
 example and for the guarantees the type system enforces.
 
 Cleartext only: TLS and ALPN are the caller's concern, and server push, HTTP/3
@@ -57,12 +57,12 @@ and stream priorities are out of scope.
 Because the crate owns no transport, attaching one is the caller's job. Three
 worked answers ship with the repo:
 
-- [`examples/h2c_server.rs`](crates/nghttp2/examples/h2c_server.rs) — a blocking
+- [`examples/h2c_server.rs`](crates/ngnet-h2/examples/h2c_server.rs) — a blocking
   h2c server on `std::net`, one thread per connection.
-- [`tests/std_net.rs`](crates/nghttp2/tests/std_net.rs) — a client and a server
+- [`tests/std_net.rs`](crates/ngnet-h2/tests/std_net.rs) — a client and a server
   exchanging requests over loopback TCP, covering multiplexed streams and bodies
   large enough to exercise flow control.
-- [`nghttp2-tests`](crates/nghttp2-tests) — the same exchanges over `tokio`,
+- [`ngnet-h2-tests`](crates/ngnet-h2-tests) — the same exchanges over `tokio`,
   plus many connections in flight at once. The adapter between session and
   socket is the same three functions in both cases; only the `.await` points
   differ.
@@ -71,7 +71,7 @@ The example answers any HTTP/2 client that speaks cleartext with prior
 knowledge, so it can be driven with `curl`:
 
 ```sh
-cargo run -p nghttp2 --example h2c_server
+cargo run -p ngnet-h2 --example h2c_server
 curl --http2-prior-knowledge -i http://127.0.0.1:8080/hello
 curl --http2-prior-knowledge -i --data 'ping' http://127.0.0.1:8080/echo
 ```
@@ -88,7 +88,7 @@ driver is `#[must_use]`; dropping it fails every exchange it was carrying.
 ```rust
 use bytes::Bytes;
 use http_body_util::Empty; // any `http_body::Body` will do
-use nghttp2::http::{handshake, transport::TokioIo};
+use ngnet_h2::http::{handshake, transport::TokioIo};
 
 let stream = tokio::net::TcpStream::connect("127.0.0.1:8080").await?;
 let (requests, connection) = handshake::<_, Empty<Bytes>>(TokioIo::new(stream))?;
@@ -115,7 +115,7 @@ enabling compio's `polling` would restore the fallback, and the module documenta
 how to check. On any other runtime, implementing the three transport traits is a twenty-line
 job.
 A runnable server is in
-[`examples/h2c_async_server.rs`](crates/nghttp2/examples/h2c_async_server.rs), answering
+[`examples/h2c_async_server.rs`](crates/ngnet-h2/examples/h2c_async_server.rs), answering
 the same `curl --http2-prior-knowledge` as the blocking one.
 
 Which to pick is measured rather than asserted, and the answer changed once the measurement
@@ -143,7 +143,7 @@ with `default-features = false` when you already have your own HTTP types, or wa
 crate at its smallest — one dependency, no async, and the sans-I/O API above unchanged.
 
 ```toml
-nghttp2 = { version = "*", default-features = false }
+ngnet-h2 = { version = "*", default-features = false }
 ```
 
 ## Dependencies
@@ -163,8 +163,8 @@ ones, do a **non-recursive** checkout.
 
 ```sh
 # Clone without any submodules...
-git clone https://github.com/youyuanwu/ngrs.git
-cd ngrs
+git clone https://github.com/youyuanwu/ngnet.git
+cd ngnet
 
 # ...then init/update only the top-level submodule (non-recursive).
 git submodule update --init deps/nghttp2
@@ -195,7 +195,7 @@ cargo build
 cargo test
 ```
 
-`crates/nghttp2-sys/build.rs` drives the native build:
+`crates/ngnet-h2-sys/build.rs` drives the native build:
 
 1. Locates the `deps/nghttp2` submodule and fails with actionable instructions
    if it has not been checked out.
@@ -222,7 +222,7 @@ NGHTTP2_SOURCE_DIR=/path/to/nghttp2 cargo build
 
 ### Downstream crates
 
-`nghttp2-sys` sets the `links = "nghttp2"` key, so dependent build scripts can
+`ngnet-h2-sys` sets the `links = "nghttp2"` key, so dependent build scripts can
 read the native paths from the environment:
 
 - `DEP_NGHTTP2_ROOT` — install prefix

@@ -825,19 +825,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21909324aa58f5c284d91cac514c6d081210901dc372d7c8ea6a9d7e0406097a"
 
 [[package]]
-name = "nghttp2"
+name = "ngnet-h2"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "compio",
  "http",
  "http-body",
- "nghttp2-sys",
+ "ngnet-h2-sys",
  "tokio",
 ]
 
 [[package]]
-name = "nghttp2-bench"
+name = "ngnet-h2-bench"
 version = "0.1.0"
 dependencies = [
  "bytes",
@@ -848,12 +848,12 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "nghttp2",
+ "ngnet-h2",
  "tokio",
 ]
 
 [[package]]
-name = "nghttp2-sys"
+name = "ngnet-h2-sys"
 version = "0.1.0"
 dependencies = [
  "bindgen",
@@ -861,14 +861,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "nghttp2-tests"
+name = "ngnet-h2-tests"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "compio",
  "http",
  "http-body",
- "nghttp2",
+ "ngnet-h2",
  "tokio",
 ]
 
