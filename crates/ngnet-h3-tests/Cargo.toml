@@ -1,0 +1,23 @@
+[package]
+name = "ngnet-h3-tests"
+version = "0.1.0"
+description = "Integration tests driving the ngnet-h3 crate over a real QUIC connection"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# This crate exists so that a QUIC implementation can be exercised against `ngnet-h3`
+# without the wrapper itself acquiring a dependency on one. `ngnet-h3` has exactly one
+# dependency and no dev-dependencies, and a test asserts as much; anything needing more
+# belongs here.
+#
+# These are `[dependencies]` rather than `[dev-dependencies]` because the harness lives in
+# `src/lib.rs`, and a library target cannot see dev-dependencies.
+[dependencies]
+ngnet-h3.workspace = true
+
+quinn.workspace = true
+rcgen.workspace = true
+tokio.workspace = true

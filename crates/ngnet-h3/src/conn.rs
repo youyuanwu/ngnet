@@ -848,6 +848,12 @@ impl<C> Conn<C> {
     /// counts every byte written on the stream rather than only body payload. Reporting
     /// more than was ever committed is refused, because nghttp3 would then release a
     /// buffer it has not yet written and still points at.
+    ///
+    /// **Stop reporting once a stream closes.** [`Conn::close_stream`] discards a stream's
+    /// accounting along with its buffers, so acknowledgement arriving afterwards has
+    /// nothing left to release and is refused. nghttp3 itself would accept it silently;
+    /// this does not, because accepting it would mean an over-report — the condition that
+    /// makes early release memory-unsafe — became silent the moment a stream closed.
     pub fn add_ack_offset(&mut self, stream: StreamId, n: u64, context: &mut C) -> Result<()> {
         self.check_usable()?;
         self.bodies.record_acked(stream, n)?;

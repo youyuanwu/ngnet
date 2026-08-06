@@ -822,6 +822,49 @@ fn a_body_that_is_never_sent_is_released_when_the_connection_goes() {
 }
 
 #[test]
+fn acknowledging_a_stream_after_closing_it_is_refused() {
+    // Closing discards the stream's accounting along with its buffers, so there is nothing
+    // left for a later acknowledgement to release. nghttp3 would accept it silently; this
+    // does not, because then an over-report -- the condition that makes early release
+    // memory-unsafe -- would become silent the moment a stream closed. The contract is
+    // therefore that a caller stops reporting once it closes a stream.
+    let mut client = Side::new(Role::Client, Policy::never_acknowledges());
+    let mut server = Side::new(Role::Server, Policy::never_acknowledges());
+
+    client
+        .conn
+        .submit_request(
+            id(0),
+            &request_fields("/closed"),
+            Some(Box::new(FixedBody::new(b"payload".to_vec()))),
+        )
+        .expect("submit request");
+    pump(&mut client, &mut server, 1);
+
+    // Before the close, acknowledgement is accepted.
+    client
+        .conn
+        .add_ack_offset(id(0), 1, &mut client.seen)
+        .expect("one byte was certainly written");
+
+    client
+        .conn
+        .close_stream(id(0), ngnet_h3::ErrorCode::new(0x0100), &mut client.seen)
+        .expect("close");
+
+    let error = client
+        .conn
+        .add_ack_offset(id(0), 1, &mut client.seen)
+        .expect_err("the stream's accounting is gone");
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(
+        error.to_string().contains("already closed"),
+        "the message should name the case, got: {error}"
+    );
+    assert!(client.conn.is_usable(), "a caller mistake is not fatal");
+}
+
+#[test]
 fn acknowledging_a_stream_that_never_wrote_is_a_typed_error() {
     let mut client = Side::new(Role::Client, Policy::eager());
     let error = client

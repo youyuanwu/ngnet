@@ -7,6 +7,7 @@ members = [
     "crates/ngnet-h2-bench",
     "crates/ngnet-h3-sys",
     "crates/ngnet-h3",
+    "crates/ngnet-h3-tests",
 ]
 
 [workspace.package]
@@ -51,11 +52,30 @@ ngnet-h2 = { path = "crates/ngnet-h2" }
 ngnet-h2-sys = { path = "crates/ngnet-h2-sys" }
 ngnet-h3 = { path = "crates/ngnet-h3" }
 ngnet-h3-sys = { path = "crates/ngnet-h3-sys" }
+# The QUIC implementation the HTTP/3 integration tests run over. Test-only: `ngnet-h3`
+# itself depends on nothing but its own `-sys` crate, and a test asserts as much.
+#
+# `platform-verifier` is off, and with it `rustls-native-certs`: the tests trust exactly one
+# self-signed certificate they generated themselves, so reading the host's trust store would
+# be dead weight and would make the result depend on the machine.
+#
+# rustls is deliberately *not* declared separately. quinn re-exports the copy it was built
+# against, so a second declaration could drift to a different version and produce two
+# incompatible `ServerConfig` types with identical names.
+quinn = { version = "0.11", default-features = false, features = [
+    "log",
+    "runtime-tokio",
+    "rustls-ring",
+] }
+rcgen = "0.14"
 tokio = { version = "1", features = [
     "io-util",
     "macros",
     "net",
     "rt",
     "rt-multi-thread",
+    # `mpsc`, which the HTTP/3 harness uses to get bytes from its per-stream reader tasks
+    # back to the connection driver.
+    "sync",
     "time",
 ] }

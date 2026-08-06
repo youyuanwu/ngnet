@@ -232,8 +232,16 @@ impl BodyRegistry {
         if n == 0 {
             return Ok(());
         }
+        // A stream with no offsets was either never written to or has since closed. The
+        // two are not distinguished because the answer is the same either way: there is
+        // nothing left to release, and reporting acknowledgement for it is a mistake.
+        // nghttp3 itself returns success for an unknown stream, but doing that here would
+        // turn a genuine over-report into silence the moment a stream closed.
         let Some(offsets) = self.offsets.get_mut(&stream) else {
-            return Err(Error::invalid_input(OVER));
+            return Err(Error::invalid_input(
+                "that stream has nothing outstanding to acknowledge; it was never written \
+                 to, or it has already closed",
+            ));
         };
         let acked = offsets
             .acked
