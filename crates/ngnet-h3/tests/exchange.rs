@@ -398,8 +398,10 @@ fn a_handler_mutates_state_it_never_captured() {
         .unwrap();
 
     let mut names: Vec<String> = Vec::new();
+    let mut drained = false;
     for _ in 0..64 {
         let Some(send) = client.writev_stream(&mut client_seen).unwrap() else {
+            drained = true;
             break;
         };
         let stream = send.stream();
@@ -412,9 +414,12 @@ fn a_handler_mutates_state_it_never_captured() {
                 .read_stream(stream, &bytes, fin, Timestamp::from_nanos(1), &mut names)
                 .unwrap();
         } else {
+            drained = true;
             break;
         }
     }
+    // Stopping at the bound would leave the assertions below judging a truncated request.
+    assert!(drained, "the client never stopped producing bytes");
     let _ = &mut client_seen;
 
     assert!(
@@ -501,8 +506,10 @@ fn stream_close_is_reported_with_both_directions() {
         )
         .unwrap();
 
+    let mut drained = false;
     for _ in 0..64 {
         let Some(send) = client.writev_stream(&mut client_seen).unwrap() else {
+            drained = true;
             break;
         };
         let stream = send.stream();
@@ -511,12 +518,14 @@ fn stream_close_is_reported_with_both_directions() {
         let taken = bytes.len();
         send.commit(taken).unwrap();
         if taken == 0 && !fin {
+            drained = true;
             break;
         }
         server
             .read_stream(stream, &bytes, fin, Timestamp::from_nanos(1), &mut closed)
             .unwrap();
     }
+    assert!(drained, "the client never stopped producing bytes");
     let _ = &mut client_seen;
 
     // Closing fires the handler through the same bridge the read path uses -- and closing

@@ -180,11 +180,13 @@ fn a_malformed_message_from_the_peer_is_a_typed_protocol_error_with_a_code() {
         .expect("nghttp3 does not validate outbound messages, so this is accepted here");
 
     let mut error = None;
+    let mut drained = false;
     for _ in 0..64 {
         let Some(send) = client
             .writev_stream(&mut client_seen)
             .expect("collect data to send")
         else {
+            drained = true;
             break;
         };
         let stream = send.stream();
@@ -205,13 +207,24 @@ fn a_malformed_message_from_the_peer_is_a_typed_protocol_error_with_a_code() {
             Ok(_) => {}
             Err(e) => {
                 error = Some(e);
+                drained = true;
                 break;
             }
         }
     }
+    // Hitting the bound would mean the assertions below judged truncated traffic, which is
+    // a far more confusing failure than saying so here.
+    assert!(drained, "the client never stopped producing bytes");
 
     let error = error.expect("the server should have rejected the malformed message");
     assert_eq!(error.kind(), ErrorKind::Protocol);
+    // The question a caller is really asking is whether the connection survives, and the
+    // code alone cannot answer it: this same protocol error off a submission would be
+    // recoverable. Off the read path it is not, and the two must not disagree.
+    assert!(
+        error.is_fatal(),
+        "a read-path failure leaves nothing but the destructor, so it must say so"
+    );
     assert!(
         error.app_error_code().is_some(),
         "a protocol error must carry the code to close the QUIC connection with"
@@ -220,6 +233,11 @@ fn a_malformed_message_from_the_peer_is_a_typed_protocol_error_with_a_code() {
         !server.is_usable(),
         "a read-path failure makes further calls undefined behaviour, so the connection \
          latches it"
+    );
+    assert_eq!(
+        error.is_fatal(),
+        !server.is_usable(),
+        "the error and the connection must agree about whether it can still be used"
     );
     // Dropping a poisoned connection is always allowed and always cleans up.
     drop(server);
@@ -275,11 +293,13 @@ fn abandoning_one_stream_leaves_its_neighbours_working() {
     }
 
     // Deliver everything except what belongs to the abandoned stream.
+    let mut drained = false;
     for _ in 0..256 {
         let Some(send) = server
             .writev_stream(&mut server_seen)
             .expect("collect data to send")
         else {
+            drained = true;
             break;
         };
         let stream = send.stream();
@@ -288,6 +308,7 @@ fn abandoning_one_stream_leaves_its_neighbours_working() {
         let taken = bytes.len();
         send.commit(taken).expect("commit");
         if taken == 0 && !fin {
+            drained = true;
             break;
         }
         if stream == id(4) {
@@ -303,6 +324,7 @@ fn abandoning_one_stream_leaves_its_neighbours_working() {
             )
             .expect("read stream data");
     }
+    assert!(drained, "the server never stopped producing bytes");
 
     assert!(client.is_usable(), "one abandoned stream is not fatal");
     for stream in [0i64, 8] {
@@ -381,7 +403,10 @@ fn a_response_delivered_for_an_abandoned_stream_is_reported_not_absorbed() {
         }
     }
 
-    let error = outcome.expect("delivering bytes for a stream this endpoint closed is refused");
+    let error = outcome.expect(
+        "delivering bytes for a stream this endpoint closed is refused -- if nothing was \
+         returned at all, the loop hit its bound before reaching stream 4",
+    );
     assert_eq!(error.kind(), ErrorKind::Protocol);
     assert!(
         error.app_error_code().is_some(),
@@ -422,11 +447,13 @@ fn an_empty_body_is_an_end_of_stream_signal_not_a_zero_length_chunk() {
     // committed, including any carrying no bytes: that a skipped commit stalls the
     // connection is proven separately, in `handshake.rs`.
     let mut writes: Vec<(usize, bool)> = Vec::new();
+    let mut drained = false;
     for _ in 0..64 {
         let Some(send) = client
             .writev_stream(&mut client_seen)
             .expect("collect data to send")
         else {
+            drained = true;
             break;
         };
         let stream = send.stream();
@@ -437,6 +464,7 @@ fn an_empty_body_is_an_end_of_stream_signal_not_a_zero_length_chunk() {
         send.commit(taken)
             .expect("commit, even with nothing on offer");
         if taken == 0 && !fin {
+            drained = true;
             break;
         }
         server
@@ -449,6 +477,7 @@ fn an_empty_body_is_an_end_of_stream_signal_not_a_zero_length_chunk() {
             )
             .expect("read");
     }
+    assert!(drained, "the client never stopped producing bytes");
 
     assert!(
         !writes.is_empty(),
@@ -508,19 +537,25 @@ fn a_body_source_that_gives_up_fails_the_connection_and_releases_its_buffers() {
         .expect("submit request");
 
     let mut failure = None;
+    let mut settled = false;
     for _ in 0..64 {
         match client.writev_stream(&mut client_seen) {
             Ok(Some(send)) => {
                 let taken = send.len();
                 send.commit(taken).expect("commit");
             }
-            Ok(None) => break,
+            Ok(None) => {
+                settled = true;
+                break;
+            }
             Err(e) => {
                 failure = Some(e);
+                settled = true;
                 break;
             }
         }
     }
+    assert!(settled, "the send loop never settled");
 
     let failure = failure.expect("the write path should have failed");
     assert!(
@@ -571,11 +606,13 @@ fn bytes_arriving_before_a_stream_is_understood_are_not_lost() {
     // Collect everything the server wants to say, then feed it to the client one byte at
     // a time -- the most adversarial split there is.
     let mut traffic: Vec<(StreamId, Vec<u8>, bool)> = Vec::new();
+    let mut drained = false;
     for _ in 0..64 {
         let Some(send) = server
             .writev_stream(&mut server_seen)
             .expect("collect data to send")
         else {
+            drained = true;
             break;
         };
         let stream = send.stream();
@@ -584,10 +621,12 @@ fn bytes_arriving_before_a_stream_is_understood_are_not_lost() {
         let taken = bytes.len();
         send.commit(taken).expect("commit");
         if taken == 0 && !fin {
+            drained = true;
             break;
         }
         traffic.push((stream, bytes, fin));
     }
+    assert!(drained, "the server never stopped producing bytes");
     assert!(!traffic.is_empty(), "the server had nothing to send");
 
     let mut credit = 0u64;
@@ -631,6 +670,79 @@ fn bytes_arriving_before_a_stream_is_understood_are_not_lost() {
 // ---------------------------------------------------------------------------
 // Edge case: a caller declares the same stream twice, or one stream for two roles.
 // ---------------------------------------------------------------------------
+
+#[test]
+fn a_response_on_a_stream_that_cannot_carry_one_is_refused() {
+    // nghttp3 asserts the stream shape here rather than checking it. A server-initiated or
+    // unidirectional stream never carried a request, so it can never carry a response.
+    let mut server = observer(Role::Server);
+    for stream in [1i64, 2, 3, 6, 7, 11] {
+        let error = server
+            .submit_response(id(stream), &[Header::new(":status", "200").unwrap()], None)
+            .expect_err("only a client-initiated bidirectional stream carries a response");
+        assert_eq!(
+            error.kind(),
+            ErrorKind::InvalidInput,
+            "stream {stream} should have been refused as a caller mistake"
+        );
+        assert!(
+            error.to_string().contains("client-initiated"),
+            "the error should name what is wrong with the stream, got: {error}"
+        );
+    }
+    assert!(server.is_usable(), "refusing a bad stream is recoverable");
+
+    // The shape that *is* allowed still is, so this is not refusing everything.
+    let mut client = observer(Role::Client);
+    let mut server_seen = Seen::default();
+    let mut client_seen = Seen::default();
+    let mut peer = observer(Role::Server);
+    client
+        .submit_request(id(0), &request("/real"), None)
+        .expect("submit request");
+    pump(
+        &mut client,
+        &mut client_seen,
+        &mut peer,
+        &mut server_seen,
+        1,
+    );
+    peer.submit_response(id(0), &[Header::new(":status", "200").unwrap()], None)
+        .expect("a client-initiated bidirectional stream carries a response");
+}
+
+#[test]
+fn a_recoverable_failure_says_the_connection_survives() {
+    // The other half of the property above. A protocol-shaped failure that did not come
+    // off the read path leaves the connection perfectly serviceable, and `is_fatal` has to
+    // say so or a caller will throw away a working connection.
+    let mut client = observer(Role::Client);
+    let mut server = observer(Role::Server);
+    let mut client_seen = Seen::default();
+    let mut server_seen = Seen::default();
+    pump(
+        &mut client,
+        &mut client_seen,
+        &mut server,
+        &mut server_seen,
+        1,
+    );
+
+    client
+        .submit_request(id(0), &request("/first"), None)
+        .expect("the first submission");
+    let error = client
+        .submit_request(id(0), &request("/again"), None)
+        .expect_err("the stream is already in use");
+
+    assert!(!error.is_fatal());
+    assert!(client.is_usable());
+    assert_eq!(
+        error.is_fatal(),
+        !client.is_usable(),
+        "the error and the connection must agree, in both directions"
+    );
+}
 
 #[test]
 fn conflicting_connection_level_declarations_are_refused_recoverably() {
@@ -708,21 +820,10 @@ fn stream_concurrency_is_a_hint_and_never_silently_drops_a_request() {
     assert!(server.is_usable());
 }
 
-// ---------------------------------------------------------------------------
-// The remaining enumerated cases, and where they are proven.
-// ---------------------------------------------------------------------------
-
-/// The retain contract's own edge cases live with the machinery they belong to.
-///
-/// This is a signpost rather than a test: `tests/body.rs` proves that dropping a
-/// connection releases retained buffers, that a body acknowledged in partial ranges is
-/// released only after its last byte, that over-reporting acknowledgement is refused, and
-/// that a source yielding nothing without an end becomes a deferral rather than a
-/// zero-length message.
-#[test]
-fn the_retain_contract_edge_cases_are_covered_in_the_body_tests() {
-    // A compile-time reminder that the types those tests exercise are the public ones, so
-    // this note cannot rot silently if they are renamed.
-    let _: fn(Vec<u8>) -> FixedBody = FixedBody::new;
-    let _: RetainedBytes = RetainedBytes::from(&b"still public"[..]);
-}
+// The retain contract's own edge cases are proven in `tests/body.rs`, with the machinery
+// they belong to: that dropping a connection releases retained buffers, that a body
+// acknowledged in partial ranges is released only after its last byte, that over-reporting
+// acknowledgement is refused, and that a source yielding nothing without an end becomes a
+// deferral rather than a zero-length message. There was a test here that named those and
+// asserted nothing; it has been removed, because a test that cannot fail is worse than a
+// comment -- it looks like coverage.

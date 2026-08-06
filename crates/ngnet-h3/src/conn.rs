@@ -104,6 +104,12 @@ impl<C> ConnBuilder<C> {
     /// Called when previously blocked stream data has been consumed, and that much more
     /// QUIC flow-control credit may be extended.
     ///
+    /// **Register this or eventually stall.** The credit reported here is credit
+    /// [`Conn::read_stream`] could not return at the time, because QPACK had not yet
+    /// unblocked the stream. It is reported once; without a handler it is dropped, the
+    /// peer is permanently under-credited by that much, and a long-lived connection
+    /// gradually starves. Nothing else will tell you.
+    ///
     /// The handler must be `Send`, because [`Conn`] is, and the handler is the only thing
     /// a connection owns that could capture something thread-affine. Without that bound a
     /// non-atomic refcount could be moved across threads by capturing it here:
@@ -200,6 +206,10 @@ impl<C> ConnBuilder<C> {
     /// nghttp3 will not read any more of what the peer is sending on that stream. Because
     /// this crate owns no transport, acting on it is the caller's: without a
     /// `STOP_SENDING`, the peer keeps sending bytes nothing will ever read.
+    ///
+    /// **Not registering this handler discards the instruction silently.** Like every
+    /// handler it is optional, but unlike most it is not merely information — there is
+    /// nothing this crate can do on your behalf.
     pub fn on_stop_sending(
         mut self,
         handler: impl FnMut(&mut C, StreamId, ErrorCode) + Send + 'static,
@@ -210,7 +220,9 @@ impl<C> ConnBuilder<C> {
 
     /// Called when the QUIC layer should reset a stream.
     ///
-    /// The sending-direction counterpart of [`ConnBuilder::on_stop_sending`].
+    /// The sending-direction counterpart of [`ConnBuilder::on_stop_sending`], and optional
+    /// in the same misleading way: without it the instruction is discarded and the peer
+    /// waits for a reset that never comes.
     pub fn on_reset_stream(
         mut self,
         handler: impl FnMut(&mut C, StreamId, ErrorCode) + Send + 'static,
@@ -424,6 +436,11 @@ impl<C> Conn<C> {
         if path_is_fatal || error.is_fatal() {
             self.poison.get_or_insert(context);
             self.bodies.clear();
+            // Marked on the error too, so `is_fatal` answers the question a caller is
+            // really asking -- may I keep this connection? -- rather than the narrower one
+            // of whether nghttp3 calls the code fatal. A protocol error off the read path
+            // is not fatal by that measure and still leaves nothing but the destructor.
+            return error.into_unusable();
         }
         error
     }
@@ -677,8 +694,12 @@ impl<C> Conn<C> {
             )
         };
         if rv != 0 {
-            // The body was never handed to nghttp3, so nothing points into its buffers.
-            self.bodies.detach(stream);
+            // Only what this call attached, and only if it attached anything. The stream
+            // may already carry an in-flight body from an earlier successful submission,
+            // and dropping *that* would release buffers nghttp3 has queued and still
+            // points at -- while returning a recoverable error, so nothing poisons and the
+            // next write hands the caller freed memory.
+            self.detach_attached(stream, reader.is_some());
             return Err(self.record(rv, "could not submit the request", false));
         }
         Ok(())
@@ -721,7 +742,7 @@ impl<C> Conn<C> {
             )
         };
         if rv != 0 {
-            self.bodies.detach(stream);
+            self.detach_attached(stream, reader.is_some());
             return Err(self.record(rv, "could not submit the response", false));
         }
         Ok(())
@@ -744,6 +765,20 @@ impl<C> Conn<C> {
         Ok(Some(sys::nghttp3_data_reader {
             read_data: Some(crate::callbacks::read_data_cb::<C>),
         }))
+    }
+
+    /// Undoes an attachment whose submission then failed.
+    ///
+    /// `attached` records whether *this* call put the entry there. That distinction is the
+    /// whole point: `BodyRegistry::attach` refuses to replace an existing entry, so a
+    /// successful attach is always a brand-new body nghttp3 has never seen and is free to
+    /// drop. An unattached call finding an entry means the stream already carried one, and
+    /// dropping that would free buffers nghttp3 has queued as application-owned and reads
+    /// through on every later write.
+    fn detach_attached(&mut self, stream: StreamId, attached: bool) {
+        if attached {
+            self.bodies.detach(stream);
+        }
     }
 
     /// Submits a trailing field section, which ends the stream.
@@ -799,21 +834,63 @@ impl<C> Conn<C> {
         Ok(())
     }
 
-    /// Tells the connection a stream has closed.
+    /// Tells the connection a stream has closed, with one code for both directions.
     ///
     /// The application error code is the one the QUIC layer saw. `0x0100`
     /// (`H3_NO_ERROR`) is the code for an ordinary close.
+    ///
+    /// Both directions are reported as carrying that code, because that is what nghttp3's
+    /// single-code entry point does — so the [`StreamClosed`] the close handler receives
+    /// will have `Some` in both fields even for a clean close. Use
+    /// [`Conn::close_stream_with`] when the two directions ended differently, which is the
+    /// usual case once resets are involved.
     pub fn close_stream(
         &mut self,
         stream: StreamId,
         code: ErrorCode,
         context: &mut C,
     ) -> Result<()> {
+        self.close_stream_with(
+            stream,
+            StreamClosed {
+                receiving: Some(code),
+                sending: Some(code),
+            },
+            context,
+        )
+    }
+
+    /// Tells the connection a stream has closed, reporting each direction separately.
+    ///
+    /// `None` means that direction ended cleanly rather than with an application error,
+    /// and it is a distinct thing to say: nghttp3 signals the difference with a flag rather
+    /// than by the code's value, so a zero would not carry it. This is the shape a QUIC
+    /// layer actually has — the peer may have reset its sending direction while ours ended
+    /// normally, or the other way round — and it is the shape the close handler reports,
+    /// so what a caller says and what it later observes use one type.
+    pub fn close_stream_with(
+        &mut self,
+        stream: StreamId,
+        closed: StreamClosed,
+        context: &mut C,
+    ) -> Result<()> {
         self.check_usable()?;
+        let mut flags = 0u32;
+        if closed.receiving.is_some() {
+            flags |= sys::NGHTTP3_STREAM_CLOSE_FLAG_RX_APP_ERROR_CODE_SET;
+        }
+        if closed.sending.is_some() {
+            flags |= sys::NGHTTP3_STREAM_CLOSE_FLAG_TX_APP_ERROR_CODE_SET;
+        }
+        let rx = closed.receiving.map_or(0, ErrorCode::get);
+        let tx = closed.sending.map_or(0, ErrorCode::get);
+
         let rv = self.with_context(context, |raw| {
-            // SAFETY: `raw` is live and the identifier is validated. This fires the
-            // stream-close handler, so a bridge is installed for it.
-            unsafe { sys::nghttp3_conn_close_stream(raw, stream.get(), code.get()) }
+            // SAFETY: `raw` is live and the identifier is validated. The flags say which of
+            // the two codes is meaningful, which is how nghttp3 distinguishes a clean
+            // direction from one that carried a zero code. This fires the stream-close
+            // handler, so a bridge is installed for it.
+            unsafe { sys::nghttp3_conn_close_stream2(raw, flags, stream.get(), rx, tx) }
         });
         if rv != 0 {
             return Err(self.record(rv, "could not close the stream", false));

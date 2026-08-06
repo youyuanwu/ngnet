@@ -95,7 +95,12 @@ impl From<&[u8]> for RetainedBytes {
 }
 
 /// What a body source has for the connection.
+///
+/// Open to extension. nghttp3 has no per-stream failure code today — its own header carries
+/// a TODO for one — so if it gains one this will gain a variant, and a caller who matched
+/// exhaustively would stop compiling for a change that took nothing away from them.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum BodyOutcome {
     /// Here are some bytes; there may be more later.
     Wrote(Vec<RetainedBytes>),

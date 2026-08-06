@@ -28,15 +28,45 @@
 //! conn.bind_control_stream(StreamId::new(2)?)?;
 //! conn.bind_qpack_streams(StreamId::new(6)?, StreamId::new(10)?)?;
 //!
-//! // Ask what to send, write it, then say how much the transport took.
+//! // The whole send loop. Every line of it earns its place; see below.
 //! while let Some(send) = conn.writev_stream(&mut ())? {
-//!     let accepted = write_to_quic(send.stream(), send.slices(), send.fin());
-//!     send.commit(accepted)?;
+//!     let stream = send.stream();
+//!     let offered = send.len();
+//!     let fin = send.fin();
+//!
+//!     let accepted = write_to_quic(stream, send.slices(), fin);
+//!     send.commit(accepted)?;                       // required even when accepted is 0
+//!
+//!     if accepted > 0 && transport_copied_the_bytes() {
+//!         conn.add_ack_offset(stream, accepted as u64, &mut ())?;
+//!     }
+//!     if accepted < offered {
+//!         conn.block_stream(stream)?;               // else this stream starves the rest
+//!     }
 //! }
 //! # Ok(())
 //! # }
 //! # fn write_to_quic(_: ngnet_h3::StreamId, _: &[std::io::IoSlice<'_>], _: bool) -> usize { 0 }
+//! # fn transport_copied_the_bytes() -> bool { true }
 //! ```
+//!
+//! Four things there are not decoration:
+//!
+//! - **`commit` is not optional**, even with nothing on offer. A stream can end with an
+//!   empty final write, and skipping that commit stalls the connection permanently.
+//! - **`add_ack_offset` is the only thing that releases outgoing body buffers.** Reporting
+//!   bytes written does not. When to call it depends on your transport: one that copies
+//!   what it accepts (quinn's `write` does) frees the buffer immediately, so reporting on
+//!   acceptance is sound. One that borrows the slices must wait until it is genuinely done
+//!   with them.
+//! - **`block_stream` on a short write.** The connection offers the highest-priority
+//!   writable stream and goes on offering the same one until it has nothing left for it, so
+//!   without this a stream whose window is exhausted is re-offered ahead of every other one
+//!   forever. Clear it with `unblock_stream` when the transport says the stream is writable
+//!   again. This is a different thing from a body source having nothing to give, which the
+//!   source signals itself and which `resume_stream` clears.
+//! - **`close_stream` when a stream is done in both directions.** It is what releases the
+//!   stream's body buffers and its send accounting; until then they are held.
 //!
 //! # Two contracts worth knowing before you start
 //!

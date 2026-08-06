@@ -78,15 +78,13 @@ fn open_enumerations_stay_open(kind: ErrorKind, shutdown: Shutdown, outcome: Bod
         Shutdown::Notice | Shutdown::NoStreamsFrom(_) | Shutdown::NoPushesFrom(_) => {}
         _ => {}
     }
-    // Matched exhaustively rather than with a wildcard, despite living in this function: a
-    // body outcome is constructed by callers and matched by this crate, so a new variant is
-    // this crate's problem to handle, not a caller's to recompile for.
     match outcome {
         BodyOutcome::Wrote(_)
         | BodyOutcome::Eof(_)
         | BodyOutcome::EofWithTrailers(_)
         | BodyOutcome::Defer
         | BodyOutcome::Fail => {}
+        _ => {}
     }
 }
 

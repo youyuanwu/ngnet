@@ -116,8 +116,10 @@ fn request_bytes() -> Vec<(i64, Vec<u8>)> {
         .unwrap();
 
     let mut out: Vec<(i64, Vec<u8>)> = Vec::new();
+    let mut drained = false;
     for _ in 0..64 {
         let Some(send) = client.writev_stream(&mut ()).unwrap() else {
+            drained = true;
             break;
         };
         let stream = send.stream().get();
@@ -125,10 +127,14 @@ fn request_bytes() -> Vec<(i64, Vec<u8>)> {
         let taken = bytes.len();
         send.commit(taken).unwrap();
         if taken == 0 {
+            drained = true;
             break;
         }
         out.push((stream, bytes));
     }
+    // Stopping at the bound would truncate the request, and the allocation count below
+    // would then be measuring a partial message while claiming to measure a whole one.
+    assert!(drained, "the client never stopped producing bytes");
     out
 }
 

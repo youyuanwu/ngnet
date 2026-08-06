@@ -90,8 +90,10 @@ fn request_bytes() -> Vec<(i64, Vec<u8>)> {
         .unwrap();
 
     let mut out: Vec<(i64, Vec<u8>)> = Vec::new();
+    let mut drained = false;
     for _ in 0..64 {
         let Some(send) = client.writev_stream(&mut ()).unwrap() else {
+            drained = true;
             break;
         };
         let stream = send.stream().get();
@@ -99,6 +101,7 @@ fn request_bytes() -> Vec<(i64, Vec<u8>)> {
         let taken = bytes.len();
         send.commit(taken).unwrap();
         if taken == 0 {
+            drained = true;
             break;
         }
         match out.last_mut() {
@@ -106,6 +109,8 @@ fn request_bytes() -> Vec<(i64, Vec<u8>)> {
             _ => out.push((stream, bytes)),
         }
     }
+    // Truncated traffic would make every split below a split of the wrong bytes.
+    assert!(drained, "the client never stopped producing bytes");
     out
 }
 

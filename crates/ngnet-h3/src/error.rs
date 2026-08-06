@@ -137,6 +137,13 @@ pub struct Error {
     kind: ErrorKind,
     native: Option<NativeCode>,
     context: &'static str,
+    /// Whether the connection this came from is now unusable.
+    ///
+    /// Not derivable from the code. A protocol error is recoverable when it comes from a
+    /// submission and unrecoverable when it comes from the read path, because nghttp3
+    /// documents that continuing after that path fails is undefined behaviour. Only the
+    /// connection knows which happened, so it says so here.
+    unusable: bool,
 }
 
 impl Error {
@@ -147,7 +154,14 @@ impl Error {
             kind: classify(native),
             native: Some(native),
             context,
+            unusable: false,
         }
+    }
+
+    /// Marks this failure as one that left the connection unusable.
+    pub(crate) fn into_unusable(mut self) -> Self {
+        self.unusable = true;
+        self
     }
 
     /// Builds an error for a precondition this crate checked itself.
@@ -166,6 +180,7 @@ impl Error {
             kind: ErrorKind::InvalidInput,
             native: None,
             context,
+            unusable: false,
         }
     }
 
@@ -175,6 +190,7 @@ impl Error {
             kind: ErrorKind::ConnectionUnusable,
             native: None,
             context: "the connection encountered an unrecoverable error and cannot be used",
+            unusable: true,
         }
     }
 
@@ -189,9 +205,18 @@ impl Error {
         self.native
     }
 
-    /// Whether this failure makes the connection unusable.
+    /// Whether this failure left the connection unusable.
+    ///
+    /// Exactly equivalent to `!conn.is_usable()` immediately after the call that returned
+    /// this error, and that equivalence is what makes it worth asking. It is **not** the
+    /// same as the code being one nghttp3 calls fatal: a protocol error is recoverable when
+    /// it comes from a submission and unrecoverable when it comes from the read path, whose
+    /// documentation says continuing is undefined behaviour. The code alone cannot tell
+    /// those apart, so the connection records which happened.
     pub fn is_fatal(&self) -> bool {
-        self.kind == ErrorKind::ConnectionUnusable || self.native.is_some_and(NativeCode::is_fatal)
+        self.unusable
+            || self.kind == ErrorKind::ConnectionUnusable
+            || self.native.is_some_and(NativeCode::is_fatal)
     }
 
     /// The HTTP/3 application error code to close the connection with.

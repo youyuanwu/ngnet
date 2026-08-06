@@ -822,6 +822,77 @@ fn a_body_that_is_never_sent_is_released_when_the_connection_goes() {
 }
 
 #[test]
+fn a_failed_resubmission_does_not_release_the_body_already_in_flight() {
+    // The rollback on a failed submission must undo only what that call attached. A stream
+    // that already carries a body has buffers nghttp3 has queued and reads through on
+    // every later write, and the failures that reach this path -- a stream already in use,
+    // a connection that is closing -- are recoverable, so nothing poisons and the next
+    // write would hand the caller freed memory.
+    let mut client = Side::new(Role::Client, Policy::never_acknowledges());
+    let mut server = Side::new(Role::Server, Policy::never_acknowledges());
+    let (arc, retained) = shared(b"in flight, and still pointed at");
+
+    client
+        .conn
+        .submit_request(
+            id(0),
+            &request_fields("/in-flight"),
+            Some(Box::new(FixedBody::new(retained))),
+        )
+        .expect("the first submission");
+    pump(&mut client, &mut server, 1);
+    assert_eq!(client.conn.retained_body_buffers(), 1);
+    assert_eq!(Arc::strong_count(&arc), 2);
+
+    // A second submission on the same stream, with no body of its own.
+    let error = client
+        .conn
+        .submit_request(id(0), &request_fields("/again"), None)
+        .expect_err("the stream is already in use");
+    assert!(
+        !error.is_fatal() && client.conn.is_usable(),
+        "this failure is recoverable, which is exactly why the release would go unnoticed"
+    );
+    assert_eq!(
+        client.conn.retained_body_buffers(),
+        1,
+        "the in-flight body must still be retained"
+    );
+    assert_eq!(
+        Arc::strong_count(&arc),
+        2,
+        "the buffer nghttp3 still points at must not have been freed"
+    );
+
+    // And with a body of its own, which is refused before nghttp3 is reached at all.
+    let (second, second_retained) = shared(b"never attached");
+    let error = client
+        .conn
+        .submit_request(
+            id(0),
+            &request_fields("/again-with-body"),
+            Some(Box::new(FixedBody::new(second_retained))),
+        )
+        .expect_err("a stream carries at most one body");
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_eq!(client.conn.retained_body_buffers(), 1);
+    assert_eq!(Arc::strong_count(&arc), 2);
+    assert_eq!(
+        Arc::strong_count(&second),
+        1,
+        "the refused body was never taken"
+    );
+
+    // The stream is still writable and its bytes are still the ones that were queued.
+    pump(&mut client, &mut server, 2);
+    assert_eq!(
+        server.seen.body.get(&0).map(Vec::as_slice),
+        Some(&arc[..]),
+        "the peer must receive the body that was actually submitted"
+    );
+}
+
+#[test]
 fn acknowledging_a_stream_after_closing_it_is_refused() {
     // Closing discards the stream's accounting along with its buffers, so there is nothing
     // left for a later acknowledgement to release. nghttp3 would accept it silently; this

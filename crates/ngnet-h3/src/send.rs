@@ -54,7 +54,7 @@ const MAX_VECTORS: usize = 16;
 /// conn.bind_control_stream(StreamId::new(2)?)?;
 /// conn.bind_qpack_streams(StreamId::new(6)?, StreamId::new(10)?)?;
 ///
-/// let send = conn.writev_stream()?.unwrap();
+/// let send = conn.writev_stream(&mut ())?.unwrap();
 /// let borrowed = send.slices();
 /// send.commit(0)?;
 /// // The bytes are gone; nghttp3 may already have reused the buffer behind them.
@@ -73,12 +73,15 @@ const MAX_VECTORS: usize = 16;
 /// conn.bind_control_stream(StreamId::new(2)?)?;
 /// conn.bind_qpack_streams(StreamId::new(6)?, StreamId::new(10)?)?;
 ///
-/// let first = conn.writev_stream()?.unwrap();
-/// let second = conn.writev_stream()?;  // `conn` is still borrowed by `first`
+/// let first = conn.writev_stream(&mut ())?.unwrap();
+/// let second = conn.writev_stream(&mut ())?;  // `conn` is still borrowed by `first`
 /// first.commit(0)?;
 /// # Ok(())
 /// # }
 /// ```
+#[must_use = "an offer must be closed with `commit` -- including `commit(0)` -- or \
+              abandoned explicitly; dropping it silently makes no progress, and a stream \
+              ending with an empty final write will be re-offered forever"]
 pub struct SendGuard<'a, C> {
     conn: &'a mut Conn<C>,
     slices: [IoSlice<'a>; MAX_VECTORS],
