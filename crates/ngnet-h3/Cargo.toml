@@ -1,0 +1,11 @@
+[package]
+name = "ngnet-h3"
+version = "0.1.0"
+description = "Safe, sans-I/O Rust bindings to libnghttp3 for HTTP/3 framing and QPACK"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ngnet-h3-sys.workspace = true

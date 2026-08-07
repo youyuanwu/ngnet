@@ -1,13 +1,17 @@
 # Invariants
 
-Properties the suite *pins* rather than merely exercises. Each is a claim the crate makes
-about itself that would otherwise decay silently, so each has a test whose failure is the
-only warning you get.
+Properties the suite *pins* rather than merely exercises. Each is a claim a crate makes about
+itself that would otherwise decay silently, so each has a test whose failure is the only
+warning you get.
 
 If you change something here, the test is not in your way — it is the reason the claim can be
 made at all.
 
-## Structural — `tests/invariants.rs`
+There are two crate families, and each pins its own invariants in its own suite. Unqualified
+references to "the crate" in the HTTP/2 sections below mean `ngnet-h2`; the HTTP/3 section
+names its crate explicitly.
+
+## HTTP/2 structural — `crates/ngnet-h2/tests/invariants.rs`
 
 These assert properties of the *source*, not of runtime behaviour.
 
@@ -28,10 +32,33 @@ The helpers have their own tests — `the_comment_stripper_actually_strips`,
 `included_docs_are_found_wherever_they_are_spelled` — because a scanner that silently stops
 matching is worse than no scanner.
 
-## Public surface — `tests/compat_surface.rs`
+## HTTP/2 public surface — `crates/ngnet-h2/tests/compat_surface.rs`
 
 `the_sans_io_surface_is_unchanged` and `the_asynchronous_surface_is_unchanged` pin the public
 API by referencing it, so a signature change breaks a build rather than a downstream user.
+
+## HTTP/3 structural — `crates/ngnet-h3/tests/invariants.rs`
+
+The same idea, scoped to `ngnet-h3`. It is a separate suite rather than a widened version of
+the HTTP/2 one, because the two crates make different promises: `ngnet-h3` has no async
+subtree to exempt, and one item from `std::io` it is allowed to name.
+
+| Test | Claim |
+| --- | --- |
+| `unsafe_lives_only_in_the_modules_that_declare_they_need_it` | `unsafe` appears only in the modules `lib.rs` grants `#[allow(unsafe_code)]`, and every module granted it actually uses it. The list is read from `lib.rs`, so the two cannot disagree. |
+| `the_allowance_list_is_the_ffi_boundary_and_nothing_else` | That list is exactly `alloc`, `callbacks`, `conn`, `error`, `send`, `settings`. The compiler cannot express this: adding an allow is precisely how it is silenced. |
+| `a_caller_never_needs_unsafe` | No test needs `unsafe` to *use* the crate. Exemptions are named individually, and the test fails if one stops being needed. |
+| `the_crate_reaches_for_no_io_threading_or_time_facility` | The crate never names `std::net`, `std::fs`, `std::thread`, `std::time`, `std::process` or `std::env`, and the only `std::io` item it names is `IoSlice` — a description of borrowed bytes, not a way to move them. The clock is the interesting one: nghttp3 wants a timestamp on every read, and the caller supplies it. |
+| `the_crate_has_no_asynchrony_of_its_own` | No `async fn` anywhere. Its absence is what lets the crate be driven from blocking code, from any runtime, and from a test with no runtime at all. |
+| `the_crate_declares_exactly_one_non_optional_dependency` | `ngnet-h3-sys`, and nothing else — nor any dev-dependency. quinn, rustls and tokio live in `ngnet-h3-tests` and reach the wrapper only through its public API. |
+| `the_scanner_sees_through_comments_and_literals` / `the_scanner_would_catch_a_real_violation` | The scans fail on real code and pass on prose. A scanner that silently stops matching is worse than no scanner. |
+
+## HTTP/3 public surface — `crates/ngnet-h3/tests/compat_surface.rs`
+
+`the_public_surface_still_has_the_shape_it_promised` names every public item and uses each in
+a way that pins its shape. It includes `ngnet_h3::raw`, the documented escape hatch, which is
+deliberately excluded from the no-unsafe claim: capabilities the safe API does not yet cover
+stay reachable, at the cost of upholding nghttp3's invariants yourself.
 
 **Adding public API means extending this file**, or the test fails.
 
@@ -98,6 +125,16 @@ for f in "" "--no-default-features" "--all-features" "--features tokio" "--featu
   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-h2 $f
 done
 
+# The HTTP/3 crates have no feature matrix -- `ngnet-h3` has one dependency and no optional
+# ones -- so one pass covers them.
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-h3 -p ngnet-h3-sys -p ngnet-h3-tests
+
+# A different claim from the manifest test above: that one asserts what `ngnet-h3` *declares*,
+# this asserts what the resolved graph actually contains, which is what a downstream user
+# gets. Cargo unifies features across a workspace, so a crate added later could pull a
+# transport in with nothing in `ngnet-h3` changing.
+cargo tree -p ngnet-h3 -e normal | grep -qiE 'quinn|rustls|tokio|ring' && exit 1
+
 # Runs each benchmark once without timing it. Benchmarks are not part of `cargo test`, so
 # without this they rot silently as the API moves.
 cargo bench --workspace -- --test
@@ -117,10 +154,19 @@ of CI or of most developer machines — this is the check that catches it where 
 cargo tree -p ngnet-h2 --features completion -e features | grep 'compio-driver feature "polling"'
 ```
 
-Two things CI deliberately does not do, both explained in the workflow: no repository-wide
-`cargo fmt --check` (this repo is not globally rustfmt-clean, and the convention is to
-format only touched files), and no MSRV job. On the second, note that the `completion`
-feature has a **higher minimum toolchain** than the crate's declared `rust-version`: compio's
-buffer crate needs a newer compiler than 1.85. The default and `tokio` builds do honour 1.85,
-which was not true before this was checked — a let-chain had been present since the first
-commit, making the declared minimum wrong from the beginning.
+CI deliberately does not run a repository-wide `cargo fmt --check`: this repo is not globally
+rustfmt-clean, and the convention is to format only touched files.
+
+MSRV is checked for the HTTP/3 crates only, in a separate job that installs 1.85 explicitly:
+
+```sh
+cargo +1.85 check -p ngnet-h3 -p ngnet-h3-sys
+```
+
+It is not checked workspace-wide, and the reason is per-crate rather than general. The
+benchmark crate's Criterion dependency requires a newer compiler than 1.85, and the
+`completion` feature has a **higher minimum toolchain** than the declared `rust-version`
+because compio's buffer crate needs one. The HTTP/3 crates have neither, so the claim can be
+made honestly for them. The HTTP/2 default and `tokio` builds do honour 1.85, which was not
+true before this was checked — a let-chain had been present since the first commit, making
+the declared minimum wrong from the beginning — but nothing enforces it on every push.

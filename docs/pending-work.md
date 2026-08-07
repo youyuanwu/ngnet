@@ -192,7 +192,10 @@ test, and no more.
 These are not gaps. They are decisions, recorded so they are not mistaken for oversights.
 
 - **Cleartext (h2c) only.** TLS and ALPN are the caller's concern.
-- **No server push, stream priorities, or HTTP/3.**
+- **No server push or stream priorities in `ngnet-h2`.** HTTP/3 is no longer on this list:
+  `ngnet-h3` wraps nghttp3 as a sans-I/O core. What that core deliberately lacks — an
+  asynchronous layer, a bundled QUIC or TLS implementation, and server push, which nghttp3
+  does not implement — is recorded in `docs/README.md`.
 - **One connection, no policy layer.** No pooling, retries, redirects, or `Service`
   abstraction — those belong in a layer above this crate.
 - **No boxed transports.** The transport traits return `impl Future`, so they are

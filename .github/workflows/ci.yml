@@ -33,11 +33,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Non-recursive on purpose. nghttp2 declares nested submodules — mruby,
-          # neverbleed, munit and more — that only its own tests and tooling need, while
-          # this repository builds the library alone. `true` is the non-recursive form and
-          # matches the minimum checkout the README documents; `recursive` would fetch the lot.
-          submodules: true
+          # No submodule work here: the correct set is not uniform across the two
+          # vendored libraries, and encoding it in two places would guarantee they drift.
+          # `just submodules` below is the single definition.
+          submodules: false
+
+      - uses: extractions/setup-just@v2
+
+      # nghttp2 wants no nested submodules; nghttp3 needs exactly one of its own
+      # (`lib/sfparse`, which is compiled into the library rather than into its tests).
+      # The justfile encodes that asymmetry, and `just submodules-status` prints what
+      # was actually checked out, which is the first thing worth seeing on a failure.
+      - name: Check out the submodules the build needs
+        run: |
+          just submodules
+          just submodules-status
 
       # Reads the channel and components from rust-toolchain.toml, so the pin lives in one
       # place and a contributor's local `cargo test` uses the same compiler this does.
@@ -87,6 +97,29 @@ jobs:
             echo "::endgroup::"
           done
 
+      # The HTTP/3 crates have no feature matrix -- `ngnet-h3` has exactly one dependency
+      # and no optional ones -- so one pass covers them.
+      - name: Rustdoc for the HTTP/3 crates
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps -p ngnet-h3 -p ngnet-h3-sys -p ngnet-h3-tests
+
+      # The HTTP/3 wrapper's whole shape rests on depending on nothing but its own bindings.
+      # The invariants test asserts what the manifest *declares*; this asserts what the
+      # resolved graph actually contains, which is the thing a downstream user gets. Cargo
+      # unifies features across a workspace, so a crate added later could pull a transport
+      # into the graph with nothing in `ngnet-h3` changing.
+      - name: The HTTP/3 wrapper depends on nothing but its bindings
+        run: |
+          tree=$(cargo tree -p ngnet-h3 -e normal)
+          echo "$tree"
+          if echo "$tree" | grep -qiE 'quinn|rustls|tokio|ring'; then
+            echo "::error::a transport or TLS crate reached ngnet-h3's dependency graph."
+            echo "::error::Test-only dependencies belong in ngnet-h3-tests."
+            exit 1
+          fi
+          echo "no transport in the HTTP/3 wrapper's graph"
+
       # The completion transport's guarantee is that no readiness backend is compiled, so it
       # cannot silently degrade to epoll. That is a property of the resolved dependency
       # graph, not of any source file, and cargo unifies features across the whole workspace
@@ -117,6 +150,43 @@ jobs:
       - name: Benchmarks compile and run once
         run: cargo bench --workspace -- --test
 
+  # A separate job, because the one above installs the toolchain named in
+  # `rust-toolchain.toml` and therefore has no 1.85 to call. Scoped to the HTTP/3 crates:
+  # a workspace-wide check cannot pass, and not for a reason anyone can fix here — the
+  # benchmark crate's Criterion dependency needs a newer compiler, and so does compio's
+  # buffer crate behind the `completion` feature. These two crates have neither, so the
+  # declared `rust-version` can be verified honestly rather than asserted.
+  msrv:
+    name: MSRV 1.85 (HTTP/3 crates)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - uses: extractions/setup-just@v2
+
+      - name: Check out the submodules the build needs
+        run: |
+          just submodules
+          just submodules-status
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.85"
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev
+
+      # `check` rather than `test`: the claim is that the declared minimum compiles the
+      # published crates, and running the suite would additionally bind the test-only
+      # dependencies to 1.85 without that being part of the promise.
+      - name: Check against the declared minimum
+        run: cargo +1.85 check -p ngnet-h3 -p ngnet-h3-sys
+
 # Deliberately absent: a `cargo fmt --check` gate. This repository is not globally
 # rustfmt-clean, and the convention is to format only the files a change touches
 # (`rustfmt --edition 2024 <file>`). A repository-wide gate would fail on every pull request
@@ -124,7 +194,8 @@ jobs:
 # the matter, but that is a decision to take deliberately rather than a side effect of
 # adding CI.
 #
-# Also absent: an MSRV job. The library crates still declare `rust-version = "1.85"`, but
-# the benchmark crate's Criterion dependency requires 1.86, so a workspace-wide check fails
-# for a crate that is never published. Checking the published crates alone would mean a
-# second toolchain and a second cold build of libnghttp2 for a claim that changes rarely.
+# Also absent: a workspace-wide MSRV job. The `msrv` job above covers the HTTP/3 crates,
+# which is as far as the claim can honestly be taken: the benchmark crate's Criterion
+# dependency requires a newer compiler than 1.85, and so does compio's buffer crate behind
+# the `completion` feature. Widening the job would mean failing on crates that are never
+# published, for a limit their own dependencies impose.
