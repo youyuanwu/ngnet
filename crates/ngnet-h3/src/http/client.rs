@@ -273,6 +273,15 @@ where
             let Some(command) = self.queue.pop() else {
                 break;
             };
+
+            // The caller may have dropped the future between submitting and now. Sending
+            // anyway would perform a side effect they have already given up on and possibly
+            // retried elsewhere, which for a non-idempotent request is the worst kind of
+            // duplicate.
+            if command.slot.is_settled() {
+                continue;
+            }
+
             let stream = self.spare.remove(0);
 
             let (parts, body) = command.request.into_parts();
@@ -288,7 +297,8 @@ where
             let views = fields.views()?;
 
             let ending = Arc::new(std::sync::Mutex::new(None));
-            let source: Option<Box<dyn crate::body::BodySource>> = if body.is_end_stream() {
+            let has_body = !body.is_end_stream();
+            let source: Option<Box<dyn crate::body::BodySource>> = if !has_body {
                 None
             } else {
                 Some(Box::new(Outgoing::new(
@@ -299,12 +309,38 @@ where
                 )))
             };
 
-            conn.submit_request(stream, &views, source)?;
+            // A recoverable refusal -- the peer sent GOAWAY, so this exchange was never
+            // looked at -- must settle the caller's future rather than escape as a
+            // connection error. The command has already been popped, so nothing else will
+            // ever settle it, and a future nobody settles is a hang.
+            if let Err(error) = conn.submit_request(stream, &views, source) {
+                let refused = error.is_fatal();
+                command.slot.fail(if refused {
+                    Error::from(error)
+                } else {
+                    Error::new(
+                        ErrorKind::Refused,
+                        "the connection stopped accepting new exchanges before this one began",
+                    )
+                });
+                if refused {
+                    return Err(Error::new(
+                        ErrorKind::Connection,
+                        "the connection became unusable while submitting a request",
+                    ));
+                }
+                continue;
+            }
             // Recorded only after submission succeeded, so a failed submission leaves no
             // stream for the future to try to abandon.
             command.slot.bind(stream);
 
-            self.endings.push((stream, ending));
+            // Only a body that exists can ever report how it ended. Recording a slot for
+            // one that cannot would grow this list with every request the connection ever
+            // carried.
+            if has_body {
+                self.endings.push((stream, ending));
+            }
 
             let liveness = Arc::new(());
             self.registry.insert(

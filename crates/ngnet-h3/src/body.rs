@@ -97,12 +97,18 @@ impl RetainedBytes {
     ///
     /// # What the owner must guarantee
     ///
-    /// [`AsRef::as_ref`] must return the same bytes every time it is called. That is true
+    /// [`AsRef::as_ref`] should return the same bytes every time it is called. That is true
     /// of every sane implementation and of every type in the standard library, but it is
     /// not something the type system promises, and nghttp3 will hold the address across
-    /// many calls. An owner that shrinks between calls cannot cause unsoundness here —
-    /// the length is fixed at construction and every read is clamped, so the worst case is
-    /// that fewer bytes are offered than the accounting expects. It must not be relied on.
+    /// many calls.
+    ///
+    /// An owner that misbehaves cannot cause unsoundness, and it takes two separate
+    /// measures to say so. Every read here is clamped to the length taken at construction,
+    /// so no access can run past the buffer. And the release accounting stores the length
+    /// nghttp3 was *told about* at the moment the pointer was handed over, rather than
+    /// measuring the buffer again when acknowledgement arrives — because those two numbers
+    /// disagreeing is exactly how a buffer gets freed while nghttp3 is still reading
+    /// through it. The clamp alone is not enough; both are needed.
     ///
     /// `Send + Sync` is required rather than merely `Send` because the buffer is stored
     /// behind an [`Arc`], and `Arc<T>` is only `Send` when `T` is both.

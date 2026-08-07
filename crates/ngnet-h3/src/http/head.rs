@@ -92,6 +92,15 @@ fn protocol(detail: &'static str) -> Error {
     Error::new(ErrorKind::Protocol, detail)
 }
 
+/// Whether a `te` field is one HTTP/3 permits.
+///
+/// RFC 9114 §4.2 keeps `te` alive where the other connection-specific fields die, but only
+/// in a request and only with the single value `trailers`. Anything else is a hop-by-hop
+/// instruction that means nothing once each exchange owns a QUIC stream.
+fn te_is_permitted(value: &[u8]) -> bool {
+    value.eq_ignore_ascii_case(b"trailers")
+}
+
 /// Whether a scheme is one this layer will carry.
 ///
 /// Both, and this is the first place HTTP/3 diverges from the HTTP/2 crate beside it. That
@@ -158,7 +167,13 @@ pub(crate) fn request_fields(parts: &http::request::Parts) -> Result<OwnedFields
             // decoder below treats disagreement as an attack.
             continue;
         }
-        if FORBIDDEN.contains(&name) {
+        if name == "te" {
+            if !te_is_permitted(value.as_bytes()) {
+                return Err(protocol(
+                    "HTTP/3 permits `te` only with the value `trailers`",
+                ));
+            }
+        } else if FORBIDDEN.contains(&name) {
             return Err(protocol(
                 "this field is connection-specific and HTTP/3 forbids it",
             ));
@@ -181,6 +196,10 @@ pub(crate) fn response_fields(parts: &http::response::Parts) -> Result<OwnedFiel
 
     for (name, value) in &parts.headers {
         let name = name.as_str();
+        if name == "te" {
+            // Permitted in a request, never in a response.
+            return Err(protocol("HTTP/3 forbids `te` in a response"));
+        }
         if FORBIDDEN.contains(&name) {
             return Err(protocol(
                 "this field is connection-specific and HTTP/3 forbids it",
@@ -256,7 +275,13 @@ pub(crate) fn request_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Reques
         }
         let name = http::HeaderName::from_bytes(name)
             .map_err(|_| protocol("the peer sent a malformed field name"))?;
-        if FORBIDDEN.contains(&name.as_str()) {
+        if name.as_str() == "te" {
+            if !te_is_permitted(value) {
+                return Err(protocol(
+                    "the peer sent a `te` field with a value HTTP/3 does not permit",
+                ));
+            }
+        } else if FORBIDDEN.contains(&name.as_str()) {
             // Refused on the way in as well as on the way out. The peer is not running this
             // code, and RFC 9114 §4.2 makes a message carrying one of these malformed —
             // delivering it would hand a handler a framing instruction from an untrusted
@@ -272,14 +297,25 @@ pub(crate) fn request_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Reques
 
     let method = method.ok_or_else(|| protocol("a request must carry :method"))?;
     let path = path.ok_or_else(|| protocol("a request must carry :path"))?;
-    let authority = authority.ok_or_else(|| protocol("a request must carry :authority"))?;
-    if let Some(host) = &host
-        && host != &authority
-    {
-        return Err(protocol(
-            "the peer sent a host field that disagrees with :authority",
-        ));
-    }
+
+    // RFC 9114 §4.3.1 lets a request carry its authority as `:authority` *or* as a `Host`
+    // field, so requiring the pseudo-header would refuse conforming peers. What is not
+    // negotiable is that the two agree when both are present: authority is a trust-boundary
+    // input, and two sources that disagree is a smuggling attempt rather than a preference.
+    let authority = match (&authority, &host) {
+        (Some(authority), Some(host)) if authority != host => {
+            return Err(protocol(
+                "the peer sent a host field that disagrees with :authority",
+            ));
+        }
+        (Some(authority), _) => authority.clone(),
+        (None, Some(host)) if !host.is_empty() => host.clone(),
+        _ => {
+            return Err(protocol(
+                "a request must name its authority, as :authority or as a host field",
+            ));
+        }
+    };
 
     // A missing scheme reads as `https` here, where the HTTP/2 crate beside this one reads
     // it as `http`: this connection arrived over QUIC, which is secured by construction.
@@ -365,6 +401,11 @@ pub(crate) fn response_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Respo
 
         let name = http::HeaderName::from_bytes(name)
             .map_err(|_| protocol("the peer sent a malformed field name"))?;
+        if name.as_str() == "te" {
+            return Err(protocol(
+                "the peer sent `te` in a response, which HTTP/3 forbids",
+            ));
+        }
         if FORBIDDEN.contains(&name.as_str()) {
             return Err(protocol(
                 "the peer sent a connection-specific field HTTP/3 forbids",
@@ -446,7 +487,7 @@ mod tests {
     use super::*;
 
     /// Builds a field list the way a decoder receives one.
-    fn fields(pairs: &[(&str, &str)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pub(super) fn fields(pairs: &[(&str, &str)]) -> Vec<(Vec<u8>, Vec<u8>)> {
         pairs
             .iter()
             .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
@@ -999,5 +1040,116 @@ mod tests {
                 "expected {case:?} to be refused"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod rfc_9114_conformance {
+    use super::tests::fields;
+    use super::*;
+
+    #[test]
+    fn te_trailers_is_permitted_on_a_request() {
+        // The one exception RFC 9114 §4.2 makes among the connection-specific names.
+        let request = http::Request::builder()
+            .uri("https://example.test/")
+            .header("te", "trailers")
+            .body(())
+            .expect("a request");
+        let (parts, ()) = request.into_parts();
+        assert!(request_fields(&parts).is_ok());
+
+        assert!(
+            request_head(&fields(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":authority", "example.test"),
+                (":path", "/"),
+                ("te", "trailers"),
+            ]))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn any_other_te_value_is_refused() {
+        // `te: gzip` is a hop-by-hop instruction that means nothing once each exchange owns
+        // a QUIC stream, and RFC 9114 makes a message carrying one malformed.
+        let request = http::Request::builder()
+            .uri("https://example.test/")
+            .header("te", "gzip")
+            .body(())
+            .expect("a request");
+        let (parts, ()) = request.into_parts();
+        assert!(request_fields(&parts).is_err());
+
+        assert!(
+            request_head(&fields(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":authority", "example.test"),
+                (":path", "/"),
+                ("te", "gzip"),
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn te_is_refused_in_a_response_whatever_its_value() {
+        let response = http::Response::builder()
+            .header("te", "trailers")
+            .body(())
+            .expect("a response");
+        let (parts, ()) = response.into_parts();
+        assert!(response_fields(&parts).is_err());
+
+        assert!(response_head(&fields(&[(":status", "200"), ("te", "trailers")])).is_err());
+    }
+
+    #[test]
+    fn a_request_may_name_its_authority_with_host_instead() {
+        // RFC 9114 §4.3.1 permits either. Requiring the pseudo-header would refuse a
+        // conforming peer.
+        let head = request_head(&fields(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            ("host", "example.test"),
+        ]))
+        .expect("host names the authority");
+        assert_eq!(
+            head.uri().authority().map(|a| a.as_str()),
+            Some("example.test")
+        );
+        assert!(
+            head.headers().get("host").is_none(),
+            "host was carried as the authority, so it is not delivered beside it"
+        );
+    }
+
+    #[test]
+    fn a_request_naming_no_authority_at_all_is_still_refused() {
+        assert!(
+            request_head(&fields(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":path", "/"),
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_empty_host_does_not_count_as_an_authority() {
+        assert!(
+            request_head(&fields(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":path", "/"),
+                ("host", ""),
+            ]))
+            .is_err()
+        );
     }
 }

@@ -214,7 +214,6 @@ where
                     // A handler produced a head HTTP/3 will not carry. That is this
                     // endpoint's fault, not the peer's, so the exchange is abandoned rather
                     // than the connection failed.
-                    eprintln!("SRV RESET bad-response-head");
                     self.shared.reset(stream, ErrorCode::new(REQUEST_CANCELLED));
                     self.forget(stream);
                     continue;
@@ -222,7 +221,8 @@ where
             };
 
             let ending = Arc::new(Mutex::new(None));
-            let source: Option<Box<dyn crate::body::BodySource>> = if body.is_end_stream() {
+            let has_body = !body.is_end_stream();
+            let source: Option<Box<dyn crate::body::BodySource>> = if !has_body {
                 None
             } else {
                 Some(Box::new(Outgoing::new(
@@ -234,7 +234,11 @@ where
             };
 
             conn.submit_response(stream, &fields.views()?, source)?;
-            self.endings.push((stream, ending));
+            // Only a body that exists can report how it ended; recording a slot for one
+            // that cannot would grow this list with every request ever answered.
+            if has_body {
+                self.endings.push((stream, ending));
+            }
         }
         Ok(())
     }
@@ -251,7 +255,6 @@ where
         // peer controls.
         if self.tasks.len() >= self.max_concurrent {
             let _ = conn.shutdown_stream_read(stream);
-            eprintln!("SRV RESET concurrency-cap");
             self.shared.reset(stream, ErrorCode::new(REQUEST_CANCELLED));
             return Ok(());
         }
@@ -261,7 +264,6 @@ where
             Err(_) => {
                 // The peer sent something HTTP/3 forbids. One exchange is refused; the
                 // connection carries on.
-                eprintln!("SRV RESET bad-request-head");
                 let _ = conn.shutdown_stream_read(stream);
                 self.shared.reset(stream, ErrorCode::new(REQUEST_CANCELLED));
                 return Ok(());
@@ -306,9 +308,15 @@ where
     fn closed(&mut self, stream: StreamId) {
         // The handler is *not* dropped. It runs to completion and its answer is discarded;
         // this only tells it, so a handler that wants to stop early can.
+        //
+        // The signal is dropped once tripped, though. Keeping one per exchange for the life
+        // of the connection would make an ordinary sequence of requests an unbounded
+        // allocation, which is the same failure as not having a limit at all.
         if let Some(index) = self.cancels.iter().position(|(s, _)| *s == stream) {
-            self.cancels[index].1.trip();
+            let (_, cancelled) = self.cancels.swap_remove(index);
+            cancelled.trip();
         }
+        self.endings.retain(|(s, _)| *s != stream);
     }
 
     fn busy(&self) -> bool {
@@ -354,7 +362,6 @@ impl<H, F: Future, B> ServerRole<H, F, B> {
                 Ending::Failed => {
                     // A handler's body failed. One exchange is abandoned; every other one
                     // on this connection carries on.
-                    eprintln!("SRV RESET response-body-failed");
                     self.shared
                         .reset(*stream, ErrorCode::new(REQUEST_CANCELLED));
                 }

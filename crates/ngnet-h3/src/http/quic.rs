@@ -130,6 +130,12 @@ pub enum QuicEvent {
     /// The number of bytes is a *delta*, not a cumulative offset. See the module
     /// documentation for when an implementation may emit this — the answer depends on
     /// [`QuicConnection::RETAINS_BUFFERS`] and getting it wrong is a use-after-free.
+    ///
+    /// **Every byte reported as accepted must eventually be released, exactly once.** An
+    /// implementation that under-reports holds the application's buffers for the life of the
+    /// connection; one that over-reports tells the state machine more was acknowledged than
+    /// was ever written, which releases a buffer nghttp3 may still be reading through. The
+    /// sum of the deltas for a stream must never exceed what that stream accepted.
     Released {
         /// The stream the bytes were written to.
         stream: StreamId,
@@ -249,9 +255,14 @@ pub trait QuicConnection {
     /// means it holds the application's memory until the peer acknowledges, so `Released`
     /// must not be reported before then.
     ///
-    /// **Declaring `false` while actually borrowing is a use-after-free.** This is a
-    /// constant rather than a comment so that the two cases cannot be confused by writing a
-    /// new adapter in the shape of an existing one.
+    /// **Declaring `false` while actually borrowing is a use-after-free.**
+    ///
+    /// Be clear about what this constant does and does not do. The layer does not branch on
+    /// it: whichever value an implementation declares, it must still report
+    /// [`QuicEvent::Released`] for every byte it accepts, and nothing is released until it
+    /// does. What the constant buys is that the choice has to be *made and written down*,
+    /// where a comment could be copied along with an adapter's shape and left unread. It is
+    /// a declaration for the reader, not a switch for the driver.
     const RETAINS_BUFFERS: bool;
 
     /// The next thing that happened on the connection.

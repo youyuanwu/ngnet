@@ -353,18 +353,35 @@ fn exceeding_the_concurrency_limit_refuses_rather_than_queues() {
 
     let mut pump = support::BothEnds::new(client, server);
     let mut pinned: Vec<_> = futures.into_iter().map(Box::pin).collect();
-    for _ in 0..200 {
-        for future in &mut pinned {
-            let _ = pump.peek(future);
+    let mut settled = vec![false; pinned.len()];
+    for _ in 0..400 {
+        for (index, future) in pinned.iter_mut().enumerate() {
+            if !settled[index] && pump.peek(future).is_some() {
+                settled[index] = true;
+            }
         }
         pump.round();
     }
 
-    assert!(
-        started.load(Ordering::Acquire) <= 2,
-        "more handlers ran at once than the limit allowed: {}",
-        started.load(Ordering::Acquire)
+    // Both halves matter. The cap must actually bind — no more than two handlers may be
+    // running — and it must *refuse* the rest rather than hold them, so the excess requests
+    // resolve instead of waiting forever on a queue the peer filled.
+    assert_eq!(
+        started.load(Ordering::Acquire),
+        2,
+        "the cap should admit exactly its limit, not fewer and not more"
     );
+    assert_eq!(
+        settled.iter().filter(|done| **done).count(),
+        4,
+        "the four requests over the cap should have been refused, not queued"
+    );
+    assert_eq!(
+        started.load(Ordering::Acquire),
+        2,
+        "a refused request must not start a handler later either"
+    );
+
     gate.open();
 }
 

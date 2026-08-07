@@ -78,11 +78,11 @@ pub struct QuinnBackend {
     quic: quinn::Connection,
     /// The sending half of every stream this endpoint may write to.
     sends: HashMap<i64, quinn::SendStream>,
+    /// Releases owed to the layer, produced by writes and drained by `poll_event`.
+    released: Vec<(StreamId, u64)>,
     events: mpsc::UnboundedReceiver<Incoming>,
     /// Held so the channel never closes of its own accord.
     _to_driver: mpsc::UnboundedSender<Incoming>,
-    /// Releases owed to the layer, produced by writes and drained by `poll_event`.
-    released: Vec<(StreamId, u64)>,
     /// Streams whose sending half has been finished.
     finished: Vec<i64>,
     /// How many more bytes the reader tasks may deliver.
@@ -116,9 +116,9 @@ impl QuinnBackend {
         Self {
             quic,
             sends: HashMap::new(),
+            released: Vec::new(),
             events,
             _to_driver: to_driver,
-            released: Vec::new(),
             finished: Vec::new(),
             budget,
             started: Instant::now(),
@@ -242,14 +242,13 @@ impl QuicConnection for QuinnBackend {
     type Error = QuinnError;
 
     // quinn's `write` copies into its own buffers, so the bytes belong to the application
-    // again the moment it returns. That is what makes reporting release on acceptance sound
-    // here — and it is exactly the claim this constant exists to make checkable rather than
-    // leave to a comment someone copies without its reasoning.
+    // again the moment it returns -- which is what makes reporting release on acceptance
+    // sound here, rather than waiting for the peer as a borrowing transport must.
     const RETAINS_BUFFERS: bool = false;
 
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Result<QuicEvent, Self::Error>> {
-        // Releases first: they are cheap, they free memory, and leaving them behind a
-        // backlog of inbound data would hold buffers for no reason.
+        // Releases first: they free memory, and queueing them behind inbound data would
+        // hold retained buffers for no reason.
         if let Some((stream, bytes)) = self.released.pop() {
             return Poll::Ready(Ok(QuicEvent::Released {
                 stream,
@@ -323,7 +322,9 @@ impl QuicConnection for QuinnBackend {
                     Poll::Ready(Err(_)) => WriteOutcome::Gone,
                     Poll::Ready(Ok(written)) => {
                         if written > 0 {
-                            // Sound because quinn copied: see `RETAINS_BUFFERS`.
+                            // Reported on acceptance, which is sound only because quinn
+                            // copied: see `RETAINS_BUFFERS`. A transport that borrowed the
+                            // bytes instead would have to wait for the peer.
                             released.push((stream, written as u64));
                         }
                         if fin && written == total && !finished.contains(&stream.get()) {

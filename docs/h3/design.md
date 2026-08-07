@@ -253,12 +253,16 @@ extended to it *even when its QUIC library manages windows itself* — otherwise
 bound moves out of flow control and into the process, where a fast peer can exhaust it. For
 quinn the two genuinely come apart, and its adapter says so where it implements the method.
 
-**The retain policy is a constant, not a convention.** `RETAINS_BUFFERS` says whether an
+**The retain policy is declared, not assumed.** `RETAINS_BUFFERS` says whether an
 implementation reads through the buffers it is given. A transport that copies may report
-release immediately; one that borrows must wait for acknowledgement. Declaring `false` while
-borrowing is a use-after-free, and the difference is too easy to lose when a new adapter is
-written in the shape of an existing one. The two implementations in this repository set it
-differently, so both arms are exercised.
+release as soon as a write returns; one that borrows must wait for the peer. Declaring
+`false` while borrowing is a use-after-free.
+
+The driver does not branch on it — every implementation reports release the same way, and
+nothing is freed until it does. What the constant buys is that the choice has to be made and
+written down, where a comment can be copied along with an adapter's shape and left unread.
+The two implementations in this repository declare it differently and reach the same answer
+by different routes, which is the useful thing to be able to see at a glance.
 
 **The clock is the backend's.** nghttp3 wants a timestamp on every read and the core will not
 invent one — that is what keeps `std::time` out of it. A transport necessarily has a runtime

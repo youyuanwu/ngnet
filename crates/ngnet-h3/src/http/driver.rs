@@ -48,6 +48,13 @@ use crate::handlers::{FieldSection, Shutdown};
 use crate::settings::Settings;
 use crate::stream::StreamId;
 
+/// How many recently-closed streams are remembered, for discarding late releases.
+///
+/// A release can only arrive for a stream the transport still knows about, so a tombstone
+/// need not outlive the transport's own accounting for it. This is generous enough that it
+/// never expires one that matters and small enough that the list cannot grow without bound.
+const CLOSED_TOMBSTONES: usize = 1024;
+
 /// `H3_REQUEST_CANCELLED`, the code an abandoned exchange carries.
 pub(crate) const REQUEST_CANCELLED: u64 = 0x10c;
 /// `H3_NO_ERROR`, for an orderly close.
@@ -262,15 +269,34 @@ pub(crate) struct Driver<Q> {
     pub(crate) config: Config,
     /// Streams the state machine has finished with, so a late release is dropped rather
     /// than reported as more acknowledgement than was ever written.
+    ///
+    /// Bounded: a tombstone only has to outlive the releases still in flight for its stream,
+    /// and the transport cannot report release for a stream it has already closed. Keeping
+    /// one per exchange for the life of the connection would turn ordinary traffic into an
+    /// unbounded allocation, so the oldest are dropped once there are more than a
+    /// connection could plausibly have in flight.
     closed: Vec<StreamId>,
     /// Streams blocked by congestion, reused across passes to avoid reallocating.
     blocked: Vec<StreamId>,
+    /// Unidirectional streams opened so far, kept across a `Pending`.
+    ///
+    /// Opening three streams is not one atomic act: a transport may hand over the first and
+    /// then make the second wait on the peer's stream limit. Rebuilding the list from
+    /// scratch on the next poll would open a fresh stream each time, spending the peer's
+    /// allowance without ever binding a control stream.
+    opened: Vec<StreamId>,
     /// One event taken while deciding whether to park, held for the next pass.
     ///
     /// The park has to answer "is there anything to do", and for the transport the only way
     /// to ask is to take an event. Throwing it away to answer the question would lose it, so
     /// it is kept here and consumed first next time round.
     pushback: Option<QuicEvent>,
+    /// A transport failure raised while parking, likewise held rather than dropped.
+    ///
+    /// The trait promises nothing about an error repeating, and a source that reports one
+    /// only once would otherwise have it swallowed -- turning a transport failure into a
+    /// hang, or into a connection that looks as though it closed cleanly.
+    pushback_error: Option<Error>,
     bound: bool,
     peer_gone: bool,
     /// The peer's limits, once it has stated them.
@@ -294,7 +320,9 @@ impl<Q: QuicConnection> Driver<Q> {
             config,
             closed: Vec::new(),
             blocked: Vec::new(),
+            opened: Vec::new(),
             pushback: None,
+            pushback_error: None,
             bound: false,
             peer_gone: false,
             peer_settings: None,
@@ -357,14 +385,14 @@ impl<Q: QuicConnection> Driver<Q> {
         if self.bound {
             return Poll::Ready(Ok(()));
         }
-        let mut ids = [StreamId::new(0).expect("zero is a valid identifier"); 3];
-        for slot in &mut ids {
+        while self.opened.len() < 3 {
             match self.backend.poll_open_uni(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(Self::transport(error))),
-                Poll::Ready(Ok(stream)) => *slot = stream,
+                Poll::Ready(Ok(stream)) => self.opened.push(stream),
             }
         }
+        let ids = &self.opened;
         if let Err(error) = self.conn.bind_control_stream(ids[0]) {
             return Poll::Ready(Err(error.into()));
         }
@@ -377,6 +405,9 @@ impl<Q: QuicConnection> Driver<Q> {
 
     /// Takes up to the configured number of transport events.
     fn take_events(&mut self, cx: &mut core::task::Context<'_>) -> Result<Vec<QuicEvent>> {
+        if let Some(error) = self.pushback_error.take() {
+            return Err(error);
+        }
         let mut taken = Vec::new();
         if let Some(event) = self.pushback.take() {
             taken.push(event);
@@ -494,8 +525,16 @@ impl<Q: QuicConnection> Driver<Q> {
             return Ok(());
         }
         if !delivered {
-            // The buffer is ours again but the data never arrived. Freeing it is right;
-            // reporting it as acknowledged would be a lie the peer could not corroborate.
+            // The buffer is the transport's to hand back but the data never arrived, so it
+            // must not be reported as acknowledged: that would claim more reached the peer
+            // than ever did, and the state machine's offset accounting would then release a
+            // buffer on the strength of it.
+            //
+            // Nothing else releases it either, so it is held until the stream closes. That
+            // errs in the safe direction — holding too long rather than freeing too early —
+            // but it *is* holding: a transport that cancels many sends on a long-lived
+            // connection accumulates them until those streams end. Recorded in
+            // `docs/h3/pending-work.md` rather than glossed.
             return Ok(());
         }
         self.conn
@@ -555,6 +594,9 @@ impl<Q: QuicConnection> Driver<Q> {
             return Ok(());
         }
         self.closed.push(stream);
+        if self.closed.len() > CLOSED_TOMBSTONES {
+            self.closed.drain(..self.closed.len() - CLOSED_TOMBSTONES);
+        }
         self.conn
             .close_stream_with(stream, closed, &mut self.events)
             .ok();
@@ -822,9 +864,13 @@ where
                         driver.pushback = Some(event);
                         Poll::Ready(())
                     }
-                    // An error is not lost either: parking would strand it, so the pass is
-                    // resumed and `take_events` reports it.
-                    Poll::Ready(Err(_)) => Poll::Ready(()),
+                    // An error is not lost either: it is kept and reported by the next
+                    // `take_events`, because the trait promises nothing about a transport
+                    // raising the same failure twice.
+                    Poll::Ready(Err(error)) => {
+                        driver.pushback_error = Some(Driver::<Q>::transport(error));
+                        Poll::Ready(())
+                    }
                 }
             })
             .await;

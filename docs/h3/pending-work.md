@@ -68,6 +68,19 @@ same as four. **Settle it by writing one**, and ngtcp2 is the most informative: 
 library nghttp3 was co-designed with, it is the one that forced the pull-shaped write side,
 and it is the only one of the four whose native model the trait has never been run against.
 
+### An undelivered release holds its buffer until the stream closes
+
+A transport may report bytes back with `delivered: false` — msquic does, when a send is
+cancelled. Those bytes must not reach the state machine as acknowledgement, because claiming
+more arrived than ever did is how its offset accounting frees a buffer early. So they are
+discarded, and nothing else releases the buffer: it is held until the stream closes.
+
+That errs in the safe direction, but it is still holding. A transport that cancels many sends
+on a long-lived connection accumulates them. **Settle it with a way to drop a retained buffer
+without reporting acknowledgement**, which the sans-I/O core does not currently offer — it
+would be a small addition beside `add_ack_offset`, and it is deliberately not being invented
+speculatively before a transport that needs it exists.
+
 ### The trait has no timer, datagram, priority or stream-limit surface
 
 quiche and ngtcp2 both require their caller to arm and fire a timer; an implementation over
