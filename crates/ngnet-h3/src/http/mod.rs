@@ -20,7 +20,14 @@
 //! # The QUIC boundary
 //!
 //! What this layer does *not* supply is QUIC. A caller brings an established connection
-//! behind a trait, so quinn, msquic, ngtcp2, s2n-quic, quiche or a test double are all
-//! implementations rather than forks. That trait starts *after* the handshake: no endpoint,
-//! TLS configuration, certificate handling or ALPN negotiation appears anywhere in it, and
-//! none of those concerns reaches this crate.
+//! behind [`QuicConnection`], so quinn, msquic, ngtcp2, s2n-quic, quiche or a test double
+//! are all implementations rather than forks. That trait starts *after* the handshake: no
+//! endpoint, TLS configuration, certificate handling or ALPN negotiation appears anywhere in
+//! it, and none of those concerns reaches this crate.
+
+pub mod quic;
+
+#[doc(hidden)]
+pub mod testing;
+
+pub use quic::{QuicConnection, QuicEvent, StreamSource, WriteOutcome};

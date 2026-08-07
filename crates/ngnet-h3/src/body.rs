@@ -29,14 +29,51 @@ use std::sync::Arc;
 ///
 /// This is deliberately not [`bytes::Bytes`]. That would be the obvious choice, but this
 /// crate declares exactly one non-optional dependency and a test enforces it, so the
-/// handle is defined here instead.
+/// handle is defined here instead. [`RetainedBytes::from_owner`] is how a caller who
+/// *does* have a `Bytes` — or any other reference-counted buffer — hands it over without
+/// a copy.
 ///
 /// [`bytes::Bytes`]: https://docs.rs/bytes
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RetainedBytes {
-    buffer: Arc<[u8]>,
+    store: Store,
     start: usize,
     end: usize,
+}
+
+/// Where the bytes actually live.
+///
+/// Two cases rather than one because the crate has no `bytes` dependency to name in its
+/// own types, but a caller who has one should not have to copy to use this crate. The
+/// erased case costs a second pointer indirection on every read; the owned case is what
+/// the crate's own [`FixedBody`] uses and stays flat.
+#[derive(Clone)]
+enum Store {
+    Owned(Arc<[u8]>),
+    Erased(Arc<dyn Owner>),
+}
+
+/// A buffer whose bytes stay put for as long as it is alive.
+///
+/// Sealed by being private: the blanket implementation below covers every type that can
+/// satisfy it, so there is nothing for a caller to implement.
+trait Owner: Send + Sync {
+    fn bytes(&self) -> &[u8];
+}
+
+impl<T: AsRef<[u8]> + Send + Sync + 'static> Owner for T {
+    fn bytes(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
+impl Store {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Owned(buffer) => buffer,
+            Self::Erased(owner) => owner.bytes(),
+        }
+    }
 }
 
 impl RetainedBytes {
@@ -45,7 +82,39 @@ impl RetainedBytes {
         let buffer: Arc<[u8]> = bytes.into();
         let end = buffer.len();
         Self {
-            buffer,
+            store: Store::Owned(buffer),
+            start: 0,
+            end,
+        }
+    }
+
+    /// Retains a buffer this crate cannot name, without copying it.
+    ///
+    /// The motivating case is [`bytes::Bytes`]: it is reference-counted already, so
+    /// copying it into an `Arc<[u8]>` to satisfy [`new`](Self::new) would defeat the whole
+    /// point of a zero-copy body path. Anything that can lend a stable slice works —
+    /// `Vec<u8>`, `Arc<Vec<u8>>`, a memory map, a caller's own buffer type.
+    ///
+    /// # What the owner must guarantee
+    ///
+    /// [`AsRef::as_ref`] must return the same bytes every time it is called. That is true
+    /// of every sane implementation and of every type in the standard library, but it is
+    /// not something the type system promises, and nghttp3 will hold the address across
+    /// many calls. An owner that shrinks between calls cannot cause unsoundness here —
+    /// the length is fixed at construction and every read is clamped, so the worst case is
+    /// that fewer bytes are offered than the accounting expects. It must not be relied on.
+    ///
+    /// `Send + Sync` is required rather than merely `Send` because the buffer is stored
+    /// behind an [`Arc`], and `Arc<T>` is only `Send` when `T` is both.
+    ///
+    /// [`bytes::Bytes`]: https://docs.rs/bytes
+    pub fn from_owner(owner: impl AsRef<[u8]> + Send + Sync + 'static) -> Self {
+        let owner: Arc<dyn Owner> = Arc::new(owner);
+        // Fixed once, here. Re-reading the length on every access would let a misbehaving
+        // owner change the size of a buffer nghttp3 is already pointing at.
+        let end = owner.bytes().len();
+        Self {
+            store: Store::Erased(owner),
             start: 0,
             end,
         }
@@ -53,12 +122,21 @@ impl RetainedBytes {
 
     /// The bytes this handle refers to.
     pub fn as_slice(&self) -> &[u8] {
-        &self.buffer[self.start..self.end]
+        // Clamped rather than indexed directly. The bounds cannot be wrong for an owner
+        // that behaves, and for one that does not this is the difference between fewer
+        // bytes than expected and a panic — which, reached from a body source, would
+        // unwind into a C frame and abort the process.
+        let all = self.store.bytes();
+        let end = self.end.min(all.len());
+        let start = self.start.min(end);
+        &all[start..end]
     }
 
     /// How many bytes this handle refers to.
     pub fn len(&self) -> usize {
-        self.end - self.start
+        // Derived from the same place as `as_slice`, so the two cannot disagree about a
+        // buffer nghttp3 has been handed.
+        self.as_slice().len()
     }
 
     /// Whether this handle refers to no bytes.
@@ -73,12 +151,20 @@ impl RetainedBytes {
     pub fn split_to(&mut self, n: usize) -> Self {
         let n = n.min(self.len());
         let head = Self {
-            buffer: Arc::clone(&self.buffer),
+            store: self.store.clone(),
             start: self.start,
             end: self.start + n,
         };
         self.start += n;
         head
+    }
+}
+
+impl core::fmt::Debug for RetainedBytes {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RetainedBytes")
+            .field("len", &self.len())
+            .finish()
     }
 }
 
@@ -185,7 +271,63 @@ mod tests {
         assert_eq!(bytes.as_slice(), b" world");
         // Both halves refer into the same buffer, which is what lets release accounting
         // hold one handle per offered vector without duplicating the payload.
-        assert!(Arc::ptr_eq(&head.buffer, &bytes.buffer));
+        assert!(std::ptr::eq(
+            head.as_slice().as_ptr(),
+            bytes.as_slice().as_ptr().wrapping_sub(5)
+        ));
+    }
+
+    #[test]
+    fn an_erased_owner_is_not_copied() {
+        // The whole point of `from_owner`: the retained handle must point *into* the
+        // caller's allocation, not at a duplicate of it. Compared by address, because
+        // comparing by value would pass just as well for a copy.
+        // Moving the `Vec` does not move its heap allocation, so the address taken before
+        // the move is the one the handle must end up pointing at.
+        let owner = b"hello world".to_vec();
+        let address = owner.as_ptr();
+
+        let bytes = RetainedBytes::from_owner(owner);
+        assert_eq!(bytes.as_slice(), b"hello world");
+        assert!(std::ptr::eq(bytes.as_slice().as_ptr(), address));
+    }
+
+    #[test]
+    fn an_erased_owner_survives_splitting() {
+        let owner = b"hello world".to_vec();
+        let address = owner.as_ptr();
+
+        let mut bytes = RetainedBytes::from_owner(owner);
+        let head = bytes.split_to(5);
+
+        assert_eq!(head.as_slice(), b"hello");
+        assert_eq!(bytes.as_slice(), b" world");
+        // Neither half copied: both still point into the original allocation.
+        assert!(std::ptr::eq(head.as_slice().as_ptr(), address));
+        assert!(std::ptr::eq(
+            bytes.as_slice().as_ptr(),
+            address.wrapping_add(5)
+        ));
+    }
+
+    #[test]
+    fn an_owner_that_shrinks_cannot_panic() {
+        // `AsRef` is not required by the type system to be stable, and a panic here would
+        // unwind into a C frame and abort. Clamping turns the worst case into fewer bytes
+        // than expected, which is a protocol problem rather than a process-ending one.
+        struct Shrinking(std::sync::atomic::AtomicUsize);
+        impl AsRef<[u8]> for Shrinking {
+            fn as_ref(&self) -> &[u8] {
+                let seen = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if seen == 0 { b"abcdef" } else { b"ab" }
+            }
+        }
+
+        let bytes = RetainedBytes::from_owner(Shrinking(std::sync::atomic::AtomicUsize::new(0)));
+        // The length was fixed at construction from the first call; every read after that
+        // sees a shorter slice and is clamped rather than indexed out of bounds.
+        assert_eq!(bytes.as_slice(), b"ab");
+        assert_eq!(bytes.len(), 2);
     }
 
     #[test]
