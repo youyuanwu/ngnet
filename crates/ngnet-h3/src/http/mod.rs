@@ -25,9 +25,12 @@
 //! endpoint, TLS configuration, certificate handling or ALPN negotiation appears anywhere in
 //! it, and none of those concerns reaches this crate.
 
+mod error;
+mod head;
 pub mod quic;
 
 #[doc(hidden)]
 pub mod testing;
 
+pub use error::{Error, ErrorKind, Result};
 pub use quic::{QuicConnection, QuicEvent, StreamSource, WriteOutcome};

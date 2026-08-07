@@ -607,3 +607,58 @@ impl StreamSource for ScriptedSource {
         true
     }
 }
+
+/// Head conversion, reachable from integration tests.
+///
+/// The conversions are `pub(crate)`: they are an implementation detail of the driver, not
+/// API. Integration tests are separate crates and cannot see them, and the alternative —
+/// testing the whole of RFC 9114's field-section rules only through a driver — would make a
+/// rejected head indistinguishable from a driver bug. So they are re-exported here, hidden
+/// and unsupported, exactly as this module's own documentation describes.
+pub mod head {
+    use crate::http::error::Result;
+
+    /// Encodes a request head, returning the field section as name/value pairs.
+    pub fn request_fields(parts: &http::request::Parts) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(pairs(&super::super::head::request_fields(parts)?))
+    }
+
+    /// Encodes a response head, returning the field section as name/value pairs.
+    pub fn response_fields(parts: &http::response::Parts) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(pairs(&super::super::head::response_fields(parts)?))
+    }
+
+    /// Encodes a trailing field section as name/value pairs.
+    pub fn trailer_fields(trailers: &http::HeaderMap) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(pairs(&super::super::head::trailer_fields(trailers)?))
+    }
+
+    /// Decodes a received request field section.
+    pub fn request_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Request<()>> {
+        super::super::head::request_head(fields)
+    }
+
+    /// Decodes a received response field section.
+    pub fn response_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Response<()>> {
+        super::super::head::response_head(fields)
+    }
+
+    /// Decodes a received trailing field section.
+    pub fn trailers(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::HeaderMap> {
+        super::super::head::trailers(fields)
+    }
+
+    /// Whether a status code is informational, and so does not settle an exchange.
+    pub fn is_informational(status: http::StatusCode) -> bool {
+        super::super::head::is_informational(status)
+    }
+
+    fn pairs(fields: &super::super::head::OwnedFields) -> Vec<(Vec<u8>, Vec<u8>)> {
+        fields
+            .views()
+            .expect("already validated during encoding")
+            .iter()
+            .map(|field| (field.name().to_vec(), field.value().to_vec()))
+            .collect()
+    }
+}
