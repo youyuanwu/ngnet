@@ -455,6 +455,87 @@ fn the_async_subtree_exists_and_is_scanned() {
     );
 }
 
+/// Facilities the asynchronous layer must not reach for either.
+///
+/// A shorter list than the core's, and for a different reason. The layer is allowed to be
+/// asynchronous — that is the point of it — but it must not bring a *runtime*. Spawning,
+/// sleeping and threading are what would make it choose an executor on the caller's behalf,
+/// and the whole design rests on it choosing none.
+const NO_RUNTIME: &[&str] = &[
+    "std::thread",
+    "thread::spawn",
+    "tokio",
+    "async_std",
+    "smol",
+    "futures_executor",
+    "std::time::sleep",
+    "spawn(",
+];
+
+/// The one file in the subtree exempt from the runtime scan, and why.
+///
+/// `testing.rs` contains a `block_on` built on a condition variable, so integration tests
+/// can drive a connection with no runtime at all. That is a *test* facility, doc-hidden and
+/// unsupported, and it is the reason the whole suite needs no async runtime; excluding it is
+/// what lets the scan say something true about the shipped layer.
+const RUNTIME_SCAN_EXEMPT: &str = "testing.rs";
+
+#[test]
+fn the_async_layer_brings_no_runtime() {
+    let mut findings = Vec::new();
+    let mut scanned = 0usize;
+    for path in async_files() {
+        if path
+            .file_name()
+            .is_some_and(|name| name == RUNTIME_SCAN_EXEMPT)
+        {
+            continue;
+        }
+        scanned += 1;
+        let source = std::fs::read_to_string(&path).expect("reading a source file");
+        let stripped = strip_comments_and_literals(&source);
+        for facility in NO_RUNTIME {
+            if stripped.contains(facility) {
+                findings.push(format!("{}: {facility}", path.display()));
+            }
+        }
+    }
+
+    assert!(
+        scanned > 0,
+        "the runtime scan matched no files; its exemption has swallowed the subtree"
+    );
+    assert!(
+        findings.is_empty(),
+        "the async layer must take no executor, spawner or timer: {findings:#?}"
+    );
+}
+
+#[test]
+fn the_async_layer_grants_itself_no_unsafe_allowance() {
+    // A different claim from containing no `unsafe`, and the one that guards it. The
+    // crate-level `#![deny(unsafe_code)]` is what turns an `unsafe` block in the subtree
+    // into a compile error, and `#[allow(unsafe_code)]` is exactly how that would be
+    // silenced -- so the allowance itself is what must not appear anywhere below `src/http/`.
+    //
+    // Checked by scanning the subtree rather than by comparing against the allowance list in
+    // `lib.rs`: that list names crate-root modules, and `http::error` shares a file stem
+    // with `error`, so comparing names would confuse the two.
+    let mut offenders = Vec::new();
+    for path in async_files() {
+        let source = std::fs::read_to_string(&path).expect("reading a source file");
+        // Read raw rather than stripped: an allowance inside a doc example still applies.
+        if source.contains("allow(unsafe_code)") {
+            offenders.push(path);
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these async modules grant themselves `unsafe`, which is how the crate-level deny \
+         would be silenced: {offenders:#?}"
+    );
+}
+
 #[test]
 fn an_included_doc_cannot_smuggle_async_past_the_scan() {
     // `include_str!` splices a file's contents into the source the compiler sees but not
