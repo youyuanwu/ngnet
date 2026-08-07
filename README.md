@@ -14,22 +14,26 @@ Design notes, the invariants the test suite pins, and the tracked backlog live i
 | [`ngnet-h2`](crates/ngnet-h2) | Safe, sans-I/O API driving a client or server connection, the caller owning the transport — plus an optional asynchronous `http`/`http-body` client and server built on it (default `http` feature). |
 | [`ngnet-h2-sys`](crates/ngnet-h2-sys) | Raw FFI bindings. Builds libnghttp2 from source and generates bindings with `bindgen`. |
 | [`ngnet-h2-tests`](crates/ngnet-h2-tests) | Not published. Drives `ngnet-h2` over a real async transport, so the wrapper needs no runtime dependency of its own. |
-| [`ngnet-h3`](crates/ngnet-h3) | Safe, sans-I/O API driving an HTTP/3 client or server connection over QUIC streams the caller owns. No asynchronous layer, and no QUIC or TLS of its own. |
+| [`ngnet-h3`](crates/ngnet-h3) | Safe, sans-I/O API driving an HTTP/3 client or server connection over QUIC streams the caller owns — plus an optional asynchronous `http`/`http-body` client and server built on it (default `http` feature). No QUIC or TLS of its own. |
 | [`ngnet-h3-sys`](crates/ngnet-h3-sys) | Raw FFI bindings. Builds libnghttp3 from source and generates bindings with `bindgen`. |
-| [`ngnet-h3-tests`](crates/ngnet-h3-tests) | Not published. Drives `ngnet-h3` over a real QUIC connection using [quinn](https://github.com/quinn-rs/quinn), so the wrapper needs no transport dependency of its own. |
+| [`ngnet-h3-tests`](crates/ngnet-h3-tests) | Not published. Drives `ngnet-h3` over a real QUIC connection using [quinn](https://github.com/quinn-rs/quinn), so the wrapper needs no transport dependency of its own. Contains the reference `QuicConnection` implementation. |
 
 ### HTTP/3, and what it deliberately is not
 
-`ngnet-h3` is the sans-I/O core and nothing above it. It owns no socket, no
-runtime and no QUIC implementation: you open the QUIC streams, tell the
-connection which of them carry control and QPACK data, and move bytes in and out.
-That boundary is where nghttp3 itself draws the line — nghttp3 depends on no QUIC
-transport and on no TLS library, and neither does this crate.
+`ngnet-h3` owns no socket, no runtime and no QUIC implementation. That boundary
+is where nghttp3 itself draws the line — it depends on no QUIC transport and on
+no TLS library — and neither does this crate.
 
-So there is no asynchronous `http`/`http-body` layer here, as there is for
-HTTP/2, and no bundled QUIC or TLS. Those are choices rather than omissions: this
-crate is what such a layer would be built on. Server push is absent because
-nghttp3 does not implement it.
+The sans-I/O core is the whole of it with the `http` feature off: you open the
+QUIC streams, tell the connection which carry control and QPACK data, and move
+bytes in and out. With the feature on, the asynchronous layer does all of that
+for you and you write `http::Request` and `http::Response` instead. What it still
+does not do is supply QUIC: you bring an *established* connection behind the
+`QuicConnection` trait, so choosing a QUIC library, authenticating the peer and
+negotiating `h3` remain yours. `ngnet-h3-tests` has a working implementation of
+that trait over quinn to copy.
+
+Server push is absent because nghttp3 does not implement it.
 
 ## Building
 

@@ -9,9 +9,10 @@ in ways that are easy to miss.
 ```
 ngnet-h3-sys      raw FFI; builds libnghttp3 from deps/nghttp3
    ↑
-ngnet-h3          sans-I/O connection state machine  (no async layer)
+ngnet-h3          sans-I/O connection state machine
+   ↑              + src/http/, an async API behind the default-on `http` feature
    ↑
-ngnet-h3-tests    unpublished; drives the wrapper over a real quinn connection
+ngnet-h3-tests    unpublished; drives both over a real quinn connection
 ```
 
 `ngnet-h3` performs no I/O. It opens no socket, blocks nowhere, creates no threads and reads
@@ -24,9 +25,13 @@ that structurally — the crate may not so much as *name* `std::net`, `std::fs`,
 That boundary is inherited rather than invented: nghttp3 depends on no QUIC transport and on
 no TLS library, so neither does this.
 
-Unlike `ngnet-h2`, there is **no asynchronous layer** — no `http`/`http-body` API, no
-feature gating one. This crate is the core such a layer would be built on. Server push is
-absent because nghttp3 does not implement it.
+The async layer at `src/http/` sits above that boundary and inherits none of it: it is
+allowed to be asynchronous, which is the point of it, and the structural tests are scoped
+accordingly — the core's scan runs over everything *outside* `src/http/`, and the subtree
+makes its own narrower promises instead. Disabling the `http` feature returns the crate to
+exactly what the paragraph above describes, with one dependency and no asynchrony at all.
+
+Server push is absent because nghttp3 does not implement it.
 
 ## Five differences from nghttp2 that are load-bearing
 
@@ -192,3 +197,114 @@ unrecoverable off the read path, so the code alone cannot say.
 - A panic inside a caller-supplied handler unwinds into a C frame and aborts. This is the
   accepted contract, matching `ngnet-h2`: `catch_unwind` would have to invent a return value
   for a callback whose contract has no "the handler is broken" case.
+
+
+## The asynchronous layer
+
+Behind the default-on `http` feature, `src/http/` turns the state machine into an API a
+caller reaches through `http::Request`, `http::Response` and `http_body::Body`. It exists
+because the core, correct as it is, cannot be used without first writing a QUIC integration:
+three unidirectional streams to open and bind, a two-phase write to drive, acknowledgement to
+report, credit to extend, per-stream bookkeeping throughout. The crate documentation lists
+thirteen such obligations and the layer discharges all of them.
+
+It takes no executor, spawner or timer. Handlers are futures the driver polls, not tasks it
+spawns, and a structural test scans the subtree for the facilities that would betray a
+runtime having crept in.
+
+### The QUIC boundary
+
+`QuicConnection` abstracts an **established** connection. No endpoint, TLS configuration,
+certificate or ALPN identifier appears anywhere in it, so none of those concerns reaches this
+crate — which is the same boundary nghttp3 itself draws, one level up.
+
+Its shape was checked against the published APIs of **quiche**, **s2n-quic**, **msquic** and
+**ngtcp2** before it was written, and that survey changed it in four places. The design is
+worth stating with its reasons, because every part of it looks arbitrary without them.
+
+**Reads are one connection-level event stream.** `poll_event` yields the next thing that
+happened on any stream. That is msquic's and ngtcp2's native shape — both are already
+callback-demultiplexed — and it lets the driver hold no per-stream futures and spawn nothing.
+A per-stream poll would have been quinn's shape and only quinn's.
+
+**Writes are pulled by the transport, not pushed at it.** When a transport has room it calls
+`StreamSource::write_next`, and the layer answers with the next stream nghttp3 wants to write.
+The obvious alternative — `write(stream, bytes) -> accepted` — is incompatible with ngtcp2,
+which is the QUIC library nghttp3 was co-designed with: it fills a *packet* and asks the
+application for stream data as it goes, so a push-shaped adapter would have to queue and copy
+every outgoing byte. That copy would defeat the retain contract, which is the entire reason a
+release signal exists. Pulling costs the other three nothing; each becomes a loop.
+
+It also makes the two-phase write contract structurally keepable. `Conn::writev_stream`
+hands back a `SendGuard` that must be committed or abandoned, and under the pull shape the
+guard is acquired, offered and disposed of inside a single function it cannot escape — so
+there is no path, including `?` and early return, on which one leaks.
+
+**Receive credit is explicit.** `extend_credit` was the clearest quinn fingerprint in the
+first draft *by its absence*: quinn returns credit implicitly when a chunk is read, so
+nothing looked missing, but ngtcp2 requires `ngtcp2_conn_extend_max_stream_offset` and msquic
+requires `StreamReceiveComplete`, and omitting it deadlocks both at the initial window. The
+layer calls it twice for the same bytes, once naming the stream and once for the connection,
+because stream credit does not imply connection credit.
+
+It is also the bound on the event stream, and that obligation is separate from the QUIC-level
+meaning. A transport that reads ahead of the layer must limit that read-ahead by the credit
+extended to it *even when its QUIC library manages windows itself* — otherwise the memory
+bound moves out of flow control and into the process, where a fast peer can exhaust it. For
+quinn the two genuinely come apart, and its adapter says so where it implements the method.
+
+**The retain policy is a constant, not a convention.** `RETAINS_BUFFERS` says whether an
+implementation reads through the buffers it is given. A transport that copies may report
+release immediately; one that borrows must wait for acknowledgement. Declaring `false` while
+borrowing is a use-after-free, and the difference is too easy to lose when a new adapter is
+written in the shape of an existing one. The two implementations in this repository set it
+differently, so both arms are exercised.
+
+**The clock is the backend's.** nghttp3 wants a timestamp on every read and the core will not
+invent one — that is what keeps `std::time` out of it. A transport necessarily has a runtime
+and therefore a clock; ngtcp2 exposes `ngtcp2_conn_get_timestamp` for exactly this.
+
+### What the survey found missing outright
+
+Three things were absent from the first draft and are present because a library other than
+quinn needed them: `extend_credit`, above; `close` with an application error code, which all
+four expose and HTTP/3 requires; and a stream-closed event carrying *both* directions' error
+codes, which `Conn::close_stream_with` needs and without which a per-stream handle map can
+only grow. `Released` also gained a `delivered` flag, because msquic's `SEND_COMPLETE` can
+mean "your buffer is back but the data was cancelled", and reporting that as acknowledgement
+would be a protocol lie.
+
+### Two asymmetries that look like inconsistencies
+
+**Dropping an unread body.** A client's unread *response* body abandons its exchange; a
+server's unread *request* body does not. A handler that ignores the body it was given still
+owes an answer, so abandoning there would destroy an exchange that is very much alive.
+
+**Waker liveness.** A body's waker goes inert when its stream is forgotten. A handler's waker
+is gated on the *handler* existing instead, because a handler routinely outlives its exchange
+— the peer resets, and the future answering it is still running — and it must stay pollable
+or it is held forever un-woken.
+
+### Delivery cannot assume containment
+
+Received body bytes are handed over as refcounted views of the transport's buffer wherever
+possible, but the bytes a handler receives are **not guaranteed to lie inside it**. When a
+stream's QPACK decoding is blocked, nghttp3 buffers the input and replays it later from its
+own memory, during a call that is feeding a different stream entirely. `Bytes::slice_ref`
+panics off-allocation, and a panic reached from a handler unwinds into a C frame and aborts
+the process — so containment is checked and the replay path copies.
+
+### A caller's body failure is not the state machine's
+
+`BodyOutcome::Fail` is connection-fatal: it poisons the connection and releases every
+retained buffer. A caller's body reporting an error must not do that to every unrelated
+exchange sharing the connection, so the layer ends the body, resets that one stream, and
+reports `ErrorKind::Body`.
+
+### One addition to the core
+
+`RetainedBytes::from_owner`. The handle owned an `Arc<[u8]>` and `From<&[u8]>` copies, so a
+`bytes::Bytes` could not become one without a copy — which made the zero-copy body path
+impossible rather than merely awkward. An erased owner needs no dependency and no `unsafe`.
+Its length is fixed at construction and every read is clamped, so an ill-behaved `AsRef`
+cannot panic inside a C frame.

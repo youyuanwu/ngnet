@@ -24,6 +24,7 @@
 //! are all implementations rather than forks. That trait starts *after* the handshake: no
 //! endpoint, TLS configuration, certificate handling or ALPN negotiation appears anywhere in
 //! it, and none of those concerns reaches this crate.
+#![doc = include_str!("doc_async_example.md")]
 
 mod body;
 mod client;
