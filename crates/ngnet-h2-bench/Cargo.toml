@@ -6,7 +6,6 @@ publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 
 # This crate exists so the comparison against a third-party HTTP/2 stack lives outside
 # `ngnet-h2`, which takes exactly one dependency and no dev-dependencies. Everything the

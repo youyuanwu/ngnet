@@ -6,7 +6,6 @@ publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 
 # This crate exists so that an async runtime can be exercised against `ngnet-h2` without
 # the wrapper itself acquiring a dependency on one. `ngnet-h2` has exactly one dependency

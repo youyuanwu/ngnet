@@ -5,7 +5,6 @@ description = "Safe, sans-I/O Rust bindings to libnghttp2 for cleartext HTTP/2 (
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 
 [features]
 # The async `http` layer is the headline API, so it is on by default. Disabling it
@@ -19,8 +18,8 @@ tokio = ["http", "dep:tokio"]
 # additionally because it compiles no readiness backend: enabling it on a host without
 # io_uring gets a runtime that fails to start rather than one that quietly uses epoll.
 #
-# This feature has a higher minimum toolchain than the crate's `rust-version`. compio's
-# buffer crate needs a newer compiler than 1.85, and pinning compio back far enough to reach
+# This feature needs a newer compiler than the rest of the workspace would. compio's
+# buffer crate is the reason, and pinning compio back far enough to reach
 # it would mean an ancient io_uring stack. The baseline applies to the crate as published —
 # default and `tokio` builds honour it — and enabling this feature opts into a newer
 # compiler, which is why it is off by default.

@@ -81,7 +81,7 @@ test, and no more.
   io_uring. Body uploads improved where a `HEADERS` block could be folded into the first DATA
   frame's `writev` (-15% at 1 KiB, -14% at 64 KiB); at 1 MiB the effect is neutral, which is
   what was wanted there — the goal at large bodies was to avoid the copy a coalescing path
-  would have imposed, not to gain. See `docs/benchmarks.md`.
+  would have imposed, not to gain. See `benchmarks.md`.
 - **Neither driver write buffer is preallocated.** `gathered` and `out` both start as
   `BytesMut::new()` and grow to their steady-state high-water marks, reallocating a few times
   during warm-up before settling — which is why `http_zero_alloc.rs` measures only the steady
@@ -99,7 +99,7 @@ test, and no more.
   16 KiB DATA frames included, so its bound is the flow-control window the *peer* advertises,
   which a peer may raise. Measure before picking either; 16 KiB is unlikely to be right for
   both. Removing `out`'s per-pass allocation was worth about 4-7% to the completion transport
-  (see `docs/benchmarks.md`), and the residual warm-up cost is what this entry is about.
+  (see `benchmarks.md`), and the residual warm-up cost is what this entry is about.
 
   Two second-order effects are worth knowing before anyone revisits this, neither a defect.
   `BytesMut::reserve` folds the split offset into the requested capacity before doubling, so a
@@ -153,7 +153,7 @@ test, and no more.
   `mem_send2` call, so a large upload is one write per frame; handing the body over lets a
   whole flow-control window's worth of frames ride in one gathering write. The batch is bounded
   by the 64 KiB initial window, not by `MAX_REGIONS`, which is a guard rail rather than the
-  binding constraint. See `docs/benchmarks.md` for the numbers, the drift controls and the
+  binding constraint. See `benchmarks.md` for the numbers, the drift controls and the
   method.
 
   **What is actually still open:**
@@ -186,6 +186,17 @@ test, and no more.
 - **SC-006's error path is evidenced by construction only.** No test exercises what a caller
   sees when io_uring is unavailable, because this machine cannot make it unavailable to order
   and a mocked one would test the mock.
+
+## Toolchain upgrades cost lint fixes
+
+Raising `rust-toolchain.toml` is routine but rarely free: each release adds lints, and this
+repository lints with `-D warnings`. The 1.95 → 1.97.1 move needed two — `manual_noop_waker`
+(a test waker that predated `Waker::noop`) and sixteen `collapsible_if` sites, all of them
+nested `if`s written that way because let-chains were once forbidden.
+
+Neither was a defect, and `cargo clippy --fix` handled the second. Recorded so the next
+person raising the pin expects a lint pass rather than a surprise, and knows to check the
+diff rather than trusting `--fix` blindly.
 
 ## Deliberate scope boundaries
 

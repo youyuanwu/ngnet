@@ -617,12 +617,12 @@ impl<C> Conn<C> {
                  unidirectional stream is written to, never read from",
             ));
         }
-        if let Some(last) = self.last_timestamp {
-            if now < last {
-                return Err(Error::invalid_input(
-                    "the timestamp went backwards; nghttp3 requires a non-decreasing clock",
-                ));
-            }
+        if let Some(last) = self.last_timestamp
+            && now < last
+        {
+            return Err(Error::invalid_input(
+                "the timestamp went backwards; nghttp3 requires a non-decreasing clock",
+            ));
         }
         self.last_timestamp = Some(now);
 

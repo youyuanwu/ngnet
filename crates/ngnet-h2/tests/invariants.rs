@@ -548,241 +548,6 @@ fn the_crate_declares_no_dev_dependencies() {
     );
 }
 
-/// The byte index of the first use of `keyword` as a token in `code`, if any.
-///
-/// The token rule is [`uses_keyword`]'s: an identifier such as `lettuce` contains the
-/// letters of `let` but is not the keyword, and matching it would make the let-chain scan
-/// below fire on innocent code.
-fn find_keyword(code: &str, keyword: &str) -> Option<usize> {
-    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
-
-    code.match_indices(keyword)
-        .find(|(index, _)| {
-            let before_ok =
-                *index == 0 || !code[..*index].chars().next_back().is_some_and(is_ident);
-            let after = &code[index + keyword.len()..];
-            let after_ok = !after.chars().next().is_some_and(is_ident);
-            before_ok && after_ok
-        })
-        .map(|(index, _)| index)
-}
-
-/// The text of an `if`/`while` header: everything from just after the keyword up to the
-/// block, statement, or match-arm boundary that ends the condition.
-///
-/// Deliberately naive, like the other scanners here: it tracks `()`/`[]` nesting so a
-/// closure body inside a call — `foo(|x| { .. })` — does not look like the block, and
-/// stops at the `;` of a `let` statement (never a header) or the `=>` of a match guard,
-/// both at nesting depth zero.
-///
-/// A `{` at depth zero is the interesting case, because it may open either the body — which
-/// ends the header — or a block expression *within* the condition, which does not. Both are
-/// legal: `if let Some(x) = { y } && x > 0 { .. }` and `if let Some(x) = match y { v => v }
-/// && x > 0 { .. }` both compile, and both are let-chains. They are told apart by what
-/// follows the matching `}`: an operator means the block was part of the condition and the
-/// scan continues past it, anything else means the body has been reached. Getting this
-/// wrong in the lenient direction would silently miss a chain, which is the one outcome
-/// this scan exists to prevent.
-fn header_up_to_block(code: &str) -> &str {
-    let chars: Vec<(usize, char)> = code.char_indices().collect();
-    let mut depth = 0i32;
-    let mut prev = ' ';
-    let mut i = 0;
-    while i < chars.len() {
-        let (index, ch) = chars[i];
-        match ch {
-            '(' | '[' => depth += 1,
-            ')' | ']' => depth -= 1,
-            ';' if depth == 0 => return &code[..index],
-            // The `>` of a `=>` match-guard arrow, distinguished from `>=` and generics by
-            // its preceding `=`.
-            '>' if depth == 0 && prev == '=' => return &code[..index],
-            '{' if depth == 0 => {
-                let Some(close) = matching_brace(&chars, i) else {
-                    // Unbalanced: treat the brace as the body, the conservative reading for
-                    // a scanner that must never run past the construct it is looking at.
-                    return &code[..index];
-                };
-                if !continues_condition(&chars, close) {
-                    return &code[..index];
-                }
-                // A block expression inside the condition. Step over it; its interior is
-                // nested text, which `header_at_top_level` blanks out.
-                i = close;
-            }
-            _ => {}
-        }
-        prev = ch;
-        i += 1;
-    }
-    code
-}
-
-/// The index of the `}` closing the `{` at `open`, if the braces balance.
-fn matching_brace(chars: &[(usize, char)], open: usize) -> Option<usize> {
-    let mut depth = 0i32;
-    for (offset, (_, ch)) in chars.iter().enumerate().skip(open) {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(offset);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Whether the token after the `}` at `close` continues an expression.
-///
-/// `&&`, `||`, `.`, `?` and the comparison operators can only follow a block that was
-/// *part of* the condition; a body block is followed by the end of the construct, an
-/// `else`, or the next statement.
-fn continues_condition(chars: &[(usize, char)], close: usize) -> bool {
-    let next = chars
-        .iter()
-        .skip(close + 1)
-        .find(|(_, ch)| !ch.is_whitespace());
-    matches!(
-        next.map(|(_, ch)| *ch),
-        Some('&' | '|' | '.' | '?' | '=' | '!' | '<' | '>' | '+' | '-' | '*' | '/' | '%')
-    )
-}
-
-/// The parts of `header` that sit at `()`/`[]` nesting depth zero, joined by spaces.
-///
-/// A `let` or `&&` inside parentheses, brackets or braces belongs to something nested in
-/// the condition — most often a closure passed as an argument, as in
-/// `if v.iter().any(|x| { let y = *x; y > 0 }) && v.len() > 1` — and not to the condition
-/// itself. Counting those would call that a let-chain, which it is not. Splitting the
-/// nested text out first is what keeps the detector from crying wolf on ordinary code.
-fn header_at_top_level(header: &str) -> String {
-    let mut depth = 0i32;
-    let mut top = String::with_capacity(header.len());
-    for ch in header.chars() {
-        match ch {
-            '(' | '[' | '{' => {
-                depth += 1;
-                top.push(' ');
-            }
-            ')' | ']' | '}' => {
-                depth -= 1;
-                top.push(' ');
-            }
-            _ if depth == 0 => top.push(ch),
-            // Nested text is replaced rather than dropped so tokens on either side of it
-            // cannot be spliced into a word that was never written.
-            _ => top.push(' '),
-        }
-    }
-    top
-}
-
-/// Whether `code` contains a let-chain: an `if`/`while` header that binds with `let` and
-/// joins another condition with `&&`, such as `if let Some(x) = a && cond`.
-///
-/// Let-chains are stable only from Rust 1.88, so on the crate's 1.85 MSRV they do not
-/// compile. This catches them as text, on every toolchain, so a let-chain written on a
-/// newer toolchain is rejected here rather than only when CI reaches the MSRV build.
-fn contains_let_chain(code: &str) -> bool {
-    for keyword in ["if", "while"] {
-        let mut rest = code;
-        while let Some(at) = find_keyword(rest, keyword) {
-            let after_keyword = &rest[at + keyword.len()..];
-            let header = header_at_top_level(header_up_to_block(after_keyword));
-            if header.contains("&&") && find_keyword(&header, "let").is_some() {
-                return true;
-            }
-            rest = after_keyword;
-        }
-    }
-    false
-}
-
-#[test]
-fn the_let_chain_detector_distinguishes_chains_from_plain_conditions() {
-    // A let-chain in every position it can take.
-    assert!(contains_let_chain("if let Some(x) = a && cond { }"));
-    assert!(contains_let_chain(
-        "while let Some(x) = it.next() && x > 0 { }"
-    ));
-    assert!(contains_let_chain("if flag && let Some(x) = a { }"));
-    assert!(contains_let_chain("if let Some(x) = a\n    && cond\n{ }"));
-
-    // Not let-chains: a plain `&&` condition, a lone `if let`, a `let` statement, and a
-    // match guard that merely uses `&&`.
-    assert!(!contains_let_chain("if a && b { }"));
-    assert!(!contains_let_chain("if let Some(x) = a { }"));
-    assert!(!contains_let_chain("let x = a && b;"));
-    assert!(!contains_let_chain("match v { x if a && b => 1, _ => 0 }"));
-    // A closure body inside the condition must not be mistaken for the header's block.
-    assert!(!contains_let_chain(
-        "if v.iter().any(|x| { *x }) && v.len() > 1 { }"
-    ));
-    // Nor may a `let` *inside* such a closure body be read as the chain's binding: it
-    // belongs to the closure, not to the condition. This is the false positive the
-    // top-level split exists to prevent.
-    assert!(!contains_let_chain(
-        "if v.iter().any(|x| { let y = *x; y > 0 }) && v.len() > 1 { }"
-    ));
-    assert!(!contains_let_chain(
-        "while q.retain(|x| { let k = key(x); k > 0 }) && q.len() > 1 { }"
-    ));
-    // A genuine chain must still be caught when a closure sits beside it.
-    assert!(contains_let_chain(
-        "if let Some(x) = v.iter().find(|y| { let z = **y; z > 0 }) && x > 1 { }"
-    ));
-
-    // A block expression *in the condition* does not end the header. All three of these
-    // compile on edition 2024 and all three are let-chains, so missing them would be a
-    // silent hole in the only guard the `completion`-gated code has.
-    assert!(contains_let_chain("if let Some(x) = { y } && x > 0 { }"));
-    assert!(contains_let_chain(
-        "if let Some(x) = match y { v => v } && x > 0 { }"
-    ));
-    assert!(contains_let_chain(
-        "if let Some(x) = { let z = y; z } && x > 0 { }"
-    ));
-    // But a body block still ends the header: what follows its `}` is not an operator, so
-    // the `&&` of a *later* statement cannot be dragged into this header.
-    assert!(!contains_let_chain("if let Some(x) = y { }\nif a && b { }"));
-    // And a `let` confined to a condition block is the block's, not the chain's.
-    assert!(!contains_let_chain("if { let z = y; z } && a > 0 { }"));
-
-    // A brace inside a character literal is not a brace. `'{'` and `'}'` appear in this
-    // file, so a scanner that took them literally would lose track of where headers end
-    // and could be used — deliberately or by accident — to hide a chain from the gate.
-    // These go through `strip_comments_and_strings` first, exactly as the crate scan does;
-    // the two together are the gate, and neither is sound alone.
-    let stripped = |code: &str| contains_let_chain(&strip_comments_and_strings(code));
-    assert!(stripped("if let Some(c) = Some('{') && c == '{' { }"));
-    assert!(stripped("if let Some(c) = Some('}') && cond { }"));
-    assert!(stripped("if let Some(c) = Some('\\'') && cond { }"));
-    // The brace-bearing literal must not swallow the body either.
-    assert!(!stripped("if let Some(c) = Some('{') { }"));
-    // An escaped quote must not leave a stray quote behind that opens a phantom literal
-    // and swallows the brace after it.
-    assert!(stripped("if let Some(cs) = Some(['\\'', '{']) && cond { }"));
-    // Raw strings carry their own quotes and hashes, so the ordinary string scan would
-    // stop inside one and let the rest leak out as if it were code.
-    assert!(stripped("if let Some(s) = Some(r#\"\"{\"#) && cond { }"));
-    assert!(stripped("if let Some(s) = Some(r\"{\") && cond { }"));
-    assert!(stripped("if let Some(s) = Some(br#\"{\"#) && cond { }"));
-    // But a chain's punctuation appearing *inside* a raw string is just text.
-    assert!(!stripped("if let Some(s) = Some(r#\"&& let x = y\"#) { }"));
-    // Lifetimes and labels are not literals and must survive the same pass untouched,
-    // or ordinary generic code would start reading as something else.
-    assert!(!contains_let_chain(
-        "if let Some(x) = foo::<&'static str>(a) { }"
-    ));
-    assert!(contains_let_chain(
-        "if let Some(x) = foo::<&'static str>(a) && x > 0 { }"
-    ));
-}
-
 #[test]
 fn stripping_removes_literals_but_keeps_lifetimes() {
     // The distinction the scanners depend on: a character literal's contents must vanish,
@@ -816,34 +581,6 @@ fn stripping_removes_literals_but_keeps_lifetimes() {
     assert_eq!(
         strip_comments_and_strings("for x in r { }"),
         "for x in r { }"
-    );
-}
-
-#[test]
-fn no_let_chain_appears_anywhere_in_the_crate() {
-    // MSRV 1.85 forbids let-chains. The scan covers `src`, `tests` and `examples` alike: a
-    // let-chain in a test or an example breaks the MSRV build just as surely as one in the
-    // library, and `cargo +1.85 check` on the default and `tokio` configurations sees none
-    // of the three in full — it cannot build the `completion`-gated code at all, and does
-    // not compile tests or examples unless asked. This scan is what closes that gap, so it
-    // must not be narrower than the crate.
-    let mut offences = Vec::new();
-
-    let root = crate_root();
-    for dir in ["src", "tests", "examples"] {
-        for file in rust_files(&root.join(dir)) {
-            let code =
-                strip_comments_and_strings(&std::fs::read_to_string(&file).expect("reading"));
-            if contains_let_chain(&code) {
-                offences.push(file.display().to_string());
-            }
-        }
-    }
-
-    assert!(
-        offences.is_empty(),
-        "let-chains do not compile on the 1.85 MSRV; use nested `if let`/`match` instead:\n{}",
-        offences.join("\n")
     );
 }
 
@@ -1084,6 +821,24 @@ fn the_send_path_has_nowhere_to_put_a_second_chunk() {
             "the send path gained a `{container}`, which can hold more than one chunk",
         );
     }
+}
+
+/// The index of the `}` closing the `{` at `open`, if the braces balance.
+fn matching_brace(chars: &[(usize, char)], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    for (offset, (_, ch)) in chars.iter().enumerate().skip(open) {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[test]

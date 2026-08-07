@@ -158,7 +158,7 @@ the gap was never the I/O model. It was the number of write syscalls per pass. `
 gathers its writes (`writev`, no copy of large blocks), which collapsed a multiplexed pass
 from 513 writes to 1 and left the two **within noise of each other** — so pick on ergonomics
 and runtime fit rather than on throughput. See
-[`docs/benchmarks.md`](docs/benchmarks.md), which gives the numbers, the mechanism and the
+[`docs/h2/benchmarks.md`](docs/h2/benchmarks.md), which gives the numbers, the mechanism and the
 confounds that bound what they license.
 
 For bodies you already hold as [`bytes::Bytes`](https://docs.rs/bytes), an opt-in set of
@@ -167,7 +167,7 @@ payload to libnghttp2 without copying it (`NGHTTP2_DATA_FLAG_NO_COPY`). The choi
 connection, the push-model API is unchanged, and the payoff is honest rather than uniform: on
 the readiness transport a 1 MiB upload runs about 30% faster, mostly by collapsing the write
 count; on the completion transport the gain is small and does not clear the benchmark's own
-drift bar. [`docs/benchmarks.md`](docs/benchmarks.md) reports both.
+drift bar. [`docs/h2/benchmarks.md`](docs/h2/benchmarks.md) reports both.
 
 ### When to disable the feature
 
