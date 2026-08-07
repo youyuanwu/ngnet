@@ -11,7 +11,7 @@
 //! The two runtimes cannot nest, but they never have to: each connection is stood up once
 //! outside the timed closure on its own runtime, and Criterion drives the bench functions
 //! one after another, each on the runtime its arm was established on. See
-//! `docs/benchmarks.md` for the confounds this comparison controls and the ones it cannot.
+//! `docs/h2/benchmarks.md` for the confounds this comparison controls and the ones it cannot.
 
 use std::hint::black_box;
 

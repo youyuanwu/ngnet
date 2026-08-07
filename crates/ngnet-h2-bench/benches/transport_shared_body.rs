@@ -7,7 +7,7 @@
 //!
 //! # Reading this honestly
 //!
-//! `docs/benchmarks.md` records that grouped A/B designs on this machine are untrustworthy:
+//! `docs/h2/benchmarks.md` records that grouped A/B designs on this machine are untrustworthy:
 //! unchanged control arms have drifted 5–11% inside a single session. Three things guard
 //! against mistaking that drift for a result.
 //!

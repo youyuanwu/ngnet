@@ -179,7 +179,7 @@ turned out to be false. The gathering path (mechanism 4 above) reaches both: it 
 multiplexed pass from one write per block to a single `writev` while copying nothing that
 the driver did not already own. Measured on the tokio transport it moved concurrent
 throughput **+109% at N=8 and +143% at N=64**, to parity with compio and slightly ahead of
-hyper, and 1 MiB body throughput up rather than down. See `docs/benchmarks.md` for the
+hyper, and 1 MiB body throughput up rather than down. See `benchmarks.md` for the
 numbers and the three confounds that bound them.
 
 ## Decisions that cost a wrong attempt first
@@ -236,7 +236,7 @@ out of the driver and fails the connection — every stream on it goes too.
 An outgoing body is different. The session pulls it *synchronously from inside an
 `extern "C"` callback*, so a panic in a body's `poll_frame` crosses a C frame, and unwinding
 out of `extern "C"` aborts the process. This has been true unconditionally since Rust 1.81,
-below this crate's MSRV, so it needs no hedge. **A body that might fail must return an
+available on the pinned toolchain, so it needs no hedge. **A body that might fail must return an
 error, not panic.**
 
 ## Performance shape
@@ -266,7 +266,7 @@ the claim, not the one-off cost of standing a stream up.
 
 ## Constraints that shape contributions
 
-- MSRV **1.85**, edition **2024**. Let-chains are a 1.88 feature and are **forbidden**.
+- Edition **2024**, built with the toolchain in `rust-toolchain.toml`. No declared MSRV.
 - `ngnet-h2` takes **no dev-dependencies** and exactly one non-optional dependency, both
   enforced by `tests/invariants.rs`. Test scaffolding lives in `src/http/testing.rs` as
   `#[doc(hidden)] pub`; anything needing third-party crates belongs in `ngnet-h2-tests`.

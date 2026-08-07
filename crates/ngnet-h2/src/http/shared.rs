@@ -787,11 +787,7 @@ mod tests {
     /// A waker that records nothing. The accounting below is what is under test, not the
     /// notification.
     fn nowhere() -> Waker {
-        struct Silent;
-        impl std::task::Wake for Silent {
-            fn wake(self: Arc<Self>) {}
-        }
-        Waker::from(Arc::new(Silent))
+        std::task::Waker::noop().clone()
     }
 
     fn taken(incoming: &Incoming) -> Option<usize> {

@@ -290,21 +290,22 @@ fn client_peer() -> Session<ClientPeer> {
             HeaderAction::Continue
         })
         .on_frame(|peer: &mut ClientPeer, frame| {
-            if frame.kind() == FrameType::HEADERS && frame.is_end_headers() {
-                if let Some(fields) = peer.opening.remove(&frame.stream_id().get()) {
-                    let stream = frame.stream_id().get();
-                    if frame.is_trailers() {
-                        if peer
-                            .bodies
-                            .get(&stream)
-                            .is_some_and(|body| !body.is_empty())
-                        {
-                            peer.trailers_after_data.insert(stream);
-                        }
-                        peer.trailers.insert(stream, fields);
-                    } else {
-                        peer.heads.insert(stream, fields);
+            if frame.kind() == FrameType::HEADERS
+                && frame.is_end_headers()
+                && let Some(fields) = peer.opening.remove(&frame.stream_id().get())
+            {
+                let stream = frame.stream_id().get();
+                if frame.is_trailers() {
+                    if peer
+                        .bodies
+                        .get(&stream)
+                        .is_some_and(|body| !body.is_empty())
+                    {
+                        peer.trailers_after_data.insert(stream);
                     }
+                    peer.trailers.insert(stream, fields);
+                } else {
+                    peer.heads.insert(stream, fields);
                 }
             }
         })

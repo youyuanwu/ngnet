@@ -4,7 +4,7 @@
 //! fairness logic of their own: identical workload, identical protocol settings, and a
 //! connection that is stood up *before* anything is measured. Both ends of each connection
 //! run over a `tokio::io::duplex` — an in-memory pipe, no sockets — so what is timed is the
-//! protocol and wrapper CPU work, never the kernel. See `docs/benchmarks.md` for what that
+//! protocol and wrapper CPU work, never the kernel. See `docs/h2/benchmarks.md` for what that
 //! does and does not tell you.
 //!
 //! # The second family: a real socket, three arms
@@ -23,7 +23,7 @@
 //! [`CompioSocket`] against [`HyperSocket`] varies both at once and so attributes to
 //! neither. The confound controls these benches rely on — matched `TCP_NODELAY`, one worker
 //! thread each, external `taskset` pinning — are set here in the fixtures and documented in
-//! `docs/benchmarks.md`.
+//! `docs/h2/benchmarks.md`.
 //!
 //! # The two `TokioIo` types
 //!
@@ -744,7 +744,7 @@ impl TokioSharedSocket {
 /// write, so this arm had no syscall collapse left to win — only the copy, and it gives part of
 /// that back minting frame headers. Measured, it gains *least*: about 4% at 1 MiB, against
 /// roughly 30% for the readiness arms, and that 4% does not clear the benchmark's own drift
-/// bar. See `docs/benchmarks.md`.
+/// bar. See `docs/h2/benchmarks.md`.
 pub struct CompioSharedSocket {
     handle: SendRequest<BenchBody>,
 }

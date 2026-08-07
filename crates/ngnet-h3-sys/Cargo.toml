@@ -5,7 +5,6 @@ description = "Low level FFI bindings to libnghttp3, built from the vendored ngh
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 
 # Declares that this crate links the native `nghttp3` library, so cargo will
 # refuse to link two copies of it into the same binary.

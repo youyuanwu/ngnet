@@ -261,12 +261,12 @@ pub(crate) fn request_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Reques
     let method = method.ok_or_else(|| protocol("a request must carry :method"))?;
     let path = path.ok_or_else(|| protocol("a request must carry :path"))?;
     let authority = authority.ok_or_else(|| protocol("a request must carry :authority"))?;
-    if let Some(host) = &host {
-        if host != &authority {
-            return Err(protocol(
-                "the peer sent a host field that disagrees with :authority",
-            ));
-        }
+    if let Some(host) = &host
+        && host != &authority
+    {
+        return Err(protocol(
+            "the peer sent a host field that disagrees with :authority",
+        ));
     }
     // Cleartext only, so a missing scheme has exactly one sensible reading — but a scheme
     // that says otherwise is the peer telling us something this crate cannot honour.

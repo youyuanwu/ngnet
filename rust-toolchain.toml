@@ -3,15 +3,14 @@
 # raise this number, not on the morning it ships — a red build nobody caused is a red
 # build nobody owns.
 #
-# This is *not* the minimum supported version. That is `rust-version` in each library
-# crate's manifest (1.85). CI verifies it for the HTTP/3 crates, in a separate job that
-# installs 1.85 explicitly, but not workspace-wide: the benchmark crate's Criterion
-# dependency needs a newer compiler, and so does compio's buffer crate behind the
-# `completion` feature. The two numbers move independently: raising this is routine, raising
-# the MSRV is a breaking change for anyone depending on the crate.
+# There is deliberately no declared MSRV. No crate here sets `rust-version`, and CI does not
+# check one: the workspace already could not honour a single minimum — the benchmark crate's
+# Criterion dependency and compio's buffer crate both require newer compilers than the rest —
+# so a declared minimum was a claim about some crates rather than the workspace. Build with
+# this toolchain.
 #
 # rustup reads this file automatically, so `cargo test` in a clone uses it with no setup.
 [toolchain]
-channel = "1.95.0"
+channel = "1.97.1"
 components = ["clippy", "rustfmt"]
 profile = "minimal"

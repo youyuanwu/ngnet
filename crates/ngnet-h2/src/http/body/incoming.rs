@@ -104,10 +104,10 @@ impl Body for IncomingBody {
 
         // Credited only once the chunk is on its way to the caller. Crediting before the
         // frame is taken would re-open the window for octets that are still sitting here.
-        if let Poll::Ready(Some(Ok(frame))) = &polled {
-            if let Some(data) = frame.data_ref() {
-                self.credit(data.len());
-            }
+        if let Poll::Ready(Some(Ok(frame))) = &polled
+            && let Some(data) = frame.data_ref()
+        {
+            self.credit(data.len());
         }
 
         polled

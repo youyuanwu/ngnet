@@ -6,7 +6,6 @@ publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-rust-version.workspace = true
 
 # This crate exists so that a QUIC implementation can be exercised against `ngnet-h3`
 # without the wrapper itself acquiring a dependency on one. `ngnet-h3` has exactly one

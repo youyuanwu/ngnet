@@ -197,10 +197,10 @@ pub(crate) struct Events {
 /// into, so a chunk the caller keeps is the same memory rather than a copy of it.
 fn resolve(events: &mut Events, buffer: &bytes::Bytes, from: usize) {
     for event in &mut events.list[from..] {
-        if let Event::Data { span, data, .. } = event {
-            if let Some(span) = span.take() {
-                *data = buffer.slice(span.offset..span.offset + span.len);
-            }
+        if let Event::Data { span, data, .. } = event
+            && let Some(span) = span.take()
+        {
+            *data = buffer.slice(span.offset..span.offset + span.len);
         }
     }
 }
@@ -258,14 +258,15 @@ fn observing(builder: SessionBuilder<Events>) -> SessionBuilder<Events> {
         })
         .on_frame(|events: &mut Events, frame| {
             let stream = frame.stream_id().get();
-            if frame.kind() == FrameType::HEADERS && frame.is_end_headers() {
-                if let Some(fields) = events.open.remove(&stream) {
-                    events.list.push(if frame.is_trailers() {
-                        Event::Trailers { stream, fields }
-                    } else {
-                        Event::Head { stream, fields }
-                    });
-                }
+            if frame.kind() == FrameType::HEADERS
+                && frame.is_end_headers()
+                && let Some(fields) = events.open.remove(&stream)
+            {
+                events.list.push(if frame.is_trailers() {
+                    Event::Trailers { stream, fields }
+                } else {
+                    Event::Head { stream, fields }
+                });
             }
             // Recorded from the flag rather than from stream closure: a stream stays open
             // until both directions have finished, and the message ends first.

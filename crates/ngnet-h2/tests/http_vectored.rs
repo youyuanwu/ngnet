@@ -279,10 +279,10 @@ fn run_passes(
 
     let mut outcome = None;
     for _ in 0..passes {
-        if outcome.is_none() {
-            if let Poll::Ready(result) = step(connection.as_mut(), waker) {
-                outcome = Some(result);
-            }
+        if outcome.is_none()
+            && let Poll::Ready(result) = step(connection.as_mut(), waker)
+        {
+            outcome = Some(result);
         }
         let _ = step(response.as_mut(), waker);
     }

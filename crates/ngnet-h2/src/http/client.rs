@@ -362,10 +362,10 @@ where
         // yet settled has seen only `1xx` heads, so this block is the awaited final
         // response head rather than trailers. Once the slot is settled a further block is
         // real trailers and is delivered as such.
-        if let Some(slot) = self.registry.slot(stream) {
-            if !slot.is_settled() {
-                return self.head(session, stream, fields, incoming);
-            }
+        if let Some(slot) = self.registry.slot(stream)
+            && !slot.is_settled()
+        {
+            return self.head(session, stream, fields, incoming);
         }
         driver::deliver_trailers(session, stream, fields, incoming)
     }

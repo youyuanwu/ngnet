@@ -753,10 +753,11 @@ fn client_peer_session() -> Session<ClientPeer> {
             HeaderAction::Continue
         })
         .on_frame(|peer: &mut ClientPeer, frame| {
-            if frame.kind() == FrameType::HEADERS && frame.is_end_headers() {
-                if let Some(fields) = peer.opening.remove(&frame.stream_id().get()) {
-                    peer.heads.insert(frame.stream_id().get(), fields);
-                }
+            if frame.kind() == FrameType::HEADERS
+                && frame.is_end_headers()
+                && let Some(fields) = peer.opening.remove(&frame.stream_id().get())
+            {
+                peer.heads.insert(frame.stream_id().get(), fields);
             }
         })
         .build()
