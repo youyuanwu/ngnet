@@ -25,12 +25,23 @@
 //! endpoint, TLS configuration, certificate handling or ALPN negotiation appears anywhere in
 //! it, and none of those concerns reaches this crate.
 
+mod body;
+mod client;
+mod config;
+mod connection;
+mod driver;
 mod error;
+mod events;
 mod head;
 pub mod quic;
+mod shared;
 
 #[doc(hidden)]
 pub mod testing;
 
+pub use body::IncomingBody;
+pub use client::{ResponseFuture, SendRequest, handshake, handshake_with};
+pub use config::Config;
+pub use connection::Connection;
 pub use error::{Error, ErrorKind, Result};
 pub use quic::{QuicConnection, QuicEvent, StreamSource, WriteOutcome};

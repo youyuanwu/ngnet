@@ -87,6 +87,12 @@ impl Error {
         }
     }
 
+    /// Attaches the application error code a failure carried.
+    pub(crate) fn with_code(mut self, code: ErrorCode) -> Self {
+        self.code = Some(code);
+        self
+    }
+
     /// What kind of failure this is.
     pub fn kind(&self) -> ErrorKind {
         self.kind
