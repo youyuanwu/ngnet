@@ -214,6 +214,7 @@ where
                     // A handler produced a head HTTP/3 will not carry. That is this
                     // endpoint's fault, not the peer's, so the exchange is abandoned rather
                     // than the connection failed.
+                    eprintln!("SRV RESET bad-response-head");
                     self.shared.reset(stream, ErrorCode::new(REQUEST_CANCELLED));
                     self.forget(stream);
                     continue;
@@ -250,6 +251,7 @@ where
         // peer controls.
         if self.tasks.len() >= self.max_concurrent {
             let _ = conn.shutdown_stream_read(stream);
+            eprintln!("SRV RESET concurrency-cap");
             self.shared.reset(stream, ErrorCode::new(REQUEST_CANCELLED));
             return Ok(());
         }
@@ -259,6 +261,7 @@ where
             Err(_) => {
                 // The peer sent something HTTP/3 forbids. One exchange is refused; the
                 // connection carries on.
+                eprintln!("SRV RESET bad-request-head");
                 let _ = conn.shutdown_stream_read(stream);
                 self.shared.reset(stream, ErrorCode::new(REQUEST_CANCELLED));
                 return Ok(());
@@ -351,6 +354,7 @@ impl<H, F: Future, B> ServerRole<H, F, B> {
                 Ending::Failed => {
                     // A handler's body failed. One exchange is abandoned; every other one
                     // on this connection carries on.
+                    eprintln!("SRV RESET response-body-failed");
                     self.shared
                         .reset(*stream, ErrorCode::new(REQUEST_CANCELLED));
                 }

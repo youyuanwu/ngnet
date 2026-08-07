@@ -30,6 +30,8 @@
 //! buffer stays retained across many writes. That case is covered in the wrapper's own
 //! `body.rs`, where acknowledgement is withheld deliberately.
 
+pub mod quic_backend;
+
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -909,4 +911,36 @@ pub fn close(quic: &quinn::Connection) {
             .into(),
         b"done",
     );
+}
+
+/// A connected pair of QUIC connections on loopback, client first.
+///
+/// Reuses the endpoint, certificate and transport setup the sans-I/O harness already has.
+/// None of it belongs behind [`ngnet_h3::http::QuicConnection`] — that trait begins with an
+/// established connection precisely so that certificates, ALPN and endpoint configuration
+/// stay the caller's business and never reach the wrapper.
+pub async fn connected_pair(
+    tuning: Tuning,
+) -> Result<(quinn::Connection, quinn::Connection), Box<dyn std::error::Error + Send + Sync>> {
+    let (server, cert) = server_endpoint(tuning)?;
+    let address = server.local_addr()?;
+    let client = client_endpoint(cert, tuning)?;
+
+    let accepting = tokio::spawn(async move {
+        let incoming = server.accept().await.ok_or("no connection arrived")?;
+        let connection = incoming.await?;
+        // The endpoint has to outlive the connection, or quinn stops driving it.
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((connection, server))
+    });
+
+    let connecting = client.connect(address, "localhost")?.await?;
+    let (accepted, server_endpoint) = accepting.await??;
+
+    // Both endpoints are leaked deliberately: they own the UDP sockets and the I/O tasks,
+    // and a test that dropped them would see its connection die halfway through for reasons
+    // that look like a protocol bug.
+    Box::leak(Box::new(client));
+    Box::leak(Box::new(server_endpoint));
+
+    Ok((connecting, accepted))
 }

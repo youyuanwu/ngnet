@@ -19,7 +19,7 @@ use super::quic::QuicConnection;
 use super::shared::{Command, Incoming, Queue, Registry, Shared, Slot};
 use crate::conn::{Conn, Role as CoreRole};
 use crate::error::ErrorCode;
-use crate::stream::{Directionality, Initiator, StreamId};
+use crate::stream::StreamId;
 
 /// Starts a client connection over an established QUIC connection.
 ///
@@ -71,7 +71,7 @@ where
         registry: Arc::clone(&registry),
         queue: Arc::clone(&queue),
         handles: Arc::downgrade(&handles),
-        next_stream: 0,
+        spare: Vec::new(),
         endings: Vec::new(),
     };
 
@@ -241,8 +241,8 @@ pub(crate) struct ClientRole<B> {
     registry: Arc<Registry>,
     queue: Arc<Queue<B>>,
     handles: std::sync::Weak<()>,
-    /// The sequence number of the next request stream, so identifiers are 0, 4, 8, …
-    next_stream: u64,
+    /// Streams the transport has opened and the role has not yet used.
+    spare: Vec<StreamId>,
     /// Bodies still running, and where each will report how it ended.
     ///
     /// A body cannot submit its own trailers: it is pulled from inside an FFI call, where
@@ -256,17 +256,24 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn core::error::Error + Send + Sync>>,
 {
+    fn needs_stream(&self) -> bool {
+        // One per queued request. Asked before `advance`, so a request never has to invent
+        // an identifier the transport has not agreed to.
+        self.spare.is_empty() && !self.queue.is_empty()
+    }
+
+    fn give_stream(&mut self, stream: StreamId) {
+        self.spare.push(stream);
+    }
+
     fn advance(&mut self, conn: &mut Conn<Events>, _events: &mut Events) -> Result<()> {
         self.finish_bodies(conn)?;
 
-        while let Some(command) = self.queue.pop() {
-            let stream = StreamId::compose(
-                Initiator::Client,
-                Directionality::Bidirectional,
-                self.next_stream,
-            )
-            .map_err(|_| Error::new(ErrorKind::Connection, "stream identifiers exhausted"))?;
-            self.next_stream += 1;
+        while !self.spare.is_empty() {
+            let Some(command) = self.queue.pop() else {
+                break;
+            };
+            let stream = self.spare.remove(0);
 
             let (parts, body) = command.request.into_parts();
             let fields = match head::request_fields(&parts) {

@@ -256,6 +256,12 @@ pub struct Loopback {
     next_bi: u64,
     /// Release owed to this endpoint but withheld, per stream.
     withheld: HashMap<StreamId, u64>,
+    /// Streams this endpoint may write to.
+    ///
+    /// Checked rather than assumed. A double that wrote to any identifier it was handed
+    /// would let the layer invent one, which is exactly the bug a real QUIC library catches
+    /// and an accommodating test double does not.
+    writable: Vec<StreamId>,
     /// Bidirectional streams this endpoint has written to, so the peer is told once.
     announced: Vec<StreamId>,
     clock: u64,
@@ -295,6 +301,7 @@ pub fn loopback() -> (Loopback, Loopback, Knobs) {
         next_uni: 0,
         next_bi: 0,
         withheld: HashMap::new(),
+        writable: Vec::new(),
         announced: Vec::new(),
         clock: 0,
     };
@@ -306,6 +313,7 @@ pub fn loopback() -> (Loopback, Loopback, Knobs) {
         next_uni: 0,
         next_bi: 0,
         withheld: HashMap::new(),
+        writable: Vec::new(),
         announced: Vec::new(),
         clock: 0,
     };
@@ -361,6 +369,12 @@ impl QuicConnection for Loopback {
         let mut inbox = self.inbox.borrow_mut();
         inbox.promote();
         if let Some(event) = inbox.ready.pop_front() {
+            // Answering a peer-opened stream means writing to it, so it becomes writable
+            // here rather than through `poll_open_bi`, which the peer called, not us.
+            if let QuicEvent::Accepted { stream } = &event {
+                self.writable.push(*stream);
+            }
+            drop(inbox);
             return Poll::Ready(Ok(event));
         }
         if inbox.closed {
@@ -385,11 +399,19 @@ impl QuicConnection for Loopback {
             let controls = &self.controls;
             let peer = &self.peer;
             let announced = &mut self.announced;
+            let writable = &self.writable;
             let end = self.end;
             let failed = &mut failed;
             let written = &mut written;
 
             while source.write_next(&mut |stream, slices, fin| {
+                // A stream this endpoint never opened and was never handed is not one it can
+                // write to, and saying so is the whole reason a real transport catches a
+                // layer that invents identifiers.
+                if !writable.contains(&stream) {
+                    return WriteOutcome::Gone;
+                }
+
                 let mut knobs = controls.borrow_mut();
 
                 if knobs.stalled.contains(&stream) {
@@ -474,7 +496,10 @@ impl QuicConnection for Loopback {
             Directionality::Unidirectional,
             sequence,
         ) {
-            Ok(stream) => Poll::Ready(Ok(stream)),
+            Ok(stream) => {
+                self.writable.push(stream);
+                Poll::Ready(Ok(stream))
+            }
             Err(_) => Poll::Ready(Err(LoopbackError("stream identifiers exhausted"))),
         }
     }
@@ -487,7 +512,10 @@ impl QuicConnection for Loopback {
             Directionality::Bidirectional,
             sequence,
         ) {
-            Ok(stream) => Poll::Ready(Ok(stream)),
+            Ok(stream) => {
+                self.writable.push(stream);
+                Poll::Ready(Ok(stream))
+            }
             Err(_) => Poll::Ready(Err(LoopbackError("stream identifiers exhausted"))),
         }
     }

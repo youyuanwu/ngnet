@@ -58,6 +58,19 @@ pub(crate) const NO_ERROR: u64 = 0x100;
 /// Everything else — reads, writes, credit, releases, teardown — is the same code at both
 /// ends rather than the same idea written twice.
 pub(crate) trait Role {
+    /// Whether the role has work waiting on a stream it does not yet have.
+    ///
+    /// Stream identifiers are the *transport's* to allocate, not this layer's: quinn will
+    /// only write to a stream it opened, and a QUIC library that let an application invent
+    /// identifiers would be one that could not enforce its own concurrency limits. So the
+    /// driver asks the backend and hands the result over.
+    fn needs_stream(&self) -> bool {
+        false
+    }
+
+    /// Hands the role a stream the backend just opened.
+    fn give_stream(&mut self, _stream: StreamId) {}
+
     /// Submits whatever the role has queued.
     fn advance(&mut self, conn: &mut Conn<Events>, events: &mut Events) -> Result<()>;
 
@@ -180,30 +193,40 @@ impl StreamSource for Offers<'_> {
             let offered = guard.len();
             let outcome = write(stream, guard.slices(), fin);
 
-            // Every arm below disposes of the guard exactly once. The empty-final-write row
-            // is the one that bites: `commit(0)` on an offer carrying `fin` and no bytes
-            // tells the state machine the stream ended, so a transport that merely declined
-            // it would leave the peer waiting for an end that was never sent.
+            // Every arm disposes of the guard exactly once, and the difference between
+            // committing and abandoning is the whole game.
+            //
+            // `commit(n)` says "n bytes of this offer are gone for good"; the rest, if any,
+            // is re-offered. `commit(0)` therefore does *not* mean "I took nothing" — it
+            // consumes the offer having taken nothing, and on an offer carrying `fin` that
+            // tells the state machine the stream ended. `abandon` is the one that means
+            // "not now, ask me again", and it is what congestion calls for.
             let disposal = match outcome {
+                // Nothing taken. The same bytes must be offered again, so the transaction
+                // is abandoned rather than committed at zero.
+                WriteOutcome::Blocked | WriteOutcome::Accepted(0) if offered > 0 => {
+                    guard.abandon();
+                    self.blocked.push(stream);
+                    (Ok(()), true, false)
+                }
+                // An offer with `fin` and no bytes: ending the stream *is* the write, and a
+                // transport that declined it leaves the peer waiting for an end that never
+                // comes. Abandoned, so it is offered again rather than reported as sent.
+                WriteOutcome::Blocked => {
+                    guard.abandon();
+                    self.blocked.push(stream);
+                    (Ok(()), true, false)
+                }
                 WriteOutcome::Accepted(taken) => {
                     let taken = taken.min(offered);
+                    // A short write is backpressure: this stream steps aside so another
+                    // gets a turn, rather than being re-offered ahead of everything else.
                     let short = taken < offered;
                     let result = guard.commit(taken);
                     if short {
                         self.blocked.push(stream);
                     }
                     (result, short, false)
-                }
-                WriteOutcome::Blocked => {
-                    if offered == 0 && fin {
-                        guard.abandon();
-                        self.blocked.push(stream);
-                        (Ok(()), true, false)
-                    } else {
-                        let result = guard.commit(0);
-                        self.blocked.push(stream);
-                        (result, true, false)
-                    }
                 }
                 WriteOutcome::Gone => {
                     guard.abandon();
@@ -692,6 +715,15 @@ where
             driver.conn.shutdown().ok();
         }
 
+        // Request streams are opened by the transport, one per queued request, before the
+        // role can submit anything onto them.
+        while guard.role.needs_stream() {
+            match poll_fn(|cx| driver.backend.poll_open_bi(cx)).await {
+                Ok(stream) => guard.role.give_stream(stream),
+                Err(error) => return Err(Driver::<Q>::transport(error)),
+            }
+        }
+
         // 6. Submit whatever the role has queued.
         {
             let mut events = core::mem::take(&mut driver.events);
@@ -757,8 +789,19 @@ where
             && !(guard.role.done() && registry.is_empty());
 
         if idle {
+            // Being woken at all is the signal that a congested stream may be writable
+            // again. The transport registered for that when `poll_write` answered `Pending`,
+            // and it wakes this same task -- but a writability wake produces no *event*, so
+            // a park that only ever asked `poll_event` would find nothing, park again, and
+            // never retry the write. Once anything has woken us, a pass with blocked streams
+            // is worth running.
+            let mut parked = false;
             poll_fn(|cx| {
                 shared.refresh_driver(cx.waker());
+                if parked && !driver.blocked.is_empty() {
+                    return Poll::Ready(());
+                }
+                parked = true;
                 // Re-checked under the waker: work may have arrived between the decision
                 // above and registering here, and missing it is a hang rather than a delay.
                 if shared.ready_len() > 0
