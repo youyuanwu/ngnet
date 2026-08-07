@@ -8,7 +8,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http_body::Body;
 
-use super::body::{IncomingBody, Outgoing};
+use super::body::{Ending, IncomingBody, Outgoing};
 use super::config::Config;
 use super::connection::Connection;
 use super::driver::{self, Driver, DriverGuard, REQUEST_CANCELLED, Role};
@@ -72,6 +72,7 @@ where
         queue: Arc::clone(&queue),
         handles: Arc::downgrade(&handles),
         next_stream: 0,
+        endings: Vec::new(),
     };
 
     let handle = SendRequest {
@@ -242,6 +243,12 @@ pub(crate) struct ClientRole<B> {
     handles: std::sync::Weak<()>,
     /// The sequence number of the next request stream, so identifiers are 0, 4, 8, …
     next_stream: u64,
+    /// Bodies still running, and where each will report how it ended.
+    ///
+    /// A body cannot submit its own trailers: it is pulled from inside an FFI call, where
+    /// the connection is already mutably borrowed. So it leaves word here and the next pass
+    /// acts on it.
+    endings: Vec<(StreamId, Arc<std::sync::Mutex<Option<Ending>>>)>,
 }
 
 impl<B> Role for ClientRole<B>
@@ -250,6 +257,8 @@ where
     B::Error: Into<Box<dyn core::error::Error + Send + Sync>>,
 {
     fn advance(&mut self, conn: &mut Conn<Events>, _events: &mut Events) -> Result<()> {
+        self.finish_bodies(conn)?;
+
         while let Some(command) = self.queue.pop() {
             let stream = StreamId::compose(
                 Initiator::Client,
@@ -287,6 +296,8 @@ where
             // Recorded only after submission succeeded, so a failed submission leaves no
             // stream for the future to try to abandon.
             command.slot.bind(stream);
+
+            self.endings.push((stream, ending));
 
             let liveness = Arc::new(());
             self.registry.insert(
@@ -334,5 +345,56 @@ where
 
     fn abandon(&mut self) {
         self.queue.abandon();
+    }
+}
+
+impl<B> ClientRole<B> {
+    /// Acts on bodies that have finished since the last pass.
+    fn finish_bodies(&mut self, conn: &mut Conn<Events>) -> Result<()> {
+        let mut done = Vec::new();
+        for (index, (stream, ending)) in self.endings.iter().enumerate() {
+            let Ok(mut slot) = ending.lock() else {
+                continue;
+            };
+            let Some(ending) = slot.take() else { continue };
+            done.push(index);
+
+            match ending {
+                Ending::Clean => {}
+                Ending::Trailers(trailers) => {
+                    // Submitted here rather than by the body, which is pulled from inside an
+                    // FFI call and cannot reach the connection.
+                    let fields = head::trailer_fields(&trailers)?;
+                    conn.submit_trailers(*stream, &fields.views()?)?;
+                }
+                Ending::Failed => {
+                    // One caller's body failing takes down one exchange. Reporting it to the
+                    // state machine as a body failure would poison the connection and take
+                    // every unrelated exchange with it.
+                    //
+                    // The caller is told here rather than left to infer it from the reset,
+                    // and told the truth: their body failed, which is not a protocol error
+                    // and not the peer's doing.
+                    if let Some(entry) = self.registry.remove(*stream) {
+                        if let Some(slot) = &entry.slot {
+                            slot.fail(Error::new(
+                                ErrorKind::Body,
+                                "the caller's message body reported an error",
+                            ));
+                        }
+                        entry.incoming.fail(Error::new(
+                            ErrorKind::Body,
+                            "the caller's message body reported an error",
+                        ));
+                    }
+                    self.shared
+                        .reset(*stream, ErrorCode::new(REQUEST_CANCELLED));
+                }
+            }
+        }
+        for index in done.into_iter().rev() {
+            self.endings.swap_remove(index);
+        }
+        Ok(())
     }
 }

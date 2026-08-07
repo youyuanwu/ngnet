@@ -40,6 +40,10 @@ pub struct Payload {
     chunk: Option<Bytes>,
     trailers: Option<http::HeaderMap>,
     polls: Option<Arc<AtomicUsize>>,
+    /// Fails instead of yielding, to prove one caller's error stays one caller's error.
+    fails: bool,
+    /// Withholds its chunk until opened, to exercise deferral.
+    gate: Option<Gate>,
 }
 
 /// A body with nothing in it.
@@ -48,6 +52,8 @@ pub fn empty() -> Payload {
         chunk: None,
         trailers: None,
         polls: None,
+        fails: false,
+        gate: None,
     }
 }
 
@@ -57,6 +63,43 @@ pub fn once(bytes: Bytes) -> Payload {
         chunk: Some(bytes),
         trailers: None,
         polls: None,
+        fails: false,
+        gate: None,
+    }
+}
+
+/// A body whose buffer reports when it is finally freed.
+///
+/// The measurement the retain contract needs. `Bytes::from_owner` keeps the owner alive for
+/// exactly as long as any reference to the bytes exists — including the ones nghttp3 is
+/// reading through — so the owner's `Drop` firing *is* the release.
+pub fn tracked(bytes: Bytes, probe: Probe) -> Payload {
+    let owner = Tracked {
+        data: bytes.to_vec(),
+        freed: probe.0,
+    };
+    once(Bytes::from_owner(owner))
+}
+
+/// A body that reports an error partway rather than ending cleanly.
+pub fn failing() -> Payload {
+    Payload {
+        chunk: None,
+        trailers: None,
+        polls: None,
+        fails: true,
+        gate: None,
+    }
+}
+
+/// A body that has nothing to give until its gate is opened.
+pub fn gated(bytes: Bytes, gate: Gate) -> Payload {
+    Payload {
+        chunk: Some(bytes),
+        trailers: None,
+        polls: None,
+        fails: false,
+        gate: Some(gate),
     }
 }
 
@@ -66,6 +109,8 @@ pub fn with_trailers(bytes: Bytes, trailers: http::HeaderMap) -> Payload {
         chunk: Some(bytes),
         trailers: Some(trailers),
         polls: None,
+        fails: false,
+        gate: None,
     }
 }
 
@@ -75,19 +120,116 @@ pub fn counting(bytes: Bytes, polls: Arc<AtomicUsize>) -> Payload {
         chunk: Some(bytes),
         trailers: None,
         polls: Some(polls),
+        fails: false,
+        gate: None,
     }
 }
 
+/// A buffer that says when it is freed.
+struct Tracked {
+    data: Vec<u8>,
+    freed: Arc<AtomicUsize>,
+}
+
+impl AsRef<[u8]> for Tracked {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        self.freed.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Watches whether a tracked buffer has been released.
+#[derive(Clone)]
+pub struct Probe(Arc<AtomicUsize>);
+
+impl Probe {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicUsize::new(0)))
+    }
+
+    /// Whether the buffer has been freed.
+    pub fn freed(&self) -> bool {
+        self.0.load(Ordering::Acquire) > 0
+    }
+}
+
+impl Default for Probe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Lets a body be held back and then let go.
+#[derive(Clone, Default)]
+pub struct Gate(Arc<std::sync::Mutex<GateState>>);
+
+#[derive(Default)]
+struct GateState {
+    open: bool,
+    waker: Option<std::task::Waker>,
+}
+
+impl Gate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lets the body proceed, waking whoever was waiting on it.
+    pub fn open(&self) {
+        let mut state = self.0.lock().expect("gate");
+        state.open = true;
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn poll(&self, context: &Context<'_>) -> bool {
+        let mut state = self.0.lock().expect("gate");
+        if state.open {
+            return true;
+        }
+        state.waker = Some(context.waker().clone());
+        false
+    }
+}
+
+/// What a deliberately failing body reports.
+#[derive(Debug)]
+pub struct BodyFailed;
+
+impl core::fmt::Display for BodyFailed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "the caller's body failed")
+    }
+}
+
+impl std::error::Error for BodyFailed {}
+
 impl Body for Payload {
     type Data = Bytes;
-    type Error = std::convert::Infallible;
+    type Error = BodyFailed;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
-        _context: &mut Context<'_>,
+        context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
         if let Some(polls) = &self.polls {
             polls.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.fails {
+            return Poll::Ready(Some(Err(BodyFailed)));
+        }
+        if let Some(gate) = &self.gate
+            && !gate.poll(context)
+        {
+            // Nothing to give yet. Distinct from a busy transport, and the layer must not
+            // confuse the two.
+            return Poll::Pending;
         }
         if let Some(chunk) = self.chunk.take() {
             return Poll::Ready(Some(Ok(Frame::data(chunk))));
@@ -99,7 +241,7 @@ impl Body for Payload {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.chunk.is_none() && self.trailers.is_none()
+        !self.fails && self.chunk.is_none() && self.trailers.is_none()
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -141,6 +283,8 @@ pub struct Seen {
     pub bodies: HashMap<i64, Vec<u8>>,
     /// Streams whose request is complete.
     pub ended: Vec<i64>,
+    /// Trailing fields received per stream.
+    pub trailers: HashMap<i64, Vec<Field>>,
 }
 
 /// A minimal HTTP/3 server built on the sans-I/O core.
@@ -160,12 +304,13 @@ impl Server {
     pub fn new(backend: Loopback) -> Self {
         let conn = ConnBuilder::<Seen>::new(Role::Server)
             .on_field(|seen, stream, section, _token, name, value| {
-                if section == FieldSection::Headers {
-                    seen.heads
-                        .entry(stream.get())
-                        .or_default()
-                        .push((name.to_vec(), value.to_vec()));
-                }
+                let into = match section {
+                    FieldSection::Headers => &mut seen.heads,
+                    FieldSection::Trailers => &mut seen.trailers,
+                };
+                into.entry(stream.get())
+                    .or_default()
+                    .push((name.to_vec(), value.to_vec()));
                 FieldAction::Continue
             })
             .on_data(|seen, stream, chunk| {
@@ -214,6 +359,16 @@ impl Server {
     /// How many unidirectional streams the peer opened.
     pub fn saw_unidirectional_streams(&self) -> usize {
         self.uni_streams.len()
+    }
+
+    /// A trailing field the peer sent, by name.
+    pub fn received_trailer(&self, name: &str) -> Option<String> {
+        self.seen.trailers.values().find_map(|fields| {
+            fields
+                .iter()
+                .find(|(field, _)| field == name.as_bytes())
+                .map(|(_, value)| String::from_utf8_lossy(value).into_owned())
+        })
     }
 
     /// The body of the first request received.
@@ -483,4 +638,65 @@ where
         .enumerate()
         .map(|(index, result)| result.unwrap_or_else(|| panic!("request {index} never resolved")))
         .collect()
+}
+
+/// Runs a connection a controlled number of rounds at a time.
+///
+/// [`exchange`] runs an exchange to completion, which is what most tests want. The retain
+/// tests want the opposite: to stop partway, look at what is retained, change something, and
+/// carry on. That is what this is for.
+pub struct Pump<D> {
+    driver: Pin<Box<Connection<D>>>,
+    server: Server,
+    finished: Option<Result<(), ngnet_h3::http::Error>>,
+}
+
+impl<D> Pump<D>
+where
+    D: Future<Output = Result<(), ngnet_h3::http::Error>>,
+{
+    pub fn new(driver: Connection<D>, server: Server) -> Self {
+        Self {
+            driver: Box::pin(driver),
+            server,
+            finished: None,
+        }
+    }
+
+    /// Runs `rounds` rounds, stopping early if the future resolves.
+    pub fn rounds<F>(&mut self, rounds: usize, future: &mut Pin<Box<F>>) -> Option<Answer>
+    where
+        F: Future<Output = Answer>,
+    {
+        for _ in 0..rounds {
+            if self.finished.is_none()
+                && let Some(outcome) = poll_once(|cx| self.driver.as_mut().poll(cx))
+            {
+                self.finished = Some(outcome);
+            }
+            self.server.pump();
+            if self.finished.is_none() {
+                let _ = poll_once(|cx| self.driver.as_mut().poll(cx));
+            }
+            if let Some(answer) = poll_once(|cx| future.as_mut().poll(cx)) {
+                return Some(answer);
+            }
+        }
+        None
+    }
+
+    /// Whether the driver ended in failure.
+    pub fn driver_failed(&self) -> bool {
+        matches!(self.finished, Some(Err(_)))
+    }
+
+    /// The peer, once the pump is finished with.
+    pub fn into_server(self) -> Server {
+        self.server
+    }
+
+    /// The peer, while the pump is still running.
+    pub fn server(&self) -> &Server {
+        &self.server
+    }
 }

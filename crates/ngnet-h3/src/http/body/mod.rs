@@ -16,4 +16,4 @@ mod incoming;
 mod outgoing;
 
 pub use incoming::IncomingBody;
-pub(crate) use outgoing::Outgoing;
+pub(crate) use outgoing::{Ending, Outgoing};
