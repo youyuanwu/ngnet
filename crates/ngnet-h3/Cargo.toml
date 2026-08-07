@@ -6,5 +6,18 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The async `http` layer is the headline API for a caller who wants HTTP/3 rather than a
+# state machine, so it is on by default. Disabling it returns the crate to a sans-I/O state
+# machine with exactly one dependency and no asynchrony of its own.
+default = ["http"]
+http = ["dep:bytes", "dep:http", "dep:http-body"]
+
+# Exactly one *non-optional* dependency. A test fails the build if that grows, and requires
+# every optional one to be reachable only through a declared feature.
 [dependencies]
 ngnet-h3-sys.workspace = true
+
+bytes = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }

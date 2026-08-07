@@ -1014,6 +1014,9 @@ dependencies = [
 name = "ngnet-h3"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "http",
+ "http-body",
  "ngnet-h3-sys",
 ]
 
