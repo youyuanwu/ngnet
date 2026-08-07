@@ -34,7 +34,9 @@ mod error;
 mod events;
 mod head;
 pub mod quic;
+mod server;
 mod shared;
+mod tasks;
 
 #[doc(hidden)]
 pub mod testing;
@@ -45,3 +47,4 @@ pub use config::Config;
 pub use connection::Connection;
 pub use error::{Error, ErrorKind, Result};
 pub use quic::{QuicConnection, QuicEvent, StreamSource, WriteOutcome};
+pub use server::{Cancelled, serve, serve_with};

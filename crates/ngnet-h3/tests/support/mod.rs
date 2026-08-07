@@ -575,7 +575,8 @@ fn poll_once<T>(mut f: impl FnMut(&mut Context<'_>) -> Poll<T>) -> Option<T> {
 /// failing one, and a hung test says nothing about what went wrong.
 const ROUNDS: usize = 2_000;
 
-type Answer = Result<http::Response<ngnet_h3::http::IncomingBody>, ngnet_h3::http::Error>;
+/// What a request resolves to.
+pub type Answer = Result<http::Response<ngnet_h3::http::IncomingBody>, ngnet_h3::http::Error>;
 
 /// Runs one request to completion, interleaving the client driver and the server.
 pub fn exchange<F, D>(
@@ -699,4 +700,155 @@ where
     pub fn server(&self) -> &Server {
         &self.server
     }
+}
+
+// -------------------------------------------------------------- this crate at both ends
+
+impl Gate {
+    /// Waits until the gate is opened.
+    pub async fn wait(&self) {
+        let gate = self.clone();
+        core::future::poll_fn(move |cx| {
+            if gate.poll(cx) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+}
+
+/// Reads a body to the end, synchronously.
+pub fn read_body(body: ngnet_h3::http::IncomingBody) -> Vec<u8> {
+    block_on(read_body_async(body))
+}
+
+/// Reads a body to the end.
+pub async fn read_body_async(mut body: ngnet_h3::http::IncomingBody) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let frame = core::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+        match frame {
+            None | Some(Err(_)) => return out,
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    out.extend_from_slice(&data);
+                }
+            }
+        }
+    }
+}
+
+/// Drives a client driver and a server driver against each other.
+///
+/// Both ends are this crate. That is the point — it is the first configuration in which the
+/// whole layer is exercised — and also its weakness, since a shared misreading would agree
+/// with itself. The hand-driven peer in [`Server`] is the counterweight for the client, and
+/// the quinn integration is the counterweight for the transport.
+pub struct BothEnds<C, S> {
+    client: Pin<Box<Connection<C>>>,
+    server: Pin<Box<Connection<S>>>,
+    client_done: bool,
+    server_done: bool,
+}
+
+impl<C, S> BothEnds<C, S>
+where
+    C: Future<Output = Result<(), ngnet_h3::http::Error>>,
+    S: Future<Output = Result<(), ngnet_h3::http::Error>>,
+{
+    pub fn new(client: Connection<C>, server: Connection<S>) -> Self {
+        Self {
+            client: Box::pin(client),
+            server: Box::pin(server),
+            client_done: false,
+            server_done: false,
+        }
+    }
+
+    /// Runs one round: client, server, client again so an answer is seen when it arrives.
+    pub fn round(&mut self) {
+        if !self.client_done && poll_once(|cx| self.client.as_mut().poll(cx)).is_some() {
+            self.client_done = true;
+        }
+        if !self.server_done && poll_once(|cx| self.server.as_mut().poll(cx)).is_some() {
+            self.server_done = true;
+        }
+        if !self.client_done && poll_once(|cx| self.client.as_mut().poll(cx)).is_some() {
+            self.client_done = true;
+        }
+    }
+
+    /// Polls a future without running a round.
+    pub fn peek<F: Future>(&mut self, future: &mut Pin<Box<F>>) -> Option<F::Output> {
+        poll_once(|cx| future.as_mut().poll(cx))
+    }
+
+    /// Runs up to `rounds` rounds, stopping as soon as the future resolves.
+    pub fn rounds<F: Future>(
+        &mut self,
+        rounds: usize,
+        future: &mut Pin<Box<F>>,
+    ) -> Option<F::Output> {
+        for _ in 0..rounds {
+            self.round();
+            if let Some(output) = poll_once(|cx| future.as_mut().poll(cx)) {
+                return Some(output);
+            }
+        }
+        None
+    }
+}
+
+/// Runs one request between this crate's client and this crate's server.
+pub fn both_ends<F, C, S>(
+    client: Connection<C>,
+    server: Connection<S>,
+    submit: impl FnOnce() -> F,
+) -> Answer
+where
+    F: Future<Output = Answer>,
+    C: Future<Output = Result<(), ngnet_h3::http::Error>>,
+    S: Future<Output = Result<(), ngnet_h3::http::Error>>,
+{
+    let mut answers = both_ends_many(client, server, vec![submit()]);
+    answers.pop().expect("one answer")
+}
+
+/// Runs several requests between this crate's client and this crate's server.
+pub fn both_ends_many<F, C, S>(
+    client: Connection<C>,
+    server: Connection<S>,
+    futures: Vec<F>,
+) -> Vec<Answer>
+where
+    F: Future<Output = Answer>,
+    C: Future<Output = Result<(), ngnet_h3::http::Error>>,
+    S: Future<Output = Result<(), ngnet_h3::http::Error>>,
+{
+    let mut pump = BothEnds::new(client, server);
+    let mut pending: Vec<Option<Pin<Box<F>>>> =
+        futures.into_iter().map(|f| Some(Box::pin(f))).collect();
+    let mut results: Vec<Option<Answer>> = (0..pending.len()).map(|_| None).collect();
+
+    for _ in 0..ROUNDS {
+        pump.round();
+        for (index, slot) in pending.iter_mut().enumerate() {
+            let Some(future) = slot else { continue };
+            if let Some(output) = pump.peek(future) {
+                results[index] = Some(output);
+                *slot = None;
+            }
+        }
+        if results.iter().all(Option::is_some) {
+            break;
+        }
+    }
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| result.unwrap_or_else(|| panic!("request {index} never resolved")))
+        .collect()
 }

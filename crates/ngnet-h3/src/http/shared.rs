@@ -459,6 +459,11 @@ impl Registry {
             .map(|entry| Arc::clone(&entry.incoming))
     }
 
+    /// Whether an exchange is still in flight on this stream.
+    pub(crate) fn contains(&self, stream: StreamId) -> bool {
+        lock(&self.entries).contains_key(&stream)
+    }
+
     /// Every stream currently in flight.
     pub(crate) fn streams(&self) -> Vec<StreamId> {
         lock(&self.entries).keys().copied().collect()
