@@ -28,19 +28,27 @@ env:
 jobs:
   ci:
     name: Test, clippy and docs
-    runs-on: ubuntu-latest
+    # Pinned rather than `ubuntu-latest`, and the pin is load-bearing: ngtcp2's `ossl`
+    # crypto backend is written against the QUIC TLS API that first shipped in OpenSSL 3.5,
+    # and `ubuntu-latest` is still 24.04, which carries 3.0.13. Ubuntu 26.04 is the first
+    # image with 3.5. Note that it is currently a preview image; when it becomes the
+    # `ubuntu-latest` default this line can go back to the label.
+    #
+    # The alternative was a second job just for the QUIC crate, which would have split the
+    # feature matrix across two runners for one dependency.
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
-          # No submodule work here: the correct set is not uniform across the two
+          # No submodule work here: the correct set is not uniform across the three
           # vendored libraries, and encoding it in two places would guarantee they drift.
           # `just submodules` below is the single definition.
           submodules: false
 
       - uses: extractions/setup-just@v2
 
-      # nghttp2 wants no nested submodules; nghttp3 needs exactly one of its own
+      # nghttp2 and ngtcp2 want no nested submodules; nghttp3 needs exactly one of its own
       # (`lib/sfparse`, which is compiled into the library rather than into its tests).
       # The justfile encodes that asymmetry, and `just submodules-status` prints what
       # was actually checked out, which is the first thing worth seeing on a failure.
@@ -58,7 +66,17 @@ jobs:
       - name: Install build prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libclang-dev
+          sudo apt-get install -y cmake libclang-dev libssl-dev pkg-config
+          # ngtcp2's OpenSSL backend needs >= 3.5, and a too-old one fails deep inside
+          # CMake's symbol probing rather than saying so. Fail here instead, where the
+          # message can name the actual requirement.
+          pkg-config --atleast-version=3.5.0 openssl || {
+            echo "::error::OpenSSL $(pkg-config --modversion openssl) is too old for"
+            echo "::error::ngtcp2's ossl crypto backend, which needs >= 3.5.0."
+            echo "::error::Has the runner image changed? See runs-on above."
+            exit 1
+          }
+          echo "OpenSSL $(pkg-config --modversion openssl)"
 
       # Three genuinely different builds. The async layer sits behind a default-on feature
       # and the sans-I/O core has to stand up without it; `--all-features` additionally
@@ -76,6 +94,12 @@ jobs:
       - name: Test (HTTP/3 sans-I/O core alone)
         run: cargo test -p ngnet-h3 --no-default-features
 
+      # The QUIC bindings' other half of the matrix. ngtcp2 itself links no TLS, and the
+      # crate promises that `--no-default-features` reflects that; the workspace runs above
+      # only ever exercise it with the crypto backend on.
+      - name: Test (QUIC bindings without the crypto backend)
+        run: cargo test -p ngnet-quic-sys --no-default-features
+
       # `--all-targets` reaches benchmarks and examples as well as tests, which is half of
       # what keeps the benchmark crate from rotting.
       - name: Clippy (all features)
@@ -92,6 +116,9 @@ jobs:
 
       - name: Clippy (HTTP/3 sans-I/O core alone)
         run: cargo clippy -p ngnet-h3 --no-default-features --all-targets -- -D warnings
+
+      - name: Clippy (QUIC bindings without the crypto backend)
+        run: cargo clippy -p ngnet-quic-sys --no-default-features --all-targets -- -D warnings
 
       # Four configurations rather than one, because of a bug this repository actually
       # shipped: a doc link to an item behind the `tokio` feature passed `--all-features`
@@ -118,7 +145,7 @@ jobs:
             cargo doc --no-deps -p ngnet-h3 $features
             echo "::endgroup::"
           done
-          cargo doc --no-deps -p ngnet-h3-sys -p ngnet-h3-tests
+          cargo doc --no-deps -p ngnet-h3-sys -p ngnet-h3-tests -p ngnet-quic-sys
 
       # Two separate claims, and they need two separate commands.
       #
@@ -159,6 +186,30 @@ jobs:
             exit 1
           fi
           echo "no transport in the HTTP/3 wrapper's graph"
+
+      # ngtcp2 links no TLS of its own; only the crypto helper does. `cargo tree` cannot
+      # check that, because OpenSSL is not a cargo dependency at all — it arrives through
+      # link flags this crate's build script emits. So the claim is checked where it is
+      # actually observable: in the dynamic section of the linked binary.
+      - name: The QUIC bindings link no TLS without the crypto backend
+        run: |
+          bins=$(cargo test -p ngnet-quic-sys --no-default-features --no-run \
+                   --message-format=json 2>/dev/null \
+                 | grep -o '"executable":"[^"]*"' | cut -d'"' -f4)
+          if [ -z "$bins" ]; then
+            echo "::error::found no test binaries to inspect; did the build layout change?"
+            exit 1
+          fi
+          found=0
+          for bin in $bins; do
+            echo "checking $bin"
+            if readelf -d "$bin" | grep -qiE 'NEEDED.*lib(ssl|crypto)'; then
+              echo "::error::$bin links OpenSSL with the crypto-ossl feature off."
+              found=1
+            fi
+          done
+          if [ "$found" != 0 ]; then exit 1; fi
+          echo "no TLS in the default-off QUIC build"
 
       # The completion transport's guarantee is that no readiness backend is compiled, so it
       # cannot silently degrade to epoll. That is a property of the resolved dependency
