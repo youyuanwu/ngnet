@@ -236,6 +236,9 @@
 //!     }
 //! }
 //! impl RegionWrite for MinimalCompletion {}
+//! // That empty block is the whole completion-side obligation: `write_regions` is provided,
+//! // and loops one owned `write` per region. Override it only if the runtime has a real
+//! // vectored write, as `CompioWriter` does.
 //! ```
 //!
 //! ## `gathers()` is gone, and the hazard it created with it

@@ -107,6 +107,18 @@ frames, not the one-off cost of standing a stream up.
   teeth, and it is a standing requirement: if `do_write_borrowed` ever stops capping, this
   test silently stops testing anything. Same shape as the PR #9 vacuity below, caught the same
   way.
+- **`an_emulating_completion_transport_delivers_every_region_in_order`** and
+  **`an_emulating_completion_partial_acceptor_leaves_no_gap_between_its_regions`**
+  (`tests/http_vectored.rs`) — the same two properties on the completion side, where
+  `RegionWrite::write_regions` is also provided and loops one owned `write` per region.
+
+  These exist for the same reason and were found the same way. Every other completion writer
+  in the workspace overrides `write_regions` — the shipped `CompioWriter` has a real vectored
+  write, and `Duplex<Regions>` records through its own — so the default was **dead code under
+  test**: a mutation making it drop all but the first region left all 835 tests green.
+  `Duplex<RegionEmulating>`, whose `impl RegionWrite for … {}` is empty, is the only shape in
+  the workspace that runs it. Its `write` records and caps for the same reason
+  `do_write_borrowed` does.
 - **`elects_owned_regions::<CompioWriter<TcpStream>>()`** (`ngnet-h2-tests/tests/http_compio.rs`)
   — a compile-time assertion that the shipped completion transport declares `Completion`. This
   replaces a runtime predicate check that was found vacuous: in PR #9, flipping

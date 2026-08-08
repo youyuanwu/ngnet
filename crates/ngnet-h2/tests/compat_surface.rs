@@ -850,7 +850,7 @@ mod asynchronous {
 #[test]
 fn the_asynchronous_surface_is_unchanged() {
     use ngnet_h2::http::testing::{
-        Duplex, DuplexReader, DuplexWriter, Empty, Emulating, Regions, Vectored,
+        Duplex, DuplexReader, DuplexWriter, Empty, Emulating, RegionEmulating, Regions, Vectored,
     };
 
     let _: fn(&ngnet_h2::http::Error) = asynchronous::error_surface;
@@ -895,6 +895,12 @@ fn the_asynchronous_surface_is_unchanged() {
     // borrowing slices.
     let _: fn() -> (Duplex<Regions>, Duplex<Regions>) =
         ngnet_h2::http::testing::duplex_owned_regions;
+    // The completion-side emulating transport: `impl RegionWrite for X {}` with no override,
+    // so its gathering writes go through `write_regions`' provided default. It is the only
+    // shape in the workspace that runs that default — every other completion writer, shipped
+    // or test-only, overrides it — so without this the completion emulation is untested.
+    let _: fn() -> (Duplex<RegionEmulating>, Duplex<RegionEmulating>) =
+        ngnet_h2::http::testing::duplex_region_emulating;
     // The election-log handle a region-write assertion reads.
     let _: fn(&Duplex<Vectored>) -> ngnet_h2::http::testing::ElectionLog = Duplex::election_log;
     // `region_writes` counts owned-region writes, and is now the only counter left on this

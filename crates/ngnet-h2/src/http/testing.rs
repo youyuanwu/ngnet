@@ -44,6 +44,21 @@ pub struct Emulating;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Regions;
 
+/// Write behaviour of a [`Duplex`]: completion, gathering *only* through the provided default.
+///
+/// The completion-side counterpart of [`Emulating`], and the only way to reach
+/// [`RegionWrite::write_regions`]'s default from a test. Its `RegionWrite` impl is the empty
+/// block the migration notes advertise — `impl RegionWrite for MyType {}` — so every gathering
+/// write it is offered is turned into one owned [`TransportWrite::write`] per region by
+/// [`emulate_region_gathering`](super::transport).
+///
+/// This exists because without it the completion emulation is *dead code under test*: every
+/// other completion transport in the crate, shipped or test-only, overrides `write_regions`.
+/// A mutation making the default drop all but the first region left the whole suite green
+/// until this marker was added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct RegionEmulating;
+
 /// The ecosystem crates the async layer is built on, re-exported for tests.
 ///
 /// Integration tests are separate crates and can only reach what this one exposes. The
@@ -245,6 +260,17 @@ pub fn duplex_emulating() -> (Duplex<Emulating>, Duplex<Emulating>) {
 /// [`Duplex::accept_at_most`] the same way, so owned-region short writes are driven
 /// deterministically rather than hoped for.
 pub fn duplex_owned_regions() -> (Duplex<Regions>, Duplex<Regions>) {
+    pair()
+}
+
+/// Creates a connected pair whose halves reach owned-region gathering only through the
+/// provided default.
+///
+/// The completion-side counterpart of [`duplex_emulating`]. Its writing half implements
+/// [`RegionWrite`] with an empty block, so every gathering write becomes one owned
+/// [`TransportWrite::write`] per region. Honours [`Duplex::accept_at_most`] on that write, so
+/// a short write can land between regions.
+pub fn duplex_region_emulating() -> (Duplex<RegionEmulating>, Duplex<RegionEmulating>) {
     pair()
 }
 
@@ -569,6 +595,7 @@ macro_rules! duplex_transport {
 duplex_transport!(Vectored);
 duplex_transport!(Emulating);
 duplex_transport!(Regions);
+duplex_transport!(RegionEmulating);
 
 impl TransportRead for DuplexReader {
     fn read(&mut self, mut buf: BytesMut) -> impl Future<Output = (io::Result<usize>, BytesMut)> {
@@ -628,6 +655,35 @@ impl<S> DuplexWriter<S> {
         notifying(&self.outgoing, |pipe| pipe.put(&buf));
         let written = buf.len();
         core::future::ready((Ok(written), buf))
+    }
+
+    /// An owned write that records and caps, backing the emulating completion half.
+    ///
+    /// Mirrors [`do_write_borrowed`](Self::do_write_borrowed) on the readiness side: one call
+    /// is one region, logged as a single-region call, and [`Duplex::accept_at_most`] applies
+    /// so a short write can land *inside* the default's loop. Without the cap the
+    /// completion-side short-write rule cannot be reached by any test.
+    fn do_write_recording(
+        &mut self,
+        buf: Bytes,
+    ) -> core::future::Ready<(io::Result<usize>, Bytes)> {
+        let cap = self
+            .limits
+            .lock()
+            .expect("write limits")
+            .pop_front()
+            .unwrap_or(buf.len());
+        let accepted = cap.min(buf.len());
+
+        *self.writes.lock().expect("write count") += 1;
+        {
+            let mut record = self.vectored.lock().expect("vectored record");
+            record.calls.push(vec![accepted]);
+            record.bases.push(vec![buf.as_ptr() as usize]);
+            record.octets.extend_from_slice(&buf[..accepted]);
+        }
+        notifying(&self.outgoing, |pipe| pipe.put(&buf[..accepted]));
+        core::future::ready((Ok(accepted), buf))
     }
 
     /// The shared body of the borrowed path, run eagerly and returned as a ready future.
@@ -773,6 +829,25 @@ macro_rules! duplex_transport_write {
 duplex_transport_write!(Vectored, Readiness);
 duplex_transport_write!(Emulating, Readiness);
 duplex_transport_write!(Regions, Completion);
+
+/// The emulating completion half: its `write` records and caps, because that is the primitive
+/// [`RegionWrite::write_regions`]'s default loops over.
+///
+/// It cannot share the `duplex_transport_write` macro's body, which neither records nor caps — for the
+/// other markers `write` is the coalescing path's single owned write and the vectored log is
+/// filled elsewhere. Here it *is* the gathering path, one call per region, so it has to fill
+/// the same log the native completion half fills through `write_regions`.
+impl TransportWrite for DuplexWriter<RegionEmulating> {
+    type Model = Completion;
+
+    fn write(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
+        self.do_write_recording(buf)
+    }
+}
+
+/// **Deliberately empty**, and the point of the marker: no `write_regions` override, so every
+/// gathering write goes through the trait's default.
+impl RegionWrite for DuplexWriter<RegionEmulating> {}
 
 /// The natively-gathering readiness half: a real vectored write, recorded region by region.
 impl BorrowedWrite for DuplexWriter<Vectored> {

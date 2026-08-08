@@ -38,8 +38,9 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
 use ngnet_h2::http::testing::{
-    Duplex, DuplexReader, Emulating, Full, Regions, Vectored, bytes_crate as bytes, duplex,
-    duplex_emulating, duplex_owned_regions, duplex_vectored, http_crate as http,
+    Duplex, DuplexReader, Emulating, Full, RegionEmulating, Regions, Vectored,
+    bytes_crate as bytes, duplex, duplex_emulating, duplex_owned_regions, duplex_region_emulating,
+    duplex_vectored, http_crate as http,
 };
 use ngnet_h2::http::transport::{Transport, TransportRead, TransportWrite};
 use ngnet_h2::http::{Config, WritePolicy};
@@ -184,6 +185,21 @@ impl TestShape for OwnedRegionsShape {
 
     fn pair() -> (Duplex<Regions>, Duplex<Regions>) {
         duplex_owned_regions()
+    }
+}
+
+/// A completion transport that reaches owned-region gathering only through the trait's default.
+///
+/// The completion-side counterpart of [`Emulated`], and the only shape that exercises
+/// `RegionWrite::write_regions`'s provided body.
+struct RegionEmulatedShape;
+
+impl TestShape for RegionEmulatedShape {
+    type Half = RegionEmulating;
+    const POLICY: WritePolicy = WritePolicy::Gathered;
+
+    fn pair() -> (Duplex<RegionEmulating>, Duplex<RegionEmulating>) {
+        duplex_region_emulating()
     }
 }
 
@@ -1080,6 +1096,91 @@ fn an_emulating_transport_delivers_every_octet_of_a_multi_region_offer_in_order(
         native.calls.iter().any(|regions| regions.len() > 1),
         "no multi-region offer was made, so nothing was at risk of being dropped",
     );
+}
+
+#[test]
+fn an_emulating_completion_transport_delivers_every_region_in_order() {
+    // The completion-side counterpart of the two readiness emulation tests, and — like them —
+    // it exists because a mutation proved the path was untested. `RegionWrite::write_regions`
+    // is provided, looping one owned `write` per region, and *every* other completion
+    // transport in this workspace overrides it: the shipped `CompioWriter` has a real
+    // vectored write, and the test duplex records through its own. So making the default drop
+    // all but the first region left all 835 tests green. `RegionEmulatedShape` is the only
+    // shape that runs it.
+    //
+    // Compared against the natively-gathering completion transport rather than a hand-built
+    // expectation, so both sides are octets the session actually produced.
+    let native = observe(
+        Run::<OwnedRegionsShape>::new(BOUNDARY_BODY)
+            .shared()
+            .passes(8),
+    );
+    let emulated = observe(
+        Run::<RegionEmulatedShape>::new(BOUNDARY_BODY)
+            .shared()
+            .passes(8),
+    );
+
+    assert_eq!(
+        emulated.peer, native.peer,
+        "the emulating completion transport put different octets on the wire than the \
+         natively-gathering one; a region was dropped or reordered",
+    );
+    assert!(
+        !native.peer.is_empty(),
+        "the body never left, so the comparison proved nothing",
+    );
+
+    // The structural evidence that the default actually ran: it writes one region per call, so
+    // every emulated call carries exactly one, while the native transport offered a list.
+    assert!(
+        native.calls.iter().any(|regions| regions.len() > 1),
+        "the native completion transport never gathered a multi-region list, so nothing was \
+         at risk of being dropped, saw {:?}",
+        native.calls,
+    );
+    assert!(
+        !emulated.calls.is_empty() && emulated.calls.iter().all(|regions| regions.len() == 1),
+        "an emulated completion call carried other than one region, so the default did not \
+         run, saw {:?}",
+        emulated.calls,
+    );
+}
+
+#[test]
+fn an_emulating_completion_partial_acceptor_leaves_no_gap_between_its_regions() {
+    // D-3a on the completion side: the owned-region default obeys the same short-write rule as
+    // the borrowed one — stop at the short region, return the running total, let the driver
+    // retry from there. Same oracle and same awkward cut points as the readiness version.
+    let uncapped = observe(
+        Run::<RegionEmulatedShape>::new(BOUNDARY_BODY)
+            .shared()
+            .passes(8),
+    );
+    let head = uncapped.calls[0][0];
+    let coalesced = observe(Run::<Coalescing>::new(BOUNDARY_BODY).shared().passes(8));
+    assert!(
+        !coalesced.peer.is_empty(),
+        "the oracle sent nothing, so every comparison below is vacuous",
+    );
+
+    for caps in [vec![1], vec![head], vec![head - 1], vec![1, head, 7, 3]] {
+        let observed = observe(
+            Run::<RegionEmulatedShape>::new(BOUNDARY_BODY)
+                .shared()
+                .caps(caps.clone())
+                .passes(8),
+        );
+        assert_eq!(
+            observed.peer, coalesced.peer,
+            "caps {caps:?} changed the octets the peer received under completion emulation",
+        );
+        assert!(
+            observed.outcome.is_none(),
+            "caps {caps:?} ended the connection: {:?}",
+            observed.outcome.as_ref().map(Result::is_err),
+        );
+    }
 }
 
 #[test]
