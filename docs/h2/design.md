@@ -50,8 +50,9 @@ the offset into a slice of the same buffer once the call returns. Zero-copy with
 somewhere else. A buffer returns to the pool only once no derived chunk still references it,
 so a retained chunk safely outlives the pass that read it.
 
-**4. The write strategy is the transport's choice, and there are four of them.**
-Two separate facts bound what a strategy may do with the session's output blocks. The C
+**4. The write policy is the h2 layer's choice, and the transport only says which I/O model
+it belongs to.**
+Two separate facts bound what any drain may do with the session's output blocks. The C
 library serialises from a reused buffer chain and recycles it at frame-item boundaries, so a
 block is invalidated by the *next* block being requested — earlier, in fact, than the
 published "until the next call of `nghttp2_session_mem_send2()`" wording promises.
@@ -59,26 +60,36 @@ Independently, `Session::send` returns `Option<&[u8]>` borrowing `&mut self`, so
 wrapper permits exactly **one live block borrow at a time** regardless of what the C library
 would tolerate. Together these mean two blocks can never be gathered *with each other*.
 They do **not** mean gathering is impossible: one live block may always be gathered with
-memory the driver already owns, and that is what the gathering paths do. A connection that
+memory the driver already owns, and that is what the gathering drains do. A connection that
 hands its bodies over (mechanism 6) loosens this further still: a handed-over payload is the
 caller's own `Bytes`, so it can be gathered as an owned region without being copied at all.
 
-The choice is made by the *type*. `TransportWrite` carries an associated
-`type Strategy`, one of four marker types, and that declaration is the whole election —
-resolved at compile time, never probed and never asked of the writer at run time. Naming a
-strategy obliges the writer to implement that strategy's operations, by compiler error, so a
-transport cannot advertise a fast path it has not supplied nor supply one the driver will not
-take. The operations themselves live on three separate traits, each reachable only from the
-matching strategy:
+**The decision is split in two, and neither half is where it used to be.** A transport
+declares its I/O model through `TransportWrite::Model` — `Readiness` or `Completion` — and
+nothing else. How a pass drains is decided by the h2 layer, from `Config::write_policy`,
+settled at handshake and held for the connection's life. An earlier design had the transport
+name one of four *strategies* (`Coalesced`, `PerRegion`, `Gathering`, `OwnedRegions`); those
+markers are gone, and with them the idea that a backend has a say in how many syscalls a pass
+costs. It does not: it knows how its I/O works, not what the traffic looks like.
 
-- `Gathering` elects the **gathering** path, for a *readiness*
-  transport, and requires `VectoredWrite` (and, through it, `BorrowedWrite`). The driver accumulates small blocks into a buffer it owns and reuses, and when a
-  block exceeds `VECTORED_THRESHOLD` it emits `[accumulated, block]` as a `writev` — the large
-  block is never copied. One syscall per pass in the common case, zero allocation in steady
-  state. The driver keeps a retained list of lifetime-free region descriptors capped at
-  `MAX_REGIONS` (currently 64) and materialises it into slices only at write time, so a write
-  carries at most `MAX_REGIONS + 1` regions — the cap, plus one live session block riding as
-  the trailing region — which is well under `IOV_MAX`. Under a default 64 KiB window the cap
+**Every transport gathers.** `BorrowedWrite::write_vectored` and `RegionWrite::write_regions`
+are both *provided*, defaulting to a loop over the model's one required primitive
+(`write_borrowed` and `write` respectively). A transport that cannot gather natively therefore
+gathers by emulation, and one that can does better by overriding. Naming a model obliges the
+writer to implement that model's trait, by compiler error — but not to implement its gathering
+operation, which is where the "cannot advertise what you have not supplied" property now
+lives: there is nothing left to advertise.
+
+The four drains, as the two policies × two models:
+
+- **`Readiness` under `WritePolicy::Gathered`** — the default, and what a real socket wants.
+  The driver accumulates small blocks into a buffer it owns and reuses, and when a
+  block exceeds `VECTORED_THRESHOLD` it emits `[accumulated, block]` through `write_vectored`
+  — the large block is never copied. One syscall per pass in the common case, zero allocation
+  in steady state. The driver keeps a retained list of lifetime-free region descriptors capped
+  at `MAX_REGIONS` (currently 64) and materialises it into slices only at write time, so a
+  write carries at most `MAX_REGIONS + 1` regions — the cap, plus one live session block riding
+  as the trailing region — which is well under `IOV_MAX`. Under a default 64 KiB window the cap
   never binds (a pass carries about nine regions); a peer may advertise a window large enough
   to reach it, and then the list is flushed mid-pass and restarted rather than overrun. (An
   earlier design capped this at two regions; handing bodies over made a longer list worth
@@ -94,57 +105,78 @@ matching strategy:
   mark, and `h2` tops the buffer up from the head of a chained payload when the accumulation is
   smaller than the threshold, so its first region is never a runt. Neither difference has been
   measured to matter here, and the second is a refinement this driver does not make.
-- `OwnedRegions` elects the **owned-region** path, for a
-  *completion* transport, and requires `RegionWrite`. A completion transport cannot lend the
-  kernel a borrowed `IoSlice` — the kernel
+- **`Completion` under `WritePolicy::Gathered`** — the same accumulation, expressed in owned
+  buffers. A completion transport cannot lend the kernel a borrowed `IoSlice`: the kernel
   writes from the buffers after submission, so they must be owned. The driver coalesces the
   session's own blocks into a driver buffer, every one of them, and hands the pass out as a
   list of owned `Bytes` through `write_regions`, reaching a single `writev`. A block borrowed
   from the session cannot be owned without a copy, so all of them are copied; a *handed-over*
   payload is already the caller's own `Bytes` and rides uncopied as its own region.
-- `PerRegion` elects the **borrowed** path and requires `BorrowedWrite`: the session's own
-  blocks go out directly, several small writes per pass but zero allocation and zero copy.
-- `Coalesced` is the **owned** path and requires nothing beyond `write`: one write per pass,
-  bought by copying every outgoing octet into a driver buffer, every pass. That buffer is
-  reused across passes, so it costs no allocation in steady state.
+- **Either model under `WritePolicy::Coalesced`** — gathering off. One write per pass, bought
+  by copying every outgoing octet into a driver buffer, every pass. That buffer is reused
+  across passes, so it costs no allocation in steady state. This is the successor to the old
+  `Coalesced` *strategy*, and the difference is who says so: it is now a caller's decision,
+  reachable wherever a connection is configured, rather than a fact baked into a transport
+  type.
 
-**A backend implements exactly one I/O model, and the type system enforces it.** `Gathering`
-and `PerRegion` are `ReadinessStrategy`; `OwnedRegions` is a `CompletionStrategy`; no strategy
-is both, and `Coalesced` is deliberately neither, since a minimal writer supplying only
-`write` belongs to both worlds equally. `BorrowedWrite` and `VectoredWrite` are bounded on
-`Self::Strategy: ReadinessStrategy` and `RegionWrite` on `Self::Strategy: CompletionStrategy`,
+The old `PerRegion` strategy — the session's own blocks written one per call, without
+accumulation — has no successor and was removed. It is dominated on every measured workload:
+emulated gathering does exactly what it did except that the driver accumulates *first*, so the
+emulating loop typically runs once instead of once per block.
+
+**A backend implements exactly one I/O model, and the type system enforces it.** `Readiness`
+is a `ReadinessModel`, `Completion` a `CompletionModel`, and neither is both. `BorrowedWrite`
+is bounded on `Self::Model: ReadinessModel` and `RegionWrite` on `Self::Model: CompletionModel`,
 so a writer *cannot* implement operations from both models — it is a compile error, not a
 convention. The two marker traits are load-bearing rather than decorative: without them the
 plain shape lets a type implement both `RegionWrite` and `BorrowedWrite` and it compiles,
-which was verified by building exactly that. `WriteStrategy` is sealed, so the set of four is
+which was verified by building exactly that. `WriteModel` is sealed, so the set of two is
 closed and the driver's handling of it is exhaustive by construction.
 
-There is no longer any precedence rule, because there is nothing left to arbitrate: a writer
-names one strategy. The old rule's reasoning survives as advice at the point of declaration —
-prefer `Gathering` over `OwnedRegions`, because it need not mint an owned `Bytes` per frame
-header — and in practice the question does not arise, since the two belong to different I/O
-models. Declining a path mid-pass is likewise gone: the operations are no longer
-`Option`-shaped, and a writer that cannot complete a write reports so through its result, a
-short count the driver re-offers or an error. Both removals are pinned by `compile_fail`
-doctests with error codes, each mutation-verified to fail when the guarded construct is made
-legal.
+There is no precedence rule, because there is nothing to arbitrate: a writer belongs to one
+model and gets one fast path with it. Declining a path mid-pass is likewise not expressible:
+the operations are not `Option`-shaped, and a writer that cannot complete a write reports so
+through its result, a short count the driver re-offers or an error. Both are pinned by
+`compile_fail` doctests with error codes, each mutation-verified to fail when the guarded
+construct is made legal.
 
-**One capability is still read at run time, once per connection.** Whether a stream *really*
-scatter-gathers is a property of the stream, not the backend — a tokio `AsyncWrite` whose
-`poll_write_vectored` is the default writes only the first region — so `VectoredWrite::gathers`
-exists, and a `Gathering` writer whose stream does not gather falls back to its borrowed
-write. That is why `VectoredWrite` requires `BorrowedWrite` and why that implementation must
-be real rather than a stub. The driver reads `gathers` **once**, immediately after
-`Transport::split`, through `Elects::prepare`, and holds the answer for the connection's life.
-It is the only capability consultation in the design.
+**No capability is read at run time, on any path.** The previous design read exactly one:
+`VectoredWrite::gathers()`, consulted once per connection through `Elects::prepare`, because
+whether a stream *really* scatter-gathers is a property of the stream rather than the backend —
+a tokio `AsyncWrite` whose `poll_write_vectored` is the default writes only the first region.
+Both the predicate and the once-per-connection machinery are gone.
 
-Two per-call costs this replaced are worth recording, because both were invisible. The driver
-used to discover the vectored capability by calling `write_vectored(&[])` and dropping the
-resulting future unpolled, once per flush pass — which forced the trait contract to be widened
-to require implementations tolerate that. And `TokioWriter::write_vectored` used to call
-`AsyncWrite::is_write_vectored`, a virtual call whose answer never changes for a given stream,
-on every write. The first has no successor; the second is now asked once, in `split`, and
-cached in a field.
+That removal is safe, and it is worth being precise about why, because the obvious reason is
+wrong. Such a stream was never a *correctness* hazard: it writes the first region and returns
+the count it actually wrote, which is an ordinary short write, and the driver's gathering loop
+re-offers the remainder from the octets still outstanding. No octet was ever at risk. What
+`gathers()` avoided was the *cost* — one syscall per region with none of the gathering
+benefit. Removing it is affordable because accumulation happens in the driver, before any
+write: 513 small blocks from eight multiplexed streams collapse into a single region, so the
+emulating loop runs once. Emulation's cost is set by the regions the driver offers, never by
+the blocks the session produced.
+
+Its removal also closed a footgun. `gathers()` defaulted to `true` while tokio's
+`is_write_vectored()` defaults to `false` — opposite conservatism — so a third-party wrapper
+that forgot to forward the question silently inherited the optimistic answer. There is now no
+question to forget: a wrapper that forwards nothing inherits the emulating default, which is
+correct and bounded.
+
+**Where mandatory gathering is genuinely worse.** At high region counts gathering loses to
+coalescing outright — the benchmarks measure roughly 68 Kelem/s against 152 at N=64 — because
+`writev` with many descriptors costs more than one `write` of the same octets copied. That
+ordering is why `WritePolicy::Coalesced` exists and is public rather than being a private
+fallback: a caller whose traffic looks like that has a real reason to turn gathering off, and
+must be able to.
+
+Two per-call costs an earlier design replaced are worth recording, because both were invisible.
+The driver used to discover the vectored capability by calling `write_vectored(&[])` and
+dropping the resulting future unpolled, once per flush pass — which forced the trait contract
+to be widened to require implementations tolerate that. And `TokioWriter::write_vectored` used
+to call `AsyncWrite::is_write_vectored`, a virtual call whose answer never changes for a given
+stream, on every write. The first has no successor; the second is asked once, in `split`, and
+cached in a field — which is now a purely private optimisation choosing between the native
+`writev` and the emulating default, invisible in the trait surface.
 
 **5. Commands reach the driver through a queue, and wakes never re-enter a held lock.** The
 session lives in the driver and is `!Sync`, so handles and bodies cannot touch it directly.
@@ -272,10 +304,10 @@ Two properties are pinned as tests rather than described (see [`invariants.md`](
 
 | Path | Writes per driver pass | Allocation per pass in steady state |
 | --- | --- | --- |
-| Gathering (`type Strategy = Gathering`) | **one**, or one per large block | **zero** |
-| Owned-region (`type Strategy = OwnedRegions`) | **one**, or one per region-cap flush | **zero**, copies each session block but no handed-over payload |
-| Borrowed (`type Strategy = PerRegion`) | one per session block | **zero** |
-| Owned (`type Strategy = Coalesced`) | **one**, coalesced | **zero**, but copies every octet |
+| Readiness, `Gathered`, native `write_vectored` | **one**, or one per large block | **zero** |
+| Readiness, `Gathered`, emulated | **one**, or one per region offered | **zero** |
+| Completion, `Gathered` | **one**, or one per region-cap flush | **zero**, copies each session block but no handed-over payload |
+| Either model, `Coalesced` | **one**, coalesced | **zero**, but copies every octet |
 
 All four reach zero steady-state allocation; both driver buffers are reused across passes
 rather than rebuilt. What separates them is the write count — a syscall count — and the

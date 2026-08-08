@@ -47,14 +47,14 @@ use crate::{
 
 use super::body::outgoing::Outgoing;
 use super::body::shared::SharedOutgoing;
-use super::config::Config;
+use super::config::{Config, WritePolicy};
 use super::error::{Error, ErrorKind, Result};
 use super::head;
 use super::shared;
 use super::shared::{Incoming, Registry, Shared};
 use super::transport::{
-    BorrowedWrite, Coalesced, CompletionStrategy, Elects, Gathering, OwnedRegions, Pass, PerRegion,
-    ReadinessStrategy, RegionWrite, Transport, TransportRead, TransportWrite, VectoredWrite,
+    BorrowedWrite, Completion, CompletionModel, Drains, Pass, Readiness, ReadinessModel,
+    RegionWrite, Transport, TransportRead, TransportWrite,
 };
 use super::waker::StreamWaker;
 
@@ -587,6 +587,7 @@ pub(crate) async fn run<T, R>(
     shared: Arc<Shared>,
     registry: Arc<Registry>,
     mut guard: DriverGuard<R>,
+    policy: WritePolicy,
 ) -> Result<()>
 where
     T: Transport,
@@ -594,13 +595,10 @@ where
 {
     let (mut reader, mut writer) = transport.split();
 
-    // The write strategy's per-connection state, resolved once here and held for the
-    // connection's life. This is the only place a transport write capability is consulted:
-    // for [`Gathering`] it reads `gathers()` a single time, and every pass reuses the
-    // answer. The strategy is the writer's compile-time choice, so `drain` never asks it
-    // again which path to take.
-    let write_state =
-        <<T::Writer as TransportWrite>::Strategy as Elects<T::Writer>>::prepare(&writer);
+    // No transport capability is consulted here, or anywhere. Earlier revisions resolved a
+    // `gathers()` answer once at this point and threaded it through every drain; the writer no
+    // longer has an opinion to resolve. The only input to a drain's shape is `policy`, which
+    // came from this endpoint's own `Config`.
 
     // Locals of this future, borrowed by both halves. Mutexes rather than a `RefCell`
     // because `&RefCell<T>` is never `Sync`, which would make the whole driver non-`Send`
@@ -751,25 +749,11 @@ where
                 &shared,
                 &mut guard.role,
             )?;
-            flush(
-                &mut session,
-                &mut writer,
-                &mut events,
-                &mut write,
-                &write_state,
-            )
-            .await?;
+            flush(&mut session, &mut writer, &mut events, &mut write, policy).await?;
             // A body announces its trailers while it is being serialised, so they can only
             // be submitted once that pass is over — and then written by a second one.
             if submit_trailers(&mut session, &shared, &registry)? {
-                flush(
-                    &mut session,
-                    &mut writer,
-                    &mut events,
-                    &mut write,
-                    &write_state,
-                )
-                .await?;
+                flush(&mut session, &mut writer, &mut events, &mut write, policy).await?;
             }
             // Serialising fires the stream-close handler, so what it observed is
             // dispatched too rather than waiting for the next pass.
@@ -1316,15 +1300,13 @@ struct Gather<'a> {
     regioned: usize,
 }
 
-/// Writes out everything the session currently has to say, on whichever strategy the writer
-/// elected at compile time.
+/// Writes out everything the session currently has to say.
 ///
-/// A thin dispatcher: the strategy named by [`TransportWrite::Strategy`] resolves, through
-/// [`Elects`], to the drain that runs it — [`flush_coalesced`], [`flush_readiness`] with or
-/// without gathering, or [`flush_owned`]. There is no run-time probe and no precedence to
-/// arbitrate; the writer's declaration settled the path once, and the per-connection `state`
-/// — only [`Gathering`] uses it, to hold its [`gathers`](VectoredWrite::gathers) answer —
-/// was resolved once when the transport was split.
+/// A thin dispatcher over two independent choices. The writer's
+/// [`Model`](TransportWrite::Model) resolves, through [`Drains`], to *which family* of drain
+/// runs — borrowed regions or owned ones — and that is settled at compile time. `policy`
+/// chooses *within* the family, and comes from this endpoint's configuration rather than from
+/// the transport. There is no run-time probe of the writer and no precedence to arbitrate.
 ///
 /// This does not commit the octets to the peer; [`TransportWrite::commit`] does, and the
 /// caller runs it once the pass is fully drained.
@@ -1333,11 +1315,11 @@ async fn flush<W: TransportWrite>(
     writer: &mut W,
     events: &mut Events,
     buffers: &mut WriteBuffers,
-    state: &<W::Strategy as Elects<W>>::State,
+    policy: WritePolicy,
 ) -> Result<()> {
-    <W::Strategy as Elects<W>>::drain(
+    <W::Model as Drains<W>>::drain(
         writer,
-        state,
+        policy,
         Pass {
             inner: PassInner {
                 session,
@@ -1365,14 +1347,13 @@ pub(crate) struct PassInner<'a> {
     pub(crate) buffers: &'a mut WriteBuffers,
 }
 
-impl<W: TransportWrite + ?Sized> Elects<W> for Coalesced {
-    type State = ();
-
-    fn prepare(_writer: &W) -> Self::State {}
-
+impl<W: BorrowedWrite + ?Sized> Drains<W> for Readiness
+where
+    W::Model: ReadinessModel,
+{
     fn drain<'a>(
         writer: &'a mut W,
-        _state: &'a Self::State,
+        policy: WritePolicy,
         pass: Pass<'a>,
     ) -> impl Future<Output = Result<()>> + 'a {
         let PassInner {
@@ -1380,21 +1361,26 @@ impl<W: TransportWrite + ?Sized> Elects<W> for Coalesced {
             events,
             buffers,
         } = pass.inner;
-        flush_coalesced(session, writer, events, buffers)
+        async move {
+            match policy {
+                // Gathering is unconditional here. Whether it reaches a real `writev` or the
+                // provided default's loop is the transport's business and never this layer's:
+                // both deliver the same octets in the same order, and the accumulation that
+                // collapses small blocks into one region happens before either.
+                WritePolicy::Gathered => flush_readiness(session, writer, events, buffers).await,
+                WritePolicy::Coalesced => flush_coalesced(session, writer, events, buffers).await,
+            }
+        }
     }
 }
 
-impl<W: BorrowedWrite + ?Sized> Elects<W> for PerRegion
+impl<W: RegionWrite + ?Sized> Drains<W> for Completion
 where
-    W::Strategy: ReadinessStrategy,
+    W::Model: CompletionModel,
 {
-    type State = ();
-
-    fn prepare(_writer: &W) -> Self::State {}
-
     fn drain<'a>(
         writer: &'a mut W,
-        _state: &'a Self::State,
+        policy: WritePolicy,
         pass: Pass<'a>,
     ) -> impl Future<Output = Result<()>> + 'a {
         let PassInner {
@@ -1402,122 +1388,22 @@ where
             events,
             buffers,
         } = pass.inner;
-        // No gathering: `vectored` is fixed false, so every block is written the instant it
-        // arrives, behind its records, and `NoVectored::write` is never reached.
-        flush_readiness::<W, NoVectored>(session, writer, events, buffers, false)
-    }
-}
-
-impl<W: VectoredWrite + ?Sized> Elects<W> for Gathering
-where
-    W::Strategy: ReadinessStrategy,
-{
-    /// The one capability read at run time: whether the stream really scatter-gathers.
-    /// Resolved once per connection by [`prepare`](Elects::prepare) and threaded into every
-    /// drain, never consulted again.
-    type State = bool;
-
-    fn prepare(writer: &W) -> Self::State {
-        writer.gathers()
-    }
-
-    fn drain<'a>(
-        writer: &'a mut W,
-        state: &'a Self::State,
-        pass: Pass<'a>,
-    ) -> impl Future<Output = Result<()>> + 'a {
-        let PassInner {
-            session,
-            events,
-            buffers,
-        } = pass.inner;
-        // A `Gathering` writer whose stream does not really gather falls back to its borrowed
-        // write, so gathering runs only when both the strategy admits it and the stream, read
-        // once at split time, confirms it.
-        let vectored = <DoVectored as VectoredOp<W>>::GATHERS_POSSIBLE && *state;
-        flush_readiness::<W, DoVectored>(session, writer, events, buffers, vectored)
-    }
-}
-
-impl<W: RegionWrite + ?Sized> Elects<W> for OwnedRegions
-where
-    W::Strategy: CompletionStrategy,
-{
-    type State = ();
-
-    fn prepare(_writer: &W) -> Self::State {}
-
-    fn drain<'a>(
-        writer: &'a mut W,
-        _state: &'a Self::State,
-        pass: Pass<'a>,
-    ) -> impl Future<Output = Result<()>> + 'a {
-        let PassInner {
-            session,
-            events,
-            buffers,
-        } = pass.inner;
-        flush_owned(
-            session,
-            writer,
-            events,
-            &mut buffers.minted,
-            &mut buffers.owned,
-            &mut buffers.send_records,
-        )
-    }
-}
-
-/// The gathering write, abstracted so the readiness drain can share one loop across the
-/// [`PerRegion`] and [`Gathering`] strategies.
-///
-/// A [`PerRegion`] writer does not implement [`VectoredWrite`], so the shared loop cannot
-/// reach `write_vectored` through a single bound. Two marker types carry the two cases
-/// instead: [`DoVectored`] forwards to the real gathering write, [`NoVectored`] stands in for
-/// a writer that has none, and `GATHERS_POSSIBLE` lets every call site guard the stub out.
-pub(crate) trait VectoredOp<W: ?Sized> {
-    /// Whether this writer has a real gathering write at all. `false` for [`NoVectored`], so
-    /// the shared loop never routes a write to its stub.
-    const GATHERS_POSSIBLE: bool;
-
-    /// Writes `r` as one gathering operation, for a writer that has one.
-    fn write<'w>(
-        w: &'w mut W,
-        r: &'w [std::io::IoSlice<'w>],
-    ) -> impl Future<Output = std::io::Result<usize>> + 'w;
-}
-
-/// The [`VectoredOp`] for a writer with no gathering write — the [`PerRegion`] strategy.
-pub(crate) struct NoVectored;
-
-/// The [`VectoredOp`] for a writer that gathers — the [`Gathering`] strategy.
-pub(crate) struct DoVectored;
-
-impl<W: BorrowedWrite + ?Sized> VectoredOp<W> for NoVectored
-where
-    W::Strategy: ReadinessStrategy,
-{
-    const GATHERS_POSSIBLE: bool = false;
-
-    async fn write<'w>(_: &'w mut W, _: &'w [std::io::IoSlice<'w>]) -> std::io::Result<usize> {
-        // Unreachable: every call site guards this behind `GATHERS_POSSIBLE`, which is `false`
-        // here, so the readiness loop routes a `NoVectored` writer's regions to its borrowed
-        // write and never here.
-        unreachable!("NoVectored::write is guarded out by GATHERS_POSSIBLE")
-    }
-}
-
-impl<W: VectoredWrite + ?Sized> VectoredOp<W> for DoVectored
-where
-    W::Strategy: ReadinessStrategy,
-{
-    const GATHERS_POSSIBLE: bool = true;
-
-    fn write<'w>(
-        w: &'w mut W,
-        r: &'w [std::io::IoSlice<'w>],
-    ) -> impl Future<Output = std::io::Result<usize>> + 'w {
-        w.write_vectored(r)
+        async move {
+            match policy {
+                WritePolicy::Gathered => {
+                    flush_owned(
+                        session,
+                        writer,
+                        events,
+                        &mut buffers.minted,
+                        &mut buffers.owned,
+                        &mut buffers.send_records,
+                    )
+                    .await
+                }
+                WritePolicy::Coalesced => flush_coalesced(session, writer, events, buffers).await,
+            }
+        }
     }
 }
 
@@ -1597,17 +1483,14 @@ async fn flush_coalesced<W: TransportWrite + ?Sized>(
     Ok(())
 }
 
-/// Drains a pass on a readiness strategy — [`PerRegion`] or [`Gathering`] — sharing one loop
-/// across both through the [`VectoredOp`] marker `V`.
+/// Drains a pass on the readiness model under [`WritePolicy::Gathered`].
 ///
-/// `V` is [`DoVectored`] for [`Gathering`] and [`NoVectored`] for [`PerRegion`]; `vectored`
-/// (which is `V::GATHERS_POSSIBLE && gathers()`, resolved once per connection) chooses at run
-/// time whether large blocks ride as their own gathered region or every region is written
-/// borrowed. When `vectored` is false — [`PerRegion`], or a [`Gathering`] stream that turned
-/// out not to gather — every block is written the instant it arrives, uncopied, behind the
-/// records that preceded it, one borrowed write per region.
+/// There is one loop and one shape. Earlier revisions had two, because a transport could
+/// decline to gather; it cannot any more — [`BorrowedWrite::write_vectored`] is always
+/// available, natively or by the provided default — so the branch and the marker type that
+/// selected it are gone.
 ///
-/// When `vectored` is true, blocks below [`VECTORED_THRESHOLD`] accumulate into `gathered`, a
+/// Blocks below [`VECTORED_THRESHOLD`] accumulate into `gathered`, a
 /// driver-owned buffer reused across passes; a block at or above it is handed to the socket
 /// beside whatever has accumulated, in one gathering call, uncopied. A handed-over payload
 /// does not force a copy either: its frame header and its octets ride as their own regions of
@@ -1625,15 +1508,14 @@ async fn flush_coalesced<W: TransportWrite + ?Sized>(
 ///
 /// This does not commit the octets to the peer; [`TransportWrite::commit`] does, and the
 /// caller runs it once the pass is fully drained.
-async fn flush_readiness<W: BorrowedWrite + ?Sized, V: VectoredOp<W>>(
+async fn flush_readiness<W: BorrowedWrite + ?Sized>(
     session: &mut Session<Events>,
     writer: &mut W,
     events: &mut Events,
     buffers: &mut WriteBuffers,
-    vectored: bool,
 ) -> Result<()>
 where
-    W::Strategy: ReadinessStrategy,
+    W::Model: ReadinessModel,
 {
     // Disjoint borrows of the buffers the readiness strategies use. `coalesced`, `minted` and
     // `owned` belong to the other strategies and are untouched here.
@@ -1686,7 +1568,7 @@ where
             // flushes first should that invariant ever fail to hold, and flushing writes and
             // closes the run itself.
             if g.gathered.len() > g.run_start && g.regions.len() >= MAX_REGIONS {
-                flush_regions::<W, V>(writer, vectored, &mut g, &[]).await?;
+                flush_regions(writer, &mut g, &[]).await?;
             }
             if g.gathered.len() > g.run_start {
                 g.regions.push(Region::Gathered {
@@ -1701,7 +1583,7 @@ where
             // overrunning the materialisation array.
             while g.regioned < g.send_records.len() {
                 if g.regions.len() + 2 > MAX_REGIONS {
-                    flush_regions::<W, V>(writer, vectored, &mut g, &[]).await?;
+                    flush_regions(writer, &mut g, &[]).await?;
                 }
                 g.regions.push(Region::Header(g.regioned));
                 g.regions.push(Region::Payload(g.regioned));
@@ -1711,32 +1593,26 @@ where
 
         let Some(block) = block else { break };
 
-        if vectored {
-            if block.len() < VECTORED_THRESHOLD {
-                // A small block extends the open run. If it would open a *fresh* run while the
-                // list is already full, the run has no slot to close into, so flush first —
-                // the one case the `regions.len() + open_run` invariant cannot absorb, since
-                // opening a run raises `open_run` from zero to one.
-                if g.gathered.len() == g.run_start && g.regions.len() >= MAX_REGIONS {
-                    flush_regions::<W, V>(writer, vectored, &mut g, &[]).await?;
-                }
-                g.gathered.extend_from_slice(block);
-                continue;
+        if block.len() < VECTORED_THRESHOLD {
+            // A small block extends the open run. If it would open a *fresh* run while the
+            // list is already full, the run has no slot to close into, so flush first —
+            // the one case the `regions.len() + open_run` invariant cannot absorb, since
+            // opening a run raises `open_run` from zero to one.
+            if g.gathered.len() == g.run_start && g.regions.len() >= MAX_REGIONS {
+                flush_regions(writer, &mut g, &[]).await?;
             }
-            // Big enough to be worth a syscall of its own, so it goes out uncopied, as the
-            // trailing region of a gathering write over everything accumulated before it.
-            flush_regions::<W, V>(writer, vectored, &mut g, block).await?;
+            g.gathered.extend_from_slice(block);
             continue;
         }
-        // Borrowed: no accumulation, so every block is written the instant it arrives, behind
-        // the records that preceded it.
-        flush_regions::<W, V>(writer, vectored, &mut g, block).await?;
+        // Big enough to be worth a syscall of its own, so it goes out uncopied, as the
+        // trailing region of a gathering write over everything accumulated before it.
+        flush_regions(writer, &mut g, block).await?;
     }
 
     // The tail of the list: an accumulated run with no large block behind it (the common
     // multiplexed pass), or records with no trailing block. One gathering write for the lot.
     if !g.regions.is_empty() || g.gathered.len() > g.run_start {
-        flush_regions::<W, V>(writer, vectored, &mut g, &[]).await?;
+        flush_regions(writer, &mut g, &[]).await?;
     }
 
     // The sink and the region list were drained at every flush above — the final one included
@@ -1764,10 +1640,9 @@ where
 /// compile. The slices are materialised into a stack array, so no heap traffic is added and
 /// `http_zero_alloc.rs` is not tripped.
 ///
-/// `vectored` chooses the write: the gathering write of `V` when true, one borrowed write per
-/// region when false. It is `V::GATHERS_POSSIBLE && gathers()`, so it is only ever true for a
-/// [`DoVectored`] writer whose stream really gathers — a [`NoVectored`] writer is always
-/// false, always takes the borrowed path, and `V::write`'s stub is never reached.
+/// The write is always the gathering one. Whether it reaches a real `writev` or the loop in
+/// [`BorrowedWrite::write_vectored`]'s provided default is the transport's business, invisible
+/// here and identical in the octets it produces.
 ///
 /// `tail` is the live session block to write after the list, or empty for a flush that has no
 /// block behind it. `g.regioned` is how many records the list names, drained on success so
@@ -1775,14 +1650,13 @@ where
 /// reset here so every call site starts the next run and batch from zero. A transport failure
 /// disposes of the *whole* sink instead and returns the error, so the drain-to-empty invariant
 /// holds on that exit too.
-async fn flush_regions<W: BorrowedWrite + ?Sized, V: VectoredOp<W>>(
+async fn flush_regions<W: BorrowedWrite + ?Sized>(
     writer: &mut W,
-    vectored: bool,
     g: &mut Gather<'_>,
     tail: &[u8],
 ) -> Result<()>
 where
-    W::Strategy: ReadinessStrategy,
+    W::Model: ReadinessModel,
 {
     // Close the open run of small blocks, if any accumulated since the last cut, so it is
     // ordered ahead of `tail`. Done here rather than at the call sites so every flush path
@@ -1803,11 +1677,7 @@ where
         // Deliberately not `?`: a failure here must still fall through to the disposal below,
         // so the write result is carried out of the borrowing scope rather than propagated
         // from inside it.
-        if vectored {
-            write_gathering::<W, V>(writer, &slots[..count]).await
-        } else {
-            write_borrowed_regions(writer, &slots[..count]).await
-        }
+        write_gathering(writer, &slots[..count]).await
     };
 
     if let Err(error) = outcome {
@@ -1898,14 +1768,18 @@ fn materialise<'a>(
 /// which some transports would count as a region for nothing. `slices` carries no empty entry
 /// to begin with, since [`materialise`] skipped them.
 ///
-/// Only ever reached with `V = DoVectored`: [`flush_regions`] routes here only when `vectored`
-/// is true, which a [`NoVectored`] writer never is, so `V::write`'s stub is unreachable.
-async fn write_gathering<W: BorrowedWrite + ?Sized, V: VectoredOp<W>>(
+/// This loop is the *only* short-write authority on the readiness path. The emulating default
+/// behind [`BorrowedWrite::write_vectored`] deliberately does not retry: it stops at the first
+/// short region and reports the running total, and this rebuilds the offer and calls it again.
+/// One authority rather than two nested ones is what keeps the accounting checkable — and it
+/// is why a transport that moves only the first region of every offer still delivers every
+/// octet, in order, at the cost of one call per region.
+async fn write_gathering<W: BorrowedWrite + ?Sized>(
     writer: &mut W,
     slices: &[std::io::IoSlice<'_>],
 ) -> Result<()>
 where
-    W::Strategy: ReadinessStrategy,
+    W::Model: ReadinessModel,
 {
     let total: usize = slices.iter().map(|slice| slice.len()).sum();
     let mut done = 0;
@@ -1925,7 +1799,7 @@ where
             skip = 0;
             count += 1;
         }
-        let written = V::write(writer, &offer[..count]).await?;
+        let written = writer.write_vectored(&offer[..count]).await?;
         if written == 0 {
             return Err(Error::new(
                 ErrorKind::Transport,
@@ -1933,35 +1807,6 @@ where
             ));
         }
         done += written;
-    }
-    Ok(())
-}
-
-/// Writes each of `slices` on its own through [`BorrowedWrite::write_borrowed`], uncopied.
-///
-/// The borrowed strategy cannot gather, so a region list reaches it as one write per region —
-/// each header, each payload, each block a separate uncopied write, in order. A short write
-/// re-offers the remainder of the same region. An accepted write of zero octets is an error
-/// rather than something to spin on.
-async fn write_borrowed_regions<W: BorrowedWrite + ?Sized>(
-    writer: &mut W,
-    slices: &[std::io::IoSlice<'_>],
-) -> Result<()>
-where
-    W::Strategy: ReadinessStrategy,
-{
-    for slice in slices {
-        let mut offset = 0;
-        while offset < slice.len() {
-            let written = writer.write_borrowed(&slice[offset..]).await?;
-            if written == 0 {
-                return Err(Error::new(
-                    ErrorKind::Transport,
-                    "the transport accepted no octets and reported no error",
-                ));
-            }
-            offset += written;
-        }
     }
     Ok(())
 }
@@ -2000,7 +1845,7 @@ async fn flush_owned<W: RegionWrite + ?Sized>(
     send_records: &mut Vec<SendRecord>,
 ) -> Result<()>
 where
-    W::Strategy: CompletionStrategy,
+    W::Model: CompletionModel,
 {
     // Whatever a previous pass left has already been written and dropped; both buffers keep
     // their capacity across the clear. `send_records` is drained to empty at every write and
@@ -2127,7 +1972,7 @@ async fn write_owned<W: RegionWrite + ?Sized>(
     regioned: &mut usize,
 ) -> Result<()>
 where
-    W::Strategy: CompletionStrategy,
+    W::Model: CompletionModel,
 {
     // Move the list out for the by-value write. The emptied handle keeps its capacity, and it
     // — or the list `write_regions` returns — is restored to `*owned` before every return.
@@ -2347,19 +2192,12 @@ mod tests {
             regioned: 1,
         };
 
-        // A transport electing the gathering path that fails its first write, so the error
-        // arrives from inside `flush_regions`' gathering write. `DoVectored` is the vectored
-        // side of the shared readiness loop, and `vectored` is `true` because this writer
-        // really gathers.
+        // A transport that gathers natively and fails its first write, so the error arrives
+        // from inside `flush_regions`' gathering write with the whole offer in one call.
         let (failing, _peer) = failing_vectored(1, false);
         let (_reader, mut writer) = failing.split();
 
-        let outcome = block_on(flush_regions::<_, DoVectored>(
-            &mut writer,
-            true,
-            &mut g,
-            &[],
-        ));
+        let outcome = block_on(flush_regions(&mut writer, &mut g, &[]));
         assert!(
             outcome.is_err(),
             "a failing gathering write must surface the transport error"
@@ -2380,10 +2218,12 @@ mod tests {
         );
     }
 
-    /// The borrowed twin of the check above: the same invariant on the other fast path, whose
-    /// write reaches the transport through [`write_borrowed_regions`] rather than
-    /// [`write_gathering`]. The record is named by two regions, so a borrowed write moves one
-    /// at a time; failing the payload region's write is what leaves the record mid-disposal.
+    /// The emulating twin of the check above: the same invariant when the gathering write is
+    /// the provided default rather than a native `writev`, so the failure surfaces from inside
+    /// the emulation loop and part-way through the offer. The record is named by two regions,
+    /// and emulation writes one region per call, so failing the *second* call leaves the
+    /// record whole in the sink at the moment the error appears — the case whole-sink disposal
+    /// has to cover and prefix disposal would miss.
     #[test]
     fn a_failing_borrowed_write_drains_the_record_sink_before_returning() {
         use crate::http::testing::{block_on, failing_borrowed};
@@ -2412,23 +2252,18 @@ mod tests {
             regioned: 1,
         };
 
-        // The borrowed path writes the header region first and the payload region second, so
-        // the second write is the one that fails — the record is still whole in the sink when
-        // it does. `NoVectored` is the borrowed side of the shared readiness loop, and
-        // `vectored` is `false`, so every region reaches the transport through
-        // `write_borrowed_regions` and `NoVectored::write` is never touched.
+        // Emulation writes the header region first and the payload region second, so the
+        // second write is the one that fails — the record is still whole in the sink when it
+        // does. This writer overrides nothing, so `write_vectored` is the provided default and
+        // every region reaches the transport through `write_borrowed`.
         let (failing, _peer) = failing_borrowed(2, false);
         let (_reader, mut writer) = failing.split();
 
-        let outcome = block_on(flush_regions::<_, NoVectored>(
-            &mut writer,
-            false,
-            &mut g,
-            &[],
-        ));
+        let outcome = block_on(flush_regions(&mut writer, &mut g, &[]));
         assert!(
             outcome.is_err(),
-            "a failing borrowed write must surface the transport error"
+            "a failing borrowed write inside the emulation loop must surface the transport \
+             error"
         );
         assert!(
             g.send_records.is_empty(),

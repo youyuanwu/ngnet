@@ -181,6 +181,7 @@ where
         Arc::clone(&shared),
         registry,
         guard,
+        config.policy(),
     ));
 
     Ok((

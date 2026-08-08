@@ -23,12 +23,11 @@ use std::io;
 use std::rc::Rc;
 
 use ngnet_h2::http::testing::{
-    Duplex, DuplexReader, DuplexWriter, Empty, Full, alongside, block_on, buffering,
+    Duplex, DuplexReader, DuplexWriter, Empty, Full, Vectored, alongside, block_on, buffering,
     bytes_crate as bytes, duplex, http_crate as http,
 };
 use ngnet_h2::http::transport::{
-    BorrowedWrite, Coalesced, Gathering, OwnedRegions, RegionWrite, Transport, TransportWrite,
-    VectoredWrite,
+    BorrowedWrite, Completion, Readiness, RegionWrite, Transport, TransportWrite,
 };
 use ngnet_h2::http::{IncomingBody, server};
 
@@ -127,14 +126,14 @@ fn a_buffering_transport_still_completes_an_exchange() {
 /// file, and the crate's public testing surface is pinned by `compat_surface.rs`, which is
 /// not a place to add things casually.
 struct GatheringBuffer {
-    inner: Duplex<Coalesced>,
+    inner: Duplex<Vectored>,
     /// Gathering calls actually polled, shared with the test so it can tell whether the
     /// path it means to exercise was taken at all.
     gathered: Rc<Cell<usize>>,
 }
 
 struct GatheringBufferWriter {
-    inner: DuplexWriter<Coalesced>,
+    inner: DuplexWriter<Vectored>,
     /// Octets written but not yet handed to the peer — the user-space buffer a `BufWriter`
     /// would keep.
     buffer: Vec<u8>,
@@ -159,7 +158,7 @@ impl Transport for GatheringBuffer {
 }
 
 impl TransportWrite for GatheringBufferWriter {
-    type Strategy = Gathering;
+    type Model = Readiness;
 
     fn write(
         &mut self,
@@ -182,15 +181,12 @@ impl TransportWrite for GatheringBufferWriter {
 
 impl BorrowedWrite for GatheringBufferWriter {
     async fn write_borrowed<'w>(&'w mut self, data: &'w [u8]) -> io::Result<usize> {
-        // The live fallback when a stream does not really scatter-gather. This transport
-        // buffers exactly as its `write` does, so the driver's borrowed path lands in the
-        // same user-space buffer that `commit` flushes.
+        // Buffers exactly as this transport's `write` does, so every path into it lands in
+        // the same user-space buffer that `commit` flushes.
         self.buffer.extend_from_slice(data);
         Ok(data.len())
     }
-}
 
-impl VectoredWrite for GatheringBufferWriter {
     async fn write_vectored<'w>(&'w mut self, regions: &'w [io::IoSlice<'w>]) -> io::Result<usize> {
         self.gathered.set(self.gathered.get() + 1);
         let mut written = 0;
@@ -204,7 +200,7 @@ impl VectoredWrite for GatheringBufferWriter {
 
 #[test]
 fn a_buffering_transport_that_gathers_still_completes_an_exchange() {
-    // The same exchange as above, over a transport that elects the gathering path. The
+    // The same exchange as above, over a transport that gathers natively. The
     // budget is what turns "the driver stopped committing after a gathered pass" into a
     // failure rather than a hung suite.
     let (client_transport, server_transport) = duplex();
@@ -283,14 +279,14 @@ fn a_buffering_transport_that_gathers_still_completes_an_exchange() {
 /// `GatheringBuffer` is — one point, one file, and the public surface stays as
 /// `compat_surface.rs` pins it.
 struct GatheringRegionBuffer {
-    inner: Duplex<Coalesced>,
+    inner: Duplex<Vectored>,
     /// Owned-region calls actually made, shared with the test so it can tell whether the
     /// completion path it means to exercise was taken at all.
     gathered: Rc<Cell<usize>>,
 }
 
 struct GatheringRegionBufferWriter {
-    inner: DuplexWriter<Coalesced>,
+    inner: DuplexWriter<Vectored>,
     /// Octets written but not yet handed to the peer — the user-space buffer a `BufWriter`
     /// would keep.
     buffer: Vec<u8>,
@@ -315,7 +311,7 @@ impl Transport for GatheringRegionBuffer {
 }
 
 impl TransportWrite for GatheringRegionBufferWriter {
-    type Strategy = OwnedRegions;
+    type Model = Completion;
 
     fn write(
         &mut self,

@@ -14,11 +14,11 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
+use ngnet_h2::http::testing::Vectored;
 use ngnet_h2::http::testing::{
     self, Duplex, DuplexWriter, Scripted, alongside, block_on, bytes_crate as bytes, duplex,
     http_crate as http, scripted, serve,
 };
-use ngnet_h2::http::transport::Coalesced;
 use ngnet_h2::http::{Transport, TransportRead};
 use ngnet_h2::{
     FrameType, Header, HeaderAction, HeaderCategory, Session, SessionBuilder, StreamId,
@@ -401,7 +401,7 @@ fn a_body_that_wakes_itself_does_not_deadlock() {
 }
 
 /// A reading half that never completes, over a real writing half.
-struct StalledRead(Duplex<Coalesced>);
+struct StalledRead(Duplex<Vectored>);
 
 /// A read that stays in flight for as long as the connection lives.
 struct NeverReads;
@@ -418,7 +418,7 @@ impl TransportRead for NeverReads {
 
 impl Transport for StalledRead {
     type Reader = NeverReads;
-    type Writer = DuplexWriter<Coalesced>;
+    type Writer = DuplexWriter<Vectored>;
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         let (_reader, writer) = self.0.split();

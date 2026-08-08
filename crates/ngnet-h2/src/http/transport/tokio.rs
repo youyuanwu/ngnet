@@ -9,27 +9,28 @@
 //!
 //! tokio is readiness-based, so nothing here needs to own a buffer while an operation is in
 //! flight. Reads take the buffer, fill it and hand it straight back, with no copy. The writer
-//! declares [`Gathering`] as its [`Strategy`](TransportWrite::Strategy), so the driver gathers
-//! the session's small output blocks into one `writev` while handing large ones to the socket
-//! uncopied — few syscalls per pass without copying a body. Declaring that strategy is what
-//! obliges this type to implement [`VectoredWrite`]; it cannot claim the path without
-//! supplying it.
+//! declares [`Readiness`] as its [`Model`](TransportWrite::Model) — which says only that its
+//! writes lend a borrowed buffer, and obliges it to implement [`BorrowedWrite`]. Whether a
+//! pass becomes one gathering write or one copied write is
+//! [`WritePolicy`](crate::http::WritePolicy)'s to decide, not this adapter's.
 //!
-//! [`BorrowedWrite`] is required alongside, and here it is a live path rather than a
-//! formality. It is what runs when the underlying I/O reports it does not really gather and
-//! would otherwise write only the first region of each call.
+//! [`write_borrowed`](BorrowedWrite::write_borrowed) is the primitive; the gathering write is
+//! provided in terms of it. This adapter overrides that provided default when — and only
+//! when — the wrapped stream really scatter-gathers.
 //!
 //! # Asking the stream once
 //!
-//! Whether a stream really scatter-gathers is a property of that stream — tokio's default
-//! `poll_write_vectored` writes the first region and ignores the rest — so it has to be asked.
-//! It is asked exactly once, in [`Transport::split`], and the answer is cached in a field for
-//! the connection's life; [`VectoredWrite::gathers`] returns that field, and the driver reads
-//! `gathers` once per connection immediately after splitting. Previously
-//! `AsyncWrite::is_write_vectored` — a virtual call whose answer never changes for a given
-//! stream — was consulted on every single vectored write, and the driver additionally probed
-//! for the capability once per flush pass by constructing a future purely to drop it unpolled.
-//! Neither happens now.
+//! Whether a stream really scatter-gathers is a property of that stream: tokio's default
+//! `poll_write_vectored` writes the first region and reports that honestly, so forwarding to
+//! it unconditionally would cost one syscall per region while still delivering every octet.
+//! Slower, not wrong — but worth avoiding, so it is asked.
+//!
+//! It is asked exactly once, in [`Transport::split`], and cached in a field for the
+//! connection's life. **The answer never leaves this adapter.** It used to be a trait method
+//! the driver read once per connection; now it selects, privately, between forwarding to the
+//! stream's own vectored write and calling the shared emulation. Nothing above this file can
+//! see it, and no third-party wrapper can inherit a wrong answer to it by forgetting to
+//! forward a question — because there is no longer a question to forward.
 //!
 //! Because the `AsyncWrite` bound also admits buffering wrappers, whose `write` only fills a
 //! buffer, [`TransportWrite::commit`] flushes: without it a `BufWriter` or `BufStream` would
@@ -40,7 +41,7 @@ use core::future::Future;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 
-use super::{BorrowedWrite, Gathering, Transport, TransportRead, TransportWrite, VectoredWrite};
+use super::{BorrowedWrite, Readiness, Transport, TransportRead, TransportWrite};
 
 /// Carries any tokio byte stream into this crate's transport traits.
 ///
@@ -85,10 +86,9 @@ where
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         let (reader, writer) = tokio::io::split(self.stream);
-        // The one place this question is asked. `is_write_vectored` is a virtual call whose
-        // answer is fixed for a given stream, so it is settled here, once, and read from the
-        // field for the connection's life. The driver in turn reads `gathers` once, just
-        // after this split, so the whole connection costs a single consultation.
+        // The one place this question is asked, and the only place it is answered.
+        // `is_write_vectored` is a virtual call whose answer is fixed for a given stream, so
+        // it is settled here, once, and read from the field for the connection's life.
         let gathers = writer.is_write_vectored();
         (
             TokioReader { half: reader },
@@ -112,6 +112,9 @@ pub struct TokioWriter<T> {
     half: WriteHalf<T>,
     /// Whether the wrapped stream really scatter-gathers, settled once in
     /// [`Transport::split`] rather than asked on every write.
+    ///
+    /// Private, and deliberately so: it selects between forwarding a gathering write to the
+    /// stream and emulating one, which is this adapter's business. No layer above sees it.
     gathers: bool,
 }
 
@@ -131,10 +134,9 @@ impl<T> TransportWrite for TokioWriter<T>
 where
     T: AsyncWrite,
 {
-    /// tokio is a readiness runtime that never needs to own the octets, so it gathers:
-    /// small blocks are accumulated into a driver-owned buffer while large ones are lent to
-    /// the socket uncopied, reaching few writes without copying payloads.
-    type Strategy = Gathering;
+    /// tokio is a readiness runtime: it never needs to own the octets, so writes lend a
+    /// borrowed buffer and the session's blocks can go out uncopied.
+    type Model = Readiness;
 
     async fn write(&mut self, buf: Bytes) -> (std::io::Result<usize>, Bytes) {
         let result = self.half.write(&buf).await;
@@ -159,36 +161,34 @@ where
         &'w mut self,
         data: &'w [u8],
     ) -> impl Future<Output = std::io::Result<usize>> + 'w {
-        // tokio never needs to own the octets, so the session's blocks are handed over as
-        // they are produced rather than gathered into one owned buffer first. This is not
-        // dead weight beside `write_vectored`: it is the path that runs whenever `gathers`
-        // is false, which is to say whenever the wrapped stream only emulates a gathering
-        // write.
+        // The readiness primitive, and a real write rather than a formality: it is what the
+        // emulated gathering write is built from, so it runs for every region of every pass
+        // whenever the wrapped stream does not scatter-gather.
         self.half.write(data)
     }
-}
 
-impl<T> VectoredWrite for TokioWriter<T>
-where
-    T: AsyncWrite,
-{
-    fn gathers(&self) -> bool {
-        // The `AsyncWrite` bound admits implementations whose `poll_write_vectored` is the
-        // provided default: it writes the first region and silently ignores the rest, so
-        // gathering there would move one region per syscall and be strictly worse than the
-        // borrowed path. Reporting `false` sends the driver to `write_borrowed` instead.
-        // Every type this crate puts behind `TokioIo` in practice — `TcpStream`,
-        // `UnixStream`, `DuplexStream`, and the buffering wrappers — reports `true`.
-        //
-        // Read from the field rather than from the stream: the answer was settled once, in
-        // `Transport::split`.
-        self.gathers
-    }
-
-    fn write_vectored<'w>(
+    // Written as `async fn` rather than `-> impl Future` with an `async move` body, unlike its
+    // sibling above. The two branches produce distinct opaque future types, so they cannot be
+    // returned directly from one `-> impl Future`; they have to be awaited inside a single
+    // future, and `async fn` is that future without the hand-rolled block clippy objects to.
+    async fn write_vectored<'w>(
         &'w mut self,
         regions: &'w [std::io::IoSlice<'w>],
-    ) -> impl Future<Output = std::io::Result<usize>> + 'w {
-        self.half.write_vectored(regions)
+    ) -> std::io::Result<usize> {
+        if self.gathers {
+            self.half.write_vectored(regions).await
+        } else {
+            // The `AsyncWrite` bound admits implementations whose `poll_write_vectored`
+            // is the provided default: it writes the first region and ignores the rest.
+            // Forwarding there would cost one syscall per region *and* go through a
+            // vectored call that only pretends. Emulating explicitly costs the same
+            // syscalls without the pretence, and shares the crate's single emulation
+            // implementation rather than growing a second one.
+            //
+            // Every type this crate puts behind `TokioIo` in practice — `TcpStream`,
+            // `UnixStream`, `DuplexStream`, and the buffering wrappers — takes the branch
+            // above.
+            super::emulate_gathering(self, regions).await
+        }
     }
 }

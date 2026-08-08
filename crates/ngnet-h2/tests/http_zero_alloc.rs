@@ -45,28 +45,46 @@
 //! rank differently on each, which is exactly why one of them alone would have answered the
 //! question wrongly.
 //!
+//! A *shape* is no longer one thing the transport declares. It is a pair: what the transport
+//! can do — gather natively, or only through `write_vectored`'s looping default — and what the
+//! h2 layer decided, through [`WritePolicy`]. The rows below name both.
+//!
 //! The allocation and write columns are asserted by the tests named in the final column;
 //! the parenthesised counts are illustrative — they are the values observed at the default
 //! 64 KiB window and eight streams, but the tests pin the *properties* rather than those
 //! incidental numbers, which move with the window size, the stream count and `bytes`'
 //! growth policy.
 //!
-//! | shape | upload: allocations / writes | multiplexed: allocations / writes | pinned by |
+//! | shape (transport × policy) | upload: allocations / writes | multiplexed: allocations / writes | pinned by |
 //! |-------|------------------------------|-----------------------------------|-----------|
-//! | owned (neither override)   | `0` / `1` | `0` / `1` | `the_owned_write_path_coalesces_a_pass_into_one_write`, `the_owned_write_path_reuses_its_coalescing_buffer` |
-//! | borrowed (`write_borrowed`) | `0` / one per block (4) | `0` / one per block (513) | `steady_state_send_allocates_nothing_on_the_borrowed_path`, `the_borrowed_write_path_writes_each_block_separately` |
-//! | gathering (`write_vectored`) | `0` / one per frame (4) | `0` / `1` | `steady_state_send_allocates_nothing_on_the_vectored_path`, `steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path`, `the_vectored_write_path_coalesces_a_multiplexed_pass_into_one_write`, `the_vectored_write_path_writes_once_per_large_block_and_no_more` |
-//! | owned-region (`write_regions`) | `0` / `1` | — | `the_owned_region_write_path_coalesces_a_pass_into_one_write`, `steady_state_send_allocates_nothing_on_the_owned_region_path` |
+//! | `CoalescedShape` — any readiness transport, gathering **off** | `0` / `1` | `0` / `1` | `the_owned_write_path_coalesces_a_pass_into_one_write`, `the_owned_write_path_reuses_its_coalescing_buffer` |
+//! | `EmulatedShape` — emulating transport, gathering on | `0` / one per frame (4) | `0` / `1` | `steady_state_send_allocates_nothing_on_the_borrowed_path`, `emulated_gathering_costs_no_more_writes_than_native_on_an_upload` |
+//! | `GatheredShape` — natively-gathering transport, gathering on | `0` / one per frame (4) | `0` / `1` | `steady_state_send_allocates_nothing_on_the_vectored_path`, `steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path`, `a_multiplexed_pass_costs_one_write_natively_and_under_emulation_alike`, `the_vectored_write_path_writes_once_per_large_block_and_no_more` |
+//! | `RegionShape` — completion transport | `0` / `1` | — | `the_owned_region_write_path_coalesces_a_pass_into_one_write`, `steady_state_send_allocates_nothing_on_the_owned_region_path` |
+//!
+//! # The emulated row used to read `513`
+//!
+//! Before the write policy moved to the h2 layer there was a fourth *drain*, `PerRegion`,
+//! which wrote each session block on its own — 513 writes on the multiplexed pass. It is gone,
+//! and with it that number. What replaced it is not a cheaper drain but the absence of one:
+//! the driver accumulates sub-threshold blocks into a single region *before* any write
+//! happens, so a transport that can only emulate gathering is handed one region and loops
+//! once. Its cost is set by the regions the driver offers, never by the blocks the session
+//! produced, which is the entire reason mandatory gathering is affordable.
+//!
+//! The `GatheredShape` and `RegionShape` rows are unchanged from before that move, deliberately
+//! and to the digit: a real `TcpStream` and a completion transport must not pay anything for a
+//! decision that was taken away from them.
 //!
 //! The owned-region row carries no multiplexed column: this file's push-model workload never
-//! hands over a payload, so the completion strategy coalesces every block into its minting
-//! buffer and looks exactly like the owned shape from here — one write per pass, no
+//! hands over a payload, so the completion path coalesces every block into its minting
+//! buffer and looks exactly like the coalesced shape from here — one write per pass, no
 //! allocation. Its distinguishing property, that a *handed-over* payload rides uncopied in
 //! its own region, needs a shared body to exercise and is proven in `http_shared_body.rs`.
 //!
-//! All four shapes now reach zero steady-state allocation, but they arrived there at
-//! different times and for different reasons, and the history is worth keeping because the
-//! table above was once the argument for a design decision.
+//! All four shapes reach zero steady-state allocation, but they arrived there at different
+//! times and for different reasons, and the history is worth keeping because the table above
+//! was once the argument for a design decision.
 //!
 //! The owned shape used to allocate every pass — four times on an upload, twelve on a
 //! multiplexed pass — and that recurring cost was the stated reason the tokio adapter took
@@ -126,9 +144,62 @@ use ngnet_h2::http::testing::{
     pool_high_water, pool_size,
 };
 use ngnet_h2::http::transport::{
-    BorrowedWrite, Coalesced, Gathering, OwnedRegions, PerRegion, RegionWrite, Transport,
-    TransportRead, TransportWrite, VectoredWrite,
+    BorrowedWrite, Completion, Readiness, RegionWrite, Transport, TransportRead, TransportWrite,
 };
+use ngnet_h2::http::{Config, WritePolicy};
+
+/// A recording transport that gathers natively — the fast path a real `TcpStream` takes.
+struct Native;
+
+/// A recording transport that reaches gathering only through `write_vectored`'s provided
+/// default, which loops the offer through `write_borrowed` one region at a time.
+struct Emul;
+
+/// A recording completion transport, which writes owned regions.
+struct Owned;
+
+/// A shape a measured run uses: a transport behaviour paired with the [`WritePolicy`] the h2
+/// layer is configured with.
+///
+/// Under the strategy-election design one marker named both, because the transport declared
+/// the drain. It no longer does — the transport declares only its I/O model and whether it
+/// gathers natively, and the policy is the h2 layer's — so a shape is a pair, and this trait
+/// is what lets a run still be written as one type parameter.
+trait Shape {
+    /// The transport behaviour marker the run is measured over.
+    type Half;
+    /// The policy the connection is configured with.
+    const POLICY: WritePolicy;
+}
+
+/// Native transport, gathering on: one `write_vectored` per pass.
+struct GatheredShape;
+/// Native transport, gathering off: one owned `write` per pass, every octet copied.
+struct CoalescedShape;
+/// Emulating transport, gathering on: the default's loop, one `write_borrowed` per region.
+struct EmulatedShape;
+/// Completion transport: one `write_regions` per pass.
+struct RegionShape;
+
+impl Shape for GatheredShape {
+    type Half = Native;
+    const POLICY: WritePolicy = WritePolicy::Gathered;
+}
+
+impl Shape for CoalescedShape {
+    type Half = Native;
+    const POLICY: WritePolicy = WritePolicy::Coalesced;
+}
+
+impl Shape for EmulatedShape {
+    type Half = Emul;
+    const POLICY: WritePolicy = WritePolicy::Gathered;
+}
+
+impl Shape for RegionShape {
+    type Half = Owned;
+    const POLICY: WritePolicy = WritePolicy::Gathered;
+}
 use ngnet_h2::{
     BytesBody, FrameType, Header, HeaderAction, HeaderCategory, Session, SessionBuilder, StreamId,
 };
@@ -369,10 +440,9 @@ macro_rules! recording_transport {
     };
 }
 
-recording_transport!(Coalesced);
-recording_transport!(PerRegion);
-recording_transport!(Gathering);
-recording_transport!(OwnedRegions);
+recording_transport!(Native);
+recording_transport!(Emul);
+recording_transport!(Owned);
 
 impl TransportRead for RecReader {
     async fn read(&mut self, mut buf: BytesMut) -> (io::Result<usize>, BytesMut) {
@@ -400,9 +470,9 @@ impl TransportRead for RecReader {
 
 /// Emits the `TransportWrite` impl for a [`RecWriter`] over one strategy marker.
 macro_rules! recording_transport_write {
-    ($marker:ty) => {
+    ($marker:ty, $model:ty) => {
         impl TransportWrite for RecWriter<$marker> {
-            type Strategy = $marker;
+            type Model = $model;
 
             fn write(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
                 self.do_write(buf)
@@ -411,12 +481,15 @@ macro_rules! recording_transport_write {
     };
 }
 
-recording_transport_write!(Coalesced);
-recording_transport_write!(PerRegion);
-recording_transport_write!(Gathering);
-recording_transport_write!(OwnedRegions);
+recording_transport_write!(Native, Readiness);
+recording_transport_write!(Emul, Readiness);
+recording_transport_write!(Owned, Completion);
 
-/// Emits the `BorrowedWrite` impl for the readiness strategies that supply it.
+/// Emits the `BorrowedWrite` impl for the readiness behaviours.
+///
+/// Emitted for both, and for `Emul` this is the *whole* impl: it takes `write_vectored`'s
+/// provided default, so its gathering writes loop back through this method one region at a
+/// time. `Native` overrides the default below.
 macro_rules! recording_borrowed_write {
     ($marker:ty) => {
         impl BorrowedWrite for RecWriter<$marker> {
@@ -430,10 +503,20 @@ macro_rules! recording_borrowed_write {
     };
 }
 
-recording_borrowed_write!(PerRegion);
-recording_borrowed_write!(Gathering);
+recording_borrowed_write!(Emul);
 
-impl VectoredWrite for RecWriter<Gathering> {
+/// The natively-gathering writer, spelled out rather than macro-emitted because it is the one
+/// that overrides `write_vectored`. Deleting that override would not fail to compile — it
+/// would silently fall back to the loop — so the tests below have to catch it instead, which
+/// is what `the_native_override_costs_fewer_writes_than_emulation` is for.
+impl BorrowedWrite for RecWriter<Native> {
+    fn write_borrowed<'w>(
+        &'w mut self,
+        data: &'w [u8],
+    ) -> impl Future<Output = io::Result<usize>> + 'w {
+        self.do_write_borrowed(data)
+    }
+
     fn write_vectored<'w>(
         &'w mut self,
         regions: &'w [io::IoSlice<'w>],
@@ -442,7 +525,7 @@ impl VectoredWrite for RecWriter<Gathering> {
     }
 }
 
-impl RegionWrite for RecWriter<OwnedRegions> {
+impl RegionWrite for RecWriter<Owned> {
     fn write_regions(
         &mut self,
         regions: Vec<Bytes>,
@@ -545,7 +628,7 @@ struct Receive {
 fn run_receive() -> Receive {
     let c2s = wire(1 << 20);
     let s2c = wire(1 << 20);
-    let transport = Recording::<PerRegion> {
+    let transport = Recording::<Native> {
         inbound: Rc::clone(&s2c),
         outbound: Rc::clone(&c2s),
         meter: Rc::new(RefCell::new(Meter::default())),
@@ -553,7 +636,7 @@ fn run_receive() -> Receive {
     };
 
     let (requests, connection) =
-        ngnet_h2::http::handshake::<Recording<PerRegion>, Empty>(transport).expect("handshake");
+        ngnet_h2::http::handshake::<Recording<Native>, Empty>(transport).expect("handshake");
 
     let mut peer = peer_session();
     let mut ctx = PeerCtx::default();
@@ -619,20 +702,26 @@ struct Send {
 
 fn run_send<S>() -> Send
 where
-    Recording<S>: Transport,
+    S: Shape,
+    Recording<S::Half>: Transport,
 {
     let c2s = wire(1 << 22);
     let s2c = wire(1 << 20);
     let meter = Rc::new(RefCell::new(Meter::default()));
-    let transport = Recording::<S> {
+    let transport = Recording::<S::Half> {
         inbound: Rc::clone(&s2c),
         outbound: Rc::clone(&c2s),
         meter: Rc::clone(&meter),
         _marker: PhantomData,
     };
 
-    let (requests, connection) =
-        ngnet_h2::http::handshake::<Recording<S>, Full>(transport).expect("handshake");
+    // The drain is the h2 layer's choice now, so it arrives through `Config` rather than
+    // being read off the transport the run was built over.
+    let (requests, connection) = ngnet_h2::http::handshake_with::<Recording<S::Half>, Full>(
+        transport,
+        Config::default().write_policy(S::POLICY),
+    )
+    .expect("handshake");
 
     let mut peer = peer_session();
     let mut ctx = PeerCtx::default();
@@ -724,7 +813,7 @@ fn the_read_buffer_pool_settles_to_a_fixed_size() {
 
 #[test]
 fn steady_state_send_allocates_nothing_on_the_borrowed_path() {
-    let measured = run_send::<PerRegion>();
+    let measured = run_send::<EmulatedShape>();
 
     assert!(
         measured.allocations.iter().all(|&count| count == 0),
@@ -735,7 +824,7 @@ fn steady_state_send_allocates_nothing_on_the_borrowed_path() {
 
 #[test]
 fn the_owned_write_path_coalesces_a_pass_into_one_write() {
-    let measured = run_send::<Coalesced>();
+    let measured = run_send::<CoalescedShape>();
 
     assert!(
         measured.writes.iter().all(|&count| count == 1),
@@ -754,29 +843,56 @@ fn the_owned_write_path_coalesces_a_pass_into_one_write() {
 }
 
 #[test]
-fn the_borrowed_write_path_writes_each_block_separately() {
-    let borrowed = run_send::<PerRegion>();
-    let owned = run_send::<Coalesced>();
+fn emulated_gathering_costs_no_more_writes_than_native_on_an_upload() {
+    // The second half of the affordability argument, on the workload the multiplexed test
+    // does not cover. An upload's blocks are full-sized `DATA` frames, so each takes the
+    // large-block path and the pass is several writes rather than one — on *both* shapes.
+    //
+    // **This test replaced `the_borrowed_write_path_writes_each_block_separately`.** That
+    // name described the old `PerRegion` drain, which is gone: there is no longer a drain that
+    // writes blocks separately, only a transport that loops over whatever regions the driver
+    // offers. Since the driver offers one region per large block either way, emulation lands
+    // on the same count as `writev`, and the comparison worth pinning is that equality rather
+    // than a difference.
+    let native = run_send::<GatheredShape>();
+    let emulated = run_send::<EmulatedShape>();
+    let coalesced = run_send::<CoalescedShape>();
 
-    // Same traffic, driven identically: the two shapes differ only in how they drain it.
+    // Same traffic, driven identically: the shapes differ only in how they drain it.
     assert_eq!(
-        borrowed.bytes, owned.bytes,
-        "the two shapes were not compared on the same traffic",
+        emulated.bytes, coalesced.bytes,
+        "the shapes were not compared on the same traffic",
+    );
+    assert_eq!(
+        emulated.bytes, native.bytes,
+        "the shapes were not compared on the same traffic",
+    );
+    assert_eq!(
+        emulated.writes, native.writes,
+        "emulated gathering cost a different number of writes than native gathering on the \
+         copying upload path, where the driver offers one region per large block; if these \
+         diverge, the driver stopped accumulating and emulation is no longer bounded by the \
+         offer",
     );
     assert!(
-        borrowed.writes.iter().all(|&count| count > 1),
-        "the borrowed path hands over each session block as its own write rather than \
-         coalescing, so a multi-block pass is more than one write, saw {:?}",
-        borrowed.writes,
+        emulated.writes.iter().all(|&count| count > 1),
+        "an upload of several full-sized frames must cost several writes, or the comparison \
+         above is between two trivial counts, saw {:?}",
+        emulated.writes,
     );
-    // "At most one per block" is the property that matters, and with a transport that accepts
-    // every block whole the count is exactly one per block: the driver's per-block loop never
-    // re-issues. That the borrowed count stays put pass to pass is what pins it.
-    let first = borrowed.writes[0];
+    // A fixed cost of the traffic, not a growing one.
+    let first = emulated.writes[0];
     assert!(
-        borrowed.writes.iter().all(|&count| count == first),
-        "one write per block is a fixed cost of the traffic, not a growing one, saw {:?}",
-        borrowed.writes,
+        emulated.writes.iter().all(|&count| count == first),
+        "one write per frame is a fixed cost of the traffic, not a growing one, saw {:?}",
+        emulated.writes,
+    );
+    // And turning gathering off really is the cheaper shape by syscall count here — the
+    // honest cost of mandatory gathering, pinned rather than hidden.
+    assert!(
+        coalesced.writes.iter().all(|&count| count == 1),
+        "with gathering off the pass coalesces into one write, saw {:?}",
+        coalesced.writes,
     );
 }
 
@@ -794,8 +910,8 @@ fn the_owned_write_path_reuses_its_coalescing_buffer() {
     // every outgoing octet — that is inherent, because the transport takes ownership — but it
     // must not reallocate to do so. A regression to `freeze()`, or to declaring the buffer
     // inside `flush`, would restore the per-pass allocation and fail here.
-    let owned = run_send::<Coalesced>();
-    let borrowed = run_send::<PerRegion>();
+    let owned = run_send::<CoalescedShape>();
+    let borrowed = run_send::<EmulatedShape>();
 
     assert!(
         owned.allocations.iter().all(|&count| count == 0),
@@ -811,16 +927,16 @@ fn the_owned_write_path_reuses_its_coalescing_buffer() {
         "the borrowed path carries the same traffic for no allocation, saw {:?}",
         borrowed.allocations,
     );
-    // The two paths now agree on allocation, so the thing that still separates them is the
-    // write count. Asserted here so the comparison this test used to draw is not simply lost.
+    // The two paths agree on allocation, so the thing that still separates them is the write
+    // count. Asserted here so the comparison this test used to draw is not simply lost.
     assert!(
         owned.writes.iter().all(|&count| count == 1),
-        "the owned path still coalesces each pass into one write, saw {:?}",
+        "with gathering off the pass still coalesces into one write, saw {:?}",
         owned.writes,
     );
     assert!(
         borrowed.writes.iter().all(|&count| count > 1),
-        "the borrowed path still pays one write per block, saw {:?}",
+        "with gathering on an upload still pays one write per large block, saw {:?}",
         borrowed.writes,
     );
 }
@@ -831,7 +947,7 @@ fn the_owned_region_write_path_coalesces_a_pass_into_one_write() {
     // uncopied, every block is coalesced into the minting buffer and the whole pass reaches
     // the transport as a single owned region. So it looks exactly like the owned path from
     // the write-count side — one gathering write per pass — which is what this pins.
-    let measured = run_send::<OwnedRegions>();
+    let measured = run_send::<RegionShape>();
 
     assert!(
         measured.writes.iter().all(|&count| count == 1),
@@ -856,7 +972,7 @@ fn steady_state_send_allocates_nothing_on_the_owned_region_path() {
     // `bytes` reclaims the capacity and the steady state allocates nothing. A regression to
     // `freeze()` in place of `split().freeze()`, or to building the buffers inside `flush`,
     // would restore a per-pass allocation and fail here.
-    let measured = run_send::<OwnedRegions>();
+    let measured = run_send::<RegionShape>();
 
     assert!(
         measured.allocations.iter().all(|&count| count == 0),
@@ -919,20 +1035,26 @@ impl Body for Trickle {
 /// per pass as [`run_send`]: what the connection allocated, and what it cost in writes.
 fn run_multiplexed<S>() -> Send
 where
-    Recording<S>: Transport,
+    S: Shape,
+    Recording<S::Half>: Transport,
 {
     let c2s = wire(1 << 22);
     let s2c = wire(1 << 20);
     let meter = Rc::new(RefCell::new(Meter::default()));
-    let transport = Recording::<S> {
+    let transport = Recording::<S::Half> {
         inbound: Rc::clone(&s2c),
         outbound: Rc::clone(&c2s),
         meter: Rc::clone(&meter),
         _marker: PhantomData,
     };
 
-    let (requests, connection) =
-        ngnet_h2::http::handshake::<Recording<S>, Trickle>(transport).expect("handshake");
+    // The drain is the h2 layer's choice now, so it arrives through `Config` rather than
+    // being read off the transport the run was built over.
+    let (requests, connection) = ngnet_h2::http::handshake_with::<Recording<S::Half>, Trickle>(
+        transport,
+        Config::default().write_policy(S::POLICY),
+    )
+    .expect("handshake");
 
     let mut peer = peer_session();
     let mut ctx = PeerCtx::default();
@@ -999,7 +1121,7 @@ fn steady_state_send_allocates_nothing_on_the_vectored_path() {
     // buffer that were reallocated each pass would have traded one recurring cost for
     // another. It is not: the driver holds it across passes and clears rather than drops it,
     // so once it has grown to what a pass needs it stops allocating entirely.
-    let measured = run_send::<Gathering>();
+    let measured = run_send::<GatheredShape>();
 
     assert!(
         measured.allocations.iter().all(|&count| count == 0),
@@ -1013,7 +1135,7 @@ fn steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path() {
     // The claim that matters, and the one the body workload cannot make: passes whose blocks
     // all land *in* the accumulation buffer, so its reuse from one pass to the next is what
     // is being measured rather than its emptiness.
-    let measured = run_multiplexed::<Gathering>();
+    let measured = run_multiplexed::<GatheredShape>();
 
     assert!(
         measured.allocations.iter().all(|&count| count == 0),
@@ -1035,30 +1157,46 @@ fn steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path() {
 }
 
 #[test]
-fn the_vectored_write_path_coalesces_a_multiplexed_pass_into_one_write() {
+fn a_multiplexed_pass_costs_one_write_natively_and_under_emulation_alike() {
     // The syscall property the whole change exists to deliver, measured against the traffic
     // it was measured to matter for. Every block a trickling stream produces is below the
-    // threshold, so the pass accumulates all of them and pays for exactly one write.
-    let vectored = run_multiplexed::<Gathering>();
-    let borrowed = run_multiplexed::<PerRegion>();
+    // threshold, so the pass accumulates all of them into a single region and pays for
+    // exactly one write.
+    //
+    // **This assertion changed.** It used to read `borrowed.writes > STREAMS` — one write per
+    // block, 513 of them — because the borrowed drain wrote region by region *without
+    // accumulating first*. There is no such drain any more: accumulation is unconditional and
+    // happens in the driver before any write, so a transport that only emulates gathering is
+    // handed the same one-region offer the natively-gathering one is, and its loop runs
+    // exactly once. That is the mechanism, and it is the whole argument that mandatory
+    // gathering is affordable: emulation's cost is set by how many regions the driver
+    // *offers*, not by how many blocks the session produced.
+    let native = run_multiplexed::<GatheredShape>();
+    let emulated = run_multiplexed::<EmulatedShape>();
 
     assert_eq!(
-        vectored.bytes, borrowed.bytes,
+        native.bytes, emulated.bytes,
         "the two shapes were not compared on the same traffic",
     );
     assert!(
-        vectored.writes.iter().all(|&count| count == 1),
+        native.writes.iter().all(|&count| count == 1),
         "a multiplexed pass of sub-threshold blocks costs one write however many streams \
          contributed, saw {:?}",
-        vectored.writes,
+        native.writes,
     );
-    // The contrast is the point. This is the factor the benchmarks measure, stated as a
-    // property so it fails the day it stops being true.
+    assert_eq!(
+        emulated.writes, native.writes,
+        "emulated gathering cost more writes than native gathering on a pass the driver \
+         accumulated into one region; if this fails, accumulation stopped happening before \
+         the write and the emulation argument no longer holds",
+    );
+    // Not vacuous: the single write really did carry every stream's contribution, so "one
+    // write" is a collapse of many blocks rather than a pass that had nothing to send.
     assert!(
-        borrowed.writes.iter().all(|&count| count > STREAMS),
-        "the borrowed path pays a write per block, which is what makes the one above worth \
-         having, saw {:?}",
-        borrowed.writes,
+        native.bytes.iter().all(|&bytes| bytes > TRICKLE * STREAMS),
+        "each measured pass must carry more than one chunk from every stream for the \
+         one-write claim to mean anything, saw {:?}",
+        native.bytes,
     );
 }
 
@@ -1069,9 +1207,9 @@ fn the_vectored_write_path_writes_once_per_large_block_and_no_more() {
     // So an upload costs one write per DATA frame — the same count the borrowed path pays,
     // and for the same reason, but with the frame's header and any control frames riding
     // along instead of costing writes of their own.
-    let vectored = run_send::<Gathering>();
-    let borrowed = run_send::<PerRegion>();
-    let owned = run_send::<Coalesced>();
+    let vectored = run_send::<GatheredShape>();
+    let borrowed = run_send::<EmulatedShape>();
+    let owned = run_send::<CoalescedShape>();
 
     assert_eq!(
         vectored.bytes, borrowed.bytes,
@@ -1158,7 +1296,7 @@ fn run_handlers() -> Vec<usize> {
 
     let to_server = wire(1 << 20);
     let from_server = wire(1 << 20);
-    let transport = Recording::<PerRegion> {
+    let transport = Recording::<Native> {
         inbound: Rc::clone(&to_server),
         outbound: Rc::clone(&from_server),
         meter: Rc::new(RefCell::new(Meter::default())),

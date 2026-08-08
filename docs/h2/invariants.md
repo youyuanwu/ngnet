@@ -46,14 +46,14 @@ frames, not the one-off cost of standing a stream up.
 | Test | Claim |
 | --- | --- |
 | `steady_state_receive_allocates_nothing` | A steady-state receive pass — and the body drainer's poll — allocate **zero**. |
-| `steady_state_send_allocates_nothing_on_the_borrowed_path` | Likewise for sending, on the borrowed write path. |
+| `steady_state_send_allocates_nothing_on_the_borrowed_path` | Likewise for sending, on a transport that reaches gathering through the emulating default. |
 | `steady_state_send_allocates_nothing_on_the_vectored_path` | Likewise on the gathering path — so gathering costs nothing the borrowed path did not. |
 | `steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path` | And still zero when eight streams are multiplexed, which is where the driver's own buffer would be tempted to grow. |
-| `steady_state_send_allocates_nothing_on_the_owned_region_path` | Likewise on the owned-region path — the completion transport's gathering strategy allocates nothing in steady state either. |
+| `steady_state_send_allocates_nothing_on_the_owned_region_path` | Likewise on the owned-region path — the completion transport's gathering allocates nothing in steady state either. |
 | `the_read_buffer_pool_settles_to_a_fixed_size` | The pool reaches a high-water mark during warm-up and does not grow afterwards. |
-| `the_owned_write_path_coalesces_a_pass_into_one_write` | One write per pass, with more than one frame's worth of bytes — so the single write is not trivially single. |
-| `the_borrowed_write_path_writes_each_block_separately` | More than one write per pass on identical traffic, constant across passes. |
-| `the_vectored_write_path_coalesces_a_multiplexed_pass_into_one_write` | One write for a whole multiplexed pass — the coalesced path's write count at the borrowed path's allocation count, which is the entire claim of the strategy. |
+| `the_owned_write_path_coalesces_a_pass_into_one_write` | Under `WritePolicy::Coalesced`, one write per pass, with more than one frame's worth of bytes — so the single write is not trivially single. |
+| `emulated_gathering_costs_no_more_writes_than_native_on_an_upload` | Emulated and native gathering cost the **same** write count on the copying upload path, because the driver offers one region per large block either way. Replaces `the_borrowed_write_path_writes_each_block_separately`, whose premise — a per-region drain — no longer exists. |
+| `a_multiplexed_pass_costs_one_write_natively_and_under_emulation_alike` | One write for a whole multiplexed pass, and **the same count** for a transport that only emulates gathering. Accumulation happens in the driver before any write, so 513 small blocks collapse into one region and the emulating loop runs once. This is the whole affordability argument for mandatory gathering. |
 | `the_vectored_write_path_writes_once_per_large_block_and_no_more` | A large block still costs exactly one write, so gathering never degenerates into a write per region. |
 | `the_owned_region_write_path_coalesces_a_pass_into_one_write` | The owned-region (completion) path coalesces a push-model pass into one write — indistinguishable from the owned path here, since a payload only rides its own region once a body is handed over. |
 | `the_owned_write_path_reuses_its_coalescing_buffer` | The owned path reuses its coalescing buffer rather than rebuilding it per pass, so it too allocates nothing in steady state — it pays a copy, not an allocation. |
@@ -69,25 +69,36 @@ frames, not the one-off cost of standing a stream up.
   that releases writes only on `commit` still completes, under a bounded poll budget so a
   regression fails rather than hanging forever.
 - **Five compile-fail doctests** on `TransportWrite` and `BorrowedWrite` — the ways an adapter
-  could get a write strategy wrong do not compile. Each pins an error code
+  could get a write declaration wrong do not compile. Each pins an error code
   (`compile_fail,E0277` or `E0053`) rather than bare `compile_fail`, so a typo in the doctest
   cannot pass for the guarded failure, and each was mutation-verified by making the guarded
-  construct legal and confirming the doctest then fails:
-  - declaring `Gathering` without implementing `VectoredWrite`;
-  - declaring `OwnedRegions` without implementing `RegionWrite`;
+  construct legal and confirming the doctest then fails. The count is unchanged at five, but
+  two were retargeted when the strategy markers went away:
+  - declaring `Readiness` without implementing `BorrowedWrite`;
+  - declaring `Completion` without implementing `RegionWrite` — which bites even though
+    `RegionWrite` has no required methods, because the empty impl block is still required;
   - implementing operations from both I/O models on one type;
   - an `Option`-returning `write_borrowed`, i.e. trying to decline a path mid-pass;
-  - implementing `WriteStrategy` downstream, i.e. inventing a fifth strategy.
-- **`the_gathering_capability_is_consulted_exactly_once_per_connection`**
-  (`tests/http_vectored.rs`) — the driver reads `VectoredWrite::gathers` once, after
-  `Transport::split`, however many passes follow. Mutation-verified: reverting `Gathering`'s
-  drain to re-read the capability per pass fails it.
+  - implementing `WriteModel` downstream, i.e. inventing a third I/O model.
+- **`the_write_policy_is_the_h2_layers_and_holds_for_the_connections_life`**
+  (`tests/http_vectored.rs`) — the *same* natively-gathering transport, driven under both
+  `WritePolicy` values, produces gathered writes under one and none under the other, across
+  several passes, with identical octets on the wire. This replaces
+  `the_gathering_capability_is_consulted_exactly_once_per_connection`, which pinned that the
+  driver read `VectoredWrite::gathers` exactly once. There is no capability to read any more —
+  nothing is consulted on any path — which is strictly stronger than reading it once.
+- **`an_emulating_transport_delivers_identical_octets_one_region_at_a_time`** and
+  **`an_emulating_transport_delivers_every_octet_of_a_multi_region_offer_in_order`**
+  (`tests/http_vectored.rs`) — the emulation contract. Both run on the handed-over body, the
+  only measured workload where the driver offers more than one region and therefore the only
+  one where native and emulated gathering are distinguishable at all; both assert that
+  multi-region offers actually occurred, so neither can pass vacuously.
 - **`elects_owned_regions::<CompioWriter<TcpStream>>()`** (`ngnet-h2-tests/tests/http_compio.rs`)
-  — a compile-time assertion that the shipped completion transport elects `OwnedRegions`. This
+  — a compile-time assertion that the shipped completion transport declares `Completion`. This
   replaces a runtime predicate check that was found vacuous: in PR #9, flipping
   `gathers_owned_regions()` to `false` left the entire workspace suite green, so the whole
   owned-region fast path could have silently regressed to copying every octet. Demoting
-  `CompioWriter` to `Coalesced` now fails to compile, and the failure is workspace-visible.
+  `CompioWriter` to `Readiness` now fails to compile, and the failure is workspace-visible.
 - **A compile-fail doctest** on `Connection` — discarding the driver is an error, because a
   connection that compiles and never sends a byte is the trap the type exists to prevent.
 - **A negative `Send` assertion** in `ngnet-h2-tests` — a connection over a non-`Send`

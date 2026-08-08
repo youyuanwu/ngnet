@@ -16,7 +16,9 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use http_body::{Body, Frame};
-use ngnet_h2::http::transport::{Coalesced, Transport, TransportRead, TransportWrite};
+use ngnet_h2::http::transport::{
+    Completion, RegionWrite, Transport, TransportRead, TransportWrite,
+};
 use ngnet_h2::http::{IncomingBody, server, transport::TokioIo};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -283,7 +285,7 @@ async fn a_large_body_crosses_a_real_socket_intact() {
 ///
 /// It deliberately does **not** override `write_borrowed`, so the connection takes the
 /// coalescing path — the other half of the comparison.
-struct Completion {
+struct CompletionShaped {
     stream: TcpStream,
 }
 
@@ -295,7 +297,7 @@ struct CompletionWriter {
     half: tokio::net::tcp::OwnedWriteHalf,
 }
 
-impl Transport for Completion {
+impl Transport for CompletionShaped {
     type Reader = CompletionReader;
     type Writer = CompletionWriter;
 
@@ -318,16 +320,24 @@ impl TransportRead for CompletionReader {
 }
 
 impl TransportWrite for CompletionWriter {
-    // Only `write`, so the simplest strategy: the driver coalesces each pass into one owned
-    // write. Naming it is the whole election — there is nothing else to declare and nothing
-    // for the driver to ask.
-    type Strategy = Coalesced;
+    // Owned throughout, so the completion model. That is now the *only* declaration a
+    // transport makes about its writes: how it does I/O, never which drain the h2 layer
+    // should use.
+    type Model = Completion;
 
     async fn write(&mut self, buf: Bytes) -> (std::io::Result<usize>, Bytes) {
         let result = tokio::io::AsyncWriteExt::write(&mut self.half, &buf).await;
         (result, buf)
     }
 }
+
+/// The whole gathering obligation, discharged by an empty impl.
+///
+/// `RegionWrite` has no required methods: its `write_regions` default loops the owned regions
+/// through `write` above. So this transport gathers — as every transport now must — without
+/// naming a single extra method, which is the shape that makes "mandatory" affordable for a
+/// backend that has nothing better to offer.
+impl RegionWrite for CompletionWriter {}
 
 #[tokio::test]
 async fn the_same_exchange_runs_over_a_completion_shaped_transport() {
@@ -340,13 +350,13 @@ async fn the_same_exchange_runs_over_a_completion_shaped_transport() {
 
         tokio::spawn(async move {
             let (stream, _peer) = listener.accept().await.expect("accepting");
-            let _ = server::serve(Completion { stream }, echo)
+            let _ = server::serve(CompletionShaped { stream }, echo)
                 .expect("serving")
                 .await;
         });
 
         let stream = TcpStream::connect(addr).await.expect("connecting");
-        let received = ask(Completion { stream }, "/echo", b"owned buffers")
+        let received = ask(CompletionShaped { stream }, "/echo", b"owned buffers")
             .await
             .expect("an exchange");
 
@@ -418,13 +428,15 @@ impl TransportRead for ThreadBoundReader {
 }
 
 impl TransportWrite for ThreadBoundWriter {
-    type Strategy = Coalesced;
+    type Model = Completion;
 
     fn write(&mut self, buf: Bytes) -> impl Future<Output = (std::io::Result<usize>, Bytes)> {
         self.peer.borrow_mut().extend_from_slice(&buf);
         core::future::ready((Ok(buf.len()), buf))
     }
 }
+
+impl RegionWrite for ThreadBoundWriter {}
 
 #[tokio::test]
 async fn a_transport_that_cannot_move_between_threads_compiles_and_runs() {

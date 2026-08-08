@@ -208,7 +208,12 @@ where
 
     let guard = DriverGuard::new(Arc::clone(&shared), Arc::clone(&registry), role);
     Ok(Connection::new(driver::run(
-        transport, session, shared, registry, guard,
+        transport,
+        session,
+        shared,
+        registry,
+        guard,
+        config.policy(),
     )))
 }
 

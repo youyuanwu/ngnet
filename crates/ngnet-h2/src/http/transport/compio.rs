@@ -21,12 +21,13 @@
 //!
 //! # The one fast write path a completion runtime can take
 //!
-//! The readiness model's two write operations — [`BorrowedWrite::write_borrowed`] and
-//! [`VectoredWrite::write_vectored`] — are not merely unused here. They are *unavailable*:
-//! both are gated on the writer's strategy being a [`ReadinessStrategy`](super::ReadinessStrategy),
-//! and this writer declares [`OwnedRegions`], which is a
-//! [`CompletionStrategy`](super::CompletionStrategy). Attempting to implement either is a
-//! compile error rather than a documented mistake.
+//! The readiness model's write operations — [`BorrowedWrite::write_borrowed`] and
+//! [`write_vectored`](BorrowedWrite::write_vectored) — are not merely unused here. They are
+//! *unavailable*: [`BorrowedWrite`] is gated on the writer's model being a
+//! [`ReadinessModel`](super::ReadinessModel), and this writer declares
+//! [`Completion`](super::Completion), which is a
+//! [`CompletionModel`](super::CompletionModel). Attempting to implement it is a compile error
+//! rather than a documented mistake.
 //!
 //! That is the right outcome and not an over-restriction. A completion runtime cannot lend
 //! the kernel a borrowed slice at all, because the operation outlives the call that started
@@ -39,14 +40,26 @@
 //! path is ownership, not capability — which is exactly why the trait split runs along the
 //! ownership line and not along a capability flag.
 //!
-//! Previously this was expressed by returning `None` from methods this transport inherited
-//! but could not serve, and by a `gathers_owned_regions` predicate that could fall out of
-//! step with the write implementing it. Both are gone: the strategy declaration says the same
-//! thing, once, and the compiler checks it.
+//! Earlier revisions expressed this by returning `None` from methods this transport inherited
+//! but could not serve, and by a `gathers_owned_regions` predicate that could fall out of step
+//! with the write implementing it. Both are gone: the model declaration says the same thing,
+//! once, and the compiler checks it.
 //!
-//! Ownership is exactly what the *owned-region* strategy provides, and this transport takes
-//! it. The writer declares [`OwnedRegions`] as its
-//! [`Strategy`](TransportWrite::Strategy), and [`RegionWrite::write_regions`] hands compio a
+//! # Gathering is not optional here, and never was
+//!
+//! A completion transport gathers on every pass under
+//! [`WritePolicy::Gathered`](crate::http::WritePolicy::Gathered). There is no capability to
+//! decline and there never was one on this side — the whole owned list goes to
+//! [`RegionWrite::write_regions`] in one call.
+//!
+//! That method is *provided* rather than required: a completion transport with no vectored
+//! submission of its own inherits a default that hands each region to
+//! [`write`](TransportWrite::write) in turn, so `impl RegionWrite for MyWriter {}` is a
+//! complete implementation. This transport overrides it, because compio has a real one.
+//!
+//! Ownership is exactly what the owned-region path provides, and this transport takes it. The
+//! writer declares [`Completion`](super::Completion) as its
+//! [`Model`](TransportWrite::Model), and [`RegionWrite::write_regions`] hands compio a
 //! `Vec<Bytes>` by value. This became
 //! possible when the crate adopted libnghttp2's no-copy `DATA` facility: a handed-over
 //! payload is now caller-owned [`Bytes`] rather than a borrow of libnghttp2's serialisation
@@ -93,7 +106,7 @@ use compio::buf::BufResult;
 use compio::io::util::Splittable;
 use compio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
-use super::{OwnedRegions, RegionWrite, Transport, TransportRead, TransportWrite};
+use super::{Completion, RegionWrite, Transport, TransportRead, TransportWrite};
 
 /// Carries a compio byte stream into this crate's transport traits.
 ///
@@ -171,12 +184,12 @@ impl<R: AsyncRead> TransportRead for CompioReader<R> {
 }
 
 impl<W: AsyncWrite> TransportWrite for CompioWriter<W> {
-    /// A completion runtime owns its buffers, which is exactly what this strategy requires
-    /// and what lets this transport issue a genuine gathering write for a no-copy body.
-    /// Declaring it *is* the election — there is no flag to set and nothing for the driver
-    /// to ask. See the module documentation for why this is the one fast path a completion
-    /// transport can take, and why the vectored one is not.
-    type Strategy = OwnedRegions;
+    /// A completion runtime owns its buffers, which is what lets this transport issue a
+    /// genuine gathering write for a no-copy body. Declaring the model settles *ownership*;
+    /// how many writes a pass becomes is [`WritePolicy`](crate::http::WritePolicy)'s to
+    /// choose. There is no flag to set and nothing for the driver to ask. See the module
+    /// documentation for why the borrowed path is unavailable here.
+    type Model = Completion;
 
     async fn write(&mut self, buf: Bytes) -> (std::io::Result<usize>, Bytes) {
         let BufResult(result, buf) = self.half.write(buf).await;
@@ -188,6 +201,8 @@ impl<W: AsyncWrite> TransportWrite for CompioWriter<W> {
 }
 
 impl<W: AsyncWrite> RegionWrite for CompioWriter<W> {
+    /// Overrides the provided default, which would write each region separately, with
+    /// compio's real vectored submission.
     async fn write_regions(&mut self, regions: Vec<Bytes>) -> (std::io::Result<usize>, Vec<Bytes>) {
         // `Vec<Bytes>` is a compio `IoVectoredBuf` (`Vec<T: IoBuf>`, `Bytes: IoBuf`), so this
         // is a real `writev` reaching `IORING_OP_SENDMSG`, not an emulation. compio takes the
