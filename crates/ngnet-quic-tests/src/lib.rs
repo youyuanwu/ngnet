@@ -203,17 +203,30 @@ pub fn core_addr(addr: std::net::SocketAddr) -> core::net::SocketAddr {
     addr
 }
 
+/// How far the harness advances the clock between writes.
+///
+/// ngtcp2 paces its sending: `ngtcp2_conn_update_pkt_tx_time` records when the next packet
+/// may leave, and a write attempted before then returns nothing. A test clock that never
+/// moves therefore gets exactly one packet and then silence -- which looks indistinguishable
+/// from a broken connection. Letting a little time pass between writes is what a real
+/// caller's event loop does anyway.
+pub const PACING_STEP_NANOS: u64 = 2_000_000;
+
 /// Drains one connection's outbound datagrams.
 ///
 /// Loops until the connection stops offering datagrams, which is the shape every caller of
-/// this API must adopt — a single write is almost never enough.
+/// this API must adopt — a single write is almost never enough. Advances the clock between
+/// attempts, for the pacing reason described on [`PACING_STEP_NANOS`].
 pub fn drain(conn: &mut TestConn<'_>, clock: &TestClock) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     let mut buf = vec![0u8; 1500];
     // Bounded so a mistake fails the test rather than hanging it.
     for _ in 0..64 {
         match conn.write_pkt(&mut buf, clock.now())? {
-            WriteOutcome::Datagram { len } => out.push(buf[..len].to_vec()),
+            WriteOutcome::Datagram { len } => {
+                out.push(buf[..len].to_vec());
+                clock.advance(PACING_STEP_NANOS);
+            }
             WriteOutcome::Idle | WriteOutcome::Blocked => break,
         }
     }

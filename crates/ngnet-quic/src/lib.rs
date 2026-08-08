@@ -78,6 +78,8 @@ mod path;
 #[allow(unsafe_code)]
 mod settings;
 #[allow(unsafe_code)]
+mod stream_io;
+#[allow(unsafe_code)]
 mod tls;
 #[cfg(feature = "tls-ossl")]
 #[allow(unsafe_code)]
@@ -105,6 +107,7 @@ pub use params::{
 pub use rand::EntropySource;
 pub use settings::Settings;
 pub use stream::{Directionality, Initiator, StreamId};
+pub use stream_io::StreamWrite;
 pub use time::{Duration, Timestamp};
 pub use tls::{NativeTlsHandle, Role, TlsBackend, TlsSession};
 

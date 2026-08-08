@@ -312,11 +312,16 @@ fn classify(native: NativeCode) -> ErrorKind {
         | sys::NGTCP2_ERR_MALFORMED_TRANSPORT_PARAM
         | sys::NGTCP2_ERR_TRANSPORT_PARAM
         | sys::NGTCP2_ERR_VERSION_NEGOTIATION_FAILURE => ErrorKind::Crypto,
+        // Genuinely transient: the same call may succeed later.
         sys::NGTCP2_ERR_STREAM_DATA_BLOCKED
         | sys::NGTCP2_ERR_STREAM_ID_BLOCKED
-        | sys::NGTCP2_ERR_STREAM_SHUT_WR
-        | sys::NGTCP2_ERR_STREAM_NOT_FOUND
         | sys::NGTCP2_ERR_CONN_ID_BLOCKED => ErrorKind::Blocked,
+        // Not transient: writing to a stream whose write side is closed, or naming one that
+        // does not exist, is a mistake on this side of the connection and retrying it will
+        // fail identically.
+        sys::NGTCP2_ERR_STREAM_SHUT_WR | sys::NGTCP2_ERR_STREAM_NOT_FOUND => {
+            ErrorKind::InvalidInput
+        }
         sys::NGTCP2_ERR_CLOSING | sys::NGTCP2_ERR_DRAINING => ErrorKind::Closing,
         sys::NGTCP2_ERR_PROTO
         | sys::NGTCP2_ERR_FRAME_ENCODING

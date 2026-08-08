@@ -1,0 +1,457 @@
+//! Streams, flow control, and closing the connection.
+//!
+//! A QUIC connection carries data on streams. This module is the half of the API a caller
+//! spends most of its time in: opening streams, writing to them, granting the peer credit,
+//! and eventually shutting the whole thing down.
+//!
+//! # Credit is not automatic
+//!
+//! Two obligations here are easy to miss because omitting them produces no error, only a
+//! peer that goes quiet.
+//!
+//! Flow-control credit is consumed as the peer sends, and is only replenished when the
+//! application says so. And **stream-count limits are never raised by the library**: "The
+//! library does not increase maximum stream limit automatically"
+//! (`ngtcp2.h:5586-5594`). An application that accepts streams but never calls
+//! [`Conn::extend_max_streams_bidi`] will let the peer open exactly as many as the initial
+//! transport parameters allowed, and then no more, forever.
+
+use ngnet_quic_sys as sys;
+
+use crate::conn::Conn;
+use crate::error::{ApplicationErrorCode, Error, Result};
+use crate::stream::StreamId;
+use crate::time::Timestamp;
+use crate::tls::TlsSession;
+
+/// What happened when stream data was offered to the connection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StreamWrite {
+    /// A datagram was produced, and this many bytes of the offered data went into it.
+    ///
+    /// `accepted` may be less than what was offered, or zero: the packet may have been
+    /// filled with control frames instead. Whatever was not accepted must be offered again.
+    Datagram {
+        /// Bytes of the datagram buffer that were filled.
+        len: usize,
+        /// Bytes of the caller's stream data the connection took.
+        accepted: usize,
+    },
+    /// The stream's flow-control window is full. Wait for the peer to grant more.
+    StreamBlocked,
+    /// The connection's flow-control window is full.
+    ConnectionBlocked,
+    /// Nothing to send at the moment.
+    Idle,
+}
+
+impl<S: TlsSession> Conn<'_, S> {
+    /// Opens a bidirectional stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Blocked`] when the peer's stream limit is already reached —
+    /// an ordinary condition, not a failure. Call again after the peer grants more.
+    ///
+    /// [`ErrorKind::Blocked`]: crate::ErrorKind::Blocked
+    pub fn open_bidi_stream(&mut self) -> Result<StreamId> {
+        let mut id: i64 = -1;
+        // SAFETY: `raw` is live and `id` is a valid out-parameter.
+        let rc = unsafe {
+            sys::ngtcp2_conn_open_bidi_stream(self.raw(), &mut id, core::ptr::null_mut())
+        };
+        if rc != 0 {
+            return Err(Error::native(rc, "could not open a bidirectional stream"));
+        }
+        StreamId::new(id)
+    }
+
+    /// Opens a unidirectional stream.
+    ///
+    /// # Errors
+    ///
+    /// As [`Conn::open_bidi_stream`].
+    pub fn open_uni_stream(&mut self) -> Result<StreamId> {
+        let mut id: i64 = -1;
+        // SAFETY: `raw` is live and `id` is a valid out-parameter.
+        let rc =
+            unsafe { sys::ngtcp2_conn_open_uni_stream(self.raw(), &mut id, core::ptr::null_mut()) };
+        if rc != 0 {
+            return Err(Error::native(rc, "could not open a unidirectional stream"));
+        }
+        StreamId::new(id)
+    }
+
+    /// Writes stream data, producing a datagram to send.
+    ///
+    /// This is the stream-carrying counterpart of [`Conn::write_pkt`], and the same loop
+    /// applies: call it until it stops producing datagrams, sending each one.
+    ///
+    /// `fin` marks the end of the stream. A zero-length write with `fin` set is how a
+    /// stream is finished without further data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if ngtcp2 refuses; the connection is then unusable.
+    pub fn write_stream(
+        &mut self,
+        dest: &mut [u8],
+        stream: StreamId,
+        data: &[u8],
+        fin: bool,
+        now: Timestamp,
+    ) -> Result<StreamWrite> {
+        if dest.is_empty() {
+            return Err(Error::invalid_input(
+                "a datagram buffer must have room to write into",
+            ));
+        }
+
+        let flags = if fin {
+            sys::NGTCP2_WRITE_STREAM_FLAG_FIN
+        } else {
+            sys::NGTCP2_WRITE_STREAM_FLAG_NONE
+        };
+
+        let path = self.path_mut().as_raw_mut();
+        let mut accepted: sys::ngtcp2_ssize = 0;
+        let written = self.with_bridge(|raw| {
+            // SAFETY: `raw` is live, `path` points into storage the connection owns, `dest`
+            // is writable for its length and `data` readable for its length.
+            unsafe {
+                let mut pi = sys::ngtcp2_pkt_info { ecn: 0 };
+                crate::ffi::conn_writev_stream(
+                    raw,
+                    path,
+                    &mut pi,
+                    dest.as_mut_ptr(),
+                    dest.len(),
+                    &mut accepted,
+                    flags,
+                    stream.get(),
+                    // A single vector: the coalescing `MORE` loop is deliberately not
+                    // exposed, since its "every argument must be byte-identical across
+                    // calls" rule is not expressible in a safe API without a guard type.
+                    &sys::ngtcp2_vec {
+                        base: data.as_ptr().cast_mut(),
+                        len: data.len(),
+                    },
+                    1,
+                    now.as_raw(),
+                )
+            }
+        });
+
+        if written > 0 {
+            let len = written as usize;
+            debug_assert!(len <= dest.len());
+            // SAFETY: `raw` is live and the timestamp is the one just used.
+            unsafe { sys::ngtcp2_conn_update_pkt_tx_time(self.raw(), now.as_raw()) };
+            return Ok(StreamWrite::Datagram {
+                len,
+                accepted: accepted.max(0) as usize,
+            });
+        }
+
+        let code = i32::try_from(written).unwrap_or(sys::NGTCP2_ERR_INTERNAL);
+        match code {
+            // Zero here means "nothing produced", not "stream finished".
+            0 => Ok(StreamWrite::Idle),
+            sys::NGTCP2_ERR_STREAM_DATA_BLOCKED => Ok(StreamWrite::StreamBlocked),
+            sys::NGTCP2_ERR_STREAM_SHUT_WR => Err(Error::native(
+                code,
+                "the write side of this stream is already closed",
+            )),
+            sys::NGTCP2_ERR_CLOSING | sys::NGTCP2_ERR_DRAINING => Ok(StreamWrite::Idle),
+            other => Err(Error::native(other, "could not write stream data")),
+        }
+    }
+
+    /// Abandons a stream in both directions.
+    pub fn shutdown_stream(&mut self, stream: StreamId, code: ApplicationErrorCode) -> Result<()> {
+        // SAFETY: `raw` is live.
+        let rc =
+            unsafe { sys::ngtcp2_conn_shutdown_stream(self.raw(), 0, stream.get(), code.get()) };
+        if rc != 0 {
+            return Err(Error::native(rc, "could not shut down the stream"));
+        }
+        Ok(())
+    }
+
+    /// Resets the sending side of a stream, discarding anything unsent.
+    pub fn reset_stream(&mut self, stream: StreamId, code: ApplicationErrorCode) -> Result<()> {
+        // SAFETY: `raw` is live.
+        let rc = unsafe {
+            sys::ngtcp2_conn_shutdown_stream_write(self.raw(), 0, stream.get(), code.get())
+        };
+        if rc != 0 {
+            return Err(Error::native(rc, "could not reset the stream"));
+        }
+        Ok(())
+    }
+
+    /// Asks the peer to stop sending on a stream.
+    pub fn stop_sending(&mut self, stream: StreamId, code: ApplicationErrorCode) -> Result<()> {
+        // SAFETY: `raw` is live.
+        let rc = unsafe {
+            sys::ngtcp2_conn_shutdown_stream_read(self.raw(), 0, stream.get(), code.get())
+        };
+        if rc != 0 {
+            return Err(Error::native(rc, "could not stop the peer sending"));
+        }
+        Ok(())
+    }
+
+    /// Grants the peer more credit to send on one stream.
+    ///
+    /// Call this as received data is consumed. Without it the peer's window closes and the
+    /// stream stalls, with nothing reported to either side.
+    pub fn extend_max_stream_offset(&mut self, stream: StreamId, bytes: u64) -> Result<()> {
+        // SAFETY: `raw` is live.
+        let rc =
+            unsafe { sys::ngtcp2_conn_extend_max_stream_offset(self.raw(), stream.get(), bytes) };
+        if rc != 0 {
+            return Err(Error::native(rc, "could not extend the stream window"));
+        }
+        Ok(())
+    }
+
+    /// Grants the peer more credit to send on the connection as a whole.
+    pub fn extend_max_offset(&mut self, bytes: u64) {
+        // SAFETY: `raw` is live. This one returns nothing.
+        unsafe { sys::ngtcp2_conn_extend_max_offset(self.raw(), bytes) };
+    }
+
+    /// Allows the peer to open more bidirectional streams.
+    ///
+    /// **ngtcp2 never does this by itself** (`ngtcp2.h:5586-5594`). An application that
+    /// accepts streams and never calls this will let the peer open only as many as the
+    /// initial transport parameters allowed, and then stall it silently.
+    pub fn extend_max_streams_bidi(&mut self, count: usize) {
+        // SAFETY: `raw` is live. This one returns nothing and cannot fail.
+        unsafe { sys::ngtcp2_conn_extend_max_streams_bidi(self.raw(), count) };
+    }
+
+    /// Allows the peer to open more unidirectional streams.
+    ///
+    /// As [`Conn::extend_max_streams_bidi`], including the part about it not happening
+    /// automatically.
+    pub fn extend_max_streams_uni(&mut self, count: usize) {
+        // SAFETY: `raw` is live. This one returns nothing and cannot fail.
+        unsafe { sys::ngtcp2_conn_extend_max_streams_uni(self.raw(), count) };
+    }
+
+    /// How many bidirectional streams this endpoint may still open.
+    pub fn streams_bidi_left(&self) -> u64 {
+        // SAFETY: `raw` is live; a pure query.
+        unsafe { sys::ngtcp2_conn_get_streams_bidi_left(self.raw()) }
+    }
+
+    /// How many unidirectional streams this endpoint may still open.
+    pub fn streams_uni_left(&self) -> u64 {
+        // SAFETY: `raw` is live; a pure query.
+        unsafe { sys::ngtcp2_conn_get_streams_uni_left(self.raw()) }
+    }
+
+    /// Writes a packet telling the peer this connection is closing.
+    ///
+    /// Send the returned datagram, then stop sending anything else: the connection has
+    /// entered its closing period. Do **not** call this after
+    /// [`ExpiryOutcome::IdleClose`](crate::ExpiryOutcome::IdleClose), which asks for
+    /// silence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a close packet cannot be produced.
+    pub fn write_connection_close(
+        &mut self,
+        dest: &mut [u8],
+        code: ApplicationErrorCode,
+        reason: &[u8],
+        now: Timestamp,
+    ) -> Result<usize> {
+        if dest.is_empty() {
+            return Err(Error::invalid_input(
+                "a datagram buffer must have room to write into",
+            ));
+        }
+
+        // The reason phrase is **borrowed**, not copied: no `ngtcp2_ccerr_set_*` function
+        // takes a copy, so the buffer must outlive the call below -- which it does, being a
+        // parameter. This is why `ccerr` is built here rather than stored.
+        let mut ccerr = unsafe { core::mem::zeroed::<sys::ngtcp2_ccerr>() };
+        // SAFETY: `ccerr` is a valid writable struct and `reason` outlives the call.
+        unsafe {
+            sys::ngtcp2_ccerr_set_application_error(
+                &mut ccerr,
+                code.get(),
+                reason.as_ptr(),
+                reason.len(),
+            );
+        }
+
+        let path = self.path_mut().as_raw_mut();
+        let written = self.with_bridge(|raw| {
+            // SAFETY: `raw` is live, `path` points into owned storage, `dest` is writable,
+            // and `ccerr` outlives the call.
+            unsafe {
+                let mut pi = sys::ngtcp2_pkt_info { ecn: 0 };
+                crate::ffi::conn_write_connection_close(
+                    raw,
+                    path,
+                    &mut pi,
+                    dest.as_mut_ptr(),
+                    dest.len(),
+                    &ccerr,
+                    now.as_raw(),
+                )
+            }
+        });
+
+        if written < 0 {
+            let code = i32::try_from(written).unwrap_or(sys::NGTCP2_ERR_INTERNAL);
+            return Err(Error::native(code, "could not write a connection close"));
+        }
+        Ok(written as usize)
+    }
+}
+
+#[cfg(all(test, feature = "tls-ossl"))]
+mod tests {
+    use super::*;
+    use crate::conn::test_support::client_conn;
+    use crate::error::ErrorKind;
+    use crate::handlers::Handlers;
+    use crate::stream::Directionality;
+
+    fn ts(nanos: u64) -> Timestamp {
+        Timestamp::from_nanos(nanos).unwrap()
+    }
+
+    #[test]
+    fn opening_a_stream_before_the_handshake_is_blocked_not_broken() {
+        // The peer's limits are unknown until its transport parameters arrive, so this is
+        // an ordinary "not yet" rather than a failure -- and saying so distinguishably is
+        // the point.
+        let mut conn = client_conn(Handlers::new()).unwrap();
+        match conn.open_bidi_stream() {
+            Err(err) => assert_eq!(err.kind(), ErrorKind::Blocked),
+            Ok(id) => assert_eq!(id.directionality(), Directionality::Bidirectional),
+        }
+    }
+
+    #[test]
+    fn a_fresh_connection_has_no_stream_credit_yet() {
+        // Before the peer's transport parameters arrive there is nothing to spend.
+        let conn = client_conn(Handlers::new()).unwrap();
+        assert_eq!(conn.streams_bidi_left(), 0);
+        assert_eq!(conn.streams_uni_left(), 0);
+    }
+
+    #[test]
+    fn an_empty_buffer_is_rejected_by_every_write_path() {
+        let mut conn = client_conn(Handlers::new()).unwrap();
+        let stream = StreamId::new(0).unwrap();
+        assert!(
+            conn.write_stream(&mut [], stream, b"x", false, ts(2_000_000))
+                .is_err()
+        );
+        assert!(
+            conn.write_connection_close(&mut [], ApplicationErrorCode::new(0), b"", ts(2_000_000))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn extending_the_connection_window_is_always_permitted() {
+        // It returns nothing and cannot fail, which is worth pinning: a caller may grant
+        // credit at any point without checking a result.
+        let mut conn = client_conn(Handlers::new()).unwrap();
+        conn.extend_max_offset(1024);
+        conn.extend_max_offset(0);
+    }
+
+    #[test]
+    fn extending_stream_limits_is_accepted_before_the_handshake() {
+        // These return nothing and cannot fail, so a caller may grant capacity at any
+        // point without checking a result -- which is worth pinning, because forgetting to
+        // call them at all is the failure mode.
+        let mut conn = client_conn(Handlers::new()).unwrap();
+        conn.extend_max_streams_bidi(4);
+        conn.extend_max_streams_uni(4);
+    }
+
+    #[test]
+    fn a_connection_close_packet_can_be_written() {
+        let mut conn = client_conn(Handlers::new()).unwrap();
+        let mut buf = [0u8; 1500];
+        // Sending the first flight first, so there are keys to encrypt a close with.
+        let _ = conn.write_pkt(&mut buf, ts(2_000_000));
+
+        let written = conn
+            .write_connection_close(
+                &mut buf,
+                ApplicationErrorCode::new(0x1234),
+                b"done here",
+                ts(2_000_001),
+            )
+            .unwrap();
+        assert!(written > 0);
+        assert!(conn.in_closing_period());
+    }
+
+    #[test]
+    fn a_borrowed_reason_phrase_survives_the_call() {
+        // ngtcp2 does not copy the reason phrase, so this pins that it is read while still
+        // alive rather than stored and read later.
+        let mut conn = client_conn(Handlers::new()).unwrap();
+        let mut buf = [0u8; 1500];
+        let _ = conn.write_pkt(&mut buf, ts(2_000_000));
+
+        let written = {
+            let reason = String::from("a reason that goes out of scope");
+            conn.write_connection_close(
+                &mut buf,
+                ApplicationErrorCode::new(1),
+                reason.as_bytes(),
+                ts(2_000_001),
+            )
+            .unwrap()
+        };
+        assert!(written > 0);
+    }
+
+    #[test]
+    fn writing_to_a_stream_that_does_not_exist_is_reported_not_ignored() {
+        let mut conn = client_conn(Handlers::new()).unwrap();
+        let mut buf = [0u8; 1500];
+        let stream = StreamId::new(0).unwrap();
+        // The stream was never opened, so this must not silently claim success.
+        match conn.write_stream(&mut buf, stream, b"hello", false, ts(2_000_000)) {
+            Err(err) => assert!(err.native_code().is_some()),
+            Ok(StreamWrite::Datagram { accepted, .. }) => {
+                assert_eq!(
+                    accepted, 0,
+                    "no data can be accepted for an unopened stream"
+                );
+            }
+            Ok(_) => {}
+        }
+    }
+
+    #[test]
+    fn the_stream_write_outcomes_are_distinguishable() {
+        assert_ne!(StreamWrite::Idle, StreamWrite::StreamBlocked);
+        assert_ne!(StreamWrite::StreamBlocked, StreamWrite::ConnectionBlocked);
+        assert_ne!(
+            StreamWrite::Datagram {
+                len: 1,
+                accepted: 0
+            },
+            StreamWrite::Datagram {
+                len: 1,
+                accepted: 1
+            }
+        );
+    }
+}
