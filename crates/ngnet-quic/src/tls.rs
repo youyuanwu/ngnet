@@ -111,6 +111,21 @@ pub unsafe trait TlsSession {
     /// The handle to give `ngtcp2_conn_set_tls_native_handle`.
     fn native_handle(&self) -> NativeTlsHandle;
 
+    /// Tells the TLS session which connection it belongs to.
+    ///
+    /// The crypto helper reaches the `ngtcp2_conn` from inside its own callbacks, through a
+    /// reference the TLS object carries. Without this the helper's callbacks fail, and the
+    /// first thing that fails is the client's opening flight -- so this is not optional
+    /// wiring, it is what makes a handshake possible at all.
+    ///
+    /// The backend decides how to represent the reference, because that representation is
+    /// backend-specific.
+    ///
+    /// # Safety
+    ///
+    /// `conn` must be a live `ngtcp2_conn` that outlives this session.
+    unsafe fn bind_connection(&mut self, conn: *mut c_void);
+
     /// Fills in the crypto half of ngtcp2's callback table.
     ///
     /// # Safety

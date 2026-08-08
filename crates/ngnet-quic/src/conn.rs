@@ -271,6 +271,13 @@ impl<'h, S: TlsSession> Conn<'h, S> {
         // SAFETY: `raw` is live and the handle is the one this backend's helper expects --
         // for OpenSSL the ossl context, not the `SSL`, which is why it is a newtype.
         unsafe { sys::ngtcp2_conn_set_tls_native_handle(self.raw, handle.as_ptr()) };
+
+        // And the reference back, which the helper's callbacks follow to reach the
+        // connection. `raw` is ngtcp2's own heap allocation and does not move when this
+        // `Conn` is returned from its builder, which is why it is safe to hand over here.
+        // SAFETY: `raw` outlives the TLS session, which is dropped after `ngtcp2_conn_del`
+        // in this type's `Drop`.
+        unsafe { self.tls.bind_connection(self.raw.cast::<c_void>()) };
         Ok(())
     }
 
@@ -337,6 +344,11 @@ impl<'h, S: TlsSession> Conn<'h, S> {
     pub(crate) fn path_mut(&mut self) -> &mut PathStorage {
         &mut self.path
     }
+
+    /// The path as a const pointer, for the read path.
+    pub(crate) fn path_ptr(&self) -> *const sys::ngtcp2_path {
+        self.path.as_raw()
+    }
 }
 
 impl<S: TlsSession> Drop for Conn<'_, S> {
@@ -368,26 +380,33 @@ unsafe impl<S: TlsSession + Send> Send for Conn<'_, S> {}
 // The connection tests need a TLS session to build a connection at all, and the only
 // implementation this crate ships is the OpenSSL one. With that feature off the seam is
 // still compiled and still type-checked; there is simply nothing behind it to instantiate.
+/// Fixtures shared by the connection tests and the packet-path tests.
+///
+/// A self-signed certificate is committed rather than generated because the crate may have
+/// no dev-dependencies; see `tests/data/README.md`.
 #[cfg(all(test, feature = "tls-ossl"))]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use crate::rand::test_support::CountingEntropy;
     use crate::time::Timestamp;
     use crate::tls::TlsBackend;
-    use crate::tls_ossl::{OsslBackend, Verify};
+    use crate::tls_ossl::{OsslBackend, OsslSession, Verify};
 
-    fn addrs() -> (SocketAddr, SocketAddr) {
+    pub(crate) const CERT: &str = include_str!("../tests/data/test-cert.pem");
+    pub(crate) const KEY: &str = include_str!("../tests/data/test-key.pem");
+
+    pub(crate) fn addrs() -> (SocketAddr, SocketAddr) {
         (
             "127.0.0.1:1000".parse().unwrap(),
             "127.0.0.1:2000".parse().unwrap(),
         )
     }
 
-    fn ts() -> Timestamp {
+    pub(crate) fn ts() -> Timestamp {
         Timestamp::from_nanos(1_000_000).unwrap()
     }
 
-    fn client_backend() -> OsslBackend {
+    pub(crate) fn client_backend() -> OsslBackend {
         OsslBackend::builder(Role::Client)
             .alpn("h3")
             .verify(Verify::DangerouslyAcceptAnyCertificate)
@@ -395,7 +414,16 @@ mod tests {
             .unwrap()
     }
 
-    fn client_conn<'h>(handlers: Handlers<'h>) -> Result<Conn<'h, crate::tls_ossl::OsslSession>> {
+    pub(crate) fn server_backend() -> OsslBackend {
+        OsslBackend::builder(Role::Server)
+            .alpn("h3")
+            .certificate_chain_pem(CERT)
+            .private_key_pem(KEY)
+            .build()
+            .unwrap()
+    }
+
+    pub(crate) fn client_conn<'h>(handlers: Handlers<'h>) -> Result<Conn<'h, OsslSession>> {
         let backend = client_backend();
         let session = backend.new_session(Role::Client, None)?;
         let (local, remote) = addrs();
@@ -410,6 +438,15 @@ mod tests {
         )
         .build(handlers)
     }
+}
+
+#[cfg(all(test, feature = "tls-ossl"))]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::rand::test_support::CountingEntropy;
+    use crate::tls::TlsBackend;
+    use crate::tls_ossl::OsslBackend;
 
     #[test]
     fn a_client_connection_can_be_built_and_dropped() {
@@ -466,8 +503,8 @@ mod tests {
         // check has to be ours. Building a server with default parameters must fail.
         let backend = OsslBackend::builder(Role::Server)
             .alpn("h3")
-            .certificate_chain_pem(test_cert::CERT)
-            .private_key_pem(test_cert::KEY)
+            .certificate_chain_pem(CERT)
+            .private_key_pem(KEY)
             .build()
             .unwrap();
         let session = backend.new_session(Role::Server, None).unwrap();
@@ -489,8 +526,8 @@ mod tests {
     fn a_server_connection_can_be_built_from_a_decoded_initial() {
         let backend = OsslBackend::builder(Role::Server)
             .alpn("h3")
-            .certificate_chain_pem(test_cert::CERT)
-            .private_key_pem(test_cert::KEY)
+            .certificate_chain_pem(CERT)
+            .private_key_pem(KEY)
             .build()
             .unwrap();
         let session = backend.new_session(Role::Server, None).unwrap();
@@ -522,8 +559,8 @@ mod tests {
     fn a_reserved_version_is_refused_for_a_server() {
         let backend = OsslBackend::builder(Role::Server)
             .alpn("h3")
-            .certificate_chain_pem(test_cert::CERT)
-            .private_key_pem(test_cert::KEY)
+            .certificate_chain_pem(CERT)
+            .private_key_pem(KEY)
             .build()
             .unwrap();
         let session = backend.new_session(Role::Server, None).unwrap();
@@ -541,12 +578,5 @@ mod tests {
         .version(0x0a0a_0a0a)
         .build(Handlers::new());
         assert!(result.is_err());
-    }
-
-    /// A self-signed certificate, generated once and committed, so the connection tests
-    /// need no certificate-generation dependency. The wrapper crate may have none.
-    mod test_cert {
-        pub(super) const CERT: &str = include_str!("../tests/data/test-cert.pem");
-        pub(super) const KEY: &str = include_str!("../tests/data/test-key.pem");
     }
 }

@@ -70,6 +70,8 @@ mod error;
 #[allow(unsafe_code)]
 mod ffi;
 #[allow(unsafe_code)]
+mod packet;
+#[allow(unsafe_code)]
 mod params;
 #[allow(unsafe_code)]
 mod path;
@@ -95,6 +97,7 @@ pub use cid::{ConnectionId, MAX_LEN as MAX_CID_LEN, MIN_LEN as MIN_CID_LEN};
 pub use conn::{Conn, ConnBuilder};
 pub use error::{ApplicationErrorCode, Error, ErrorKind, NativeCode, Result, TransportErrorCode};
 pub use handlers::{Handlers, StreamCloseReason};
+pub use packet::{ExpiryOutcome, ReadOutcome, WriteOutcome};
 pub use params::{
     DEFAULT_CONNECTION_DATA, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_STREAMS, DEFAULT_STREAM_DATA,
     TransportParams,

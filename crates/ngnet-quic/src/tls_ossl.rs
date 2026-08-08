@@ -445,6 +445,21 @@ unsafe extern "C" fn alpn_select_cb(
     sys::SSL_TLSEXT_ERR_ALERT_FATAL as c_int
 }
 
+/// Hands the crypto helper the connection stored in the reference.
+///
+/// The helper calls this from six different callbacks, each having just recovered the
+/// reference from the `SSL`'s application data.
+unsafe extern "C" fn get_conn_cb(
+    conn_ref: *mut sys::ngtcp2_crypto_conn_ref,
+) -> *mut sys::ngtcp2_conn {
+    if conn_ref.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: the reference is the boxed one this session owns, and its `user_data` is the
+    // `ngtcp2_conn` pointer installed by `bind_connection`.
+    unsafe { (*conn_ref).user_data.cast::<sys::ngtcp2_conn>() }
+}
+
 /// An OpenSSL `SSL_CTX`, freed on drop.
 struct SslCtx(*mut sys::SSL_CTX);
 
@@ -677,7 +692,7 @@ impl OsslSession {
     ///
     /// `get_conn` must return a live `ngtcp2_conn` for as long as this session exists, and
     /// `user_data` must remain valid for the same period.
-    pub(crate) unsafe fn bind_conn_ref(
+    unsafe fn bind_conn_ref(
         &mut self,
         get_conn: sys::ngtcp2_crypto_get_conn,
         user_data: *mut c_void,
@@ -736,6 +751,15 @@ unsafe impl Send for OsslSession {}
 // `ngtcp2_conn_set_tls_native_handle` expects for this backend -- see `NativeTlsHandle`.
 // The teardown order required by the helper is enforced by `Drop` above.
 unsafe impl TlsSession for OsslSession {
+    unsafe fn bind_connection(&mut self, conn: *mut c_void) {
+        // `user_data` is the `ngtcp2_conn` pointer itself rather than anything of ours.
+        // That matters: ngtcp2 allocates the connection on the heap and never moves it, so
+        // the pointer stays valid even though the Rust `Conn` wrapper around it is moved
+        // when it is returned from its builder. Pointing at the wrapper would dangle.
+        // SAFETY: the caller guarantees `conn` outlives this session.
+        unsafe { self.bind_conn_ref(Some(get_conn_cb), conn) };
+    }
+
     fn native_handle(&self) -> NativeTlsHandle {
         // The ossl ctx, NOT the `SSL`. The parameter is `void *`, so the wrong one would
         // compile and corrupt memory at run time.
