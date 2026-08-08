@@ -56,9 +56,15 @@
 // module's name from its file stem, so a nested file would produce a name this list never
 // mentions and be reported as using `unsafe` without a grant.
 #[allow(unsafe_code)]
+mod accept;
+#[allow(unsafe_code)]
 mod alloc;
 #[allow(unsafe_code)]
+mod callbacks;
+#[allow(unsafe_code)]
 mod cid;
+#[allow(unsafe_code)]
+mod conn;
 #[allow(unsafe_code)]
 mod error;
 #[allow(unsafe_code)]
@@ -75,18 +81,27 @@ mod tls;
 #[allow(unsafe_code)]
 mod tls_ossl;
 
+mod handlers;
 mod rand;
+mod stream;
 mod time;
 mod validate;
 
+pub use accept::{
+    Inspection, VERSION_V1, inspect, is_acceptable_initial, supported_versions,
+    write_version_negotiation,
+};
 pub use cid::{ConnectionId, MAX_LEN as MAX_CID_LEN, MIN_LEN as MIN_CID_LEN};
+pub use conn::{Conn, ConnBuilder};
 pub use error::{ApplicationErrorCode, Error, ErrorKind, NativeCode, Result, TransportErrorCode};
+pub use handlers::{Handlers, StreamCloseReason};
 pub use params::{
     DEFAULT_CONNECTION_DATA, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_STREAMS, DEFAULT_STREAM_DATA,
     TransportParams,
 };
 pub use rand::EntropySource;
 pub use settings::Settings;
+pub use stream::{Directionality, Initiator, StreamId};
 pub use time::{Duration, Timestamp};
 pub use tls::{NativeTlsHandle, Role, TlsBackend, TlsSession};
 

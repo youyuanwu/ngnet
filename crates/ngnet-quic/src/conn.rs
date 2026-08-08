@@ -1,0 +1,552 @@
+//! The QUIC connection.
+//!
+//! One `Conn` wraps one `ngtcp2_conn`, plus everything ngtcp2 retains a pointer to and
+//! everything the callbacks need to reach. It is the type that turns a pile of C objects
+//! with interlocking lifetime rules into something that can be moved, used and dropped like
+//! any other Rust value.
+//!
+//! # What must outlive the connection, and what need not
+//!
+//! ngtcp2 **copies** its callbacks struct, its settings, its transport parameters, the path
+//! addresses and the connection IDs. Those may be temporaries.
+//!
+//! It **retains pointers** to exactly four things: the `ngtcp2_mem` allocator
+//! (`ngtcp2_conn.h:645`, dereferenced during `ngtcp2_conn_del` at `ngtcp2_conn.c:1827`), the
+//! `user_data` pointer, `settings.rand_ctx.native_handle`, and `path.user_data` (unused
+//! here). Those live in boxes this type owns.
+//!
+//! Once the TLS handle is installed there is a fifth, and it points the other way: the
+//! connection holds the TLS session, and OpenSSL holds a reference back to the connection.
+//! That cycle is what the TLS session's hand-written `Drop` exists to unwind safely.
+
+// The read/write entry points that use `with_bridge`, `raw` and `path_mut` arrive with the
+// packet paths. The connection is built and dropped by the tests below regardless.
+#![allow(dead_code)]
+
+use core::ffi::c_void;
+use core::net::SocketAddr;
+
+use ngnet_quic_sys as sys;
+
+use crate::accept;
+use crate::alloc::Allocator;
+use crate::callbacks::{self, Bridge, BridgeGuard, BridgeSlot, RandCtx, RandGuard};
+use crate::cid::ConnectionId;
+use crate::error::{Error, Result};
+use crate::handlers::Handlers;
+use crate::params::TransportParams;
+use crate::path::PathStorage;
+use crate::rand::EntropySource;
+use crate::settings::Settings;
+use crate::tls::{Role, TlsSession};
+use crate::validate;
+
+/// Builder for a [`Conn`].
+pub struct ConnBuilder<S> {
+    role: Role,
+    settings: Settings,
+    params: TransportParams,
+    entropy: Box<dyn EntropySource + Send>,
+    tls: S,
+    local: SocketAddr,
+    remote: SocketAddr,
+    dcid: Option<ConnectionId>,
+    scid: Option<ConnectionId>,
+    version: u32,
+    cid_len: usize,
+}
+
+impl<S: TlsSession> ConnBuilder<S> {
+    /// Starts building a connection.
+    pub fn new(
+        role: Role,
+        settings: Settings,
+        params: TransportParams,
+        entropy: Box<dyn EntropySource + Send>,
+        tls: S,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Self {
+        Self {
+            role,
+            settings,
+            params,
+            entropy,
+            tls,
+            local,
+            remote,
+            dcid: None,
+            scid: None,
+            version: accept::VERSION_V1,
+            cid_len: 8,
+        }
+    }
+
+    /// Sets the destination connection ID.
+    ///
+    /// A client generates one at random; a server takes the client's source identifier.
+    pub fn dcid(mut self, dcid: ConnectionId) -> Self {
+        self.dcid = Some(dcid);
+        self
+    }
+
+    /// Sets this endpoint's own source connection ID.
+    pub fn scid(mut self, scid: ConnectionId) -> Self {
+        self.scid = Some(scid);
+        self
+    }
+
+    /// Sets the QUIC version. Defaults to version 1.
+    pub fn version(mut self, version: u32) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Sets the length of identifiers this endpoint generates when one is not supplied.
+    pub fn cid_len(mut self, len: usize) -> Self {
+        self.cid_len = len;
+        self
+    }
+
+    /// Builds the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] if the configuration is inconsistent — which
+    /// includes every check ngtcp2 makes with an assertion, because those vanish in release
+    /// builds — or a native error if ngtcp2 refuses.
+    ///
+    /// [`ErrorKind::InvalidInput`]: crate::ErrorKind::InvalidInput
+    pub fn build<'h>(mut self, handlers: Handlers<'h>) -> Result<Conn<'h, S>> {
+        let server = self.role.is_server();
+        validate::server_version(server, self.version)?;
+
+        // Identifiers first, because they may need entropy and a failure here should not
+        // leave a half-built connection behind.
+        let dcid = match self.dcid {
+            Some(dcid) => dcid,
+            None => ConnectionId::generate(&mut *self.entropy, self.cid_len)?,
+        };
+        let scid = match self.scid {
+            Some(scid) => scid,
+            None => ConnectionId::generate(&mut *self.entropy, self.cid_len)?,
+        };
+
+        let mut settings = self.settings.build()?;
+        let params = self.params.build(server)?;
+
+        // Everything ngtcp2 keeps a pointer to is boxed here, before the constructor runs,
+        // so the addresses it records stay valid for the connection's whole life.
+        let allocator = Allocator::new();
+        let slot = BridgeSlot::new();
+        let mut rand_ctx = Box::new(RandCtx {
+            source: self.entropy,
+        });
+        let path = PathStorage::new(self.local, self.remote);
+
+        let rand_handle: *mut RandCtx = &mut *rand_ctx;
+        settings.rand_ctx.native_handle = rand_handle.cast::<c_void>();
+
+        let cbs = Self::callbacks(&self.tls, self.role);
+
+        let mut raw: *mut sys::ngtcp2_conn = core::ptr::null_mut();
+        // The `rand` callback fires inside this call, so the entropy source has to be
+        // reachable before it rather than after.
+        // SAFETY: the context outlives the guard, which is dropped at the end of the block.
+        let rc = {
+            let _guard = unsafe { RandGuard::install(rand_handle) };
+            // SAFETY: every pointer is valid for the call; the four the library retains
+            // point into boxes this function is about to hand to the returned `Conn`.
+            unsafe {
+                if server {
+                    crate::ffi::conn_server_new(
+                        &mut raw,
+                        dcid.as_raw(),
+                        scid.as_raw(),
+                        path.as_raw(),
+                        self.version,
+                        &cbs,
+                        &settings,
+                        &params,
+                        allocator.as_mem_ptr(),
+                        slot.as_ptr(),
+                    )
+                } else {
+                    crate::ffi::conn_client_new(
+                        &mut raw,
+                        dcid.as_raw(),
+                        scid.as_raw(),
+                        path.as_raw(),
+                        self.version,
+                        &cbs,
+                        &settings,
+                        &params,
+                        allocator.as_mem_ptr(),
+                        slot.as_ptr(),
+                    )
+                }
+            }
+        };
+        if rc != 0 {
+            return Err(Error::native(rc, "could not create the connection"));
+        }
+        debug_assert!(!raw.is_null());
+
+        let mut conn = Conn {
+            raw,
+            tls: self.tls,
+            handlers,
+            _allocator: allocator,
+            slot,
+            _rand_ctx: rand_ctx,
+            path,
+            role: self.role,
+            scid,
+        };
+
+        // The TLS handle is installed after construction, which is also when the cycle
+        // between the connection and the TLS session is formed.
+        conn.bind_tls()?;
+        Ok(conn)
+    }
+
+    /// Builds the callback table: the crypto half from the TLS backend, the transport half
+    /// here.
+    fn callbacks(tls: &S, role: Role) -> sys::ngtcp2_callbacks {
+        // SAFETY: a zeroed callbacks struct is the documented starting point; every
+        // mandatory entry is filled below or by the backend.
+        let mut cbs = unsafe { core::mem::zeroed::<sys::ngtcp2_callbacks>() };
+
+        // The crypto entries are backend-specific and must come from the backend -- see
+        // `crate::tls`. Naming them here would not compile without a TLS feature.
+        // SAFETY: `cbs` is a valid, writable callbacks struct.
+        unsafe { tls.install_callbacks((&raw mut cbs).cast::<c_void>()) };
+
+        // The transport half. The mandatory set is taken from the runtime assert block at
+        // `ngtcp2_conn.c:1272-1286`, not from the header prose, whose "added since
+        // NGTCP2_CALLBACKS_V*" comments are off by one against the length table in
+        // `ngtcp2_callbacks.c`.
+        cbs.rand = Some(callbacks::rand_cb);
+        cbs.get_new_connection_id = Some(callbacks::get_new_connection_id_cb);
+
+        // Optional, but these are the events an application acts on.
+        cbs.recv_stream_data = Some(callbacks::recv_stream_data_cb);
+        cbs.stream_open = Some(callbacks::stream_open_cb);
+        cbs.stream_close = Some(callbacks::stream_close_cb);
+        cbs.stream_reset = Some(callbacks::stream_reset_cb);
+        cbs.recv_stop_sending = Some(callbacks::recv_stop_sending_cb);
+        cbs.acked_stream_data_offset = Some(callbacks::acked_stream_data_offset_cb);
+        cbs.handshake_completed = Some(callbacks::handshake_completed_cb);
+
+        let _ = role;
+        cbs
+    }
+}
+
+/// A QUIC connection.
+///
+/// Sans-I/O: it never touches a socket and never reads a clock. Datagrams and timestamps
+/// come from the caller, and datagrams to send go back to the caller.
+pub struct Conn<'h, S: TlsSession> {
+    raw: *mut sys::ngtcp2_conn,
+    tls: S,
+    handlers: Handlers<'h>,
+    /// Retained by ngtcp2 as `mem`, and dereferenced during `ngtcp2_conn_del`.
+    _allocator: Box<Allocator>,
+    /// Retained by ngtcp2 as `user_data`; the indirection every callback recovers state
+    /// through.
+    slot: Box<BridgeSlot>,
+    /// Retained through `settings.rand_ctx.native_handle`.
+    _rand_ctx: Box<RandCtx>,
+    /// Copied by ngtcp2, but kept so the connection can report its own path.
+    path: Box<PathStorage>,
+    role: Role,
+    scid: ConnectionId,
+}
+
+impl<'h, S: TlsSession> Conn<'h, S> {
+    /// Installs the TLS handle and the reference the crypto helper reads back.
+    fn bind_tls(&mut self) -> Result<()> {
+        let handle = self.tls.native_handle();
+        // SAFETY: `raw` is live and the handle is the one this backend's helper expects --
+        // for OpenSSL the ossl context, not the `SSL`, which is why it is a newtype.
+        unsafe { sys::ngtcp2_conn_set_tls_native_handle(self.raw, handle.as_ptr()) };
+        Ok(())
+    }
+
+    /// The role this endpoint plays.
+    pub fn role(&self) -> Role {
+        self.role
+    }
+
+    /// This endpoint's source connection ID.
+    pub fn scid(&self) -> &ConnectionId {
+        &self.scid
+    }
+
+    /// The local address this connection was built with.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.path.local()
+    }
+
+    /// The peer's address.
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.path.remote()
+    }
+
+    /// Whether the TLS handshake has completed.
+    pub fn is_handshake_completed(&self) -> bool {
+        // SAFETY: `raw` is live; this is a pure query.
+        unsafe { sys::ngtcp2_conn_get_handshake_completed(self.raw) != 0 }
+    }
+
+    /// The application protocol the handshake negotiated, if it has completed.
+    pub fn negotiated_alpn(&self) -> Option<Vec<u8>> {
+        self.tls.negotiated_alpn()
+    }
+
+    /// The TLS session driving this connection.
+    pub fn tls(&self) -> &S {
+        &self.tls
+    }
+
+    /// Runs a closure with the bridge installed, so callbacks can reach the handlers.
+    ///
+    /// Every entry point that can fire a callback goes through here. It is deliberately not
+    /// a universal wrapper: calls that cannot fire one skip it, so the cost and the borrow
+    /// are only paid where they are needed.
+    pub(crate) fn with_bridge<T>(&mut self, f: impl FnOnce(*mut sys::ngtcp2_conn) -> T) -> T {
+        let rand_handle: *mut RandCtx = &mut *self._rand_ctx;
+        let mut bridge = Bridge {
+            handlers: &mut self.handlers,
+        };
+        // SAFETY: both `bridge` and the rand context outlive the guards, which are dropped
+        // at the end of this function -- including while unwinding.
+        let _rand_guard = unsafe { RandGuard::install(rand_handle) };
+        // SAFETY: `bridge` lives until the end of this function and is not moved.
+        let _guard = unsafe { BridgeGuard::install(&self.slot, &mut bridge) };
+        f(self.raw)
+    }
+
+    /// The raw connection, for the modules that call into ngtcp2.
+    pub(crate) fn raw(&self) -> *mut sys::ngtcp2_conn {
+        self.raw
+    }
+
+    /// The path, for the write paths that need it mutable.
+    pub(crate) fn path_mut(&mut self) -> &mut PathStorage {
+        &mut self.path
+    }
+}
+
+impl<S: TlsSession> Drop for Conn<'_, S> {
+    fn drop(&mut self) {
+        // Order matters. The connection is destroyed first, while the TLS session is still
+        // alive: the helper's callbacks may run during teardown and reach the connection
+        // through the reference OpenSSL holds. Freeing the TLS session first would leave
+        // that reference dangling.
+        //
+        // The TLS session's own `Drop` then runs -- clearing OpenSSL's app data before
+        // `SSL_free`, and freeing the helper context last -- followed by the boxes ngtcp2
+        // was holding pointers into, which nothing can reach any more.
+        if !self.raw.is_null() {
+            // SAFETY: the pointer came from a connection constructor and is freed exactly
+            // once. The allocator it dereferences here is still alive, since it is dropped
+            // after this method returns.
+            unsafe { sys::ngtcp2_conn_del(self.raw) };
+            self.raw = core::ptr::null_mut();
+        }
+    }
+}
+
+// SAFETY: a `Conn` owns its native connection, its TLS session and every box ngtcp2 points
+// into, exclusively. It is deliberately not `Sync`: the bridge slot is written and read
+// without synchronisation, which is sound only because a `&mut Conn` is required to reach
+// it.
+unsafe impl<S: TlsSession + Send> Send for Conn<'_, S> {}
+
+// The connection tests need a TLS session to build a connection at all, and the only
+// implementation this crate ships is the OpenSSL one. With that feature off the seam is
+// still compiled and still type-checked; there is simply nothing behind it to instantiate.
+#[cfg(all(test, feature = "tls-ossl"))]
+mod tests {
+    use super::*;
+    use crate::rand::test_support::CountingEntropy;
+    use crate::time::Timestamp;
+    use crate::tls::TlsBackend;
+    use crate::tls_ossl::{OsslBackend, Verify};
+
+    fn addrs() -> (SocketAddr, SocketAddr) {
+        (
+            "127.0.0.1:1000".parse().unwrap(),
+            "127.0.0.1:2000".parse().unwrap(),
+        )
+    }
+
+    fn ts() -> Timestamp {
+        Timestamp::from_nanos(1_000_000).unwrap()
+    }
+
+    fn client_backend() -> OsslBackend {
+        OsslBackend::builder(Role::Client)
+            .alpn("h3")
+            .verify(Verify::DangerouslyAcceptAnyCertificate)
+            .build()
+            .unwrap()
+    }
+
+    fn client_conn<'h>(handlers: Handlers<'h>) -> Result<Conn<'h, crate::tls_ossl::OsslSession>> {
+        let backend = client_backend();
+        let session = backend.new_session(Role::Client, None)?;
+        let (local, remote) = addrs();
+        ConnBuilder::new(
+            Role::Client,
+            Settings::new(ts()),
+            TransportParams::new(),
+            Box::new(CountingEntropy::default()),
+            session,
+            local,
+            remote,
+        )
+        .build(handlers)
+    }
+
+    #[test]
+    fn a_client_connection_can_be_built_and_dropped() {
+        // The first real proof that the callback table satisfies ngtcp2's mandatory set:
+        // a missing entry trips an assertion inside the constructor in a debug build.
+        let conn = client_conn(Handlers::new()).unwrap();
+        assert_eq!(conn.role(), Role::Client);
+        assert!(!conn.is_handshake_completed());
+        drop(conn);
+    }
+
+    #[test]
+    fn a_connection_reports_the_addresses_it_was_built_with() {
+        let conn = client_conn(Handlers::new()).unwrap();
+        let (local, remote) = addrs();
+        assert_eq!(conn.local_addr(), local);
+        assert_eq!(conn.remote_addr(), remote);
+    }
+
+    #[test]
+    fn a_connection_can_be_dropped_without_any_method_being_called() {
+        for _ in 0..8 {
+            drop(client_conn(Handlers::new()).unwrap());
+        }
+    }
+
+    #[test]
+    fn the_bridge_is_not_armed_outside_a_call() {
+        // A callback firing between calls must find nothing rather than a stale pointer.
+        let mut conn = client_conn(Handlers::new()).unwrap();
+        assert!(!conn.slot.is_armed());
+        conn.with_bridge(|_| {});
+        assert!(!conn.slot.is_armed());
+    }
+
+    #[test]
+    fn the_bridge_is_armed_during_a_call() {
+        let mut conn = client_conn(Handlers::new()).unwrap();
+        let armed = conn.with_bridge(|_| true);
+        assert!(armed);
+    }
+
+    #[test]
+    fn construction_draws_on_the_entropy_source() {
+        // The `rand` callback fires inside the constructor, before `user_data` exists, so
+        // this is the proof that the `rand_ctx` route works where the bridge cannot.
+        let conn = client_conn(Handlers::new()).unwrap();
+        assert_eq!(conn.scid().as_bytes().len(), 8);
+    }
+
+    #[test]
+    fn a_server_without_an_original_dcid_is_refused_in_both_profiles() {
+        // ngtcp2 asserts this, and the assertion is compiled out of release builds, so the
+        // check has to be ours. Building a server with default parameters must fail.
+        let backend = OsslBackend::builder(Role::Server)
+            .alpn("h3")
+            .certificate_chain_pem(test_cert::CERT)
+            .private_key_pem(test_cert::KEY)
+            .build()
+            .unwrap();
+        let session = backend.new_session(Role::Server, None).unwrap();
+        let (local, remote) = addrs();
+        let result = ConnBuilder::new(
+            Role::Server,
+            Settings::new(ts()),
+            TransportParams::new(),
+            Box::new(CountingEntropy::default()),
+            session,
+            local,
+            remote,
+        )
+        .build(Handlers::new());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_server_connection_can_be_built_from_a_decoded_initial() {
+        let backend = OsslBackend::builder(Role::Server)
+            .alpn("h3")
+            .certificate_chain_pem(test_cert::CERT)
+            .private_key_pem(test_cert::KEY)
+            .build()
+            .unwrap();
+        let session = backend.new_session(Role::Server, None).unwrap();
+        let (local, remote) = addrs();
+
+        // What a server would have taken from the client's first packet.
+        let original_dcid = ConnectionId::new(&[0xaa; 8]).unwrap();
+        let client_scid = ConnectionId::new(&[0xbb; 8]).unwrap();
+
+        let conn = ConnBuilder::new(
+            Role::Server,
+            Settings::new(ts()),
+            TransportParams::new().original_dcid(&original_dcid),
+            Box::new(CountingEntropy::default()),
+            session,
+            local,
+            remote,
+        )
+        .dcid(client_scid)
+        .scid(ConnectionId::new(&[0xcc; 8]).unwrap())
+        .build(Handlers::new())
+        .unwrap();
+
+        assert_eq!(conn.role(), Role::Server);
+        assert_eq!(conn.scid().as_bytes(), &[0xcc; 8]);
+    }
+
+    #[test]
+    fn a_reserved_version_is_refused_for_a_server() {
+        let backend = OsslBackend::builder(Role::Server)
+            .alpn("h3")
+            .certificate_chain_pem(test_cert::CERT)
+            .private_key_pem(test_cert::KEY)
+            .build()
+            .unwrap();
+        let session = backend.new_session(Role::Server, None).unwrap();
+        let (local, remote) = addrs();
+        let dcid = ConnectionId::new(&[0xaa; 8]).unwrap();
+        let result = ConnBuilder::new(
+            Role::Server,
+            Settings::new(ts()),
+            TransportParams::new().original_dcid(&dcid),
+            Box::new(CountingEntropy::default()),
+            session,
+            local,
+            remote,
+        )
+        .version(0x0a0a_0a0a)
+        .build(Handlers::new());
+        assert!(result.is_err());
+    }
+
+    /// A self-signed certificate, generated once and committed, so the connection tests
+    /// need no certificate-generation dependency. The wrapper crate may have none.
+    mod test_cert {
+        pub(super) const CERT: &str = include_str!("../tests/data/test-cert.pem");
+        pub(super) const KEY: &str = include_str!("../tests/data/test-key.pem");
+    }
+}

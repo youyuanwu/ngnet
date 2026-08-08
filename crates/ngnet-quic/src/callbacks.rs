@@ -1,0 +1,570 @@
+//! The bridge from ngtcp2's C callbacks back to Rust state.
+//!
+//! ngtcp2 accepts a `user_data` pointer at construction and hands it to every callback. It
+//! offers no way to change it afterwards. But the state a callback needs — the
+//! application's handlers, the connection's own bookkeeping — is borrowed only for the
+//! duration of one call into the library, and lives at an address that may move between
+//! calls. Registering it directly is therefore not possible.
+//!
+//! The indirection is the same one `ngnet-h3` uses. What ngtcp2 receives is a stable,
+//! boxed [`BridgeSlot`] that lives as long as the connection. Before each call that can
+//! fire callbacks, a [`Bridge`] holding the live borrows is installed into the slot by a
+//! [`BridgeGuard`], and the guard clears it on drop — **including while unwinding**, so a
+//! stray later callback cannot follow a pointer into a dead frame.
+//!
+//! # What this does not have to handle
+//!
+//! Nested calls. The slot holds exactly one pointer, so an installed bridge would be
+//! overwritten by a second. That is sound here because ngtcp2 forbids re-entering it:
+//! `read_pkt`, `writev_stream` and `write_connection_close` all state they "must not be
+//! called from inside the callback functions" (`ngtcp2.h:4256`, `:5318`, `:6665`).
+//!
+//! # The one callback this cannot serve
+//!
+//! `rand` receives neither the connection nor `user_data`, and fires during construction
+//! before `user_data` is stored. It reaches its entropy source through
+//! `settings.rand_ctx.native_handle` instead — see [`crate::rand`].
+
+use core::cell::Cell;
+use core::ffi::c_void;
+
+use ngnet_quic_sys as sys;
+
+use crate::error::ApplicationErrorCode;
+use crate::handlers::{Handlers, StreamCloseReason};
+use crate::rand::EntropySource;
+use crate::stream::StreamId;
+
+/// The stable indirection ngtcp2 is given at construction.
+///
+/// Interior mutability is required because the slot is written through a shared reference
+/// while ngtcp2 holds a raw pointer to it.
+pub(crate) struct BridgeSlot {
+    current: Cell<*mut c_void>,
+}
+
+impl BridgeSlot {
+    /// Allocates an empty slot.
+    pub(crate) fn new() -> Box<Self> {
+        Box::new(Self {
+            current: Cell::new(core::ptr::null_mut()),
+        })
+    }
+
+    /// The pointer to hand to a connection constructor.
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
+        (self as *const Self).cast_mut().cast::<c_void>()
+    }
+
+    /// Whether a bridge is currently installed.
+    #[cfg(test)]
+    pub(crate) fn is_armed(&self) -> bool {
+        !self.current.get().is_null()
+    }
+}
+
+// SAFETY: the slot holds a raw pointer that is only ever written and read while the
+// connection is mutably borrowed, so no two threads can observe it at once. The connection
+// is `Send` and not `Sync`, which is what enforces that.
+unsafe impl Send for BridgeSlot {}
+
+/// Everything a callback may reach, for the duration of one call.
+pub(crate) struct Bridge<'a, 'h> {
+    pub(crate) handlers: &'a mut Handlers<'h>,
+}
+
+/// Installs a bridge into the slot for as long as it is alive.
+///
+/// Clearing on drop rather than after the call is what makes a panic safe: the slot is
+/// emptied while unwinding, so a later callback cannot follow a pointer to a dead frame.
+pub(crate) struct BridgeGuard<'a> {
+    slot: &'a BridgeSlot,
+}
+
+impl<'a> BridgeGuard<'a> {
+    /// # Safety
+    ///
+    /// `bridge` must remain alive and unmoved for the lifetime of the returned guard.
+    pub(crate) unsafe fn install(slot: &'a BridgeSlot, bridge: &mut Bridge<'_, '_>) -> Self {
+        let raw = (bridge as *mut Bridge<'_, '_>).cast::<c_void>();
+        slot.current.set(raw);
+        Self { slot }
+    }
+}
+
+impl Drop for BridgeGuard<'_> {
+    fn drop(&mut self) {
+        self.slot.current.set(core::ptr::null_mut());
+    }
+}
+
+/// Recovers the bridge a callback was handed.
+///
+/// Returns `None` when no call is in progress, which is not a bug: ngtcp2 invokes several
+/// callbacks from inside its own constructor, before any bridge has been installed.
+///
+/// # Safety
+///
+/// `user_data` must be null or the pointer given to a connection constructor by
+/// [`BridgeSlot::as_ptr`].
+unsafe fn bridge<'a, 'h>(user_data: *mut c_void) -> Option<&'a mut Bridge<'a, 'h>> {
+    if user_data.is_null() {
+        return None;
+    }
+    // SAFETY: the caller guarantees this is the slot pointer, which lives in a box the
+    // connection owns and outlives every callback.
+    let slot = unsafe { &*(user_data.cast::<BridgeSlot>()) };
+    let current = slot.current.get();
+    if current.is_null() {
+        return None;
+    }
+    // SAFETY: the slot holds a pointer to a live `Bridge` installed by `BridgeGuard`, which
+    // clears it before the bridge goes out of scope, including while unwinding.
+    Some(unsafe { &mut *(current.cast::<Bridge<'a, 'h>>()) })
+}
+
+/// The entropy source, reached through `settings.rand_ctx.native_handle`.
+///
+/// Boxed and owned by the connection so its address is stable.
+pub(crate) struct RandCtx {
+    pub(crate) source: Box<dyn EntropySource + Send>,
+}
+
+/// `ngtcp2_rand`: fill a buffer with unpredictable bytes.
+///
+/// The odd one out. It receives only `rand_ctx`, never the connection or `user_data`, and
+/// fires during `ngtcp2_conn_client_new` before `user_data` has been stored — so the bridge
+/// above cannot serve it.
+pub(crate) unsafe extern "C" fn rand_cb(
+    dest: *mut u8,
+    destlen: usize,
+    rand_ctx: *const sys::ngtcp2_rand_ctx,
+) {
+    if dest.is_null() || destlen == 0 || rand_ctx.is_null() {
+        return;
+    }
+    // SAFETY: ngtcp2 guarantees `dest` is writable for `destlen` bytes.
+    let out = unsafe { core::slice::from_raw_parts_mut(dest, destlen) };
+    // SAFETY: `rand_ctx` is the struct inside the settings the connection built, whose
+    // `native_handle` is the boxed `RandCtx` the connection owns.
+    let handle = unsafe { (*rand_ctx).native_handle };
+    if handle.is_null() {
+        return;
+    }
+    // SAFETY: the handle is the boxed `RandCtx`, alive for as long as the connection.
+    let ctx = unsafe { &mut *handle.cast::<RandCtx>() };
+    // A failing entropy source has no way to report an error here: the callback returns
+    // nothing. Zeroing would be worse than useless -- predictable identifiers presented as
+    // random ones -- so the buffer is left as ngtcp2 provided it and the failure surfaces
+    // when the handshake does not complete.
+    let _ = ctx.source.fill(out);
+}
+
+/// `ngtcp2_get_new_connection_id`: mint an identifier and its stateless reset token.
+pub(crate) unsafe extern "C" fn get_new_connection_id_cb(
+    _conn: *mut sys::ngtcp2_conn,
+    cid: *mut sys::ngtcp2_cid,
+    token: *mut u8,
+    cidlen: usize,
+    user_data: *mut c_void,
+) -> core::ffi::c_int {
+    // This one *can* reach the entropy source through `user_data`, but routing it through
+    // the same `RandCtx` the `rand` callback uses keeps a single source of randomness per
+    // connection rather than two that could diverge.
+    let _ = user_data;
+    if cid.is_null() || token.is_null() {
+        return sys::NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    // SAFETY: ngtcp2 guarantees `cid` is writable and `cidlen` is within its capacity.
+    unsafe {
+        (*cid).datalen = cidlen;
+        let bytes = core::slice::from_raw_parts_mut((*cid).data.as_mut_ptr(), cidlen);
+        let tokens =
+            core::slice::from_raw_parts_mut(token, sys::NGTCP2_STATELESS_RESET_TOKENLEN as usize);
+        if fill_from_conn_rand(bytes).is_err() || fill_from_conn_rand(tokens).is_err() {
+            return sys::NGTCP2_ERR_CALLBACK_FAILURE;
+        }
+    }
+    0
+}
+
+// Thread-local handle to the entropy source of the connection currently being called into.
+//
+// `get_new_connection_id` has no `rand_ctx` parameter, so the source has to be reachable
+// some other way. It is set for the duration of each call that can fire the callback,
+// alongside the bridge.
+thread_local! {
+    static CURRENT_RAND: Cell<*mut RandCtx> = const { Cell::new(core::ptr::null_mut()) };
+}
+
+/// Installs the current entropy source for the duration of a call.
+pub(crate) struct RandGuard;
+
+impl RandGuard {
+    /// # Safety
+    ///
+    /// `ctx` must remain alive for the lifetime of the returned guard.
+    pub(crate) unsafe fn install(ctx: *mut RandCtx) -> Self {
+        CURRENT_RAND.with(|slot| slot.set(ctx));
+        Self
+    }
+}
+
+impl Drop for RandGuard {
+    fn drop(&mut self) {
+        CURRENT_RAND.with(|slot| slot.set(core::ptr::null_mut()));
+    }
+}
+
+/// Fills a buffer from the connection currently being called into.
+fn fill_from_conn_rand(dest: &mut [u8]) -> crate::Result<()> {
+    let ptr = CURRENT_RAND.with(|slot| slot.get());
+    if ptr.is_null() {
+        return Err(crate::Error::with_kind(
+            crate::ErrorKind::Internal,
+            "no entropy source is installed for this call",
+        ));
+    }
+    // SAFETY: the guard that set this keeps the `RandCtx` alive for the whole call.
+    let ctx = unsafe { &mut *ptr };
+    ctx.source.fill(dest)
+}
+
+/// `ngtcp2_recv_stream_data`: bytes arrived on a stream.
+pub(crate) unsafe extern "C" fn recv_stream_data_cb(
+    _conn: *mut sys::ngtcp2_conn,
+    flags: u32,
+    stream_id: i64,
+    _offset: u64,
+    data: *const u8,
+    datalen: usize,
+    user_data: *mut c_void,
+    _stream_user_data: *mut c_void,
+) -> core::ffi::c_int {
+    // SAFETY: `user_data` is the slot pointer given at construction.
+    let Some(bridge) = (unsafe { bridge(user_data) }) else {
+        return 0;
+    };
+    let Ok(id) = StreamId::new(stream_id) else {
+        return 0;
+    };
+    let fin = flags & sys::NGTCP2_STREAM_DATA_FLAG_FIN != 0;
+    let bytes = if data.is_null() || datalen == 0 {
+        &[][..]
+    } else {
+        // SAFETY: ngtcp2 guarantees the buffer is readable for `datalen` bytes and valid
+        // for the duration of this call.
+        unsafe { core::slice::from_raw_parts(data, datalen) }
+    };
+    if let Some(handler) = bridge.handlers.on_stream_data.as_mut() {
+        handler(id, bytes, fin);
+    }
+    0
+}
+
+/// `ngtcp2_stream_open`: the peer opened a stream.
+pub(crate) unsafe extern "C" fn stream_open_cb(
+    _conn: *mut sys::ngtcp2_conn,
+    stream_id: i64,
+    user_data: *mut c_void,
+) -> core::ffi::c_int {
+    // SAFETY: `user_data` is the slot pointer given at construction.
+    let Some(bridge) = (unsafe { bridge(user_data) }) else {
+        return 0;
+    };
+    if let (Ok(id), Some(handler)) = (
+        StreamId::new(stream_id),
+        bridge.handlers.on_stream_open.as_mut(),
+    ) {
+        handler(id);
+    }
+    0
+}
+
+/// `ngtcp2_stream_close`: a stream ended.
+pub(crate) unsafe extern "C" fn stream_close_cb(
+    _conn: *mut sys::ngtcp2_conn,
+    flags: u32,
+    stream_id: i64,
+    app_error_code: u64,
+    user_data: *mut c_void,
+    _stream_user_data: *mut c_void,
+) -> core::ffi::c_int {
+    // SAFETY: `user_data` is the slot pointer given at construction.
+    let Some(bridge) = (unsafe { bridge(user_data) }) else {
+        return 0;
+    };
+    let Ok(id) = StreamId::new(stream_id) else {
+        return 0;
+    };
+    let reason = if flags & sys::NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET != 0 {
+        StreamCloseReason::Reset(ApplicationErrorCode::new(app_error_code))
+    } else {
+        StreamCloseReason::Finished
+    };
+    if let Some(handler) = bridge.handlers.on_stream_close.as_mut() {
+        handler(id, reason);
+    }
+    0
+}
+
+/// `ngtcp2_stream_reset`: the peer reset a stream it was sending on.
+pub(crate) unsafe extern "C" fn stream_reset_cb(
+    _conn: *mut sys::ngtcp2_conn,
+    stream_id: i64,
+    _final_size: u64,
+    app_error_code: u64,
+    user_data: *mut c_void,
+    _stream_user_data: *mut c_void,
+) -> core::ffi::c_int {
+    // SAFETY: `user_data` is the slot pointer given at construction.
+    let Some(bridge) = (unsafe { bridge(user_data) }) else {
+        return 0;
+    };
+    if let (Ok(id), Some(handler)) = (
+        StreamId::new(stream_id),
+        bridge.handlers.on_stream_reset.as_mut(),
+    ) {
+        handler(id, ApplicationErrorCode::new(app_error_code));
+    }
+    0
+}
+
+/// `ngtcp2_recv_stop_sending`: the peer wants this endpoint to stop sending.
+pub(crate) unsafe extern "C" fn recv_stop_sending_cb(
+    _conn: *mut sys::ngtcp2_conn,
+    stream_id: i64,
+    app_error_code: u64,
+    user_data: *mut c_void,
+    _stream_user_data: *mut c_void,
+) -> core::ffi::c_int {
+    // SAFETY: `user_data` is the slot pointer given at construction.
+    let Some(bridge) = (unsafe { bridge(user_data) }) else {
+        return 0;
+    };
+    if let (Ok(id), Some(handler)) = (
+        StreamId::new(stream_id),
+        bridge.handlers.on_stop_sending.as_mut(),
+    ) {
+        handler(id, ApplicationErrorCode::new(app_error_code));
+    }
+    0
+}
+
+/// `ngtcp2_acked_stream_data_offset`: the peer acknowledged stream bytes.
+pub(crate) unsafe extern "C" fn acked_stream_data_offset_cb(
+    _conn: *mut sys::ngtcp2_conn,
+    stream_id: i64,
+    _offset: u64,
+    datalen: u64,
+    user_data: *mut c_void,
+    _stream_user_data: *mut c_void,
+) -> core::ffi::c_int {
+    // SAFETY: `user_data` is the slot pointer given at construction.
+    let Some(bridge) = (unsafe { bridge(user_data) }) else {
+        return 0;
+    };
+    if let (Ok(id), Some(handler)) = (
+        StreamId::new(stream_id),
+        bridge.handlers.on_acked_stream_data.as_mut(),
+    ) {
+        handler(id, datalen);
+    }
+    0
+}
+
+/// `ngtcp2_handshake_completed`: the TLS handshake finished.
+pub(crate) unsafe extern "C" fn handshake_completed_cb(
+    _conn: *mut sys::ngtcp2_conn,
+    user_data: *mut c_void,
+) -> core::ffi::c_int {
+    // SAFETY: `user_data` is the slot pointer given at construction.
+    let Some(bridge) = (unsafe { bridge(user_data) }) else {
+        return 0;
+    };
+    if let Some(handler) = bridge.handlers.on_handshake_completed.as_mut() {
+        handler();
+    }
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rand::test_support::CountingEntropy;
+
+    #[test]
+    fn a_slot_starts_empty_and_a_guard_arms_and_clears_it() {
+        let slot = BridgeSlot::new();
+        assert!(!slot.is_armed());
+
+        let mut handlers = Handlers::new();
+        {
+            let mut bridge = Bridge {
+                handlers: &mut handlers,
+            };
+            // SAFETY: `bridge` outlives the guard.
+            let _guard = unsafe { BridgeGuard::install(&slot, &mut bridge) };
+            assert!(slot.is_armed());
+        }
+        assert!(!slot.is_armed());
+    }
+
+    #[test]
+    fn the_slot_is_cleared_even_when_a_panic_unwinds_through_it() {
+        // The property that makes a panicking handler merely fatal rather than a
+        // use-after-free: an unwinding drop still empties the slot.
+        let slot = BridgeSlot::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut handlers = Handlers::new();
+            let mut bridge = Bridge {
+                handlers: &mut handlers,
+            };
+            // SAFETY: `bridge` outlives the guard.
+            let _guard = unsafe { BridgeGuard::install(&slot, &mut bridge) };
+            assert!(slot.is_armed());
+            panic!("unwinding through the guard");
+        }));
+        assert!(result.is_err());
+        assert!(
+            !slot.is_armed(),
+            "the guard must clear the slot while unwinding"
+        );
+    }
+
+    #[test]
+    fn recovering_from_a_null_user_data_yields_nothing() {
+        // ngtcp2 fires callbacks from inside its own constructor, before any bridge exists.
+        // Returning `None` rather than dereferencing is what makes that safe.
+        // SAFETY: null is explicitly permitted.
+        assert!(unsafe { bridge(core::ptr::null_mut()) }.is_none());
+    }
+
+    #[test]
+    fn recovering_from_an_unarmed_slot_yields_nothing() {
+        let slot = BridgeSlot::new();
+        // SAFETY: the pointer is the slot's own.
+        assert!(unsafe { bridge(slot.as_ptr()) }.is_none());
+    }
+
+    #[test]
+    fn a_callback_reaches_the_handler_through_the_slot() {
+        let slot = BridgeSlot::new();
+        let mut seen: Vec<(i64, Vec<u8>, bool)> = Vec::new();
+        {
+            let mut handlers = Handlers::new()
+                .on_stream_data(|id, data, fin| seen.push((id.get(), data.to_vec(), fin)));
+            let mut bridge = Bridge {
+                handlers: &mut handlers,
+            };
+            // SAFETY: `bridge` outlives the guard.
+            let _guard = unsafe { BridgeGuard::install(&slot, &mut bridge) };
+
+            let payload = [1u8, 2, 3];
+            // SAFETY: the slot is armed and the buffer is readable for its length.
+            unsafe {
+                recv_stream_data_cb(
+                    core::ptr::null_mut(),
+                    sys::NGTCP2_STREAM_DATA_FLAG_FIN,
+                    0,
+                    0,
+                    payload.as_ptr(),
+                    payload.len(),
+                    slot.as_ptr(),
+                    core::ptr::null_mut(),
+                );
+            }
+        }
+        assert_eq!(seen, vec![(0, vec![1, 2, 3], true)]);
+    }
+
+    #[test]
+    fn a_callback_on_an_unarmed_slot_is_a_no_op_rather_than_a_crash() {
+        let slot = BridgeSlot::new();
+        // SAFETY: the slot is valid but unarmed, which the callback must tolerate.
+        let rc = unsafe { stream_open_cb(core::ptr::null_mut(), 0, slot.as_ptr()) };
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn the_rand_callback_reaches_its_source_through_rand_ctx() {
+        // The callback that cannot use the bridge at all, because it fires before
+        // `user_data` exists and never receives it.
+        let mut ctx = Box::new(RandCtx {
+            source: Box::new(CountingEntropy::default()),
+        });
+        let handle: *mut RandCtx = &mut *ctx;
+        let rand_ctx = sys::ngtcp2_rand_ctx {
+            native_handle: handle.cast::<c_void>(),
+        };
+
+        let mut buf = [0xffu8; 4];
+        // SAFETY: the buffer is writable and the context outlives the call.
+        unsafe { rand_cb(buf.as_mut_ptr(), buf.len(), &rand_ctx) };
+        assert_eq!(buf, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn the_rand_callback_tolerates_a_null_context() {
+        let rand_ctx = sys::ngtcp2_rand_ctx {
+            native_handle: core::ptr::null_mut(),
+        };
+        let mut buf = [0xffu8; 2];
+        // SAFETY: the buffer is writable; a null handle must be tolerated.
+        unsafe { rand_cb(buf.as_mut_ptr(), buf.len(), &rand_ctx) };
+        // Left untouched rather than zeroed: predictable bytes presented as random ones
+        // would be worse than an obvious failure.
+        assert_eq!(buf, [0xff, 0xff]);
+    }
+
+    #[test]
+    fn connection_ids_are_minted_from_the_installed_source() {
+        let mut ctx = Box::new(RandCtx {
+            source: Box::new(CountingEntropy::default()),
+        });
+        let handle: *mut RandCtx = &mut *ctx;
+        // SAFETY: the context outlives the guard.
+        let _guard = unsafe { RandGuard::install(handle) };
+
+        let mut cid = sys::ngtcp2_cid {
+            datalen: 0,
+            data: [0; 20],
+        };
+        let mut token = [0u8; sys::NGTCP2_STATELESS_RESET_TOKENLEN as usize];
+        // SAFETY: both out-parameters are valid and a source is installed.
+        let rc = unsafe {
+            get_new_connection_id_cb(
+                core::ptr::null_mut(),
+                &mut cid,
+                token.as_mut_ptr(),
+                8,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(cid.datalen, 8);
+        assert_eq!(&cid.data[..8], &[0, 1, 2, 3, 4, 5, 6, 7]);
+        // The token continues the same sequence, proving one source rather than two.
+        assert_eq!(token[0], 8);
+    }
+
+    #[test]
+    fn minting_a_connection_id_without_a_source_fails_rather_than_inventing_bytes() {
+        let mut cid = sys::ngtcp2_cid {
+            datalen: 0,
+            data: [0; 20],
+        };
+        let mut token = [0u8; sys::NGTCP2_STATELESS_RESET_TOKENLEN as usize];
+        // SAFETY: both out-parameters are valid; no source is installed.
+        let rc = unsafe {
+            get_new_connection_id_cb(
+                core::ptr::null_mut(),
+                &mut cid,
+                token.as_mut_ptr(),
+                8,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, sys::NGTCP2_ERR_CALLBACK_FAILURE);
+    }
+}
