@@ -28,6 +28,8 @@ cargo test --workspace
 cargo test -p ngnet-h2 --no-default-features
 cargo test -p ngnet-h3 --no-default-features
 cargo test -p ngnet-quic-sys --no-default-features
+cargo test -p ngnet-quic --no-default-features
+cargo test -p ngnet-quic --release
 cargo test -p ngnet-h2-tests --features completion
 
 cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -36,6 +38,8 @@ cargo clippy -p ngnet-h2 --no-default-features --all-targets -- -D warnings
 cargo clippy -p ngnet-h3 --all-targets -- -D warnings
 cargo clippy -p ngnet-h3 --no-default-features --all-targets -- -D warnings
 cargo clippy -p ngnet-quic-sys --no-default-features --all-targets -- -D warnings
+cargo clippy -p ngnet-quic --all-targets -- -D warnings
+cargo clippy -p ngnet-quic --no-default-features --all-targets -- -D warnings
 
 for f in "" "--no-default-features" "--all-features" "--features tokio" "--features completion"; do
   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-h2 $f
@@ -48,6 +52,13 @@ for f in "" "--no-default-features" "--all-features"; do
   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-h3 $f
 done
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-h3-sys -p ngnet-h3-tests -p ngnet-quic-sys
+
+# `ngnet-quic` has a matrix of its own for the same reason: its TLS backend is default-on,
+# so a doc link into it breaks the configuration without it.
+for f in "" "--no-default-features" "--all-features"; do
+  RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-quic $f
+done
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-quic-tests
 
 # Two claims, two commands, and the flags are the whole point.
 #
@@ -70,6 +81,13 @@ cargo tree -p ngnet-h3 -e normal | grep -qiE 'quinn|rustls|tokio|ring' && exit 1
 cargo test -p ngnet-quic-sys --no-default-features --no-run
 readelf -d target/debug/deps/smoke-*  | grep -i 'NEEDED.*libssl'   # expect nothing
 
+# And the same claim one layer up, which is the one that actually discriminates. With the
+# TLS backend on, `ngnet-quic` genuinely does link OpenSSL; with it off it must not. CI
+# asserts *both* halves, because a guard that passes in either configuration proves nothing
+# -- which was true of the bindings check above until the wrapper gave it something to see.
+cargo test -p ngnet-quic --no-run                      # expect libssl
+cargo test -p ngnet-quic --no-default-features --no-run # expect none
+
 # Runs each benchmark once without timing it. Benchmarks are not part of `cargo test`, so
 # without this they rot silently as the API moves.
 cargo bench --workspace -- --test
@@ -91,6 +109,11 @@ cargo tree -p ngnet-h2 --features completion -e features | grep 'compio-driver f
 
 CI deliberately does not run a repository-wide `cargo fmt --check`: this repo is not globally
 rustfmt-clean, and the convention is to format only touched files.
+
+The QUIC wrapper is additionally tested in **release**, which the other crates are not.
+ngtcp2 validates its settings and transport parameters with `assert()`, and `NDEBUG` strips
+every one of them from a release build -- so `ngnet-quic` performs those checks itself, and
+that run is what proves they hold where the C library's own no longer do.
 
 There is no MSRV check, because there is no declared MSRV: no crate sets `rust-version`.
 The workspace could not honour a single minimum anyway — the benchmark crate's Criterion

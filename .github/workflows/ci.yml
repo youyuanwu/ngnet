@@ -100,6 +100,20 @@ jobs:
       - name: Test (QUIC bindings without the crypto backend)
         run: cargo test -p ngnet-quic-sys --no-default-features
 
+      # The QUIC wrapper with no TLS backend at all. The seam is still compiled and still
+      # type-checked; there is simply nothing behind it. This is the configuration that
+      # catches a stray `ngtcp2_crypto_*` reference outside the feature gate, because those
+      # symbols do not exist in the bindings at all when the backend is off.
+      - name: Test (QUIC wrapper without a TLS backend)
+        run: cargo test -p ngnet-quic --no-default-features
+
+      # Release matters here in a way it usually does not. ngtcp2 checks its settings and
+      # transport parameters with `assert()`, and `NDEBUG` removes every one of them from a
+      # release build -- so the crate performs those checks itself, and this is the run that
+      # proves they hold where the C library's own no longer do.
+      - name: Test (QUIC wrapper, release)
+        run: cargo test -p ngnet-quic --release
+
       # `--all-targets` reaches benchmarks and examples as well as tests, which is half of
       # what keeps the benchmark crate from rotting.
       - name: Clippy (all features)
@@ -119,6 +133,12 @@ jobs:
 
       - name: Clippy (QUIC bindings without the crypto backend)
         run: cargo clippy -p ngnet-quic-sys --no-default-features --all-targets -- -D warnings
+
+      - name: Clippy (QUIC wrapper, default features)
+        run: cargo clippy -p ngnet-quic --all-targets -- -D warnings
+
+      - name: Clippy (QUIC wrapper without a TLS backend)
+        run: cargo clippy -p ngnet-quic --no-default-features --all-targets -- -D warnings
 
       # Four configurations rather than one, because of a bug this repository actually
       # shipped: a doc link to an item behind the `tokio` feature passed `--all-features`
@@ -146,6 +166,19 @@ jobs:
             echo "::endgroup::"
           done
           cargo doc --no-deps -p ngnet-h3-sys -p ngnet-h3-tests -p ngnet-quic-sys
+
+      # And the QUIC wrapper's own matrix, for the same reason: its TLS backend sits behind
+      # a default-on feature, so a doc link into it breaks the configuration without it.
+      - name: Rustdoc across the QUIC feature matrix
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          for features in "" "--no-default-features" "--all-features"; do
+            echo "::group::cargo doc -p ngnet-quic ${features:-(default)}"
+            cargo doc --no-deps -p ngnet-quic $features
+            echo "::endgroup::"
+          done
+          cargo doc --no-deps -p ngnet-quic-tests
 
       # Two separate claims, and they need two separate commands.
       #
@@ -210,6 +243,40 @@ jobs:
           done
           if [ "$found" != 0 ]; then exit 1; fi
           echo "no TLS in the default-off QUIC build"
+
+      # The same claim one layer up, and the one that actually discriminates. `ngnet-quic`
+      # with its TLS backend on genuinely does link OpenSSL; with it off it must not. Both
+      # halves are asserted, because a guard that passes in both configurations is proving
+      # nothing -- which was true of the bindings-level check above until the wrapper gave
+      # it something to see.
+      - name: The QUIC wrapper links TLS only when its backend is enabled
+        run: |
+          inspect() {
+            cargo test -p ngnet-quic $1 --no-run --message-format=json 2>/dev/null               | grep -o '"executable":"[^"]*"' | cut -d'"' -f4
+          }
+
+          off=$(inspect --no-default-features)
+          if [ -z "$off" ]; then
+            echo "::error::found no test binaries to inspect; did the build layout change?"
+            exit 1
+          fi
+          for bin in $off; do
+            if readelf -d "$bin" | grep -qiE 'NEEDED.*lib(ssl|crypto)'; then
+              echo "::error::$bin links OpenSSL with the TLS backend off."
+              exit 1
+            fi
+          done
+
+          on=$(inspect "")
+          linked=0
+          for bin in $on; do
+            if readelf -d "$bin" | grep -qiE 'NEEDED.*libssl'; then linked=1; fi
+          done
+          if [ "$linked" != 1 ]; then
+            echo "::error::no binary links libssl with the TLS backend on, so the check above proves nothing."
+            exit 1
+          fi
+          echo "TLS is linked with the backend on and absent without it"
 
       # The completion transport's guarantee is that no readiness backend is compiled, so it
       # cannot silently degrade to epoll. That is a property of the resolved dependency

@@ -61,7 +61,6 @@ mod accept;
 mod alloc;
 #[allow(unsafe_code)]
 mod callbacks;
-#[allow(unsafe_code)]
 mod cid;
 #[allow(unsafe_code)]
 mod conn;
