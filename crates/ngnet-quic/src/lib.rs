@@ -56,16 +56,33 @@
 // module's name from its file stem, so a nested file would produce a name this list never
 // mentions and be reported as using `unsafe` without a grant.
 #[allow(unsafe_code)]
+mod alloc;
+#[allow(unsafe_code)]
+mod cid;
+#[allow(unsafe_code)]
 mod error;
 #[allow(unsafe_code)]
 mod ffi;
+#[allow(unsafe_code)]
+mod params;
+#[allow(unsafe_code)]
+mod path;
+#[allow(unsafe_code)]
+mod settings;
 
+mod rand;
+mod time;
 mod validate;
 
+pub use cid::{ConnectionId, MAX_LEN as MAX_CID_LEN, MIN_LEN as MIN_CID_LEN};
 pub use error::{ApplicationErrorCode, Error, ErrorKind, NativeCode, Result, TransportErrorCode};
+pub use params::{
+    DEFAULT_CONNECTION_DATA, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_STREAMS, DEFAULT_STREAM_DATA,
+    TransportParams,
+};
+pub use rand::EntropySource;
+pub use settings::Settings;
 pub use time::{Duration, Timestamp};
-
-mod time;
 
 /// The raw bindings, for capabilities the safe API does not cover yet.
 ///
