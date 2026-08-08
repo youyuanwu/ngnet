@@ -9,6 +9,7 @@ members = [
     "crates/ngnet-h3",
     "crates/ngnet-h3-tests",
     "crates/ngnet-quic-sys",
+    "crates/ngnet-quic",
 ]
 
 [workspace.package]
@@ -52,7 +53,8 @@ ngnet-h2 = { path = "crates/ngnet-h2" }
 ngnet-h2-sys = { path = "crates/ngnet-h2-sys" }
 ngnet-h3 = { path = "crates/ngnet-h3" }
 ngnet-h3-sys = { path = "crates/ngnet-h3-sys" }
-ngnet-quic-sys = { path = "crates/ngnet-quic-sys" }
+ngnet-quic-sys = { path = "crates/ngnet-quic-sys", default-features = false }
+ngnet-quic = { path = "crates/ngnet-quic" }
 # Build-time only, and only for the `crypto-ossl` feature of `ngnet-quic-sys`:
 # it locates the system OpenSSL that ngtcp2's crypto helper is compiled against.
 pkg-config = "0.3"

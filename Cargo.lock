@@ -1042,6 +1042,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ngnet-quic"
+version = "0.1.0"
+dependencies = [
+ "ngnet-quic-sys",
+]
+
+[[package]]
 name = "ngnet-quic-sys"
 version = "0.1.0"
 dependencies = [
