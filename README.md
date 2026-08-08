@@ -17,7 +17,9 @@ Design notes, the invariants the test suite pins, and the tracked backlog live i
 | [`ngnet-h3`](crates/ngnet-h3) | Safe, sans-I/O API driving an HTTP/3 client or server connection over QUIC streams the caller owns — plus an optional asynchronous `http`/`http-body` client and server built on it (default `http` feature). No QUIC or TLS of its own. |
 | [`ngnet-h3-sys`](crates/ngnet-h3-sys) | Raw FFI bindings. Builds libnghttp3 from source and generates bindings with `bindgen`. |
 | [`ngnet-h3-tests`](crates/ngnet-h3-tests) | Not published. Drives `ngnet-h3` over a real QUIC connection using [quinn](https://github.com/quinn-rs/quinn), so the wrapper needs no transport dependency of its own. Contains the reference `QuicConnection` implementation. |
-| [`ngnet-quic-sys`](crates/ngnet-quic-sys) | Raw FFI bindings to [ngtcp2](https://github.com/ngtcp2/ngtcp2), the QUIC transport. Builds libngtcp2 from source with `bindgen`, plus its OpenSSL crypto helper behind a default-on `crypto-ossl` feature. Nothing else in the workspace depends on it yet. |
+| [`ngnet-quic`](crates/ngnet-quic) | Safe, sans-I/O API driving a QUIC client or server connection, the caller owning the socket and the clock. TLS is a backend seam with a default-on OpenSSL implementation. No async layer. |
+| [`ngnet-quic-sys`](crates/ngnet-quic-sys) | Raw FFI bindings to [ngtcp2](https://github.com/ngtcp2/ngtcp2), the QUIC transport. Builds libngtcp2 from source with `bindgen`, plus its OpenSSL crypto helper behind a default-on `crypto-ossl` feature. |
+| [`ngnet-quic-tests`](crates/ngnet-quic-tests) | Not published. Drives `ngnet-quic` through real TLS handshakes, in process and over loopback UDP, so the wrapper needs no certificate or runtime dependency of its own. |
 
 ### HTTP/3, and what it deliberately is not
 
