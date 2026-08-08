@@ -226,6 +226,19 @@ impl Error {
         }
     }
 
+    /// Builds an error of a given kind with no native code behind it.
+    ///
+    /// For failures that originate outside ngtcp2 — a TLS backend, say — where there is a
+    /// meaningful classification but no ngtcp2 error to attach.
+    pub(crate) const fn with_kind(kind: ErrorKind, context: &'static str) -> Self {
+        Self {
+            kind,
+            native: None,
+            context,
+            unusable: false,
+        }
+    }
+
     /// Builds the error every operation returns once the connection is poisoned.
     pub(crate) fn unusable() -> Self {
         Self {

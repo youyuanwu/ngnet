@@ -340,13 +340,92 @@ fn generate_bindings(manifest_dir: &Path, include_dir: &Path, openssl: Option<&O
         for dir in &openssl.include_paths {
             builder = builder.clang_arg(format!("-I{}", dir.display()));
         }
-        // The crypto helpers take `SSL *`. Only the handful of OpenSSL types
-        // that ngtcp2's own signatures mention are wanted; allowlisting them
-        // keeps the rest of <openssl/ssl.h> out of the generated file.
+        // `wrapper.h` already includes `<ngtcp2/ngtcp2_crypto_ossl.h>`, which
+        // includes `<openssl/ssl.h>`, so OpenSSL's declarations are parsed
+        // whether or not anything is emitted from them. What follows is
+        // therefore purely a decision about what to *emit*.
+        //
+        // `ngnet-quic` needs more than the `SSL *` that ngtcp2's own signatures
+        // mention: it configures the TLS objects the crypto helper then drives.
+        // The set below is what a client and a server need to complete a
+        // verified handshake with ALPN, loading credentials from memory rather
+        // than from paths.
+        //
+        // A missing entry here is a link error at build time, not a silent
+        // runtime fault, so this errs towards generous.
         builder = builder
             .allowlist_type("SSL")
             .allowlist_type("SSL_CTX")
-            .allowlist_type("OSSL_ENCRYPTION_LEVEL");
+            .allowlist_type("SSL_METHOD")
+            .allowlist_type("SSL_CIPHER")
+            .allowlist_type("X509")
+            .allowlist_type("X509_STORE")
+            .allowlist_type("EVP_PKEY")
+            .allowlist_type("BIO")
+            .allowlist_type("BIO_METHOD")
+            .allowlist_type("pem_password_cb")
+            // Context and session lifecycle.
+            .allowlist_function("SSL_CTX_new")
+            .allowlist_function("SSL_CTX_free")
+            .allowlist_function("SSL_new")
+            .allowlist_function("SSL_free")
+            .allowlist_function("TLS_client_method")
+            .allowlist_function("TLS_server_method")
+            .allowlist_function("SSL_set_connect_state")
+            .allowlist_function("SSL_set_accept_state")
+            // `SSL_set_app_data` / `SSL_get_app_data` are macros over these, and
+            // bindgen does not emit function-like macros. Attaching the
+            // `ngtcp2_crypto_conn_ref` is not optional -- every one of the ossl
+            // dispatch callbacks begins by reading it back.
+            .allowlist_function("SSL_set_ex_data")
+            .allowlist_function("SSL_get_ex_data")
+            // ALPN. Mandatory in QUIC rather than optional as it is over TCP.
+            .allowlist_function("SSL_set_alpn_protos")
+            .allowlist_function("SSL_CTX_set_alpn_select_cb")
+            .allowlist_function("SSL_get0_alpn_selected")
+            .allowlist_function("SSL_select_next_proto")
+            // Credentials, read from memory so the API need not take paths.
+            .allowlist_function("SSL_CTX_use_certificate")
+            .allowlist_function("SSL_CTX_use_certificate_chain_file")
+            .allowlist_function("SSL_CTX_use_PrivateKey")
+            .allowlist_function("SSL_CTX_use_PrivateKey_file")
+            .allowlist_function("SSL_CTX_check_private_key")
+            .allowlist_function("BIO_new_mem_buf")
+            .allowlist_function("BIO_free")
+            .allowlist_function("PEM_read_bio_X509")
+            .allowlist_function("PEM_read_bio_PrivateKey")
+            .allowlist_function("X509_free")
+            .allowlist_function("X509_up_ref")
+            .allowlist_function("EVP_PKEY_free")
+            // Verification. On by default in this crate, unlike the ngtcp2
+            // examples, which verify nothing at all.
+            .allowlist_function("SSL_CTX_set_verify")
+            .allowlist_function("SSL_CTX_set_default_verify_paths")
+            .allowlist_function("SSL_CTX_get_cert_store")
+            .allowlist_function("X509_STORE_add_cert")
+            .allowlist_function("SSL_set1_host")
+            .allowlist_function("SSL_get_verify_result")
+            // `SSL_set_tlsext_host_name` (SNI) is a macro over `SSL_ctrl`.
+            .allowlist_function("SSL_ctrl")
+            .allowlist_function("SSL_CTX_ctrl")
+            // Diagnostics, so a handshake failure can say what went wrong
+            // rather than surfacing as a bare -1.
+            .allowlist_function("SSL_get_error")
+            .allowlist_function("SSL_get_current_cipher")
+            .allowlist_function("SSL_CIPHER_get_name")
+            .allowlist_function("ERR_get_error")
+            .allowlist_function("ERR_error_string_n")
+            .allowlist_function("ERR_clear_error")
+            .allowlist_function("X509_verify_cert_error_string")
+            .allowlist_var("SSL_ERROR_.*")
+            .allowlist_var("SSL_VERIFY_.*")
+            .allowlist_var("SSL_TLSEXT_ERR_.*")
+            .allowlist_var("SSL_CTRL_SET_TLSEXT_HOSTNAME")
+            .allowlist_var("TLSEXT_NAMETYPE_host_name")
+            .allowlist_var("SSL_FILETYPE_PEM")
+            .allowlist_var("X509_V_OK")
+            .allowlist_var("X509_V_ERR_.*")
+            .allowlist_var("SSL_CTRL_CHAIN_CERT");
     }
 
     let bindings = builder

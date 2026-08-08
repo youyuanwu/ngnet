@@ -69,6 +69,11 @@ mod params;
 mod path;
 #[allow(unsafe_code)]
 mod settings;
+#[allow(unsafe_code)]
+mod tls;
+#[cfg(feature = "tls-ossl")]
+#[allow(unsafe_code)]
+mod tls_ossl;
 
 mod rand;
 mod time;
@@ -83,6 +88,10 @@ pub use params::{
 pub use rand::EntropySource;
 pub use settings::Settings;
 pub use time::{Duration, Timestamp};
+pub use tls::{NativeTlsHandle, Role, TlsBackend, TlsSession};
+
+#[cfg(feature = "tls-ossl")]
+pub use tls_ossl::{OsslBackend, OsslBackendBuilder, OsslSession, Verify};
 
 /// The raw bindings, for capabilities the safe API does not cover yet.
 ///

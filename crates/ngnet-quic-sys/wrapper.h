@@ -15,6 +15,9 @@
 /* Pulls in <openssl/ssl.h>, which is why the build script has to hand bindgen
    OpenSSL's include path as well as ngtcp2's. */
 #include <ngtcp2/ngtcp2_crypto_ossl.h>
+/* Not reached through <openssl/ssl.h>, but a TLS backend that cannot read the
+   error queue can only report that a handshake failed, never why. */
+#include <openssl/err.h>
 #endif
 
 /* ---------------------------------------------------------------------------
