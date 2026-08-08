@@ -1,0 +1,19 @@
+[package]
+name = "ngnet-quic-tests"
+version = "0.1.0"
+description = "Integration tests driving the ngnet-quic crate through real handshakes and real sockets"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# This crate exists so that `ngnet-quic` can be driven through a genuine TLS handshake --
+# which needs certificates, and therefore a certificate-generating dependency -- without the
+# wrapper itself acquiring one. `ngnet-quic` has exactly one dependency and no
+# dev-dependencies, and a test asserts as much; anything needing more belongs here.
+#
+# These are `[dependencies]` rather than `[dev-dependencies]` because the harness lives in
+# `src/lib.rs`, and a library target cannot see dev-dependencies.
+[dependencies]
+ngnet-quic.workspace = true
+rcgen.workspace = true

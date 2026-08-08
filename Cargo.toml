@@ -10,6 +10,7 @@ members = [
     "crates/ngnet-h3-tests",
     "crates/ngnet-quic-sys",
     "crates/ngnet-quic",
+    "crates/ngnet-quic-tests",
 ]
 
 [workspace.package]
