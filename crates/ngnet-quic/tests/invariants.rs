@@ -180,6 +180,7 @@ fn the_allowance_list_is_the_ffi_boundary_and_nothing_else() {
         "packet",
         "params",
         "path",
+        "retain",
         "settings",
         "stream_io",
         "tls",
@@ -267,6 +268,50 @@ fn no_asynchrony_escapes_into_the_crate() {
     assert!(
         offenders.is_empty(),
         "the crate acquired asynchrony, which it is not supposed to have: {offenders:#?}"
+    );
+}
+
+#[test]
+fn an_included_file_cannot_smuggle_code_past_the_scans() {
+    // `include_str!` splices a file's contents into what the compiler sees, but not into
+    // what the scans above read. A file included from `src/` could therefore carry `unsafe`,
+    // an `async fn`, or a forbidden `std::` path that this suite would report as absent.
+    //
+    // `ngnet-h3` closes the same hole by requiring every include to resolve inside its async
+    // subtree. There is no subtree here, so the claim is made directly: every included file
+    // must be inert data, not source. Today that is two PEM certificates.
+    const INERT: &[&str] = &["pem", "md", "txt", "json"];
+
+    let mut offenders = Vec::new();
+    for path in rust_files(&crate_root().join("src")) {
+        let source = std::fs::read_to_string(&path).expect("reading a source file");
+        // The included path is a string literal, so it survives only in the raw source --
+        // which is exactly why this scan reads the unstripped text.
+        for capture in source.split("include_str!(").skip(1) {
+            let Some(literal) = capture.split('"').nth(1) else {
+                continue;
+            };
+            let extension = literal.rsplit('.').next().unwrap_or("");
+            if !INERT.contains(&extension) {
+                offenders.push(format!("{} includes {literal}", path.display()));
+                continue;
+            }
+            // And it must actually exist, or the claim is about nothing.
+            let target = path
+                .parent()
+                .expect("a source file has a parent")
+                .join(literal);
+            assert!(
+                target.exists(),
+                "{} includes {literal}, which does not exist",
+                path.display()
+            );
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these includes could carry code the scans cannot see: {offenders:#?}"
     );
 }
 

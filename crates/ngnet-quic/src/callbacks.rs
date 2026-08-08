@@ -71,6 +71,8 @@ unsafe impl Send for BridgeSlot {}
 /// Everything a callback may reach, for the duration of one call.
 pub(crate) struct Bridge<'a, 'h> {
     pub(crate) handlers: &'a mut Handlers<'h>,
+    /// The retained copies of sent stream data, so acknowledgements can release them.
+    pub(crate) retained: &'a mut crate::retain::Retained,
 }
 
 /// Installs a bridge into the slot for as long as it is alive.
@@ -128,6 +130,19 @@ unsafe fn bridge<'a, 'h>(user_data: *mut c_void) -> Option<&'a mut Bridge<'a, 'h
 /// Boxed and owned by the connection so its address is stable.
 pub(crate) struct RandCtx {
     pub(crate) source: Box<dyn EntropySource + Send>,
+    /// Set if the source ever failed.
+    ///
+    /// The `rand` callback returns `void`, so a failure cannot be reported where it
+    /// happens. It is latched here instead, and the connection builder refuses to hand back
+    /// a connection whose randomness was not what it asked for.
+    pub(crate) failed: Cell<bool>,
+}
+
+impl RandCtx {
+    /// Whether the entropy source failed at any point.
+    pub(crate) fn failed(&self) -> bool {
+        self.failed.get()
+    }
 }
 
 /// `ngtcp2_rand`: fill a buffer with unpredictable bytes.
@@ -140,24 +155,39 @@ pub(crate) unsafe extern "C" fn rand_cb(
     destlen: usize,
     rand_ctx: *const sys::ngtcp2_rand_ctx,
 ) {
-    if dest.is_null() || destlen == 0 || rand_ctx.is_null() {
+    if dest.is_null() || destlen == 0 {
         return;
     }
     // SAFETY: ngtcp2 guarantees `dest` is writable for `destlen` bytes.
     let out = unsafe { core::slice::from_raw_parts_mut(dest, destlen) };
-    // SAFETY: `rand_ctx` is the struct inside the settings the connection built, whose
-    // `native_handle` is the boxed `RandCtx` the connection owns.
-    let handle = unsafe { (*rand_ctx).native_handle };
-    if handle.is_null() {
-        return;
+
+    let handle = if rand_ctx.is_null() {
+        core::ptr::null_mut()
+    } else {
+        // SAFETY: `rand_ctx` is the struct inside the settings the connection built, whose
+        // `native_handle` is the boxed `RandCtx` the connection owns.
+        unsafe { (*rand_ctx).native_handle }
+    };
+
+    if !handle.is_null() {
+        // SAFETY: the handle is the boxed `RandCtx`, alive for as long as the connection.
+        let ctx = unsafe { &mut *handle.cast::<RandCtx>() };
+        if ctx.source.fill(out).is_ok() {
+            return;
+        }
+        ctx.failed.set(true);
     }
-    // SAFETY: the handle is the boxed `RandCtx`, alive for as long as the connection.
-    let ctx = unsafe { &mut *handle.cast::<RandCtx>() };
-    // A failing entropy source has no way to report an error here: the callback returns
-    // nothing. Zeroing would be worse than useless -- predictable identifiers presented as
-    // random ones -- so the buffer is left as ngtcp2 provided it and the failure surfaces
-    // when the handshake does not complete.
-    let _ = ctx.source.fill(out);
+
+    // Reaching here means no source, or a source that failed. The callback returns `void`,
+    // so there is no way to tell ngtcp2 -- and at three of its four call sites `dest` is an
+    // *uninitialised stack local* it will use regardless (`ngtcp2_conn.c:1234`, `:1240`,
+    // `:1149`). Leaving it untouched would therefore be an uninitialised read in C, seeding
+    // a hash map and a PRNG from stack residue.
+    //
+    // So the buffer is zeroed, which is defined rather than undefined, and the failure is
+    // latched above. `ConnBuilder::build` refuses to return a connection whose randomness
+    // came from here, so these deterministic bytes never reach the wire.
+    out.fill(0);
 }
 
 /// `ngtcp2_get_new_connection_id`: mint an identifier and its stateless reset token.
@@ -297,6 +327,11 @@ pub(crate) unsafe extern "C" fn stream_close_cb(
     let Ok(id) = StreamId::new(stream_id) else {
         return 0;
     };
+    // A closed stream will never be retransmitted, so anything still held for it is dead
+    // weight -- and ngtcp2's own contract says retention ends at close as well as at
+    // acknowledgement.
+    bridge.retained.forget(id);
+
     let reason = if flags & sys::NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET != 0 {
         StreamCloseReason::Reset(ApplicationErrorCode::new(app_error_code))
     } else {
@@ -355,7 +390,7 @@ pub(crate) unsafe extern "C" fn recv_stop_sending_cb(
 pub(crate) unsafe extern "C" fn acked_stream_data_offset_cb(
     _conn: *mut sys::ngtcp2_conn,
     stream_id: i64,
-    _offset: u64,
+    offset: u64,
     datalen: u64,
     user_data: *mut c_void,
     _stream_user_data: *mut c_void,
@@ -364,10 +399,15 @@ pub(crate) unsafe extern "C" fn acked_stream_data_offset_cb(
     let Some(bridge) = (unsafe { bridge(user_data) }) else {
         return 0;
     };
-    if let (Ok(id), Some(handler)) = (
-        StreamId::new(stream_id),
-        bridge.handlers.on_acked_stream_data.as_mut(),
-    ) {
+    let Ok(id) = StreamId::new(stream_id) else {
+        return 0;
+    };
+
+    // Releasing the retained copy is the point of this callback, and it happens whether or
+    // not the application registered a handler: the memory is held on its behalf either way.
+    bridge.retained.acknowledge(id, offset, datalen);
+
+    if let Some(handler) = bridge.handlers.on_acked_stream_data.as_mut() {
         handler(id, datalen);
     }
     0
@@ -400,8 +440,10 @@ mod tests {
 
         let mut handlers = Handlers::new();
         {
+            let mut retained = crate::retain::Retained::default();
             let mut bridge = Bridge {
                 handlers: &mut handlers,
+                retained: &mut retained,
             };
             // SAFETY: `bridge` outlives the guard.
             let _guard = unsafe { BridgeGuard::install(&slot, &mut bridge) };
@@ -417,8 +459,10 @@ mod tests {
         let slot = BridgeSlot::new();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut handlers = Handlers::new();
+            let mut retained = crate::retain::Retained::default();
             let mut bridge = Bridge {
                 handlers: &mut handlers,
+                retained: &mut retained,
             };
             // SAFETY: `bridge` outlives the guard.
             let _guard = unsafe { BridgeGuard::install(&slot, &mut bridge) };
@@ -454,8 +498,10 @@ mod tests {
         {
             let mut handlers = Handlers::new()
                 .on_stream_data(|id, data, fin| seen.push((id.get(), data.to_vec(), fin)));
+            let mut retained = crate::retain::Retained::default();
             let mut bridge = Bridge {
                 handlers: &mut handlers,
+                retained: &mut retained,
             };
             // SAFETY: `bridge` outlives the guard.
             let _guard = unsafe { BridgeGuard::install(&slot, &mut bridge) };
@@ -492,6 +538,7 @@ mod tests {
         // `user_data` exists and never receives it.
         let mut ctx = Box::new(RandCtx {
             source: Box::new(CountingEntropy::default()),
+            failed: Cell::new(false),
         });
         let handle: *mut RandCtx = &mut *ctx;
         let rand_ctx = sys::ngtcp2_rand_ctx {
@@ -505,22 +552,61 @@ mod tests {
     }
 
     #[test]
-    fn the_rand_callback_tolerates_a_null_context() {
+    fn the_rand_callback_initialises_the_buffer_even_with_no_source() {
+        // ngtcp2 passes *uninitialised stack locals* to this callback at three of its four
+        // call sites (`ngtcp2_conn.c:1234`, `:1240`, `:1149`) and uses them regardless of
+        // what happened here. Leaving the buffer untouched would therefore be an
+        // uninitialised read in C, seeding a hash map and a PRNG from stack residue.
+        //
+        // Zeroing is defined rather than undefined. It is only acceptable because the
+        // failure is latched and `ConnBuilder::build` refuses to return the connection, so
+        // these deterministic bytes never reach the wire.
         let rand_ctx = sys::ngtcp2_rand_ctx {
             native_handle: core::ptr::null_mut(),
         };
         let mut buf = [0xffu8; 2];
         // SAFETY: the buffer is writable; a null handle must be tolerated.
         unsafe { rand_cb(buf.as_mut_ptr(), buf.len(), &rand_ctx) };
-        // Left untouched rather than zeroed: predictable bytes presented as random ones
-        // would be worse than an obvious failure.
-        assert_eq!(buf, [0xff, 0xff]);
+        assert_eq!(buf, [0, 0]);
+    }
+
+    #[test]
+    fn a_failing_entropy_source_is_latched_rather_than_ignored() {
+        struct Failing;
+        impl EntropySource for Failing {
+            fn fill(&mut self, _dest: &mut [u8]) -> crate::Result<()> {
+                Err(crate::Error::with_kind(
+                    crate::ErrorKind::Internal,
+                    "no entropy today",
+                ))
+            }
+        }
+
+        let mut ctx = Box::new(RandCtx {
+            source: Box::new(Failing),
+            failed: Cell::new(false),
+        });
+        let handle: *mut RandCtx = &mut *ctx;
+        let rand_ctx = sys::ngtcp2_rand_ctx {
+            native_handle: handle.cast::<c_void>(),
+        };
+
+        let mut buf = [0xffu8; 4];
+        // SAFETY: the buffer is writable and the context outlives the call.
+        unsafe { rand_cb(buf.as_mut_ptr(), buf.len(), &rand_ctx) };
+
+        assert_eq!(buf, [0, 0, 0, 0], "the buffer must be left initialised");
+        assert!(
+            ctx.failed(),
+            "the failure must be recorded, since the callback cannot report it"
+        );
     }
 
     #[test]
     fn connection_ids_are_minted_from_the_installed_source() {
         let mut ctx = Box::new(RandCtx {
             source: Box::new(CountingEntropy::default()),
+            failed: Cell::new(false),
         });
         let handle: *mut RandCtx = &mut *ctx;
         // SAFETY: the context outlives the guard.

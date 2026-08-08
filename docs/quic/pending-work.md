@@ -94,3 +94,57 @@ There are no QUIC benchmarks. The crate has never been run against another QUIC
 implementation, only against itself; interoperability with quinn, quiche, msquic or a browser
 is unverified. Neither is a gap in correctness so much as an absence of evidence, but the
 distinction is worth keeping visible.
+
+## Sent stream data is copied
+
+ngtcp2 does not copy the stream data it accepts. It keeps the caller's pointer so it can
+retransmit, and requires the bytes stay intact "until `acked_stream_data_offset` indicates
+that they are acknowledged by a remote endpoint or the stream is closed"
+(`ngtcp2.h:5244-5248`).
+
+`Conn::write_stream` takes an ordinary `&[u8]` that the caller may reuse the moment the call
+returns, so the crate copies the accepted portion and holds it until the acknowledgement
+arrives. `Conn::retained_bytes` reports how much is held.
+
+That is one copy of every byte sent. `ngnet-h3` avoids the equivalent copy by making callers
+hand over ownership through its `BodySource`; the same could be done here, and would be
+worth doing if this crate is ever used somewhere the copy matters.
+
+**What would settle it:** an ownership-taking overload — `write_stream_owned(Bytes)` or
+similar — alongside the copying one, so the zero-copy path is available without making the
+ordinary path require a paragraph of documentation to use safely.
+
+## Mutual TLS is not implemented
+
+`Verify::RequireClientCertificate` exists and returns an error. It is there so that asking
+for mutual TLS fails loudly rather than silently producing a server that accepts anyone —
+which is what `Verify::Peer` on a server means, since demanding a client certificate would
+reject every ordinary QUIC client.
+
+**What would settle it:** `SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT` on the server
+context, a way to configure client trust anchors separately from server ones, and a way for
+the application to see the peer certificate.
+
+## Platform portability of the address conversion
+
+`src/path.rs` hand-rolls `sockaddr_in` and `sockaddr_in6` rather than taking a `libc`
+dependency, and selects `AF_INET6` per platform. It does **not** carry the `sa_len` byte that
+the BSDs and macOS place first in those structures, so on those targets the family would land
+in the wrong byte.
+
+The code is self-consistent — the sizes and the reported lengths agree, so nothing is
+memory-unsafe — but the per-platform `AF_INET6` table implies a portability the layout does
+not deliver. CI is Linux only.
+
+**What would settle it:** a `cfg`-selected layout with the leading length byte for the BSD
+family, and a CI target that would notice.
+
+## Zero-length connection IDs
+
+`accept::inspect` rejects a zero-length connection ID, because `ConnectionId` requires at
+least `NGTCP2_MIN_CIDLEN` bytes. QUIC permits an endpoint to use a zero-length connection ID
+— it is how an endpoint says "I do not need you to route by identifier".
+
+This only affects inspecting a peer's identifiers, not issuing our own. **What would settle
+it:** allowing an empty `ConnectionId` on the decode path specifically, distinct from the
+generation path where a zero length would be a mistake.

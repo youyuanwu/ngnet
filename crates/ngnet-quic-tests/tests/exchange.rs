@@ -4,8 +4,7 @@
 //! actually carry bytes — which exercises the parts of the API a caller spends its time in,
 //! and the flow-control obligations that produce no error when forgotten.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use ngnet_quic::{
     ApplicationErrorCode, Handlers, Inspection, StreamCloseReason, StreamId, StreamWrite, inspect,
@@ -22,19 +21,27 @@ struct Observed {
     data: Vec<(i64, Vec<u8>, bool)>,
     closed: Vec<(i64, String)>,
     acked: Vec<(i64, u64)>,
+    reset: Vec<(i64, u64)>,
 }
 
-type Shared = Rc<RefCell<Observed>>;
+/// `Arc<Mutex<_>>` rather than `Rc<RefCell<_>>`, because handlers must be `Send`: a `Conn`
+/// is `Send` and owns them, so a non-`Send` capture would let safe code move a non-atomic
+/// refcount across threads. The compiler enforces it now; this is what that costs.
+type Shared = Arc<Mutex<Observed>>;
 
 fn handlers(sink: &Shared) -> Handlers<'_> {
-    let a = Rc::clone(sink);
-    let b = Rc::clone(sink);
-    let c = Rc::clone(sink);
-    let d = Rc::clone(sink);
+    let a = Arc::clone(sink);
+    let b = Arc::clone(sink);
+    let c = Arc::clone(sink);
+    let d = Arc::clone(sink);
+    let e = Arc::clone(sink);
     Handlers::new()
-        .on_stream_open(move |id| a.borrow_mut().opened.push(id.get()))
+        .on_stream_reset(move |id, code| {
+            e.lock().unwrap().reset.push((id.get(), code.get()));
+        })
+        .on_stream_open(move |id| a.lock().unwrap().opened.push(id.get()))
         .on_stream_data(move |id, data, fin| {
-            b.borrow_mut().data.push((id.get(), data.to_vec(), fin));
+            b.lock().unwrap().data.push((id.get(), data.to_vec(), fin));
         })
         .on_stream_close(move |id, reason| {
             // A wildcard is required rather than optional: `StreamCloseReason` is
@@ -45,9 +52,9 @@ fn handlers(sink: &Shared) -> Handlers<'_> {
                 StreamCloseReason::Reset(code) => format!("reset:{}", code.get()),
                 other => format!("{other:?}"),
             };
-            c.borrow_mut().closed.push((id.get(), text));
+            c.lock().unwrap().closed.push((id.get(), text));
         })
-        .on_acked_stream_data(move |id, len| d.borrow_mut().acked.push((id.get(), len)))
+        .on_acked_stream_data(move |id, len| d.lock().unwrap().acked.push((id.get(), len)))
 }
 
 fn addrs() -> (std::net::SocketAddr, std::net::SocketAddr) {
@@ -147,7 +154,10 @@ fn send_on(
                 }
                 to.read_pkt(&buf[..len], clock.now()).expect("delivering");
             }
-            StreamWrite::Idle | StreamWrite::StreamBlocked | StreamWrite::ConnectionBlocked => {
+            StreamWrite::Idle
+            | StreamWrite::Blocked
+            | StreamWrite::StreamBlocked
+            | StreamWrite::ConnectionBlocked => {
                 // Let acknowledgements and window updates come back.
                 let _ = pump(from, to, clock, 4);
             }
@@ -162,15 +172,15 @@ fn send_on(
 #[test]
 fn a_client_can_send_a_payload_to_the_server() {
     let credentials = TestCredentials::generate();
-    let client_sink: Shared = Rc::default();
-    let server_sink: Shared = Rc::default();
+    let client_sink: Shared = Shared::default();
+    let server_sink: Shared = Shared::default();
     let (mut client, mut server, clock) = connected(&credentials, &client_sink, &server_sink);
 
     let stream = client.open_bidi_stream().expect("opening a stream");
     let payload = b"the quick brown fox jumps over the lazy dog";
     send_on(&mut client, &mut server, &clock, stream, payload, true);
 
-    let observed = server_sink.borrow();
+    let observed = server_sink.lock().unwrap();
     assert!(
         observed.opened.contains(&stream.get()),
         "the server should have seen the stream open, saw {:?}",
@@ -192,14 +202,14 @@ fn a_client_can_send_a_payload_to_the_server() {
 #[test]
 fn the_server_observes_the_end_of_the_stream() {
     let credentials = TestCredentials::generate();
-    let client_sink: Shared = Rc::default();
-    let server_sink: Shared = Rc::default();
+    let client_sink: Shared = Shared::default();
+    let server_sink: Shared = Shared::default();
     let (mut client, mut server, clock) = connected(&credentials, &client_sink, &server_sink);
 
     let stream = client.open_bidi_stream().unwrap();
     send_on(&mut client, &mut server, &clock, stream, b"short", true);
 
-    let observed = server_sink.borrow();
+    let observed = server_sink.lock().unwrap();
     assert!(
         observed
             .data
@@ -215,8 +225,8 @@ fn the_sender_is_told_which_bytes_were_acknowledged() {
     // This is what releases retransmission buffers. An application that ignores it holds
     // every byte it ever sent, so it is worth proving the event actually arrives.
     let credentials = TestCredentials::generate();
-    let client_sink: Shared = Rc::default();
-    let server_sink: Shared = Rc::default();
+    let client_sink: Shared = Shared::default();
+    let server_sink: Shared = Shared::default();
     let (mut client, mut server, clock) = connected(&credentials, &client_sink, &server_sink);
 
     let stream = client.open_bidi_stream().unwrap();
@@ -230,7 +240,7 @@ fn the_sender_is_told_which_bytes_were_acknowledged() {
     );
     let _ = pump(&mut client, &mut server, &clock, 16);
 
-    let observed = client_sink.borrow();
+    let observed = client_sink.lock().unwrap();
     let total: u64 = observed
         .acked
         .iter()
@@ -247,8 +257,8 @@ fn the_sender_is_told_which_bytes_were_acknowledged() {
 #[test]
 fn both_directions_carry_data_on_one_bidirectional_stream() {
     let credentials = TestCredentials::generate();
-    let client_sink: Shared = Rc::default();
-    let server_sink: Shared = Rc::default();
+    let client_sink: Shared = Shared::default();
+    let server_sink: Shared = Shared::default();
     let (mut client, mut server, clock) = connected(&credentials, &client_sink, &server_sink);
 
     let stream = client.open_bidi_stream().unwrap();
@@ -256,14 +266,16 @@ fn both_directions_carry_data_on_one_bidirectional_stream() {
     send_on(&mut server, &mut client, &clock, stream, b"response", false);
 
     let from_client: Vec<u8> = server_sink
-        .borrow()
+        .lock()
+        .unwrap()
         .data
         .iter()
         .filter(|(id, _, _)| *id == stream.get())
         .flat_map(|(_, b, _)| b.clone())
         .collect();
     let from_server: Vec<u8> = client_sink
-        .borrow()
+        .lock()
+        .unwrap()
         .data
         .iter()
         .filter(|(id, _, _)| *id == stream.get())
@@ -279,8 +291,8 @@ fn a_payload_larger_than_one_datagram_arrives_intact() {
     // Anything that fits in a single packet would not exercise segmentation, reassembly or
     // the flow-control loop at all.
     let credentials = TestCredentials::generate();
-    let client_sink: Shared = Rc::default();
-    let server_sink: Shared = Rc::default();
+    let client_sink: Shared = Shared::default();
+    let server_sink: Shared = Shared::default();
     let (mut client, mut server, clock) = connected(&credentials, &client_sink, &server_sink);
 
     let stream = client.open_bidi_stream().unwrap();
@@ -288,7 +300,8 @@ fn a_payload_larger_than_one_datagram_arrives_intact() {
     send_on(&mut client, &mut server, &clock, stream, &payload, true);
 
     let received: Vec<u8> = server_sink
-        .borrow()
+        .lock()
+        .unwrap()
         .data
         .iter()
         .filter(|(id, _, _)| *id == stream.get())
@@ -305,8 +318,8 @@ fn a_payload_larger_than_one_datagram_arrives_intact() {
 #[test]
 fn a_unidirectional_stream_carries_data_one_way() {
     let credentials = TestCredentials::generate();
-    let client_sink: Shared = Rc::default();
-    let server_sink: Shared = Rc::default();
+    let client_sink: Shared = Shared::default();
+    let server_sink: Shared = Shared::default();
     let (mut client, mut server, clock) = connected(&credentials, &client_sink, &server_sink);
 
     let stream = client.open_uni_stream().expect("opening a uni stream");
@@ -317,7 +330,8 @@ fn a_unidirectional_stream_carries_data_one_way() {
     send_on(&mut client, &mut server, &clock, stream, b"one way", true);
 
     let received: Vec<u8> = server_sink
-        .borrow()
+        .lock()
+        .unwrap()
         .data
         .iter()
         .filter(|(id, _, _)| *id == stream.get())
@@ -329,8 +343,8 @@ fn a_unidirectional_stream_carries_data_one_way() {
 #[test]
 fn a_reset_stream_is_reported_to_the_peer() {
     let credentials = TestCredentials::generate();
-    let client_sink: Shared = Rc::default();
-    let server_sink: Shared = Rc::default();
+    let client_sink: Shared = Shared::default();
+    let server_sink: Shared = Shared::default();
     let (mut client, mut server, clock) = connected(&credentials, &client_sink, &server_sink);
 
     let stream = client.open_bidi_stream().unwrap();
@@ -341,20 +355,25 @@ fn a_reset_stream_is_reported_to_the_peer() {
         .expect("resetting the stream");
     let _ = pump(&mut client, &mut server, &clock, 16);
 
-    let observed = server_sink.borrow();
+    // Asserting on the reset specifically, and on its error code. An earlier version of
+    // this test accepted "or any data event on the stream", which the `send_on` above had
+    // already guaranteed -- so it passed whether or not RESET_STREAM was ever emitted.
+    let observed = server_sink.lock().unwrap();
     assert!(
-        observed.closed.iter().any(|(id, _)| *id == stream.get())
-            || observed.data.iter().any(|(id, _, _)| *id == stream.get()),
-        "the server should have noticed the stream, saw closed={:?}",
-        observed.closed
+        observed
+            .reset
+            .iter()
+            .any(|(id, code)| *id == stream.get() && *code == 0x99),
+        "the server should have seen the stream reset with code 0x99, saw reset={:?}",
+        observed.reset
     );
 }
 
 #[test]
 fn an_ordinary_close_is_not_an_error_for_either_side() {
     let credentials = TestCredentials::generate();
-    let client_sink: Shared = Rc::default();
-    let server_sink: Shared = Rc::default();
+    let client_sink: Shared = Shared::default();
+    let server_sink: Shared = Shared::default();
     let (mut client, mut server, clock) = connected(&credentials, &client_sink, &server_sink);
 
     let mut buf = vec![0u8; 1500];
@@ -382,8 +401,8 @@ fn stream_credit_becomes_available_once_the_peer_transport_parameters_arrive() {
     // Before the handshake there is no credit; after it there is. A caller that opened
     // streams eagerly would otherwise see an unexplained failure.
     let credentials = TestCredentials::generate();
-    let client_sink: Shared = Rc::default();
-    let server_sink: Shared = Rc::default();
+    let client_sink: Shared = Shared::default();
+    let server_sink: Shared = Shared::default();
     let (client, _server, _clock) = connected(&credentials, &client_sink, &server_sink);
 
     assert!(

@@ -143,6 +143,28 @@ dependency, so it has no RNG to reach for, and one seeded from a clock would pro
 predictable connection identifiers — a real weakness, since an observer who can guess the
 identifiers an endpoint will issue can correlate or interfere with its connections.
 
+## Sent stream data has to be copied
+
+ngtcp2 does not copy what `writev_stream` accepts — it keeps the caller's pointer so it can
+retransmit, and requires the bytes stay intact "until `acked_stream_data_offset` indicates
+that they are acknowledged by a remote endpoint or the stream is closed"
+(`ngtcp2.h:5244-5248`).
+
+A safe API cannot pass a caller's borrow through and return. The caller may free that buffer
+the instant the call ends, and a later retransmission would read freed memory — a
+use-after-free reachable from entirely safe code, with nothing in the signature to warn
+anyone.
+
+So `src/retain.rs` keeps a copy of every accepted byte and hands ngtcp2 a pointer into that,
+releasing it when the acknowledgement arrives or the stream closes. Each accepted write is
+its own `Box<[u8]>`: a growing `Vec` would reallocate and move bytes ngtcp2 still points at.
+
+The cost is one copy of everything sent, held until acknowledged. `ngnet-h3` avoids the
+equivalent copy by making its callers hand over ownership; this crate takes the copy instead,
+because the safety of an ordinary `&[u8]` parameter should not depend on the caller having
+read a paragraph of documentation. An ownership-taking alternative is in
+[`pending-work.md`](pending-work.md).
+
 ## `Idle` and `Blocked` are different answers
 
 `ngtcp2_conn_writev_stream` returning `0` means "buffer too small or congestion limited",

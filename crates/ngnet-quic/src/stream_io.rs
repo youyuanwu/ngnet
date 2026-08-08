@@ -41,6 +41,12 @@ pub enum StreamWrite {
     StreamBlocked,
     /// The connection's flow-control window is full.
     ConnectionBlocked,
+    /// ngtcp2 has something to send but cannot right now — the datagram buffer was too
+    /// small, or the congestion window is closed.
+    ///
+    /// **Not** "finished". Keep the connection running and try again; treating this as the
+    /// end of the send loop is the classic QUIC stall.
+    Blocked,
     /// Nothing to send at the moment.
     Idle,
 }
@@ -90,6 +96,15 @@ impl<S: TlsSession> Conn<'_, S> {
     /// `fin` marks the end of the stream. A zero-length write with `fin` set is how a
     /// stream is finished without further data.
     ///
+    /// # Data is copied
+    ///
+    /// ngtcp2 does **not** copy what it accepts — it keeps the pointer so it can
+    /// retransmit, and requires the bytes stay intact "until
+    /// `acked_stream_data_offset` indicates that they are acknowledged by a remote endpoint
+    /// or the stream is closed" (`ngtcp2.h:5244-5248`). Since `data` is an ordinary borrow
+    /// the caller may reuse immediately, this crate copies the accepted portion and holds
+    /// it until then. [`Conn::retained_bytes`] reports how much is currently held.
+    ///
     /// # Errors
     ///
     /// Returns an error if ngtcp2 refuses; the connection is then unusable.
@@ -113,11 +128,17 @@ impl<S: TlsSession> Conn<'_, S> {
             sys::NGTCP2_WRITE_STREAM_FLAG_NONE
         };
 
+        // The bytes handed to ngtcp2 must outlive this call -- see the note above -- so a
+        // copy is staged first and *that* is what ngtcp2 is given a pointer to.
+        let staged = self.retained_mut().stage(stream, data);
+        let (base, len) = staged.unwrap_or((core::ptr::null(), 0));
+
         let path = self.path_mut().as_raw_mut();
         let mut accepted: sys::ngtcp2_ssize = 0;
         let written = self.with_bridge(|raw| {
             // SAFETY: `raw` is live, `path` points into storage the connection owns, `dest`
-            // is writable for its length and `data` readable for its length.
+            // is writable for its length, and `base` points into the retained copy, which
+            // outlives this call and is released only on acknowledgement or stream close.
             unsafe {
                 let mut pi = sys::ngtcp2_pkt_info { ecn: 0 };
                 crate::ffi::conn_writev_stream(
@@ -133,14 +154,25 @@ impl<S: TlsSession> Conn<'_, S> {
                     // exposed, since its "every argument must be byte-identical across
                     // calls" rule is not expressible in a safe API without a guard type.
                     &sys::ngtcp2_vec {
-                        base: data.as_ptr().cast_mut(),
-                        len: data.len(),
+                        base: base.cast_mut(),
+                        len,
                     },
                     1,
                     now.as_raw(),
                 )
             }
         });
+
+        // Whatever ngtcp2 did not take was never handed over, so it must not stay retained
+        // or count towards the stream's offset -- the caller will offer it again.
+        let taken = if written > 0 {
+            accepted.max(0) as usize
+        } else {
+            0
+        };
+        if staged.is_some() {
+            self.retained_mut().commit(stream, taken);
+        }
 
         if written > 0 {
             let len = written as usize;
@@ -149,14 +181,30 @@ impl<S: TlsSession> Conn<'_, S> {
             unsafe { sys::ngtcp2_conn_update_pkt_tx_time(self.raw(), now.as_raw()) };
             return Ok(StreamWrite::Datagram {
                 len,
-                accepted: accepted.max(0) as usize,
+                accepted: taken,
             });
         }
 
         let code = i32::try_from(written).unwrap_or(sys::NGTCP2_ERR_INTERNAL);
         match code {
-            // Zero here means "nothing produced", not "stream finished".
-            0 => Ok(StreamWrite::Idle),
+            // Zero means "buffer too small or congestion limited" -- wait and retry -- not
+            // "finished". Reporting it as `Idle` would tell a caller to stop writing, which
+            // is the stall this whole enum exists to prevent, and it is why `write_pkt`
+            // maps zero the same way.
+            //
+            // Connection-level flow control is distinguished here rather than by a separate
+            // ngtcp2 error: `writev_stream` returns `STREAM_DATA_BLOCKED` only while
+            // connection credit remains, so zero with no connection credit left is the
+            // connection window being full.
+            0 => {
+                // SAFETY: `raw` is live; a pure query.
+                let connection_credit = unsafe { sys::ngtcp2_conn_get_max_data_left(self.raw()) };
+                if connection_credit == 0 {
+                    Ok(StreamWrite::ConnectionBlocked)
+                } else {
+                    Ok(StreamWrite::Blocked)
+                }
+            }
             sys::NGTCP2_ERR_STREAM_DATA_BLOCKED => Ok(StreamWrite::StreamBlocked),
             sys::NGTCP2_ERR_STREAM_SHUT_WR => Err(Error::native(
                 code,
@@ -253,6 +301,48 @@ impl<S: TlsSession> Conn<'_, S> {
         unsafe { sys::ngtcp2_conn_get_streams_uni_left(self.raw()) }
     }
 
+    /// Writes a close packet for a **transport** error, from the ngtcp2 error that caused
+    /// it.
+    ///
+    /// ngtcp2 requires that most failures of [`Conn::read_pkt`] be answered with a
+    /// CONNECTION_CLOSE carrying a transport error code (`ngtcp2.h:4282-4285`), not an
+    /// application one. Passing the original [`Error`] lets ngtcp2 derive the right code
+    /// itself, through `ngtcp2_ccerr_set_liberr`, rather than this crate maintaining a
+    /// second mapping that could disagree with it.
+    ///
+    /// For an ordinary application-level shutdown use [`Conn::write_connection_close`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a close packet cannot be produced.
+    pub fn write_transport_close(
+        &mut self,
+        dest: &mut [u8],
+        cause: &Error,
+        reason: &[u8],
+        now: Timestamp,
+    ) -> Result<usize> {
+        if dest.is_empty() {
+            return Err(Error::invalid_input(
+                "a datagram buffer must have room to write into",
+            ));
+        }
+
+        // As below, the reason phrase is borrowed rather than copied, so it must outlive
+        // the call -- which it does, being a parameter.
+        // SAFETY: a zeroed `ngtcp2_ccerr` is the documented starting point.
+        let mut ccerr = unsafe { core::mem::zeroed::<sys::ngtcp2_ccerr>() };
+        let liberr = cause
+            .native_code()
+            .map_or(sys::NGTCP2_ERR_INTERNAL, |code| code.get());
+        // SAFETY: `ccerr` is a valid writable struct and `reason` outlives the call.
+        unsafe {
+            sys::ngtcp2_ccerr_set_liberr(&mut ccerr, liberr, reason.as_ptr(), reason.len());
+        }
+
+        self.write_close_with(dest, &ccerr, now)
+    }
+
     /// Writes a packet telling the peer this connection is closing.
     ///
     /// Send the returned datagram, then stop sending anything else: the connection has
@@ -290,6 +380,16 @@ impl<S: TlsSession> Conn<'_, S> {
             );
         }
 
+        self.write_close_with(dest, &ccerr, now)
+    }
+
+    /// The shared tail of both close paths.
+    fn write_close_with(
+        &mut self,
+        dest: &mut [u8],
+        ccerr: &sys::ngtcp2_ccerr,
+        now: Timestamp,
+    ) -> Result<usize> {
         let path = self.path_mut().as_raw_mut();
         let written = self.with_bridge(|raw| {
             // SAFETY: `raw` is live, `path` points into owned storage, `dest` is writable,
@@ -302,7 +402,7 @@ impl<S: TlsSession> Conn<'_, S> {
                     &mut pi,
                     dest.as_mut_ptr(),
                     dest.len(),
-                    &ccerr,
+                    ccerr,
                     now.as_raw(),
                 )
             }
@@ -395,6 +495,22 @@ mod tests {
                 b"done here",
                 ts(2_000_001),
             )
+            .unwrap();
+        assert!(written > 0);
+        assert!(conn.in_closing_period());
+    }
+
+    #[test]
+    fn a_transport_close_can_be_written_from_a_native_error() {
+        // ngtcp2 requires most `read_pkt` failures be answered with a *transport* error
+        // code, not an application one. Without this path a caller had no way to comply.
+        let mut conn = client_conn(Handlers::new()).unwrap();
+        let mut buf = [0u8; 1500];
+        let _ = conn.write_pkt(&mut buf, ts(2_000_000));
+
+        let cause = Error::native(sys::NGTCP2_ERR_PROTO, "a protocol violation");
+        let written = conn
+            .write_transport_close(&mut buf, &cause, b"protocol error", ts(2_000_001))
             .unwrap();
         assert!(written > 0);
         assert!(conn.in_closing_period());

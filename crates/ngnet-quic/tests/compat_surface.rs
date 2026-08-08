@@ -133,6 +133,7 @@ fn the_public_surface_still_has_the_shape_it_promised() {
             }
             | StreamWrite::StreamBlocked
             | StreamWrite::ConnectionBlocked
+            | StreamWrite::Blocked
             | StreamWrite::Idle => {}
         }
     }
@@ -252,6 +253,9 @@ fn the_public_surface_still_has_the_shape_it_promised() {
 
 /// A backend that exists only so the generic bounds above have something to name.
 struct DummyBackend;
+
+/// Deliberately `Send`, so the auto-trait assertions above are about `Conn` rather than
+/// about this stand-in.
 struct DummySession;
 
 // SAFETY: never used to build a connection; it exists to pin the trait's shape.
@@ -275,11 +279,37 @@ unsafe impl TlsBackend for DummyBackend {
     }
 }
 
+/// A `Conn` is `Send`, and it owns its handlers and its entropy source. Both must therefore
+/// be `Send` themselves, or the unsafe impl on `Conn` launders non-`Send` state across a
+/// thread boundary -- an `Rc` captured by a handler, cloned before the connection is moved,
+/// is a data race on a non-atomic refcount reachable from entirely safe code.
+///
+/// The compiler will not catch that: `unsafe impl Send` is precisely the escape hatch that
+/// silences it. So it is asserted here.
+#[test]
+fn the_types_a_connection_owns_are_send_because_the_connection_is() {
+    fn assert_send<T: Send>() {}
+
+    // The two things a `Conn` actually keeps. `Settings` and `TransportParams` are not
+    // asserted because ngtcp2 copies them at construction and the connection does not hold
+    // them; they wrap C structs containing raw pointers and are deliberately consumed by
+    // value into `build`.
+    assert_send::<Handlers<'static>>();
+    assert_send::<Box<dyn EntropySource + Send>>();
+    assert_send::<ConnectionId>();
+
+    // And the connection itself, for a `Send` session.
+    fn conn_is_send<S: TlsSession + Send>() {
+        assert_send::<ngnet_quic::Conn<'static, S>>();
+    }
+    let _ = conn_is_send::<DummySession>;
+}
+
 #[test]
 fn the_connection_surface_still_has_the_shape_it_promised() {
     // Named through a generic function rather than instantiated, so this pins the signatures
     // without needing a TLS backend or a live connection.
-    fn uses_conn<S: TlsSession>(conn: &mut ngnet_quic::Conn<'_, S>) -> Result<()> {
+    fn uses_conn<S: TlsSession>(conn: &mut ngnet_quic::Conn<'_, S>, cause: &Error) -> Result<()> {
         let now = Timestamp::from_nanos(1)?;
         let mut buf = [0u8; 1500];
 
@@ -312,6 +342,8 @@ fn the_connection_surface_still_has_the_shape_it_promised() {
         let _: u64 = conn.streams_uni_left();
         let _: usize =
             conn.write_connection_close(&mut buf, ApplicationErrorCode::new(0), b"", now)?;
+        let _: usize = conn.write_transport_close(&mut buf, cause, b"", now)?;
+        let _: usize = conn.retained_bytes();
         Ok(())
     }
     let _ = uses_conn::<DummySession>;
@@ -349,12 +381,14 @@ fn the_openssl_backend_surface_still_has_the_shape_it_promised() {
         .use_system_trust_store(false)
         .verify(Verify::Peer);
 
-    // **Open.** A future backend may grow a third verification mode, and adding one must
-    // not break a caller that names the two it knows.
+    // **Open.** A future backend may grow another verification mode, and adding one must
+    // not break a caller that names the ones it knows.
     fn on_verify(verify: Verify) {
         match verify {
             Verify::Peer => {}
+            Verify::RequireClientCertificate => {}
             Verify::DangerouslyAcceptAnyCertificate => {}
+            _ => {}
         }
     }
     let _ = on_verify;

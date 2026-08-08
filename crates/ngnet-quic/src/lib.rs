@@ -75,6 +75,8 @@ mod params;
 #[allow(unsafe_code)]
 mod path;
 #[allow(unsafe_code)]
+mod retain;
+#[allow(unsafe_code)]
 mod settings;
 #[allow(unsafe_code)]
 mod stream_io;

@@ -312,10 +312,14 @@ fn classify(native: NativeCode) -> ErrorKind {
         | sys::NGTCP2_ERR_MALFORMED_TRANSPORT_PARAM
         | sys::NGTCP2_ERR_TRANSPORT_PARAM
         | sys::NGTCP2_ERR_VERSION_NEGOTIATION_FAILURE => ErrorKind::Crypto,
-        // Genuinely transient: the same call may succeed later.
+        // Genuinely transient: the same call may succeed later. `NOBUF` belongs here rather
+        // than with the internal errors -- it means the buffer offered was too small or the
+        // amplification limit is in force, and retrying with more room or after more credit
+        // can succeed.
         sys::NGTCP2_ERR_STREAM_DATA_BLOCKED
         | sys::NGTCP2_ERR_STREAM_ID_BLOCKED
-        | sys::NGTCP2_ERR_CONN_ID_BLOCKED => ErrorKind::Blocked,
+        | sys::NGTCP2_ERR_CONN_ID_BLOCKED
+        | sys::NGTCP2_ERR_NOBUF => ErrorKind::Blocked,
         // Not transient: writing to a stream whose write side is closed, or naming one that
         // does not exist, is a mistake on this side of the connection and retrying it will
         // fail identically.
@@ -329,9 +333,13 @@ fn classify(native: NativeCode) -> ErrorKind {
         | sys::NGTCP2_ERR_FINAL_SIZE
         | sys::NGTCP2_ERR_FLOW_CONTROL
         | sys::NGTCP2_ERR_STREAM_LIMIT => ErrorKind::Protocol,
-        sys::NGTCP2_ERR_CALLBACK_FAILURE | sys::NGTCP2_ERR_INTERNAL => {
-            ErrorKind::ConnectionUnusable
-        }
+        // Terminal. `AEAD_LIMIT_REACHED` is the one worth naming: ngtcp2 documents that the
+        // connection must be dropped immediately, because continuing would reuse key
+        // material past its safe limit. Classifying it as `Internal` would leave
+        // `is_fatal()` false and invite a caller to carry on.
+        sys::NGTCP2_ERR_CALLBACK_FAILURE
+        | sys::NGTCP2_ERR_INTERNAL
+        | sys::NGTCP2_ERR_AEAD_LIMIT_REACHED => ErrorKind::ConnectionUnusable,
         _ => ErrorKind::Internal,
     }
 }

@@ -48,18 +48,24 @@ pub(crate) struct AllocState {
 
 impl AllocState {
     /// Blocks currently allocated and not yet freed.
-    pub(crate) fn live(&self) -> i64 {
+    ///
+    /// Zero once a connection has been dropped, if the connection leaked nothing.
+    pub(crate) fn live_blocks(&self) -> i64 {
         self.live.load(Ordering::Relaxed)
     }
 
-    /// Bytes requested over the connection's life.
-    pub(crate) fn total_bytes(&self) -> u64 {
+    /// Blocks allocated over the lifetime of the connection, never decremented.
+    ///
+    /// Used by tests to confirm the allocator was actually exercised, so a balance
+    /// assertion cannot pass vacuously.
+    #[cfg(test)]
+    pub(crate) fn total_allocations(&self) -> u64 {
         self.total.load(Ordering::Relaxed)
     }
 
-    fn record_alloc(&self, size: usize) {
+    fn record_alloc(&self) {
         self.live.fetch_add(1, Ordering::Relaxed);
-        self.total.fetch_add(size as u64, Ordering::Relaxed);
+        self.total.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_free(&self) {
@@ -141,7 +147,7 @@ unsafe extern "C" fn malloc_cb(size: usize, user_data: *mut c_void) -> *mut c_vo
     if !ptr.is_null() {
         // SAFETY: `user_data` is what `Allocator::new` installed.
         if let Some(state) = unsafe { state(user_data) } {
-            state.record_alloc(size);
+            state.record_alloc();
         }
     }
     ptr
@@ -167,7 +173,7 @@ unsafe extern "C" fn calloc_cb(nmemb: usize, size: usize, user_data: *mut c_void
     if !ptr.is_null() {
         // SAFETY: `user_data` is what `Allocator::new` installed.
         if let Some(state) = unsafe { state(user_data) } {
-            state.record_alloc(nmemb.saturating_mul(size));
+            state.record_alloc();
         }
     }
     ptr
@@ -185,11 +191,11 @@ unsafe extern "C" fn realloc_cb(
         // SAFETY: `user_data` is what `Allocator::new` installed.
         if let Some(state) = unsafe { state(user_data) } {
             // A realloc from null is a fresh allocation; one from a real pointer replaces a
-            // block that is still live, so only the byte total moves.
+            // block that is already counted, so nothing moves. Counting blocks rather than
+            // bytes is what makes this unambiguous -- a byte total would have to decide
+            // whether to subtract the old size, which is not knowable here.
             if was_null {
-                state.record_alloc(size);
-            } else {
-                state.total.fetch_add(size as u64, Ordering::Relaxed);
+                state.record_alloc();
             }
         }
     }
@@ -218,8 +224,12 @@ mod tests {
     fn allocations_are_counted_and_balance_after_freeing() {
         let allocator = Allocator::new();
         exercise(&allocator);
-        assert_eq!(allocator.state().live(), 0);
-        assert_eq!(allocator.state().total_bytes(), 64 + 64);
+        assert_eq!(allocator.state().live_blocks(), 0);
+        assert_eq!(
+            allocator.state().total_allocations(),
+            2,
+            "the balance above must not be able to pass without the allocator being used"
+        );
     }
 
     #[test]
@@ -233,7 +243,7 @@ mod tests {
             let user_data = (*mem).user_data;
             ((*mem).free.unwrap())(core::ptr::null_mut(), user_data);
         }
-        assert_eq!(allocator.state().live(), 0);
+        assert_eq!(allocator.state().live_blocks(), 0);
     }
 
     #[test]
@@ -267,9 +277,9 @@ mod tests {
         unsafe {
             let user_data = (*mem).user_data;
             let p = ((*mem).realloc.unwrap())(core::ptr::null_mut(), 32, user_data);
-            assert_eq!(allocator.state().live(), 1);
+            assert_eq!(allocator.state().live_blocks(), 1);
             ((*mem).free.unwrap())(p, user_data);
         }
-        assert_eq!(allocator.state().live(), 0);
+        assert_eq!(allocator.state().live_blocks(), 0);
     }
 }

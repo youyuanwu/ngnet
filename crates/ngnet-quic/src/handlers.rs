@@ -29,10 +29,16 @@ pub enum StreamCloseReason {
 ///
 /// Named rather than written inline because the borrowed slice makes the closure type long
 /// enough to obscure the signature it appears in.
-type StreamDataHandler<'a> = Box<dyn FnMut(StreamId, &[u8], bool) + 'a>;
+///
+/// The `Send` bound is load-bearing. A [`crate::Conn`] is `Send`, and it owns its handlers;
+/// without this bound a handler capturing an `Rc` or a `RefCell` could be moved to another
+/// thread while a clone stayed behind, which is a data race on a non-atomic refcount
+/// reachable from entirely safe code. The entropy source carries the same bound for the
+/// same reason.
+type StreamDataHandler<'a> = Box<dyn FnMut(StreamId, &[u8], bool) + Send + 'a>;
 
 /// A handler taking a stream and an application error code.
-type StreamErrorHandler<'a> = Box<dyn FnMut(StreamId, ApplicationErrorCode) + 'a>;
+type StreamErrorHandler<'a> = Box<dyn FnMut(StreamId, ApplicationErrorCode) + Send + 'a>;
 
 /// The callbacks an application supplies.
 ///
@@ -41,12 +47,12 @@ type StreamErrorHandler<'a> = Box<dyn FnMut(StreamId, ApplicationErrorCode) + 'a
 #[derive(Default)]
 pub struct Handlers<'a> {
     pub(crate) on_stream_data: Option<StreamDataHandler<'a>>,
-    pub(crate) on_stream_open: Option<Box<dyn FnMut(StreamId) + 'a>>,
-    pub(crate) on_stream_close: Option<Box<dyn FnMut(StreamId, StreamCloseReason) + 'a>>,
+    pub(crate) on_stream_open: Option<Box<dyn FnMut(StreamId) + Send + 'a>>,
+    pub(crate) on_stream_close: Option<Box<dyn FnMut(StreamId, StreamCloseReason) + Send + 'a>>,
     pub(crate) on_stream_reset: Option<StreamErrorHandler<'a>>,
     pub(crate) on_stop_sending: Option<StreamErrorHandler<'a>>,
-    pub(crate) on_acked_stream_data: Option<Box<dyn FnMut(StreamId, u64) + 'a>>,
-    pub(crate) on_handshake_completed: Option<Box<dyn FnMut() + 'a>>,
+    pub(crate) on_acked_stream_data: Option<Box<dyn FnMut(StreamId, u64) + Send + 'a>>,
+    pub(crate) on_handshake_completed: Option<Box<dyn FnMut() + Send + 'a>>,
 }
 
 impl<'a> Handlers<'a> {
@@ -58,31 +64,40 @@ impl<'a> Handlers<'a> {
     /// Called with data received on a stream, and whether that data ends it.
     ///
     /// The slice borrows ngtcp2's own buffer and is valid only for the call.
-    pub fn on_stream_data(mut self, f: impl FnMut(StreamId, &[u8], bool) + 'a) -> Self {
+    pub fn on_stream_data(mut self, f: impl FnMut(StreamId, &[u8], bool) + Send + 'a) -> Self {
         self.on_stream_data = Some(Box::new(f));
         self
     }
 
     /// Called when the peer opens a stream.
-    pub fn on_stream_open(mut self, f: impl FnMut(StreamId) + 'a) -> Self {
+    pub fn on_stream_open(mut self, f: impl FnMut(StreamId) + Send + 'a) -> Self {
         self.on_stream_open = Some(Box::new(f));
         self
     }
 
     /// Called when a stream is fully closed.
-    pub fn on_stream_close(mut self, f: impl FnMut(StreamId, StreamCloseReason) + 'a) -> Self {
+    pub fn on_stream_close(
+        mut self,
+        f: impl FnMut(StreamId, StreamCloseReason) + Send + 'a,
+    ) -> Self {
         self.on_stream_close = Some(Box::new(f));
         self
     }
 
     /// Called when the peer resets a stream it was sending on.
-    pub fn on_stream_reset(mut self, f: impl FnMut(StreamId, ApplicationErrorCode) + 'a) -> Self {
+    pub fn on_stream_reset(
+        mut self,
+        f: impl FnMut(StreamId, ApplicationErrorCode) + Send + 'a,
+    ) -> Self {
         self.on_stream_reset = Some(Box::new(f));
         self
     }
 
     /// Called when the peer asks this endpoint to stop sending on a stream.
-    pub fn on_stop_sending(mut self, f: impl FnMut(StreamId, ApplicationErrorCode) + 'a) -> Self {
+    pub fn on_stop_sending(
+        mut self,
+        f: impl FnMut(StreamId, ApplicationErrorCode) + Send + 'a,
+    ) -> Self {
         self.on_stop_sending = Some(Box::new(f));
         self
     }
@@ -91,13 +106,13 @@ impl<'a> Handlers<'a> {
     ///
     /// This is what releases buffers retained for retransmission. An application that sends
     /// large bodies and ignores this will hold every byte it ever sent.
-    pub fn on_acked_stream_data(mut self, f: impl FnMut(StreamId, u64) + 'a) -> Self {
+    pub fn on_acked_stream_data(mut self, f: impl FnMut(StreamId, u64) + Send + 'a) -> Self {
         self.on_acked_stream_data = Some(Box::new(f));
         self
     }
 
     /// Called once, when the TLS handshake completes.
-    pub fn on_handshake_completed(mut self, f: impl FnMut() + 'a) -> Self {
+    pub fn on_handshake_completed(mut self, f: impl FnMut() + Send + 'a) -> Self {
         self.on_handshake_completed = Some(Box::new(f));
         self
     }

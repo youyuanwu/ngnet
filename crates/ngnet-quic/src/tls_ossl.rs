@@ -119,11 +119,34 @@ fn encode_alpn(protocols: &[Vec<u8>]) -> Result<Vec<u8>> {
 }
 
 /// How a peer's certificate should be checked.
+///
+/// # What this means per role
+///
+/// For a **client**, [`Verify::Peer`] verifies the server's certificate chain against the
+/// configured trust anchors *and* checks it was issued for the requested name. That is the
+/// default, and the reason a verifying client must be given a server name.
+///
+/// For a **server**, [`Verify::Peer`] means "request no client certificate", because
+/// ordinary QUIC clients present none and demanding one would reject every one of them.
+/// Mutual TLS is not implemented; a server that needs it should not silently get something
+/// weaker, so [`Verify::RequireClientCertificate`] exists and returns an error rather than
+/// pretending.
+/// Open rather than closed: a backend may grow a verification mode -- this one already
+/// grew `RequireClientCertificate` -- and adding another must not break a caller that names
+/// the ones it knows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[non_exhaustive]
 pub enum Verify {
-    /// Verify the peer against the configured trust anchors. The default.
+    /// Verify the peer where there is a peer certificate to verify. The default.
+    ///
+    /// See the note above: this is asymmetric, because the roles are.
     #[default]
     Peer,
+    /// Require and verify a client certificate. **Servers only, and not yet implemented.**
+    ///
+    /// Present so that asking for mutual TLS fails loudly rather than silently producing a
+    /// server that accepts anyone.
+    RequireClientCertificate,
     /// Do not verify the peer at all.
     ///
     /// Named this way on purpose. There is no `Verify::None`, because "none" reads as an
@@ -253,28 +276,42 @@ impl OsslBackendBuilder {
             add_trust_anchor(ctx.0, anchor)?;
         }
 
+        if self.verify == Verify::RequireClientCertificate {
+            return Err(Error::invalid_input(
+                "mutual TLS is not implemented; a server cannot require a client certificate",
+            ));
+        }
+
         let mode = match self.verify {
             Verify::Peer if self.role == Role::Client => sys::SSL_VERIFY_PEER as c_int,
             // A server that demanded a client certificate would reject every ordinary
-            // client, so peer verification on the server means "do not require one".
+            // client, so `Verify::Peer` on a server means "request none" -- documented on
+            // the enum, and `RequireClientCertificate` is refused above rather than
+            // silently downgraded to this.
             _ => sys::SSL_VERIFY_NONE as c_int,
         };
         // SAFETY: `ctx` is valid; a null callback means "use the default decision".
         unsafe { sys::SSL_CTX_set_verify(ctx.0, mode, None) };
 
+        let mut alpn_offers = None;
         if self.role == Role::Server {
-            // The selection callback reads the offer list through the context's app data.
-            // Leaked deliberately: it must outlive every session made from this context,
-            // and there is exactly one per backend.
-            let offers = Box::into_raw(Box::new(alpn_wire.clone()));
-            // SAFETY: `ctx` is valid and `offers` outlives it by construction.
+            // The selection callback reads the offer list through the callback argument,
+            // which must stay at a fixed address for as long as any session made from this
+            // context can run. Owning it here -- rather than leaking it, as an earlier
+            // version did -- means it is freed when the backend is, and the field order
+            // below ensures `SSL_CTX_free` runs first.
+            let offers = Box::new(alpn_wire.clone());
+            let ptr: *const Vec<u8> = &*offers;
+            // SAFETY: `ctx` is valid, and `offers` is owned by the backend being returned,
+            // so the pointer stays valid for the context's whole life.
             unsafe {
                 sys::SSL_CTX_set_alpn_select_cb(
                     ctx.0,
                     Some(alpn_select_cb),
-                    offers.cast::<c_void>(),
+                    ptr.cast_mut().cast::<c_void>(),
                 )
             };
+            alpn_offers = Some(offers);
         }
 
         Ok(OsslBackend {
@@ -282,6 +319,7 @@ impl OsslBackendBuilder {
             alpn_wire,
             role: self.role,
             verify: self.verify,
+            _alpn_offers: alpn_offers,
         })
     }
 }
@@ -521,10 +559,19 @@ impl Drop for Pkey {
 
 /// A configured OpenSSL TLS stack.
 pub struct OsslBackend {
+    /// Declared first so it is dropped first: `SSL_CTX_free` must run before the ALPN
+    /// buffer its selection callback points at.
     ctx: SslCtx,
     alpn_wire: Vec<u8>,
     role: Role,
     verify: Verify,
+    /// The server's ALPN offer list, at a fixed address for the selection callback.
+    ///
+    /// `Box<Vec<u8>>` rather than `Vec<u8>` deliberately, despite what the lint suggests:
+    /// the callback recovers a `*const Vec<u8>` and dereferences it, so the `Vec` *struct*
+    /// must not move. It would, when this backend is returned by value. Boxing pins it.
+    #[allow(clippy::box_collection)]
+    _alpn_offers: Option<Box<Vec<u8>>>,
 }
 
 impl OsslBackend {

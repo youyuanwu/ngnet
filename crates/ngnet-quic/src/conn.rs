@@ -37,6 +37,7 @@ use crate::handlers::Handlers;
 use crate::params::TransportParams;
 use crate::path::PathStorage;
 use crate::rand::EntropySource;
+use crate::retain::Retained;
 use crate::settings::Settings;
 use crate::tls::{Role, TlsSession};
 use crate::validate;
@@ -123,8 +124,19 @@ impl<S: TlsSession> ConnBuilder<S> {
 
         // Identifiers first, because they may need entropy and a failure here should not
         // leave a half-built connection behind.
+        //
+        // A server must be told the client's source identifier: generating one would name a
+        // connection the client has never heard of, and every packet sent would be ignored.
+        // ngtcp2 does not catch that -- the connection builds and then silently stalls --
+        // so it is refused here.
         let dcid = match self.dcid {
             Some(dcid) => dcid,
+            None if server => {
+                return Err(Error::invalid_input(
+                    "a server must be given the client's source connection ID as its \
+                     destination; take it from `Inspection::Supported`",
+                ));
+            }
             None => ConnectionId::generate(&mut *self.entropy, self.cid_len)?,
         };
         let scid = match self.scid {
@@ -141,6 +153,7 @@ impl<S: TlsSession> ConnBuilder<S> {
         let slot = BridgeSlot::new();
         let mut rand_ctx = Box::new(RandCtx {
             source: self.entropy,
+            failed: core::cell::Cell::new(false),
         });
         let path = PathStorage::new(self.local, self.remote);
 
@@ -192,6 +205,20 @@ impl<S: TlsSession> ConnBuilder<S> {
         }
         debug_assert!(!raw.is_null());
 
+        // The `rand` callback fires inside the constructor and returns `void`, so a failing
+        // entropy source cannot be reported where it happens -- and ngtcp2 uses the buffer
+        // regardless, seeding a hash map and a PRNG from it. The failure is latched instead,
+        // and checked here, so a connection whose randomness was not what was asked for is
+        // never handed back.
+        if rand_ctx.failed() {
+            // SAFETY: `raw` came from the constructor above and has not been freed.
+            unsafe { sys::ngtcp2_conn_del(raw) };
+            return Err(Error::with_kind(
+                crate::ErrorKind::Internal,
+                "the entropy source failed while the connection was being created",
+            ));
+        }
+
         let mut conn = Conn {
             raw,
             tls: self.tls,
@@ -202,6 +229,7 @@ impl<S: TlsSession> ConnBuilder<S> {
             path,
             role: self.role,
             scid,
+            retained: Retained::default(),
         };
 
         // The TLS handle is installed after construction, which is also when the cycle
@@ -262,6 +290,11 @@ pub struct Conn<'h, S: TlsSession> {
     path: Box<PathStorage>,
     role: Role,
     scid: ConnectionId,
+    /// Copies of stream data ngtcp2 has accepted but the peer has not acknowledged.
+    ///
+    /// ngtcp2 keeps the caller's pointer rather than copying, so this is what stops a
+    /// retransmission reading a buffer the caller already freed. See `crate::retain`.
+    retained: Retained,
 }
 
 impl<'h, S: TlsSession> Conn<'h, S> {
@@ -326,6 +359,7 @@ impl<'h, S: TlsSession> Conn<'h, S> {
         let rand_handle: *mut RandCtx = &mut *self._rand_ctx;
         let mut bridge = Bridge {
             handlers: &mut self.handlers,
+            retained: &mut self.retained,
         };
         // SAFETY: both `bridge` and the rand context outlive the guards, which are dropped
         // at the end of this function -- including while unwinding.
@@ -348,6 +382,20 @@ impl<'h, S: TlsSession> Conn<'h, S> {
     /// The path as a const pointer, for the read path.
     pub(crate) fn path_ptr(&self) -> *const sys::ngtcp2_path {
         self.path.as_raw()
+    }
+
+    /// Bytes of sent stream data still held awaiting acknowledgement.
+    ///
+    /// ngtcp2 does not copy what it accepts, so this crate does; the copy is released when
+    /// the peer acknowledges it. A connection whose peer stops acknowledging will see this
+    /// grow, which is the honest signal that memory is being held on its behalf.
+    pub fn retained_bytes(&self) -> usize {
+        self.retained.bytes_held()
+    }
+
+    /// The retention map, for the write path and the acknowledgement callback.
+    pub(crate) fn retained_mut(&mut self) -> &mut Retained {
+        &mut self.retained
     }
 }
 
