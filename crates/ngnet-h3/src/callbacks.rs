@@ -533,18 +533,34 @@ pub(crate) unsafe extern "C" fn read_data_cb<C>(
         let Some(piece) = entry.take_piece() else {
             break;
         };
-        debug_assert!(!piece.is_empty());
+        // Read once. Everything below uses these two values, and the retain queue stores
+        // the length rather than measuring the buffer again later: a `RetainedBytes` built
+        // from a caller-supplied owner reads through `AsRef`, which promises nothing about
+        // answering the same way twice, and release accounting that disagreed with what
+        // nghttp3 was told would free a buffer it is still reading through.
         let bytes = piece.as_slice();
+        let base = bytes.as_ptr();
+        let handed = bytes.len();
+
+        // nghttp3 silently skips a zero-length vector without queueing it, so retaining one
+        // would put an element at the front of the queue awaiting an acknowledgement that
+        // can never arrive -- and every buffer behind it would wait with it. Filtered when
+        // the source hands pieces over, and checked again here because the length is read
+        // from the owner rather than from anything this crate controls.
+        if handed == 0 {
+            continue;
+        }
+
         // SAFETY: `vec` is an array of at least `veccnt` entries supplied by nghttp3 for
         // this call, and `filled` is below `veccnt`.
         unsafe {
-            (*vec.add(filled)).base = bytes.as_ptr().cast_mut();
-            (*vec.add(filled)).len = bytes.len();
+            (*vec.add(filled)).base = base.cast_mut();
+            (*vec.add(filled)).len = handed;
         }
         // Retained *after* its address has been handed over, and before returning, so the
         // allocation behind that address outlives the write. `RetainedBytes` is an `Arc`,
         // so moving the handle into the queue does not move the bytes.
-        entry.retain(piece);
+        entry.retain(piece, handed);
         filled += 1;
     }
 

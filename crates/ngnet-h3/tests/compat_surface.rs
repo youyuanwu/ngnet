@@ -375,3 +375,193 @@ fn the_public_surface_still_has_the_shape_it_promised() {
     connection_surface().expect("the connection surface");
     raw_escape_hatch_is_reachable();
 }
+
+/// The asynchronous layer's public surface.
+///
+/// Behind the `http` feature, so this file pins two shapes rather than one: with the feature
+/// off, everything above is the whole crate; with it on, everything below is added. Both are
+/// promises, and a change to either should be deliberate.
+#[cfg(feature = "http")]
+mod asynchronous {
+    use ngnet_h3::http::quic::Timestamp;
+    use ngnet_h3::http::testing::bytes_crate::Bytes;
+    use ngnet_h3::http::testing::http_body_crate::Body;
+    use ngnet_h3::http::{
+        Cancelled, Config, Connection, Error, ErrorKind, IncomingBody, QuicConnection, QuicEvent,
+        ResponseFuture, Result, SendRequest, StreamSource, WriteOutcome, handshake, handshake_with,
+        serve, serve_with,
+    };
+    use ngnet_h3::{ErrorCode, RetainedBytes, StreamId};
+
+    /// `WriteOutcome` is closed: a transport answers an offer in exactly three ways, and a
+    /// fourth would be a change every implementation has to notice.
+    fn write_outcomes_are_closed(outcome: WriteOutcome) -> &'static str {
+        match outcome {
+            WriteOutcome::Accepted(_) => "accepted",
+            WriteOutcome::Blocked => "blocked",
+            WriteOutcome::Gone => "gone",
+        }
+    }
+
+    /// `QuicEvent` and `ErrorKind` are open, so both are matched with a wildcard: adding a
+    /// variant must not break a caller.
+    fn open_enumerations_stay_open(event: QuicEvent, kind: ErrorKind) -> bool {
+        let named = matches!(
+            event,
+            QuicEvent::Data { .. }
+                | QuicEvent::Accepted { .. }
+                | QuicEvent::Released { .. }
+                | QuicEvent::StopSending { .. }
+                | QuicEvent::Reset { .. }
+                | QuicEvent::StreamClosed { .. }
+                | QuicEvent::Closed { .. }
+        );
+        let categorised = matches!(
+            kind,
+            ErrorKind::Transport
+                | ErrorKind::Connection
+                | ErrorKind::Stream
+                | ErrorKind::Protocol
+                | ErrorKind::Closed
+                | ErrorKind::Body
+                | ErrorKind::Refused
+        );
+        named && categorised
+    }
+
+    /// Every builder on `Config`, and the fact that each is `#[must_use]`.
+    fn config_surface() -> Config {
+        Config::default()
+            .max_concurrent_streams(64)
+            .max_field_section_size(16 * 1024)
+            .qpack_max_dtable_capacity(4096)
+            .qpack_blocked_streams(8)
+            .events_per_pass(32)
+    }
+
+    /// The error surface a caller reads.
+    fn error_surface(error: &Error) -> (ErrorKind, bool, bool, Option<ErrorCode>) {
+        let _: &dyn std::error::Error = error;
+        let _ = format!("{error}");
+        let _ = format!("{error:?}");
+        (
+            error.kind(),
+            error.is_closed(),
+            error.is_retriable(),
+            error.code(),
+        )
+    }
+
+    /// `IncomingBody` is an `http_body::Body` of `Bytes`, and says so in its own types.
+    fn incoming_body_surface(body: &IncomingBody) -> bool {
+        fn assert_body<B: Body<Data = Bytes, Error = Error>>() {}
+        assert_body::<IncomingBody>();
+        let _ = format!("{body:?}");
+        Body::is_end_stream(body)
+    }
+
+    /// The client surface: a cloneable handle, a future, and the four things the handle does.
+    fn client_surface<B>(handle: &SendRequest<B>) -> (bool, bool) {
+        let cloned = handle.clone();
+        cloned.shutdown();
+        (cloned.is_closed(), cloned.is_refusing())
+    }
+
+    /// The cancellation signal a handler receives.
+    async fn cancellation_surface(cancelled: Cancelled) -> bool {
+        let copy = cancelled.clone();
+        let _ = format!("{copy:?}");
+        if copy.is_cancelled() {
+            copy.cancelled().await;
+            return true;
+        }
+        false
+    }
+
+    /// The backend trait, named in full so a change to it is a change here.
+    fn backend_surface<Q: QuicConnection>(backend: &mut Q) {
+        let _: bool = Q::RETAINS_BUFFERS;
+        let _: Timestamp = backend.now();
+        let _ = backend.reset(stream(), ErrorCode::new(0x10c));
+        let _ = backend.stop_sending(stream(), ErrorCode::new(0x10c));
+        let _ = backend.extend_credit(Some(stream()), 1);
+        let _ = backend.extend_credit(None, 1);
+        let _ = backend.close(ErrorCode::new(0x100), b"");
+    }
+
+    /// The source a transport pulls from.
+    fn source_surface<S: StreamSource>(source: &mut S) -> bool {
+        source.write_next(&mut |_stream, _slices, _fin| WriteOutcome::Accepted(0))
+    }
+
+    /// The erased-owner constructor the zero-copy body path needs.
+    fn retained_surface() -> usize {
+        let retained = RetainedBytes::from_owner(Bytes::from_static(b"pinned"));
+        retained.len()
+    }
+
+    fn stream() -> StreamId {
+        StreamId::new(0).expect("zero is a valid identifier")
+    }
+
+    /// A minimal body, since `Bytes` is not itself an `http_body::Body`.
+    struct Nothing;
+
+    impl Body for Nothing {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<
+            Option<Result2<ngnet_h3::http::testing::http_body_crate::Frame<Bytes>, Self::Error>>,
+        > {
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    type Result2<T, E> = core::result::Result<T, E>;
+    type Backend = ngnet_h3::http::testing::Loopback;
+    type Answer = core::future::Ready<http::Response<Nothing>>;
+    type Handler = fn(http::Request<IncomingBody>) -> Answer;
+    type Client<D> = Result<(SendRequest<Nothing>, Connection<D>)>;
+
+    /// Names all four entry points, so their signatures are pinned even though calling them
+    /// here would prove nothing about shape.
+    fn entry_points_are_named() {
+        let _: fn(Backend) -> Client<_> = handshake;
+        let _: fn(Backend, Config) -> Client<_> = handshake_with;
+
+        fn handler(_request: http::Request<IncomingBody>) -> Answer {
+            core::future::ready(http::Response::new(Nothing))
+        }
+        let _: fn(Backend, Handler) -> Result<Connection<_>> = serve;
+        let _: fn(Backend, Handler, Config) -> Result<Connection<_>> = serve_with;
+        let _ = handler;
+    }
+
+    #[test]
+    fn the_async_surface_still_has_the_shape_it_promised() {
+        assert_eq!(write_outcomes_are_closed(WriteOutcome::Blocked), "blocked");
+        assert!(open_enumerations_stay_open(
+            QuicEvent::Closed { code: None },
+            ErrorKind::Transport
+        ));
+        let _ = config_surface();
+        assert_eq!(retained_surface(), 6);
+
+        let (mut backend, _peer, _knobs) = ngnet_h3::http::testing::loopback();
+        backend_surface(&mut backend);
+
+        // Named so the compiler checks the signatures; not called, because they need a
+        // driver to mean anything and this file is about shape rather than behaviour.
+        let _ = entry_points_are_named;
+        let _ = client_surface::<Nothing>;
+        let _ = cancellation_surface;
+        let _ = incoming_body_surface;
+        let _ = error_surface;
+        let _ = source_surface::<ngnet_h3::http::testing::ScriptedSource>;
+        let _ = ResponseFuture::poll;
+    }
+}

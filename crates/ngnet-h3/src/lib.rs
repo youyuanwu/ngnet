@@ -141,8 +141,11 @@
 //! # Scope
 //!
 //! Cleartext framing only, in the sense that TLS and QUIC are the caller's concern. Server
-//! push is not implemented, because nghttp3 does not implement it. There is deliberately
-//! no asynchronous layer here; this crate is the core such a layer would be built on.
+//! push is not implemented, because nghttp3 does not implement it.
+//!
+//! An asynchronous HTTP/3 API over this core lives in the `http` module, behind the
+//! default-on `http` feature. Disabling that feature returns the crate to what this page
+//! describes: a state machine with one dependency and no asynchrony of its own.
 
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
@@ -169,6 +172,9 @@ mod handlers;
 mod header;
 mod state;
 mod stream;
+
+#[cfg(feature = "http")]
+pub mod http;
 
 pub use body::{BodyOutcome, BodySource, FixedBody, RetainedBytes};
 pub use conn::{Conn, ConnBuilder, FlowCredit, Role, Timestamp};

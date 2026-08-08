@@ -73,6 +73,9 @@ jobs:
       - name: Test (sans-I/O core alone)
         run: cargo test -p ngnet-h2 --no-default-features
 
+      - name: Test (HTTP/3 sans-I/O core alone)
+        run: cargo test -p ngnet-h3 --no-default-features
+
       # `--all-targets` reaches benchmarks and examples as well as tests, which is half of
       # what keeps the benchmark crate from rotting.
       - name: Clippy (all features)
@@ -83,6 +86,12 @@ jobs:
 
       - name: Clippy (sans-I/O core alone)
         run: cargo clippy -p ngnet-h2 --no-default-features --all-targets -- -D warnings
+
+      - name: Clippy (HTTP/3, default features)
+        run: cargo clippy -p ngnet-h3 --all-targets -- -D warnings
+
+      - name: Clippy (HTTP/3 sans-I/O core alone)
+        run: cargo clippy -p ngnet-h3 --no-default-features --all-targets -- -D warnings
 
       # Four configurations rather than one, because of a bug this repository actually
       # shipped: a doc link to an item behind the `tokio` feature passed `--all-features`
@@ -97,19 +106,50 @@ jobs:
             echo "::endgroup::"
           done
 
-      # The HTTP/3 crates have no feature matrix -- `ngnet-h3` has exactly one dependency
-      # and no optional ones -- so one pass covers them.
-      - name: Rustdoc for the HTTP/3 crates
+      # `ngnet-h3` has a feature matrix of its own now that the async layer is behind a
+      # default-on `http` feature: a doc link to a gated item passes under one configuration
+      # and breaks the others, which is exactly the failure the h2 matrix above exists for.
+      - name: Rustdoc across the HTTP/3 feature matrix
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps -p ngnet-h3 -p ngnet-h3-sys -p ngnet-h3-tests
+        run: |
+          for features in "" "--no-default-features" "--all-features"; do
+            echo "::group::cargo doc -p ngnet-h3 ${features:-(default)}"
+            cargo doc --no-deps -p ngnet-h3 $features
+            echo "::endgroup::"
+          done
+          cargo doc --no-deps -p ngnet-h3-sys -p ngnet-h3-tests
 
-      # The HTTP/3 wrapper's whole shape rests on depending on nothing but its own bindings.
-      # The invariants test asserts what the manifest *declares*; this asserts what the
-      # resolved graph actually contains, which is the thing a downstream user gets. Cargo
-      # unifies features across a workspace, so a crate added later could pull a transport
-      # into the graph with nothing in `ngnet-h3` changing.
-      - name: The HTTP/3 wrapper depends on nothing but its bindings
+      # Two separate claims, and they need two separate commands.
+      #
+      # The first is that the sans-I/O core still stands alone. `cargo tree` resolves default
+      # features, and the async layer's feature is default-on, so this must be asked with
+      # `--no-default-features` or it is asking about the async layer instead. The invariants
+      # test asserts what the manifest *declares*; this asserts what the resolved graph
+      # actually contains, which is the thing a downstream user gets.
+      #
+      # The second is that no transport or TLS crate reaches the graph in *any* configuration.
+      # That one is asked with default features on, because cargo unifies features across a
+      # workspace and a crate added later could pull a transport in with nothing in
+      # `ngnet-h3` changing.
+      - name: The HTTP/3 sans-I/O core depends on nothing but its bindings
+        run: |
+          # `cargo tree` prints the crate itself on the first line and one line per
+          # dependency after it, each prefixed with a box-drawing character. So the claim
+          # "exactly one dependency" is "exactly one line after the first", and the name on
+          # it has to be the right one -- counting lines alone would pass for any single
+          # dependency at all.
+          tree=$(cargo tree -p ngnet-h3 --no-default-features -e normal)
+          echo "$tree"
+          deps=$(echo "$tree" | tail -n +2)
+          if [ "$(echo "$deps" | grep -c .)" != "1" ] \
+             || ! echo "$deps" | grep -q 'ngnet-h3-sys'; then
+            echo "::error::the HTTP/3 core's dependency graph is no longer just its bindings."
+            exit 1
+          fi
+          echo "the HTTP/3 core still stands alone"
+
+      - name: No transport or TLS crate reaches the HTTP/3 wrapper
         run: |
           tree=$(cargo tree -p ngnet-h3 -e normal)
           echo "$tree"

@@ -52,8 +52,43 @@ const FORBIDDEN: &[&str] = &[
 /// to. Anything else from `std::io` would be the real thing.
 const PERMITTED_STD_IO: &str = "std::io::IoSlice";
 
+/// The subtree the asynchronous layer lives in, relative to `src`.
+///
+/// The core's structural claims are about the code *outside* this directory. Inside it the
+/// crate is deliberately asynchronous and deliberately reaches for a waker, so scanning it
+/// for those would flag the feature rather than a defect. The subtree makes its own claims,
+/// pinned separately below, and [`the_async_subtree_exists_and_is_scanned`] fails if this
+/// path ever stops matching anything — a filter that silently matches nothing turns every
+/// test that uses it into a test of nothing.
+const ASYNC_SUBTREE: &str = "http";
+
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Whether `path` is inside the asynchronous subtree.
+fn in_async_subtree(path: &Path) -> bool {
+    let src = crate_root().join("src");
+    path.strip_prefix(&src)
+        .ok()
+        .and_then(|rest| rest.components().next())
+        .is_some_and(|first| first.as_os_str() == ASYNC_SUBTREE)
+}
+
+/// The crate's source outside the asynchronous subtree.
+fn core_files() -> Vec<PathBuf> {
+    rust_files(&crate_root().join("src"))
+        .into_iter()
+        .filter(|path| !in_async_subtree(path))
+        .collect()
+}
+
+/// The crate's source inside the asynchronous subtree.
+fn async_files() -> Vec<PathBuf> {
+    rust_files(&crate_root().join("src"))
+        .into_iter()
+        .filter(|path| in_async_subtree(path))
+        .collect()
 }
 
 fn rust_files(dir: &Path) -> Vec<PathBuf> {
@@ -333,10 +368,9 @@ fn a_caller_never_needs_unsafe() {
 }
 
 #[test]
-fn the_crate_reaches_for_no_io_threading_or_time_facility() {
-    let src = crate_root().join("src");
-    let files = rust_files(&src);
-    assert!(!files.is_empty(), "no source files found under {src:?}");
+fn the_core_reaches_for_no_io_threading_or_time_facility() {
+    let files = core_files();
+    assert!(!files.is_empty(), "no core source files found");
 
     let mut findings = Vec::new();
     for path in &files {
@@ -366,12 +400,12 @@ fn the_crate_reaches_for_no_io_threading_or_time_facility() {
 }
 
 #[test]
-fn the_crate_has_no_asynchrony_of_its_own() {
-    // There is deliberately no async layer here. Its absence is what lets the crate be
-    // driven from blocking code, from any runtime, and from a test with no runtime at all.
-    let src = crate_root().join("src");
+fn no_asynchrony_escapes_the_subtree() {
+    // The core is driven, not driving. Its freedom from asynchrony is what lets it be used
+    // from blocking code, from any runtime, and from a test with no runtime at all — so
+    // the async layer is allowed to exist only inside `src/http/`, and nowhere else.
     let mut offenders = Vec::new();
-    for path in rust_files(&src) {
+    for path in core_files() {
         let source = std::fs::read_to_string(&path).expect("reading a source file");
         let stripped = strip_comments_and_literals(&source);
         if stripped.contains("async fn") || stripped.contains("async move") {
@@ -380,7 +414,148 @@ fn the_crate_has_no_asynchrony_of_its_own() {
     }
     assert!(
         offenders.is_empty(),
-        "these modules introduce asynchrony the crate promises not to have: {offenders:#?}"
+        "asynchrony must stay inside the `{ASYNC_SUBTREE}` subtree: {offenders:#?}"
+    );
+}
+
+#[test]
+fn the_async_subtree_contains_no_unsafe_at_all() {
+    // Not "confined to a declared list", as the core's rule is: *none*. Every FFI call and
+    // every raw pointer lives below this layer, which is the whole reason the layer can be
+    // reviewed as ordinary Rust.
+    let mut offenders = Vec::new();
+    for path in async_files() {
+        let source = std::fs::read_to_string(&path).expect("reading a source file");
+        if mentions_unsafe(&strip_comments_and_literals(&source)) {
+            offenders.push(path);
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "the async layer must need no `unsafe`: {offenders:#?}"
+    );
+}
+
+#[test]
+fn the_async_subtree_exists_and_is_scanned() {
+    // Guards the path filter itself. If `src/http/` were renamed, every claim above would
+    // pass by scanning nothing, which is the most dangerous way for a structural test to
+    // fail.
+    let found = async_files();
+    assert!(
+        !found.is_empty(),
+        "no files found under src/{ASYNC_SUBTREE}/; the subtree filter has gone stale and \
+         the claims made about the async layer are now claims about an empty set"
+    );
+
+    let core = core_files();
+    assert!(
+        !core.is_empty(),
+        "no files found outside src/{ASYNC_SUBTREE}/; the filter has swallowed the core"
+    );
+}
+
+/// Facilities the asynchronous layer must not reach for either.
+///
+/// A shorter list than the core's, and for a different reason. The layer is allowed to be
+/// asynchronous — that is the point of it — but it must not bring a *runtime*. Spawning,
+/// sleeping and threading are what would make it choose an executor on the caller's behalf,
+/// and the whole design rests on it choosing none.
+const NO_RUNTIME: &[&str] = &[
+    "std::thread",
+    "thread::spawn",
+    "tokio",
+    "async_std",
+    "smol",
+    "futures_executor",
+    "std::time::sleep",
+    "spawn(",
+];
+
+/// The one file in the subtree exempt from the runtime scan, and why.
+///
+/// `testing.rs` contains a `block_on` built on a condition variable, so integration tests
+/// can drive a connection with no runtime at all. That is a *test* facility, doc-hidden and
+/// unsupported, and it is the reason the whole suite needs no async runtime; excluding it is
+/// what lets the scan say something true about the shipped layer.
+const RUNTIME_SCAN_EXEMPT: &str = "testing.rs";
+
+#[test]
+fn the_async_layer_brings_no_runtime() {
+    let mut findings = Vec::new();
+    let mut scanned = 0usize;
+    for path in async_files() {
+        if path
+            .file_name()
+            .is_some_and(|name| name == RUNTIME_SCAN_EXEMPT)
+        {
+            continue;
+        }
+        scanned += 1;
+        let source = std::fs::read_to_string(&path).expect("reading a source file");
+        let stripped = strip_comments_and_literals(&source);
+        for facility in NO_RUNTIME {
+            if stripped.contains(facility) {
+                findings.push(format!("{}: {facility}", path.display()));
+            }
+        }
+    }
+
+    assert!(
+        scanned > 0,
+        "the runtime scan matched no files; its exemption has swallowed the subtree"
+    );
+    assert!(
+        findings.is_empty(),
+        "the async layer must take no executor, spawner or timer: {findings:#?}"
+    );
+}
+
+#[test]
+fn the_async_layer_grants_itself_no_unsafe_allowance() {
+    // A different claim from containing no `unsafe`, and the one that guards it. The
+    // crate-level `#![deny(unsafe_code)]` is what turns an `unsafe` block in the subtree
+    // into a compile error, and `#[allow(unsafe_code)]` is exactly how that would be
+    // silenced -- so the allowance itself is what must not appear anywhere below `src/http/`.
+    //
+    // Checked by scanning the subtree rather than by comparing against the allowance list in
+    // `lib.rs`: that list names crate-root modules, and `http::error` shares a file stem
+    // with `error`, so comparing names would confuse the two.
+    let mut offenders = Vec::new();
+    for path in async_files() {
+        let source = std::fs::read_to_string(&path).expect("reading a source file");
+        // Read raw rather than stripped: an allowance inside a doc example still applies.
+        if source.contains("allow(unsafe_code)") {
+            offenders.push(path);
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these async modules grant themselves `unsafe`, which is how the crate-level deny \
+         would be silenced: {offenders:#?}"
+    );
+}
+
+#[test]
+fn an_included_doc_cannot_smuggle_async_past_the_scan() {
+    // `include_str!` splices a file's contents into the source the compiler sees but not
+    // into the source these scans read. A doc page outside the subtree could therefore
+    // carry an async example that the core appears not to contain. Requiring every include
+    // to resolve inside the subtree closes that.
+    let mut offenders = Vec::new();
+    for path in rust_files(&crate_root().join("src")) {
+        let source = std::fs::read_to_string(&path).expect("reading a source file");
+        let stripped = strip_comments_and_literals(&source);
+        // The path is a string literal, so it is stripped along with the rest; the marker
+        // that survives is the macro name itself.
+        if stripped.contains("include_str!") && !in_async_subtree(&path) {
+            offenders.push(path);
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these files outside the subtree use include_str!, which the async scan cannot see \
+         through: {offenders:#?}"
     );
 }
 
@@ -393,6 +568,7 @@ fn the_crate_declares_exactly_one_non_optional_dependency() {
 
     let mut in_dependencies = false;
     let mut declared = Vec::new();
+    let mut optional = Vec::new();
     for line in manifest.lines() {
         let line = line.trim();
         if line.starts_with('[') {
@@ -405,12 +581,13 @@ fn the_crate_declares_exactly_one_non_optional_dependency() {
         let Some((name, rest)) = line.split_once('=') else {
             continue;
         };
-        if rest.contains("optional = true") {
-            continue;
-        }
         // `ngnet-h3-sys.workspace = true` names the crate before the dot; the shorthand is
         // what the workspace uses, so it has to be understood rather than tripped over.
         let name = name.trim().split('.').next().expect("a dependency name");
+        if rest.contains("optional = true") {
+            optional.push(name.to_string());
+            continue;
+        }
         declared.push(name.to_string());
     }
 
@@ -418,6 +595,21 @@ fn the_crate_declares_exactly_one_non_optional_dependency() {
         declared,
         vec!["ngnet-h3-sys".to_string()],
         "the crate's dependency list has changed; its whole shape depends on staying at one"
+    );
+
+    // An optional dependency that no feature names is still compiled whenever anything in
+    // the workspace happens to enable it, which would make the claim above true of the
+    // manifest and false of the artefact. Requiring `dep:` means each one is reachable
+    // only through a feature a caller asked for.
+    let mut ungated = Vec::new();
+    for name in &optional {
+        if !manifest.contains(&format!("dep:{name}")) {
+            ungated.push(name.clone());
+        }
+    }
+    assert!(
+        ungated.is_empty(),
+        "these optional dependencies are not gated behind a `dep:` feature entry: {ungated:?}"
     );
 
     // No dev-dependencies either: a test-only dependency is still something a contributor

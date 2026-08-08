@@ -17,6 +17,13 @@ repository.workspace = true
 [dependencies]
 ngnet-h3.workspace = true
 
+# The async layer speaks `http` and `http-body`, so a crate driving it needs them too. They
+# reach `ngnet-h3` only through its own optional dependencies; nothing here widens what the
+# wrapper itself declares, and the CI dependency-graph check still holds.
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+
 quinn.workspace = true
 rcgen.workspace = true
 tokio.workspace = true

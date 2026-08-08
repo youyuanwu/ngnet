@@ -19,25 +19,39 @@ Everything below runs on every pull request. CI reads the compiler from
 cargo test --workspace --all-features
 cargo test --workspace
 cargo test -p ngnet-h2 --no-default-features
+cargo test -p ngnet-h3 --no-default-features
 cargo test -p ngnet-h2-tests --features completion
 
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo clippy -p ngnet-h2 --all-targets -- -D warnings
 cargo clippy -p ngnet-h2 --no-default-features --all-targets -- -D warnings
+cargo clippy -p ngnet-h3 --all-targets -- -D warnings
+cargo clippy -p ngnet-h3 --no-default-features --all-targets -- -D warnings
 
 for f in "" "--no-default-features" "--all-features" "--features tokio" "--features completion"; do
   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-h2 $f
 done
 
-# The HTTP/3 crates have no feature matrix -- `ngnet-h3` has one dependency and no optional
-# ones -- so one pass covers them.
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-h3 -p ngnet-h3-sys -p ngnet-h3-tests
+# `ngnet-h3` has a matrix of its own now that its async layer sits behind a default-on
+# `http` feature. A doc link to a gated item passes under one configuration and breaks the
+# others, which is the failure the h2 matrix above exists for.
+for f in "" "--no-default-features" "--all-features"; do
+  RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-h3 $f
+done
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-h3-sys -p ngnet-h3-tests
 
-# A different claim from the manifest test in h3/invariants.md: that one asserts what
-# `ngnet-h3` *declares*,
-# this asserts what the resolved graph actually contains, which is what a downstream user
-# gets. Cargo unifies features across a workspace, so a crate added later could pull a
-# transport in with nothing in `ngnet-h3` changing.
+# Two claims, two commands, and the flags are the whole point.
+#
+# That the sans-I/O core still stands alone -- asked with `--no-default-features`, because
+# `cargo tree` resolves default features and the async layer's feature is default-on, so
+# without the flag this asks about the async layer instead. A different claim from the
+# manifest test in h3/invariants.md: that one asserts what `ngnet-h3` *declares*, this
+# asserts what the resolved graph contains, which is what a downstream user gets.
+cargo tree -p ngnet-h3 --no-default-features -e normal   # only ngnet-h3-sys
+
+# That no transport or TLS crate reaches the graph in *any* configuration -- asked with
+# default features on. Cargo unifies features across a workspace, so a crate added later
+# could pull a transport in with nothing in `ngnet-h3` changing.
 cargo tree -p ngnet-h3 -e normal | grep -qiE 'quinn|rustls|tokio|ring' && exit 1
 
 # Runs each benchmark once without timing it. Benchmarks are not part of `cargo test`, so

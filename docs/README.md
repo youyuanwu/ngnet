@@ -19,7 +19,7 @@ keeps its own notes. Anything genuinely shared sits at this level.
 
 | Document | What it covers |
 | --- | --- |
-| [`h3/design.md`](h3/design.md) | Why the HTTP/3 crates are shaped the way they are, and the five places nghttp3 differs from nghttp2 in ways that are easy to miss. |
+| [`h3/design.md`](h3/design.md) | Why the HTTP/3 crates are shaped the way they are, the five places nghttp3 differs from nghttp2 in ways that are easy to miss, and what a survey of four QUIC libraries changed about the transport abstraction. |
 | [`h3/pending-work.md`](h3/pending-work.md) | Known gaps and deferred decisions, with what would settle each. |
 | [`h3/invariants.md`](h3/invariants.md) | The properties the `ngnet-h3` suite pins, and where each is enforced. |
 
@@ -42,11 +42,15 @@ dev-dependencies while still being driven against real runtimes and real sockets
 Cleartext (h2c) only for HTTP/2. TLS, ALPN, server push and stream priorities are out of
 scope there, and that is a scope decision rather than a to-do.
 
-**HTTP/3.** `ngnet-h3-sys` builds libnghttp3 and generates raw bindings; `ngnet-h3` is a
-safe sans-I/O wrapper over it, and `ngnet-h3-tests` drives that wrapper over a real quinn
-connection. There is deliberately no asynchronous layer over `ngnet-h3` — it is the core
-such a layer would be built on — and no QUIC or TLS implementation is bundled, because
-nghttp3 depends on neither. Server push is absent because nghttp3 does not implement it.
+**HTTP/3.** `ngnet-h3-sys` builds libnghttp3 and generates raw bindings; `ngnet-h3` wraps it
+twice, in the same shape as the HTTP/2 family — a sans-I/O state machine, and behind the
+default-on `http` feature an asynchronous HTTP/3 API over it. `ngnet-h3-tests` is unpublished
+and drives both over a real quinn connection.
+
+No QUIC or TLS implementation is bundled, because nghttp3 depends on neither. The async
+layer's `QuicConnection` trait begins with an *established* connection, so which QUIC library
+to use, how to authenticate the peer and how to negotiate `h3` stay entirely with the caller.
+Server push is absent because nghttp3 does not implement it.
 
 Within a family's own documents, "the crate" means that family's wrapper: `ngnet-h2` under
 [`h2/`](h2/), `ngnet-h3` under [`h3/`](h3/).

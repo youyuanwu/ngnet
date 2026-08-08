@@ -30,6 +30,8 @@
 //! buffer stays retained across many writes. That case is covered in the wrapper's own
 //! `body.rs`, where acknowledgement is withheld deliberately.
 
+pub mod quic_backend;
+
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -909,4 +911,61 @@ pub fn close(quic: &quinn::Connection) {
             .into(),
         b"done",
     );
+}
+
+/// A connected pair of QUIC connections on loopback, and the endpoints behind them.
+///
+/// The endpoints are handed back rather than disposed of internally because each owns a UDP
+/// socket and the task driving it. Returning them makes that ownership the caller's, which
+/// is the only arrangement under which the resources are actually released when the caller
+/// is finished — an earlier version leaked them instead, which worked but never gave
+/// anything back.
+///
+/// They are **not** load-bearing for connection liveness, despite how it looks. quinn's
+/// endpoint driver shuts down only once its reference count has reached zero *and* no
+/// connections remain (`quinn-0.11.11/src/endpoint.rs:384-388`), so a connection outlives
+/// the handle it was created from. Dropping [`endpoints`](Self::endpoints) early is
+/// therefore safe; it simply gives up the ability to open further connections on that
+/// socket.
+pub struct ConnectedPair {
+    /// The connection the client end drives.
+    pub client: quinn::Connection,
+    /// The connection the server end drives.
+    pub server: quinn::Connection,
+    /// The client and server endpoints, in that order.
+    ///
+    /// Owned by the caller so they are released rather than leaked. See the type
+    /// documentation for why holding them is not required for the connections to work.
+    pub endpoints: (quinn::Endpoint, quinn::Endpoint),
+}
+
+/// Connects a pair of QUIC connections on loopback.
+///
+/// Reuses the endpoint, certificate and transport setup the sans-I/O harness already has.
+/// None of it belongs behind [`ngnet_h3::http::QuicConnection`] — that trait begins with an
+/// established connection precisely so that certificates, ALPN and endpoint configuration
+/// stay the caller's business and never reach the wrapper.
+pub async fn connected_pair(
+    tuning: Tuning,
+) -> Result<ConnectedPair, Box<dyn std::error::Error + Send + Sync>> {
+    let (server, cert) = server_endpoint(tuning)?;
+    let address = server.local_addr()?;
+    let client = client_endpoint(cert, tuning)?;
+
+    let accepting = tokio::spawn(async move {
+        let incoming = server.accept().await.ok_or("no connection arrived")?;
+        let connection = incoming.await?;
+        // Returned alongside the connection so ownership reaches the caller rather than
+        // ending with this task.
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((connection, server))
+    });
+
+    let connecting = client.connect(address, "localhost")?.await?;
+    let (accepted, server_endpoint) = accepting.await??;
+
+    Ok(ConnectedPair {
+        client: connecting,
+        server: accepted,
+        endpoints: (client, server_endpoint),
+    })
 }

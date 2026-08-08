@@ -52,7 +52,8 @@ pub(crate) struct BodyEntry {
     /// its first vector was acknowledged, or never, depending on which length was
     /// compared. One element per vector makes the queue's lengths add up to exactly the
     /// byte count nghttp3 reports.
-    retained: VecDeque<RetainedBytes>,
+    /// Pieces handed to nghttp3, each with the length it was told about.
+    retained: VecDeque<(RetainedBytes, u64)>,
     /// Acknowledged bytes that do not yet cover the front of `retained`.
     carry: u64,
 }
@@ -110,9 +111,15 @@ impl BodyEntry {
     }
 
     /// Records a piece as handed over, keeping its bytes alive until they are acknowledged.
-    pub(crate) fn retain(&mut self, piece: RetainedBytes) {
-        debug_assert!(!piece.is_empty(), "a zero-length vector is never queued");
-        self.retained.push_back(piece);
+    ///
+    /// `handed` is the length nghttp3 was actually told about, captured at the moment the
+    /// pointer was written into its vector array. It is stored rather than re-derived,
+    /// and that is a soundness requirement rather than an optimisation — see [`on_acked`].
+    ///
+    /// [`on_acked`]: Self::on_acked
+    pub(crate) fn retain(&mut self, piece: RetainedBytes, handed: usize) {
+        debug_assert!(handed > 0, "a zero-length vector is never queued");
+        self.retained.push_back((piece, handed as u64));
     }
 
     /// The end marker to report, once everything the source gave has been handed over.
@@ -126,14 +133,26 @@ impl BodyEntry {
     /// `min(offset, ack_base + buflen) - ack_offset` and reports it only for
     /// application-owned buffers, so the deltas sum to exactly the bytes of this queue.
     /// A partially covered element stays retained, because nghttp3 still points into it.
+    ///
+    /// # Why the length is stored rather than measured
+    ///
+    /// The length used here **must** be the one nghttp3 was given, not one re-derived from
+    /// the buffer now. A [`RetainedBytes`] built by
+    /// [`RetainedBytes::from_owner`](crate::RetainedBytes::from_owner) reads its bytes
+    /// through a caller-supplied `AsRef<[u8]>`, and `AsRef` promises nothing about
+    /// returning the same slice twice. An owner that reported a hundred bytes when the
+    /// pointer was handed over and fifty when this ran would have its buffer popped after
+    /// fifty were acknowledged — while nghttp3, which pops only once the acknowledged
+    /// offset reaches the length *it* recorded, is still reading through the other fifty.
+    /// That is a use-after-free reachable from entirely safe code, and storing the handed
+    /// length is what closes it without an `unsafe` contract on the caller.
     pub(crate) fn on_acked(&mut self, n: u64) {
         self.carry = self.carry.saturating_add(n);
-        while let Some(front) = self.retained.front() {
-            let len = front.len() as u64;
-            if self.carry < len {
+        while let Some((_, handed)) = self.retained.front() {
+            if self.carry < *handed {
                 break;
             }
-            self.carry -= len;
+            self.carry -= *handed;
             self.retained.pop_front();
         }
     }
@@ -319,6 +338,111 @@ impl BodyRegistry {
 }
 
 #[cfg(test)]
+mod retain_accounting {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// An owner whose reported length shrinks after it has been read twice.
+    ///
+    /// Nothing about `AsRef<[u8]>` forbids this. It is the sharpest probe of the release
+    /// accounting there is: if the length nghttp3 was told about were measured again when
+    /// acknowledgement arrived, rather than stored at handover, this owner would have its
+    /// buffer released while nghttp3 was still reading through the second half of it.
+    struct Shrinking {
+        data: Vec<u8>,
+        reads: AtomicUsize,
+    }
+
+    impl AsRef<[u8]> for Shrinking {
+        fn as_ref(&self) -> &[u8] {
+            // Full length only for the construction read, which is what fixes the snapshot
+            // and what the handover would have reported. Half thereafter -- so any code
+            // that measures the buffer again later sees a different answer.
+            if self.reads.fetch_add(1, Ordering::AcqRel) < 1 {
+                &self.data
+            } else {
+                &self.data[..self.data.len() / 2]
+            }
+        }
+    }
+
+    /// Builds an entry holding one piece, as the handover path would.
+    fn retained_entry(piece: RetainedBytes, handed: usize) -> BodyEntry {
+        struct Silent;
+        impl BodySource for Silent {
+            fn next(&mut self) -> BodyOutcome {
+                BodyOutcome::Defer
+            }
+        }
+        let mut entry = BodyEntry::new(Box::new(Silent));
+        entry.retain(piece, handed);
+        entry
+    }
+
+    #[test]
+    fn a_shrinking_owner_cannot_cause_an_early_release() {
+        // The regression. nghttp3 was told 64; acknowledging 32 must release nothing,
+        // because it pops a buffer only once the acknowledged offset reaches the length it
+        // recorded -- and it is still reading through the rest.
+        let owner = Shrinking {
+            data: vec![0xab; 64],
+            reads: AtomicUsize::new(0),
+        };
+        let piece = RetainedBytes::from_owner(owner);
+        let mut entry = retained_entry(piece, 64);
+
+        entry.on_acked(32);
+        assert_eq!(
+            entry.retained_buffers(),
+            1,
+            "half an acknowledgement released a buffer nghttp3 is still reading through"
+        );
+
+        entry.on_acked(32);
+        assert_eq!(
+            entry.retained_buffers(),
+            0,
+            "the buffer was fully acknowledged and should have been released"
+        );
+    }
+
+    #[test]
+    fn a_well_behaved_owner_releases_on_exactly_its_own_length() {
+        let piece = RetainedBytes::from_owner(vec![0xcd; 16]);
+        let mut entry = retained_entry(piece, 16);
+
+        entry.on_acked(15);
+        assert_eq!(
+            entry.retained_buffers(),
+            1,
+            "a partial ack releases nothing"
+        );
+        entry.on_acked(1);
+        assert_eq!(entry.retained_buffers(), 0);
+    }
+
+    #[test]
+    fn acknowledgement_spanning_several_pieces_releases_them_in_order() {
+        struct Silent;
+        impl BodySource for Silent {
+            fn next(&mut self) -> BodyOutcome {
+                BodyOutcome::Defer
+            }
+        }
+        let mut entry = BodyEntry::new(Box::new(Silent));
+        entry.retain(RetainedBytes::from_owner(vec![0u8; 10]), 10);
+        entry.retain(RetainedBytes::from_owner(vec![1u8; 10]), 10);
+
+        entry.on_acked(25);
+        assert_eq!(
+            entry.retained_buffers(),
+            0,
+            "an acknowledgement covering both should release both"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::body::FixedBody;
@@ -341,7 +465,8 @@ mod tests {
     /// Hands everything the entry has over, as nghttp3's callback would.
     fn hand_over(entry: &mut BodyEntry) {
         while let Some(piece) = entry.take_piece() {
-            entry.retain(piece);
+            let handed = piece.len();
+            entry.retain(piece, handed);
         }
     }
 
@@ -393,7 +518,8 @@ mod tests {
         let mut entry = entry(vec![b"one", b"two"]);
         assert!(matches!(entry.begin_round(), Handover::Ready));
         let first = entry.take_piece().expect("a piece");
-        entry.retain(first);
+        let handed = first.len();
+        entry.retain(first, handed);
         assert_eq!(entry.end_reached(), None, "one piece is still pending");
         hand_over(&mut entry);
         assert_eq!(entry.end_reached(), Some(BodyEnd::Stream));
