@@ -638,22 +638,35 @@ impl<S> DuplexWriter<S> {
     /// One borrowed write is one region, so it is logged as a single-region call. The address
     /// is meaningful only for the instant of the call, as the vectored log's own note explains.
     ///
-    /// There is no longer any way to decline: the strategy was settled when the writer declared
-    /// its marker, so a [`PerRegion`] or [`Gathering`] half always writes here rather than
-    /// returning `None`.
+    /// There is no longer any way to decline: a writer declares an I/O model, not a drain, so
+    /// a readiness half always writes here rather than returning `None`.
+    ///
+    /// **Honours [`accept_at_most`](Duplex::accept_at_most), and must.** This is the primitive
+    /// [`BorrowedWrite::write_vectored`]'s emulating default loops over, so it is the only
+    /// place a short write can land *inside* a gathering offer. If this accepted everything
+    /// unconditionally, no test could reach the default's short-write rule and deleting that
+    /// rule would leave the whole suite green — which it did, until this cap was added.
     fn do_write_borrowed<'w>(
         &'w mut self,
         data: &'w [u8],
     ) -> core::future::Ready<io::Result<usize>> {
+        let cap = self
+            .limits
+            .lock()
+            .expect("write limits")
+            .pop_front()
+            .unwrap_or(data.len());
+        let accepted = cap.min(data.len());
+
         *self.writes.lock().expect("write count") += 1;
         {
             let mut record = self.vectored.lock().expect("vectored record");
-            record.calls.push(vec![data.len()]);
+            record.calls.push(vec![accepted]);
             record.bases.push(vec![data.as_ptr() as usize]);
-            record.octets.extend_from_slice(data);
+            record.octets.extend_from_slice(&data[..accepted]);
         }
-        notifying(&self.outgoing, |pipe| pipe.put(data));
-        core::future::ready(Ok(data.len()))
+        notifying(&self.outgoing, |pipe| pipe.put(&data[..accepted]));
+        core::future::ready(Ok(accepted))
     }
 
     /// The shared body of the vectored path: an inert future that does the recording, capping,

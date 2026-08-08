@@ -93,6 +93,20 @@ frames, not the one-off cost of standing a stream up.
   only measured workload where the driver offers more than one region and therefore the only
   one where native and emulated gathering are distinguishable at all; both assert that
   multi-region offers actually occurred, so neither can pass vacuously.
+- **`an_emulating_partial_acceptor_leaves_no_gap_between_the_regions_it_wrote`**
+  (`tests/http_vectored.rs`) — the emulating default's *short-write* rule: stop at the short
+  region and return the running total, rather than carrying on to the next one. Carrying on
+  would report a total the driver then retries from while later octets had already gone out,
+  putting a hole in the stream and a duplicate after it.
+
+  This test exists because the rule was initially **unpinned**, and the gap was found by
+  mutation rather than by review: deleting the `break` from `emulate_gathering` left all 834
+  tests green. The cause was in the harness, not the suite — `DuplexWriter::do_write_borrowed`
+  accepted every write whole, so `Duplex::accept_at_most` could not reach the one primitive
+  the emulation loop is built from. Making that method honour the cap is what gives this test
+  teeth, and it is a standing requirement: if `do_write_borrowed` ever stops capping, this
+  test silently stops testing anything. Same shape as the PR #9 vacuity below, caught the same
+  way.
 - **`elects_owned_regions::<CompioWriter<TcpStream>>()`** (`ngnet-h2-tests/tests/http_compio.rs`)
   — a compile-time assertion that the shipped completion transport declares `Completion`. This
   replaces a runtime predicate check that was found vacuous: in PR #9, flipping

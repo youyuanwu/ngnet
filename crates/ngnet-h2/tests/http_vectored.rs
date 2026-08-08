@@ -1083,6 +1083,65 @@ fn an_emulating_transport_delivers_every_octet_of_a_multi_region_offer_in_order(
 }
 
 #[test]
+fn an_emulating_partial_acceptor_leaves_no_gap_between_the_regions_it_wrote() {
+    // D-3a's short-write rule, and the one test that pins it. The emulating default writes
+    // region by region, so a short write *inside* the run leaves the regions after it
+    // unwritten — and the count it returns is what tells the driver where to resume. Stopping
+    // at the short region and returning the running total is what makes that count honest.
+    // Carrying on to the next region instead would put later octets on the wire while
+    // reporting a total the driver then retries *from*, so the peer receives the stream with
+    // a hole in the middle and a duplicate after it.
+    //
+    // Every other emulation test accepts writes whole, so none of them can see this: a
+    // mutation that deletes the `break` leaves the entire workspace suite green. It is
+    // exactly the vacuous-guard shape this project has been bitten by twice, so the caps
+    // below are the point of the test rather than incidental hardening.
+    //
+    // `caps` chops the transport's acceptance at awkward offsets — one octet, a whole first
+    // region, one short of it, and interleaved sequences — which under emulation lands inside
+    // and across `write_borrowed` calls rather than inside a single `writev`.
+    let uncapped = observe(Run::<Emulated>::new(BOUNDARY_BODY).shared().passes(8));
+    assert!(
+        uncapped.calls.iter().any(|regions| regions.len() == 1),
+        "the emulating run made no single-region call, so the default's loop did not run",
+    );
+    let head = uncapped.calls[0][0];
+
+    // The oracle: the same handed-over body over the coalescing policy, which copies the lot
+    // into one owned write. Its octets are what a partial acceptor must reproduce exactly.
+    let coalesced = observe(Run::<Coalescing>::new(BOUNDARY_BODY).shared().passes(8));
+    assert!(
+        !coalesced.peer.is_empty(),
+        "the oracle sent nothing, so every comparison below is vacuous",
+    );
+
+    for caps in [
+        vec![1],
+        vec![head],
+        vec![head - 1],
+        vec![1, head, 7, 3],
+        vec![head, 1, MAX_FRAME, 5],
+    ] {
+        let observed = observe(
+            Run::<Emulated>::new(BOUNDARY_BODY)
+                .shared()
+                .caps(caps.clone())
+                .passes(8),
+        );
+        assert_eq!(
+            observed.peer, coalesced.peer,
+            "caps {caps:?} changed the octets the peer received under emulation; a short \
+             write inside the region loop dropped or duplicated something",
+        );
+        assert!(
+            observed.outcome.is_none(),
+            "caps {caps:?} ended the connection: {:?}",
+            observed.outcome.as_ref().map(Result::is_err),
+        );
+    }
+}
+
+#[test]
 fn the_write_policy_is_the_h2_layers_and_holds_for_the_connections_life() {
     // The inversion itself, pinned. The transport is the *same* natively-gathering duplex in
     // both runs — `Gathered` and `Coalescing` differ only in the `WritePolicy` handed to
