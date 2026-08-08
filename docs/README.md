@@ -3,8 +3,8 @@
 Notes that outlive any one change. API documentation lives with the code (`cargo doc`);
 what is here is the reasoning a reader cannot recover from the source.
 
-There are two crate families, built the same way and independent of each other, so each
-keeps its own notes. Anything genuinely shared sits at this level.
+There are three crate families, built the same way and largely independent of each other, so
+each keeps its own notes. Anything genuinely shared sits at this level.
 
 ## HTTP/2 — [`h2/`](h2/)
 
@@ -24,6 +24,17 @@ keeps its own notes. Anything genuinely shared sits at this level.
 | [`h3/invariants.md`](h3/invariants.md) | The properties the `ngnet-h3` suite pins, and where each is enforced. |
 
 There are no HTTP/3 benchmarks yet.
+
+## QUIC — [`quic/`](quic/)
+
+| Document | What it covers |
+| --- | --- |
+| [`quic/design.md`](quic/design.md) | Why the QUIC crates are shaped the way they are: the API ngtcp2 documents but does not export, why validation is duplicated in Rust, the three-object TLS teardown order, and why entropy cannot travel through the callback bridge. |
+| [`quic/pending-work.md`](quic/pending-work.md) | Known gaps and deferred decisions, with what would settle each. |
+| [`quic/invariants.md`](quic/invariants.md) | The properties the `ngnet-quic` suite pins, and where each is enforced. |
+
+There are no QUIC benchmarks, and the crate has not been tested against another QUIC
+implementation.
 
 ## Shared
 
@@ -47,13 +58,27 @@ twice, in the same shape as the HTTP/2 family — a sans-I/O state machine, and 
 default-on `http` feature an asynchronous HTTP/3 API over it. `ngnet-h3-tests` is unpublished
 and drives both over a real quinn connection.
 
-No QUIC or TLS implementation is bundled, because nghttp3 depends on neither. The async
-layer's `QuicConnection` trait begins with an *established* connection, so which QUIC library
-to use, how to authenticate the peer and how to negotiate `h3` stay entirely with the caller.
-Server push is absent because nghttp3 does not implement it.
+No QUIC or TLS implementation is bundled *with the HTTP/3 crates*, because nghttp3 depends on
+neither. The async layer's `QuicConnection` trait begins with an *established* connection, so
+which QUIC library to use, how to authenticate the peer and how to negotiate `h3` stay
+entirely with the caller. Server push is absent because nghttp3 does not implement it.
+
+`ngnet-quic` is a QUIC implementation living in this same workspace, but nothing in the
+HTTP/3 family depends on it and no adapter between the two exists yet — see
+[`quic/pending-work.md`](quic/pending-work.md).
+
+**QUIC.** `ngnet-quic-sys` builds ngtcp2 from the vendored submodule and generates raw
+bindings; `ngnet-quic` wraps it **once**, as a sans-I/O state machine with no async layer —
+the one structural difference from the other two families. TLS is a backend seam with a
+default-on OpenSSL implementation, which needs system OpenSSL 3.5 or newer.
+`ngnet-quic-tests` is unpublished and drives real handshakes, in process and over loopback
+UDP.
+
+Client and server are both supported. 0-RTT, unreliable datagrams, connection migration and
+key update are not implemented, and that is a scope decision rather than a to-do.
 
 Within a family's own documents, "the crate" means that family's wrapper: `ngnet-h2` under
-[`h2/`](h2/), `ngnet-h3` under [`h3/`](h3/).
+[`h2/`](h2/), `ngnet-h3` under [`h3/`](h3/), `ngnet-quic` under [`quic/`](quic/).
 
 ## Toolchain
 
