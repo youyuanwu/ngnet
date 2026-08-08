@@ -112,13 +112,15 @@ where
     F: FnOnce(ngnet_h3::http::SendRequest<Payload>) -> Fut,
     Fut: core::future::Future<Output = T>,
 {
-    let (client_quic, server_quic) = ngnet_h3_tests::connected_pair(tuning)
+    // Held for the whole of this function so its endpoints -- and the UDP sockets they own
+    // -- are released when it returns rather than leaked.
+    let pair = ngnet_h3_tests::connected_pair(tuning)
         .await
         .expect("a connected pair");
 
     let (handle, client_driver) =
-        handshake::<_, Payload>(QuinnBackend::new(client_quic)).expect("handshake");
-    let server_driver = serve(QuinnBackend::new(server_quic), handler).expect("serve");
+        handshake::<_, Payload>(QuinnBackend::new(pair.client.clone())).expect("handshake");
+    let server_driver = serve(QuinnBackend::new(pair.server.clone()), handler).expect("serve");
 
     let client = tokio::task::spawn_local(async move {
         let _ = client_driver.await;
@@ -133,6 +135,7 @@ where
 
     client.abort();
     server.abort();
+    drop(pair);
     outcome
 }
 
@@ -402,4 +405,57 @@ fn a_handler_carries_a_cancellation_signal_over_real_quic() {
             "the request reached the handler without a cancellation signal"
         );
     }));
+}
+
+#[test]
+fn a_connection_outlives_the_endpoint_it_was_created_from() {
+    // Pins the claim `ConnectedPair` makes about itself. An earlier version of the harness
+    // leaked both endpoints to keep them alive, justified by the belief that a connection
+    // dies with its endpoint. That belief was wrong -- quinn's endpoint driver shuts down
+    // only once its reference count reaches zero *and* no connections remain -- and the leak
+    // was buying nothing.
+    //
+    // Stated as a test because it is a claim about someone else's crate, which is exactly
+    // the kind that rots silently on an upgrade.
+    run(async {
+        let pair = ngnet_h3_tests::connected_pair(Tuning::roomy())
+            .await
+            .expect("a connected pair");
+
+        let client_quic = pair.client.clone();
+        let server_quic = pair.server.clone();
+        drop(pair.endpoints);
+
+        let (handle, client_driver) =
+            handshake::<_, Payload>(QuinnBackend::new(client_quic)).expect("handshake");
+        let server_driver = serve(QuinnBackend::new(server_quic), echo()).expect("serve");
+
+        let client = tokio::task::spawn_local(async move {
+            let _ = client_driver.await;
+        });
+        let server = tokio::task::spawn_local(async move {
+            let _ = server_driver.await;
+        });
+
+        let response = tokio::time::timeout(
+            LIMIT,
+            handle.send_request(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("https://localhost/")
+                    .body(once(Bytes::from_static(b"still here")))
+                    .expect("a request"),
+            ),
+        )
+        .await
+        .expect("the exchange should not take this long")
+        .expect("a response");
+
+        assert_eq!(response.status(), 200);
+        let (body, _) = read_body(response.into_body()).await;
+        assert_eq!(&body[..], b"still here");
+
+        client.abort();
+        server.abort();
+    });
 }
