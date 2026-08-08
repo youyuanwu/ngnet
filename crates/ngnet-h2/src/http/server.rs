@@ -89,7 +89,10 @@ where
 
 /// Serves requests over `transport` with an explicit [`Config`].
 ///
-/// Identical to [`serve`] but for the limits advertised to the peer and enforced locally.
+/// Identical to [`serve`] but for the limits advertised to the peer and enforced locally, and
+/// for the local [`WritePolicy`](crate::http::WritePolicy), which decides how this connection
+/// drains a pass to the transport — this is the entry point through which a server turns
+/// gathering off.
 /// The concurrency limit in particular is the ceiling on how many handler futures one peer
 /// can have running at once — including handlers retained after their stream was reset —
 /// so it is a real bound on this connection's memory, not merely advice to the peer. See

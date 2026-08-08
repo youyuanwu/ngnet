@@ -135,9 +135,16 @@ pub enum WritePolicy {
     /// such a transport pays one write per region, and on a pass carrying many handed-over
     /// payloads that can be dozens.
     ///
-    /// On a completion transport this is close to pure loss: it replaces one owned vectored
-    /// submission with one owned contiguous write plus a copy of every octet, and there is no
-    /// per-write overhead being saved. Its use there is diagnostic — bisecting whether a
-    /// fault lies in the region path — rather than performance.
+    /// On a completion transport that submits regions natively — as the shipped `CompioWriter`
+    /// does — this is close to pure loss: it replaces one owned vectored submission with one
+    /// owned contiguous write plus a copy of every octet, and there is no per-write overhead
+    /// being saved. Its use there is diagnostic — bisecting whether a fault lies in the region
+    /// path — rather than performance.
+    ///
+    /// A completion transport that leaves [`RegionWrite::write_regions`] at its default is the
+    /// exception, and the same case as the readiness one above: the default submits one owned
+    /// write per region, so coalescing genuinely trades a copy for a syscall there too.
+    ///
+    /// [`RegionWrite::write_regions`]: crate::http::transport::RegionWrite::write_regions
     Coalesced,
 }

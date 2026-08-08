@@ -140,11 +140,20 @@ through its result, a short count the driver re-offers or an error. Both are pin
 `compile_fail` doctests with error codes, each mutation-verified to fail when the guarded
 construct is made legal.
 
-**No capability is read at run time, on any path.** The previous design read exactly one:
+**No capability is read on any path the driver or the trait surface can see.** The previous
+design read exactly one:
 `VectoredWrite::gathers()`, consulted once per connection through `Elects::prepare`, because
 whether a stream *really* scatter-gathers is a property of the stream rather than the backend —
 a tokio `AsyncWrite` whose `poll_write_vectored` is the default writes only the first region.
 Both the predicate and the once-per-connection machinery are gone.
+
+What remains is strictly private and strictly local. `TokioWriter` calls tokio's own
+`is_write_vectored()` once, at construction, and keeps the answer in a private field to choose
+between forwarding to `poll_write_vectored` and running the emulating default. That is not the
+old capability under another name: nothing outside the adapter can read it, no trait exposes
+it, the driver never branches on it, and both answers produce the same octets — it selects
+only which of two implementations of the *same* contract runs. The property that matters is
+that a transport can no longer change what the h2 layer does, and that holds.
 
 That removal is safe, and it is worth being precise about why, because the obvious reason is
 wrong. Such a stream was never a *correctness* hazard: it writes the first region and returns

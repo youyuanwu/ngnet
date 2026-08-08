@@ -85,8 +85,11 @@ frames, not the one-off cost of standing a stream up.
   `WritePolicy` values, produces gathered writes under one and none under the other, across
   several passes, with identical octets on the wire. This replaces
   `the_gathering_capability_is_consulted_exactly_once_per_connection`, which pinned that the
-  driver read `VectoredWrite::gathers` exactly once. There is no capability to read any more —
-  nothing is consulted on any path — which is strictly stronger than reading it once.
+  driver read `VectoredWrite::gathers` exactly once. There is no capability on the trait
+  surface to read any more, and the driver consults nothing on any path — strictly stronger
+  than reading it once. (`TokioWriter` still probes tokio's `is_write_vectored()` once at
+  construction, but that is a private field inside one adapter, invisible to the driver and to
+  every trait, and both branches deliver identical octets.)
 - **`an_emulating_transport_delivers_identical_octets_one_region_at_a_time`** and
   **`an_emulating_transport_delivers_every_octet_of_a_multi_region_offer_in_order`**
   (`tests/http_vectored.rs`) — the emulation contract. Both run on the handed-over body, the
