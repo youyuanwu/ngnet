@@ -63,12 +63,16 @@ memory the driver already owns, and that is what the gathering paths do. A conne
 hands its bodies over (mechanism 6) loosens this further still: a handed-over payload is the
 caller's own `Bytes`, so it can be gathered as an owned region without being copied at all.
 
-`TransportWrite` exposes the choice through overridable methods. The borrowed and vectored
-methods each both elect a strategy and *are* how that strategy writes; the owned-region
-strategy is the one exception, splitting election from write for the reason given below:
+The choice is made by the *type*. `TransportWrite` carries an associated
+`type Strategy`, one of four marker types, and that declaration is the whole election —
+resolved at compile time, never probed and never asked of the writer at run time. Naming a
+strategy obliges the writer to implement that strategy's operations, by compiler error, so a
+transport cannot advertise a fast path it has not supplied nor supply one the driver will not
+take. The operations themselves live on three separate traits, each reachable only from the
+matching strategy:
 
-- `write_vectored` returns `Some` to elect the **gathering** path, for a *readiness*
-  transport. The driver accumulates small blocks into a buffer it owns and reuses, and when a
+- `Gathering` elects the **gathering** path, for a *readiness*
+  transport, and requires `VectoredWrite` (and, through it, `BorrowedWrite`). The driver accumulates small blocks into a buffer it owns and reuses, and when a
   block exceeds `VECTORED_THRESHOLD` it emits `[accumulated, block]` as a `writev` — the large
   block is never copied. One syscall per pass in the common case, zero allocation in steady
   state. The driver keeps a retained list of lifetime-free region descriptors capped at
@@ -90,34 +94,57 @@ strategy is the one exception, splitting election from write for the reason give
   mark, and `h2` tops the buffer up from the head of a chained payload when the accumulation is
   smaller than the threshold, so its first region is never a runt. Neither difference has been
   measured to matter here, and the second is a refinement this driver does not make.
-- `gathers_owned_regions` returns `true` to elect the **owned-region** path, for a
-  *completion* transport, which cannot lend the kernel a borrowed `IoSlice` — the kernel
+- `OwnedRegions` elects the **owned-region** path, for a
+  *completion* transport, and requires `RegionWrite`. A completion transport cannot lend the
+  kernel a borrowed `IoSlice` — the kernel
   writes from the buffers after submission, so they must be owned. The driver coalesces the
   session's own blocks into a driver buffer, every one of them, and hands the pass out as a
   list of owned `Bytes` through `write_regions`, reaching a single `writev`. A block borrowed
   from the session cannot be owned without a copy, so all of them are copied; a *handed-over*
   payload is already the caller's own `Bytes` and rides uncopied as its own region.
-- `write_borrowed` returns `Some` to elect the **borrowed** path: the session's own blocks go
-  out directly, several small writes per pass but zero allocation and zero copy.
-- All defaults left in place leaves the **owned** (coalesced) path: one write per pass,
-  bought by allocating and copying every outgoing octet, every pass.
+- `PerRegion` elects the **borrowed** path and requires `BorrowedWrite`: the session's own
+  blocks go out directly, several small writes per pass but zero allocation and zero copy.
+- `Coalesced` is the **owned** path and requires nothing beyond `write`: one write per pass,
+  bought by copying every outgoing octet into a driver buffer, every pass. That buffer is
+  reused across passes, so it costs no allocation in steady state.
 
-Precedence among the four, highest first: vectored, owned-region, borrowed, owned. The two
-gathering strategies serve disjoint populations — a readiness transport lends borrowed slices
-and elects vectored, a completion transport owns its buffers and elects owned-region — and a
-transport advertising both is served the vectored one, which need not mint an owned `Bytes`
-per frame header. A transport may also decline the vectored path mid-pass — return `None`
-after having returned `Some` earlier in the same pass — and the driver falls back to
-coalescing the remainder without losing octets.
+**A backend implements exactly one I/O model, and the type system enforces it.** `Gathering`
+and `PerRegion` are `ReadinessStrategy`; `OwnedRegions` is a `CompletionStrategy`; no strategy
+is both, and `Coalesced` is deliberately neither, since a minimal writer supplying only
+`write` belongs to both worlds equally. `BorrowedWrite` and `VectoredWrite` are bounded on
+`Self::Strategy: ReadinessStrategy` and `RegionWrite` on `Self::Strategy: CompletionStrategy`,
+so a writer *cannot* implement operations from both models — it is a compile error, not a
+convention. The two marker traits are load-bearing rather than decorative: without them the
+plain shape lets a type implement both `RegionWrite` and `BorrowedWrite` and it compiles,
+which was verified by building exactly that. `WriteStrategy` is sealed, so the set of four is
+closed and the driver's handling of it is exhaustive by construction.
 
-For the borrowed and vectored paths, one method carries both the decision and the operation
-deliberately. An earlier form — a boolean plus a separately overridable method — let an
-adapter advertise the fast path without supplying it, or supply it without the driver ever
-taking it. Both compiled; both regressions were silent. Now neither is expressible, pinned by
-`compile_fail` doctests. The owned-region path is the one deliberate exception: its election
-(`gathers_owned_regions`) *is* split from its write (`write_regions`), because a combined
-election returning `None` late — from inside the write — would consume and lose the owned
-regions it had been handed, which is unrecoverable in a way a borrowed slice's loss is not.
+There is no longer any precedence rule, because there is nothing left to arbitrate: a writer
+names one strategy. The old rule's reasoning survives as advice at the point of declaration —
+prefer `Gathering` over `OwnedRegions`, because it need not mint an owned `Bytes` per frame
+header — and in practice the question does not arise, since the two belong to different I/O
+models. Declining a path mid-pass is likewise gone: the operations are no longer
+`Option`-shaped, and a writer that cannot complete a write reports so through its result, a
+short count the driver re-offers or an error. Both removals are pinned by `compile_fail`
+doctests with error codes, each mutation-verified to fail when the guarded construct is made
+legal.
+
+**One capability is still read at run time, once per connection.** Whether a stream *really*
+scatter-gathers is a property of the stream, not the backend — a tokio `AsyncWrite` whose
+`poll_write_vectored` is the default writes only the first region — so `VectoredWrite::gathers`
+exists, and a `Gathering` writer whose stream does not gather falls back to its borrowed
+write. That is why `VectoredWrite` requires `BorrowedWrite` and why that implementation must
+be real rather than a stub. The driver reads `gathers` **once**, immediately after
+`Transport::split`, through `Elects::prepare`, and holds the answer for the connection's life.
+It is the only capability consultation in the design.
+
+Two per-call costs this replaced are worth recording, because both were invisible. The driver
+used to discover the vectored capability by calling `write_vectored(&[])` and dropping the
+resulting future unpolled, once per flush pass — which forced the trait contract to be widened
+to require implementations tolerate that. And `TokioWriter::write_vectored` used to call
+`AsyncWrite::is_write_vectored`, a virtual call whose answer never changes for a given stream,
+on every write. The first has no successor; the second is now asked once, in `split`, and
+cached in a field.
 
 **5. Commands reach the driver through a queue, and wakes never re-enter a held lock.** The
 session lives in the driver and is `!Sync`, so handles and bodies cannot touch it directly.
@@ -245,10 +272,10 @@ Two properties are pinned as tests rather than described (see [`invariants.md`](
 
 | Path | Writes per driver pass | Allocation per pass in steady state |
 | --- | --- | --- |
-| Gathering (`write_vectored` → `Some`) | **one**, or one per large block | **zero** |
-| Owned-region (`gathers_owned_regions` → `true`) | **one**, or one per region-cap flush | **zero**, copies each session block but no handed-over payload |
-| Borrowed (`write_borrowed` → `Some`) | one per session block | **zero** |
-| Owned (all defaults) | **one**, coalesced | **zero**, but copies every octet |
+| Gathering (`type Strategy = Gathering`) | **one**, or one per large block | **zero** |
+| Owned-region (`type Strategy = OwnedRegions`) | **one**, or one per region-cap flush | **zero**, copies each session block but no handed-over payload |
+| Borrowed (`type Strategy = PerRegion`) | one per session block | **zero** |
+| Owned (`type Strategy = Coalesced`) | **one**, coalesced | **zero**, but copies every octet |
 
 All four reach zero steady-state allocation; both driver buffers are reused across passes
 rather than rebuilt. What separates them is the write count — a syscall count — and the

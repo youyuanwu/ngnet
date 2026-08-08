@@ -26,7 +26,10 @@ use ngnet_h2::http::testing::{
     Duplex, DuplexReader, DuplexWriter, Empty, Full, alongside, block_on, buffering,
     bytes_crate as bytes, duplex, http_crate as http,
 };
-use ngnet_h2::http::transport::{Transport, TransportWrite};
+use ngnet_h2::http::transport::{
+    BorrowedWrite, Coalesced, Gathering, OwnedRegions, RegionWrite, Transport, TransportWrite,
+    VectoredWrite,
+};
 use ngnet_h2::http::{IncomingBody, server};
 
 /// Drives `work`, but gives up after `budget` self-woken polls.
@@ -124,14 +127,14 @@ fn a_buffering_transport_still_completes_an_exchange() {
 /// file, and the crate's public testing surface is pinned by `compat_surface.rs`, which is
 /// not a place to add things casually.
 struct GatheringBuffer {
-    inner: Duplex,
+    inner: Duplex<Coalesced>,
     /// Gathering calls actually polled, shared with the test so it can tell whether the
     /// path it means to exercise was taken at all.
     gathered: Rc<Cell<usize>>,
 }
 
 struct GatheringBufferWriter {
-    inner: DuplexWriter,
+    inner: DuplexWriter<Coalesced>,
     /// Octets written but not yet handed to the peer — the user-space buffer a `BufWriter`
     /// would keep.
     buffer: Vec<u8>,
@@ -156,6 +159,8 @@ impl Transport for GatheringBuffer {
 }
 
 impl TransportWrite for GatheringBufferWriter {
+    type Strategy = Gathering;
+
     fn write(
         &mut self,
         buf: bytes::Bytes,
@@ -163,24 +168,6 @@ impl TransportWrite for GatheringBufferWriter {
         self.buffer.extend_from_slice(&buf);
         let written = buf.len();
         core::future::ready((Ok(written), buf))
-    }
-
-    fn write_vectored<'w>(
-        &'w mut self,
-        regions: &'w [io::IoSlice<'w>],
-    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
-        // Nothing happens here: the driver builds one of these with no regions at all to
-        // learn which path this transport offers, and drops it without polling. An `async`
-        // block is inert until polled, so the copy below only ever runs for a real write.
-        Some(async move {
-            self.gathered.set(self.gathered.get() + 1);
-            let mut written = 0;
-            for region in regions {
-                self.buffer.extend_from_slice(region);
-                written += region.len();
-            }
-            Ok(written)
-        })
     }
 
     async fn commit(&mut self) -> io::Result<()> {
@@ -193,12 +180,34 @@ impl TransportWrite for GatheringBufferWriter {
     }
 }
 
+impl BorrowedWrite for GatheringBufferWriter {
+    async fn write_borrowed<'w>(&'w mut self, data: &'w [u8]) -> io::Result<usize> {
+        // The live fallback when a stream does not really scatter-gather. This transport
+        // buffers exactly as its `write` does, so the driver's borrowed path lands in the
+        // same user-space buffer that `commit` flushes.
+        self.buffer.extend_from_slice(data);
+        Ok(data.len())
+    }
+}
+
+impl VectoredWrite for GatheringBufferWriter {
+    async fn write_vectored<'w>(&'w mut self, regions: &'w [io::IoSlice<'w>]) -> io::Result<usize> {
+        self.gathered.set(self.gathered.get() + 1);
+        let mut written = 0;
+        for region in regions {
+            self.buffer.extend_from_slice(region);
+            written += region.len();
+        }
+        Ok(written)
+    }
+}
+
 #[test]
 fn a_buffering_transport_that_gathers_still_completes_an_exchange() {
     // The same exchange as above, over a transport that elects the gathering path. The
     // budget is what turns "the driver stopped committing after a gathered pass" into a
     // failure rather than a hung suite.
-    let (client_transport, server_transport) = duplex(false);
+    let (client_transport, server_transport) = duplex();
     let gathered = Rc::new(Cell::new(0usize));
     let client_transport = GatheringBuffer {
         inner: client_transport,
@@ -274,14 +283,14 @@ fn a_buffering_transport_that_gathers_still_completes_an_exchange() {
 /// `GatheringBuffer` is — one point, one file, and the public surface stays as
 /// `compat_surface.rs` pins it.
 struct GatheringRegionBuffer {
-    inner: Duplex,
+    inner: Duplex<Coalesced>,
     /// Owned-region calls actually made, shared with the test so it can tell whether the
     /// completion path it means to exercise was taken at all.
     gathered: Rc<Cell<usize>>,
 }
 
 struct GatheringRegionBufferWriter {
-    inner: DuplexWriter,
+    inner: DuplexWriter<Coalesced>,
     /// Octets written but not yet handed to the peer — the user-space buffer a `BufWriter`
     /// would keep.
     buffer: Vec<u8>,
@@ -306,6 +315,8 @@ impl Transport for GatheringRegionBuffer {
 }
 
 impl TransportWrite for GatheringRegionBufferWriter {
+    type Strategy = OwnedRegions;
+
     fn write(
         &mut self,
         buf: bytes::Bytes,
@@ -313,25 +324,6 @@ impl TransportWrite for GatheringRegionBufferWriter {
         self.buffer.extend_from_slice(&buf);
         let written = buf.len();
         core::future::ready((Ok(written), buf))
-    }
-
-    fn gathers_owned_regions(&self) -> bool {
-        // The completion election. A plain predicate the driver reads once per pass — unlike
-        // the vectored one, there is no unpolled future to build, so buffering here is safe.
-        true
-    }
-
-    fn write_regions(
-        &mut self,
-        regions: Vec<bytes::Bytes>,
-    ) -> impl Future<Output = (io::Result<usize>, Vec<bytes::Bytes>)> {
-        self.gathered.set(self.gathered.get() + 1);
-        let mut written = 0;
-        for region in &regions {
-            self.buffer.extend_from_slice(region);
-            written += region.len();
-        }
-        core::future::ready((Ok(written), regions))
     }
 
     async fn commit(&mut self) -> io::Result<()> {
@@ -344,13 +336,28 @@ impl TransportWrite for GatheringRegionBufferWriter {
     }
 }
 
+impl RegionWrite for GatheringRegionBufferWriter {
+    fn write_regions(
+        &mut self,
+        regions: Vec<bytes::Bytes>,
+    ) -> impl Future<Output = (io::Result<usize>, Vec<bytes::Bytes>)> {
+        self.gathered.set(self.gathered.get() + 1);
+        let mut written = 0;
+        for region in &regions {
+            self.buffer.extend_from_slice(region);
+            written += region.len();
+        }
+        core::future::ready((Ok(written), regions))
+    }
+}
+
 #[test]
 fn a_buffering_transport_that_gathers_owned_regions_still_completes_an_exchange() {
     // The same exchange, over a transport that elects the completion path and buffers until
     // `commit`. `handshake_shared` is required: only a shared body reaches the owned-region
     // strategy, and `Full` is a shared body whose data is `Bytes`. The budget turns "the
     // driver stopped committing after an owned-region pass" into a failure, not a hung suite.
-    let (client_transport, server_transport) = duplex(false);
+    let (client_transport, server_transport) = duplex();
     let gathered = Rc::new(Cell::new(0usize));
     let client_transport = GatheringRegionBuffer {
         inner: client_transport,

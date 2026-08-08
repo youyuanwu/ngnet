@@ -160,8 +160,8 @@ coalescing arms, and the slow arm was the one writing per block — a cost invis
 duplex, dominant over a socket, and growing with the number of multiplexed streams because
 each stream adds blocks to the pass.
 
-This was confirmed directly rather than inferred. Flipping *only* `TokioWriter::write_borrowed`
-to return `None`, changing nothing else, moved `ngnet-h2-tokio` by **+95% at N=8 and +128% at
+This was confirmed directly rather than inferred. Flipping *only* `TokioWriter`'s borrowed write off — at the time, by returning `None`;
+since the strategy split, by declaring `Coalesced` instead of `Gathering` — changing nothing else, moved `ngnet-h2-tokio` by **+95% at N=8 and +128% at
 N=64** (to ~152 Kelem/s), putting it level with compio and ahead of hyper.
 
 #### What that framing got wrong, and the gathering path
@@ -174,7 +174,7 @@ frame-item boundaries, and `Session::send` hands back a slice borrowing the sess
 most one block is live at a time. That forecloses gathering blocks **with each other** —
 nothing more. A live block gathers perfectly well with memory the driver already owns.
 
-`TransportWrite::write_vectored` does exactly that: small blocks accumulate into a
+`VectoredWrite::write_vectored` does exactly that: small blocks accumulate into a
 driver-owned buffer reused across passes, and a block at or above `VECTORED_THRESHOLD` goes
 out as the second region of a two-region `writev`, never copied.
 
@@ -240,7 +240,8 @@ Neither regression survives. The lesson is recorded rather than the first number
 A/B designs are not trustworthy on this machine, and unchanged arms are the cheapest available
 control.**
 
-`ngnet-h2-compio`, which does not implement `write_vectored`, moved −0.2% (N=8), −0.7% (N=64),
+`ngnet-h2-compio`, which cannot implement `write_vectored` — it is a completion transport,
+and the borrowed gathering write is unavailable to it — moved −0.2% (N=8), −0.7% (N=64),
 +0.9% (serial) and +0.2% (1 MiB) — inert, as required.
 
 #### Reusing the coalescing buffer, measured

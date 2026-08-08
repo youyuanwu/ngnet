@@ -18,8 +18,11 @@ use ngnet_h2::http::testing::{
     self, Duplex, DuplexWriter, Scripted, alongside, block_on, bytes_crate as bytes, duplex,
     http_crate as http, scripted, serve,
 };
+use ngnet_h2::http::transport::Coalesced;
 use ngnet_h2::http::{Transport, TransportRead};
-use ngnet_h2::{FrameType, Header, HeaderAction, HeaderCategory, Session, SessionBuilder, StreamId};
+use ngnet_h2::{
+    FrameType, Header, HeaderAction, HeaderCategory, Session, SessionBuilder, StreamId,
+};
 
 /// Yields once, so the driver gets a full poll before the test looks again.
 async fn yield_now() {
@@ -127,7 +130,7 @@ use core::future::Future;
 
 #[test]
 fn a_deferred_body_is_consulted_only_after_a_wake() {
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Scripted>(client_side).expect("handshake");
 
@@ -207,7 +210,7 @@ fn a_deferred_body_is_consulted_only_after_a_wake() {
 
 #[test]
 fn a_spurious_wake_costs_exactly_one_consultation() {
-    let (client_side, _server_side) = duplex(false);
+    let (client_side, _server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Scripted>(client_side).expect("handshake");
 
@@ -252,7 +255,7 @@ fn a_spurious_wake_costs_exactly_one_consultation() {
 
 #[test]
 fn a_wake_after_the_body_finished_is_swallowed() {
-    let (client_side, _server_side) = duplex(false);
+    let (client_side, _server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Scripted>(client_side).expect("handshake");
 
@@ -287,7 +290,7 @@ fn a_wake_after_the_body_finished_is_swallowed() {
 
 #[test]
 fn stale_wakes_from_closed_streams_do_not_accumulate() {
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Scripted>(client_side).expect("handshake");
 
@@ -361,7 +364,7 @@ impl testing::http_body_crate::Body for SelfWaking {
 
 #[test]
 fn a_body_that_wakes_itself_does_not_deadlock() {
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, SelfWaking>(client_side).expect("handshake");
 
@@ -398,7 +401,7 @@ fn a_body_that_wakes_itself_does_not_deadlock() {
 }
 
 /// A reading half that never completes, over a real writing half.
-struct StalledRead(Duplex);
+struct StalledRead(Duplex<Coalesced>);
 
 /// A read that stays in flight for as long as the connection lives.
 struct NeverReads;
@@ -415,7 +418,7 @@ impl TransportRead for NeverReads {
 
 impl Transport for StalledRead {
     type Reader = NeverReads;
-    type Writer = DuplexWriter;
+    type Writer = DuplexWriter<Coalesced>;
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         let (_reader, writer) = self.0.split();
@@ -425,7 +428,7 @@ impl Transport for StalledRead {
 
 #[test]
 fn a_read_in_flight_does_not_block_a_write() {
-    let (client_side, _server_side) = duplex(false);
+    let (client_side, _server_side) = duplex();
     let writes = client_side.write_counter();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Scripted>(StalledRead(client_side)).expect("handshake");

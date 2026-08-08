@@ -21,7 +21,7 @@ one task so the example depends on nothing of its own.
 # };
 # use ngnet_h2::http::testing::http_body_crate::Body;
 # fn main() {
-# let (client_io, server_io) = duplex(false);
+# let (client_io, server_io) = duplex();
 # let server = serve(server_io, |_request: http::Request<IncomingBody>| async {
 #     http::Response::builder().status(200).body(Full::new("hello")).unwrap()
 # })

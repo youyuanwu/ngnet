@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ngnet_h2::http::testing::{
-    self, Empty, Full, alongside, block_on, duplex, http_crate as http, serve,
+    self, Empty, Full, alongside, block_on, duplex, duplex_borrowed, http_crate as http, serve,
 };
 use ngnet_h2::{
     BodyOutcome, BodySource, ErrorCode, FrameType, Header, HeaderAction, HeaderCategory, Session,
@@ -93,7 +93,7 @@ fn request(path: &str) -> http::Request<Empty> {
 
 #[test]
 fn a_request_and_response_complete() {
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -123,7 +123,7 @@ fn a_request_and_response_complete() {
 
 #[test]
 fn a_request_body_reaches_the_peer() {
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Full>(client_side).expect("handshake");
 
@@ -156,7 +156,7 @@ fn a_request_body_reaches_the_peer() {
 
 #[test]
 fn four_concurrent_requests_resolve_in_reverse_order() {
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -197,7 +197,7 @@ fn four_concurrent_requests_resolve_in_reverse_order() {
 
 #[test]
 fn the_response_head_arrives_before_the_exchange_ends() {
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -233,7 +233,7 @@ fn an_informational_head_does_not_settle_the_future_as_final() {
     // surfaces the `1xx` head to the client before it marks the stream as expecting a
     // final response, so a client that settled on the first head would resolve with `103`
     // and discard the `200` that follows. The future must resolve with `200`.
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -309,7 +309,7 @@ fn a_stream_carrying_only_an_informational_head_fails_rather_than_hangs() {
     // The other side of ignoring `1xx`: if a stream only ever carries an informational
     // head and then ends, the future must resolve — with an error — rather than wait for a
     // final response that will never come.
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -361,7 +361,7 @@ fn a_stream_carrying_only_an_informational_head_fails_rather_than_hangs() {
 
 #[test]
 fn dropping_the_driver_resolves_every_pending_request() {
-    let (client_side, _server_side) = duplex(false);
+    let (client_side, _server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -386,7 +386,7 @@ fn dropping_the_driver_resolves_every_pending_request() {
 
 #[test]
 fn a_cloned_handle_submits_on_the_same_connection() {
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -414,7 +414,7 @@ fn a_cloned_handle_submits_on_the_same_connection() {
 
 #[test]
 fn the_connection_ends_once_the_last_handle_is_dropped() {
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -441,7 +441,7 @@ fn a_driver_over_a_send_transport_is_send() {
     // makes `tokio::spawn` usable is that the property propagates when it holds.
     fn assert_send<T: Send>(_value: &T) {}
 
-    let (client_side, _server_side) = duplex(false);
+    let (client_side, _server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -459,7 +459,7 @@ fn the_client_session_reports_consumption_itself() {
 
 #[test]
 fn a_request_without_an_authority_is_rejected() {
-    let (client_side, _server_side) = duplex(false);
+    let (client_side, _server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -476,7 +476,7 @@ fn a_request_without_an_authority_is_rejected() {
 
 #[test]
 fn a_connection_specific_field_is_rejected() {
-    let (client_side, _server_side) = duplex(false);
+    let (client_side, _server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -497,7 +497,7 @@ fn the_borrowed_write_path_carries_an_exchange_too() {
     // Which write strategy runs is the transport's choice and the two are mutually
     // exclusive, so both have to be exercised. This is the same exchange as the first
     // test over a transport that takes its octets borrowed.
-    let (client_side, server_side) = duplex(true);
+    let (client_side, server_side) = duplex_borrowed();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Full>(client_side).expect("handshake");
 
@@ -536,7 +536,7 @@ fn a_body_frame_larger_than_one_data_frame_arrives_whole() {
     // only for large payloads.
     let payload: Vec<u8> = (0..70_000u32).map(|index| (index % 251) as u8).collect();
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Full>(client_side).expect("handshake");
 

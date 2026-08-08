@@ -16,7 +16,9 @@ use ngnet_h2::http::testing::{
     Empty, Full, Scripted, alongside, block_on, buffered_chunks, duplex, http_crate as http,
     scripted, serve,
 };
-use ngnet_h2::{FrameType, Header, HeaderAction, HeaderCategory, Session, SessionBuilder, StreamId};
+use ngnet_h2::{
+    FrameType, Header, HeaderAction, HeaderCategory, Session, SessionBuilder, StreamId,
+};
 
 // ---------------------------------------------------------------------------
 // The peer
@@ -170,7 +172,7 @@ fn a_deferred_body_emits_no_frames_and_is_asked_nothing_further() {
     // consulted; this proves the *connection* stays quiet too — a driver that answered a
     // deferral by emitting empty DATA frames would satisfy the consultation count and
     // flood the peer.
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Scripted>(client_side).expect("handshake");
 
@@ -229,7 +231,7 @@ fn at_most_one_chunk_is_held_back_and_the_body_is_not_read_ahead() {
     // something: the bridge must serve many frames from a single chunk.
     let expected = payload(400 * 1024);
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Scripted>(client_side).expect("handshake");
 
@@ -281,7 +283,7 @@ fn outgoing_trailers_reach_the_peer_after_the_final_data() {
     // and in what order.
     let expected = payload(3_000);
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Scripted>(client_side).expect("handshake");
 
@@ -343,7 +345,7 @@ fn two_streams_trailing_in_one_pass_each_get_their_own_block() {
     // in the same serialisation pass are exactly the case where a stash keyed wrongly —
     // or drained assuming one entry — would go unnoticed. Their blocks differ, so a
     // crossed wire is visible rather than merely possible.
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Scripted>(client_side).expect("handshake");
 
@@ -390,7 +392,7 @@ fn a_forbidden_outgoing_trailer_fails_only_its_own_stream() {
     // A trailing block this crate cannot encode is one message's problem. Failing the
     // connection instead would make a caller's own bad trailer more destructive than a
     // peer's — the receive side resets just the stream for the mirror image of this.
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Scripted>(client_side).expect("handshake");
 
@@ -452,7 +454,7 @@ fn a_forbidden_outgoing_trailer_fails_only_its_own_stream() {
 fn a_failing_body_resets_the_stream_and_surfaces_its_error() {
     // Spec SC-010. Two halves: the peer must see the stream go away, and the caller must
     // get back the error their own body produced rather than a rendering of it.
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Scripted>(client_side).expect("handshake");
 
@@ -498,7 +500,7 @@ fn a_body_larger_than_the_flow_control_window_transfers_intact() {
     // to be granted repeatedly for any of it to arrive.
     let expected = payload(400 * 1024);
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Full>(client_side).expect("handshake");
 
@@ -528,7 +530,7 @@ fn a_zero_length_body_emits_no_spurious_data_frame() {
     // one. A bridge that forwarded the empty frame its body produced *and* the one that
     // ends the message would send two, and would keep sending them for a body that
     // yielded empty frames indefinitely.
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Full>(client_side).expect("handshake");
 
@@ -560,7 +562,7 @@ fn a_zero_length_body_emits_no_spurious_data_frame() {
 fn a_request_with_no_body_emits_no_data_frame_at_all() {
     // A body that reports itself already ended is never submitted as a body, so the head
     // carries end-of-stream and nothing follows it.
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 

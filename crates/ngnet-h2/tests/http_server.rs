@@ -214,7 +214,7 @@ fn a_handler_sees_the_whole_request_head() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&seen);
 
-    let (server_side, client_side) = duplex(false);
+    let (server_side, client_side) = duplex();
     let connection = server::serve(server_side, move |request: http::Request<IncomingBody>| {
         recorder.lock().expect("record").push((
             request.method().clone(),
@@ -271,7 +271,7 @@ fn a_handler_reads_the_request_body() {
     let received = Arc::new(Mutex::new(None));
     let recorder = Arc::clone(&received);
 
-    let (server_side, client_side) = duplex(false);
+    let (server_side, client_side) = duplex();
     let connection = server::serve(server_side, move |request: http::Request<IncomingBody>| {
         let recorder = Arc::clone(&recorder);
         async move {
@@ -314,7 +314,7 @@ fn a_handler_sends_a_response_body() {
     let expected = payload(200_000);
     let answer = expected.clone();
 
-    let (server_side, client_side) = duplex(false);
+    let (server_side, client_side) = duplex();
     let connection = server::serve(server_side, move |_request: http::Request<IncomingBody>| {
         let answer = answer.clone();
         async move {
@@ -358,7 +358,7 @@ fn a_slow_handler_delays_no_other_stream() {
     let recorder = Arc::clone(&log);
     let observer = Arc::clone(&log);
 
-    let (server_side, client_side) = duplex(false);
+    let (server_side, client_side) = duplex();
     let connection = server::serve(server_side, move |request: http::Request<IncomingBody>| {
         let gate = Arc::clone(&gate);
         let recorder = Arc::clone(&recorder);
@@ -420,7 +420,7 @@ fn a_parked_handler_is_not_polled_by_another_streams_traffic() {
     let gate = Arc::new(Gate::default());
     let watcher = Arc::clone(&gate);
 
-    let (server_side, client_side) = duplex(false);
+    let (server_side, client_side) = duplex();
     let connection = server::serve(server_side, move |request: http::Request<IncomingBody>| {
         let gate = Arc::clone(&gate);
         let watched = request.uri().path() == "/watched";
@@ -498,7 +498,7 @@ fn a_reset_stream_discards_its_response_without_failing_the_connection() {
     let noticed = Arc::new(Mutex::new(None));
     let recorder = Arc::clone(&noticed);
 
-    let (server_side, client_side) = duplex(false);
+    let (server_side, client_side) = duplex();
     let connection = server::serve(server_side, move |request: http::Request<IncomingBody>| {
         let gate = Arc::clone(&gate);
         let recorder = Arc::clone(&recorder);
@@ -600,7 +600,7 @@ fn a_retained_handler_still_counts_against_the_concurrency_cap() {
     let invocations = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&invocations);
 
-    let (server_side, client_side) = duplex(false);
+    let (server_side, client_side) = duplex();
     let config = ngnet_h2::http::Config::default().max_concurrent_streams(1);
     let connection = server::serve_with(
         server_side,
@@ -688,7 +688,7 @@ fn a_handler_sends_trailers_after_its_body() {
 
     let body_slot = Arc::new(Mutex::new(Some(body)));
     let taker = Arc::clone(&body_slot);
-    let (server_side, client_side) = duplex(false);
+    let (server_side, client_side) = duplex();
     let connection = server::serve(server_side, move |_request: http::Request<IncomingBody>| {
         let taker = Arc::clone(&taker);
         async move {
@@ -753,7 +753,7 @@ fn a_failed_response_body_resets_only_its_own_stream() {
     let bodies = Arc::new(Mutex::new(bodies));
     let taker = Arc::clone(&bodies);
 
-    let (server_side, client_side) = duplex(false);
+    let (server_side, client_side) = duplex();
     let connection = server::serve(server_side, move |request: http::Request<IncomingBody>| {
         let taker = Arc::clone(&taker);
         let path = request.uri().path().to_owned();

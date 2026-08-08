@@ -128,7 +128,7 @@ async fn yield_now() {
 fn dropping_a_pending_request_resets_its_stream() {
     // Spec SC-011, first half, asserted from the peer's side — which is the only side that
     // can tell the difference between "cancelled" and "forgotten about".
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -164,7 +164,7 @@ fn dropping_a_pending_request_resets_its_stream() {
 fn dropping_an_unread_response_body_resets_its_stream() {
     // Spec SC-011, second half. Returning the window without stopping the peer would
     // invite it to send the rest of something nobody will ever read.
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -199,7 +199,7 @@ fn dropping_an_unread_response_body_resets_its_stream() {
 fn a_completed_response_body_is_not_reset_when_dropped() {
     // The other side of the rule. A stream that already ended has nothing left to stop,
     // and resetting it would tell the peer something went wrong when nothing did.
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -237,7 +237,7 @@ fn a_servers_unread_request_body_is_not_reset_and_its_answer_still_arrives() {
     // Spec SC-011's exception. Dropping a *request* body says nothing about wanting the
     // exchange to stop: a handler that ignores the body is entitled to answer anyway, and
     // resetting would destroy the response it is about to send.
-    let (server_side, client_side) = duplex(false);
+    let (server_side, client_side) = duplex();
     let connection = server::serve(server_side, |request: http::Request<IncomingBody>| {
         // Dropped, unread, immediately.
         drop(request.into_body());
@@ -281,7 +281,7 @@ fn a_servers_unread_request_body_is_not_reset_and_its_answer_still_arrives() {
 fn a_graceful_shutdown_finishes_what_is_in_flight_and_refuses_what_is_not() {
     // Spec SC-024. The distinction that matters: in-flight work is not collateral damage,
     // and what is turned away is turned away in a way the caller can act on.
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -322,7 +322,7 @@ fn a_peer_going_away_refuses_the_streams_it_never_began() {
     // Spec SC-014. A `GOAWAY` names the last stream the peer looked at; everything above it
     // was never begun, which is the one failure safe to retry without knowing anything
     // about the request.
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -390,7 +390,7 @@ fn a_peer_going_away_refuses_the_streams_it_never_began() {
 fn a_peer_reset_carries_the_peers_reason() {
     // Spec SC-013. "The peer refused this" and "we could not send it" are different
     // things to a caller, and the reason code is what separates them.
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -476,7 +476,7 @@ fn a_transport_failure_is_identifiable_as_one() {
 fn end_of_file_part_way_through_a_frame_is_a_connection_error() {
     // Spec SC-030. A truncated frame is not a clean close: treating it as one would let a
     // connection cut mid-message look like a connection that finished.
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -525,7 +525,7 @@ fn a_handler_learns_its_stream_was_lost_even_with_no_body_to_read() {
     let observed = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&observed);
 
-    let (server_side, client_side) = duplex(false);
+    let (server_side, client_side) = duplex();
     let connection = server::serve(server_side, move |request: http::Request<IncomingBody>| {
         let counter = Arc::clone(&counter);
         let lost = request.extensions().get::<Cancelled>().cloned();
@@ -593,7 +593,7 @@ fn a_request_dropped_before_it_is_sent_never_reaches_the_peer() {
     // A response future dropped before the driver has run has no stream to reset, and
     // sending the request only to take it back would be work the peer has to do for
     // nothing. It is simply never sent.
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -625,7 +625,7 @@ fn a_client_going_away_does_not_discard_the_responses_a_server_owes_it() {
     // work the receiver started. A client's ordinary wind-down names zero, and a server
     // reading that as "discard everything in flight" would drop responses its peer is
     // still waiting for — including for this crate talking to itself.
-    let (server_side, client_side) = duplex(false);
+    let (server_side, client_side) = duplex();
     let connection = server::serve(server_side, |request: http::Request<IncomingBody>| {
         let lost = request.extensions().get::<Cancelled>().cloned();
         async move {
@@ -683,7 +683,7 @@ fn a_client_going_away_does_not_discard_the_responses_a_server_owes_it() {
 #[test]
 fn shutting_down_twice_is_no_worse_than_once() {
     // Documented as idempotent, so it has to be.
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
