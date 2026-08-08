@@ -17,6 +17,7 @@ Design notes, the invariants the test suite pins, and the tracked backlog live i
 | [`ngnet-h3`](crates/ngnet-h3) | Safe, sans-I/O API driving an HTTP/3 client or server connection over QUIC streams the caller owns — plus an optional asynchronous `http`/`http-body` client and server built on it (default `http` feature). No QUIC or TLS of its own. |
 | [`ngnet-h3-sys`](crates/ngnet-h3-sys) | Raw FFI bindings. Builds libnghttp3 from source and generates bindings with `bindgen`. |
 | [`ngnet-h3-tests`](crates/ngnet-h3-tests) | Not published. Drives `ngnet-h3` over a real QUIC connection using [quinn](https://github.com/quinn-rs/quinn), so the wrapper needs no transport dependency of its own. Contains the reference `QuicConnection` implementation. |
+| [`ngnet-quic-sys`](crates/ngnet-quic-sys) | Raw FFI bindings to [ngtcp2](https://github.com/ngtcp2/ngtcp2), the QUIC transport. Builds libngtcp2 from source with `bindgen`, plus its OpenSSL crypto helper behind a default-on `crypto-ossl` feature. Nothing else in the workspace depends on it yet. |
 
 ### HTTP/3, and what it deliberately is not
 
@@ -185,32 +186,41 @@ ngnet-h2 = { version = "*", default-features = false }
 
 ## Dependencies
 
-This repo vendors two upstream C libraries as git submodules:
+This repo vendors three upstream C libraries as git submodules:
 
 | Submodule | Tag | Purpose |
 | --- | --- | --- |
 | [`deps/nghttp2`](https://github.com/nghttp2/nghttp2) | `v1.70.0` | HTTP/2, behind `ngnet-h2-sys`. |
 | [`deps/nghttp3`](https://github.com/ngtcp2/nghttp3) | `v1.18.0` | HTTP/3 (RFC 9114) framing and QPACK (RFC 9204), behind `ngnet-h3-sys`. |
+| [`deps/ngtcp2`](https://github.com/ngtcp2/ngtcp2) | `v1.25.0` | QUIC transport (RFC 9000), behind `ngnet-quic-sys`. |
 
 `nghttp3` depends on no QUIC transport and on no TLS library — it is a state
 machine over stream bytes — and neither does `ngnet-h3`. Choosing a QUIC
 implementation is left to the caller; the integration tests happen to use quinn,
 and that choice reaches no crate but `ngnet-h3-tests`.
 
+`ngtcp2` is vendored as a step towards a second QUIC backend, and is not wired
+into `ngnet-h3` yet. It draws the same line one layer down: libngtcp2 itself
+links no TLS, and the OpenSSL handshake helper is a separate archive behind
+`ngnet-quic-sys`'s default-on `crypto-ossl` feature. That helper needs **OpenSSL
+3.5 or newer** — the first release with the QUIC TLS API it is written against —
+which is why CI pins its runner image rather than using `ubuntu-latest`.
+
 ## Minimum submodule checkout
 
-Both libraries declare nested submodules that only their own tests, tooling and
-example applications need, so a `--recursive` checkout fetches a great deal this
-repo never compiles:
+All three libraries declare nested submodules that only their own tests, tooling
+and example applications need, so a `--recursive` checkout fetches a great deal
+this repo never compiles:
 
 | Nested submodule | Needed here? |
 | --- | --- |
 | `nghttp2/third-party/{mruby,neverbleed,urlparse}`, `nghttp2/tests/munit` | No — `nghttpx`, `nghttp`, `h2load` and the upstream test suite only. |
 | `nghttp3/tests/munit` | No — upstream test suite only. |
+| `ngtcp2/tests/munit`, `ngtcp2/third-party/urlparse` | No — upstream test suite, and the example client/server. `urlparse` reads like a library dependency, but its CMake target is guarded on libev and nghttp3 being found, so a lib-only build never reaches it. |
 | `nghttp3/lib/sfparse` | **Yes** — the structured-field parser is part of the library, not its tests. `nghttp3` does not compile without it. |
 
 That last row is the trap: "clone non-recursively" is correct for `nghttp2` and
-quietly wrong for `nghttp3`. The [`justfile`](justfile) encodes the right set, so
+`ngtcp2`, and quietly wrong for `nghttp3`. The [`justfile`](justfile) encodes the right set, so
 it does not have to be remembered:
 
 ```sh
@@ -224,8 +234,8 @@ just submodules
 git clone https://github.com/youyuanwu/ngnet.git
 cd ngnet
 
-# ...then init the two top-level submodules (non-recursive)...
-git submodule update --init deps/nghttp2 deps/nghttp3
+# ...then init the three top-level submodules (non-recursive)...
+git submodule update --init deps/nghttp2 deps/nghttp3 deps/ngtcp2
 
 # ...plus the one nested submodule that nghttp3's own sources require.
 git -C deps/nghttp3 submodule update --init lib/sfparse

@@ -4,3 +4,6 @@
 [submodule "deps/nghttp3"]
 	path = deps/nghttp3
 	url = https://github.com/ngtcp2/nghttp3
+[submodule "deps/ngtcp2"]
+	path = deps/ngtcp2
+	url = https://github.com/ngtcp2/ngtcp2

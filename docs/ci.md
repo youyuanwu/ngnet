@@ -15,11 +15,19 @@ and broke every other configuration.
 Everything below runs on every pull request. CI reads the compiler from
 `rust-toolchain.toml`, so a local run uses the same one.
 
+CI pins `runs-on: ubuntu-26.04` rather than using `ubuntu-latest`, and the pin is
+load-bearing. ngtcp2's OpenSSL crypto helper needs OpenSSL >= 3.5, and `ubuntu-latest` is
+still 24.04, which ships 3.0.13; 26.04 is the first image with 3.5. It is currently a
+preview image, so when it becomes the `ubuntu-latest` default the pin can go away. A step
+before the build asserts the OpenSSL version, so a runner image change fails with that
+message rather than somewhere inside CMake's symbol probing.
+
 ```sh
 cargo test --workspace --all-features
 cargo test --workspace
 cargo test -p ngnet-h2 --no-default-features
 cargo test -p ngnet-h3 --no-default-features
+cargo test -p ngnet-quic-sys --no-default-features
 cargo test -p ngnet-h2-tests --features completion
 
 cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -27,6 +35,7 @@ cargo clippy -p ngnet-h2 --all-targets -- -D warnings
 cargo clippy -p ngnet-h2 --no-default-features --all-targets -- -D warnings
 cargo clippy -p ngnet-h3 --all-targets -- -D warnings
 cargo clippy -p ngnet-h3 --no-default-features --all-targets -- -D warnings
+cargo clippy -p ngnet-quic-sys --no-default-features --all-targets -- -D warnings
 
 for f in "" "--no-default-features" "--all-features" "--features tokio" "--features completion"; do
   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-h2 $f
@@ -38,7 +47,7 @@ done
 for f in "" "--no-default-features" "--all-features"; do
   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-h3 $f
 done
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-h3-sys -p ngnet-h3-tests
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-h3-sys -p ngnet-h3-tests -p ngnet-quic-sys
 
 # Two claims, two commands, and the flags are the whole point.
 #
@@ -53,6 +62,13 @@ cargo tree -p ngnet-h3 --no-default-features -e normal   # only ngnet-h3-sys
 # default features on. Cargo unifies features across a workspace, so a crate added later
 # could pull a transport in with nothing in `ngnet-h3` changing.
 cargo tree -p ngnet-h3 -e normal | grep -qiE 'quinn|rustls|tokio|ring' && exit 1
+
+# That the QUIC bindings link no TLS with `crypto-ossl` off. `cargo tree` cannot answer
+# this one: OpenSSL is not a cargo dependency at all, it arrives through link flags the
+# build script emits. So it is asked of the linked binary instead. CI inspects every test
+# executable; by hand, one is enough to see the difference:
+cargo test -p ngnet-quic-sys --no-default-features --no-run
+readelf -d target/debug/deps/smoke-*  | grep -i 'NEEDED.*libssl'   # expect nothing
 
 # Runs each benchmark once without timing it. Benchmarks are not part of `cargo test`, so
 # without this they rot silently as the API moves.
