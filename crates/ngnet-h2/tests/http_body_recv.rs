@@ -243,7 +243,7 @@ fn a_delivered_chunk_is_a_view_of_the_drivers_read_buffer() {
     let expected = payload(40_000);
     let answers = Answers::one("/zero-copy", expected.clone());
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let log = client_side.buffer_log();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
@@ -277,7 +277,7 @@ fn a_retained_chunk_outlives_the_reads_that_follow_it() {
     let expected = payload(200_000);
     let answers = Answers::one("/retain", expected.clone());
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let log = client_side.buffer_log();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
@@ -339,7 +339,7 @@ fn a_four_hundred_kilobyte_body_arrives_intact() {
     let expected = payload(400 * 1024);
     let answers = Answers::one("/large", expected.clone());
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -372,7 +372,7 @@ fn an_unread_body_stalls_the_peer_and_resumes_once_it_is_read() {
     let answers = Answers::one("/backpressure", expected.clone());
     let sent = Arc::clone(&answers.sent);
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -423,7 +423,7 @@ fn an_unread_body_does_not_hold_up_another_stream() {
     let answers = Answers::one("/ignored", ignored.clone()).and("/wanted", wanted.clone());
     let sent = Arc::clone(&answers.sent);
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -468,7 +468,7 @@ fn dropping_an_unread_body_returns_its_window() {
     let answers = Answers::one("/abandoned", abandoned).and("/wanted", wanted.clone());
     let sent = Arc::clone(&answers.sent);
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -523,7 +523,7 @@ fn trailers_arrive_as_trailers_and_not_as_headers() {
     let expected = payload(5_000);
     let answers = Answers::one("/trailers", expected.clone()).with_trailers();
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 
@@ -565,7 +565,7 @@ fn the_head_is_readable_while_the_body_is_still_arriving() {
     let expected = payload(120_000);
     let answers = Answers::one("/streaming", expected.clone());
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Empty>(client_side).expect("handshake");
 

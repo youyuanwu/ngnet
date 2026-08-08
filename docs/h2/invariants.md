@@ -68,9 +68,26 @@ frames, not the one-off cost of standing a stream up.
 - `a_buffering_transport_still_completes_an_exchange` (`tests/http_flush.rs`) — a transport
   that releases writes only on `commit` still completes, under a bounded poll budget so a
   regression fails rather than hanging forever.
-- **Compile-fail doctests** on `TransportWrite::write_borrowed` and
-  `TransportWrite::write_vectored` — the ways an adapter could implement a write strategy
-  inconsistently do not compile.
+- **Five compile-fail doctests** on `TransportWrite` and `BorrowedWrite` — the ways an adapter
+  could get a write strategy wrong do not compile. Each pins an error code
+  (`compile_fail,E0277` or `E0053`) rather than bare `compile_fail`, so a typo in the doctest
+  cannot pass for the guarded failure, and each was mutation-verified by making the guarded
+  construct legal and confirming the doctest then fails:
+  - declaring `Gathering` without implementing `VectoredWrite`;
+  - declaring `OwnedRegions` without implementing `RegionWrite`;
+  - implementing operations from both I/O models on one type;
+  - an `Option`-returning `write_borrowed`, i.e. trying to decline a path mid-pass;
+  - implementing `WriteStrategy` downstream, i.e. inventing a fifth strategy.
+- **`the_gathering_capability_is_consulted_exactly_once_per_connection`**
+  (`tests/http_vectored.rs`) — the driver reads `VectoredWrite::gathers` once, after
+  `Transport::split`, however many passes follow. Mutation-verified: reverting `Gathering`'s
+  drain to re-read the capability per pass fails it.
+- **`elects_owned_regions::<CompioWriter<TcpStream>>()`** (`ngnet-h2-tests/tests/http_compio.rs`)
+  — a compile-time assertion that the shipped completion transport elects `OwnedRegions`. This
+  replaces a runtime predicate check that was found vacuous: in PR #9, flipping
+  `gathers_owned_regions()` to `false` left the entire workspace suite green, so the whole
+  owned-region fast path could have silently regressed to copying every octet. Demoting
+  `CompioWriter` to `Coalesced` now fails to compile, and the failure is workspace-visible.
 - **A compile-fail doctest** on `Connection` — discarding the driver is an error, because a
   connection that compiles and never sends a byte is the trap the type exists to prevent.
 - **A negative `Send` assertion** in `ngnet-h2-tests` — a connection over a non-`Send`

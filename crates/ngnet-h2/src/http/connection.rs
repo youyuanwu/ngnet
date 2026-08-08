@@ -28,10 +28,11 @@ use super::error::Result;
 /// ```compile_fail
 /// #![deny(unused_must_use)]
 /// # use ngnet_h2::http::testing::{Duplex, Empty, duplex};
+/// # use ngnet_h2::http::transport::Coalesced;
 /// # fn example() -> Result<(), ngnet_h2::http::Error> {
-/// let (transport, _peer) = duplex(false);
+/// let (transport, _peer) = duplex();
 /// // The handle is kept and the driver thrown away, so nothing will ever be sent.
-/// ngnet_h2::http::handshake::<Duplex, Empty>(transport)?;
+/// ngnet_h2::http::handshake::<Duplex<Coalesced>, Empty>(transport)?;
 /// # Ok(())
 /// # }
 /// ```
@@ -40,9 +41,10 @@ use super::error::Result;
 ///
 /// ```
 /// # use ngnet_h2::http::testing::{Duplex, Empty, duplex};
+/// # use ngnet_h2::http::transport::Coalesced;
 /// # fn example() -> Result<(), ngnet_h2::http::Error> {
-/// let (transport, _peer) = duplex(false);
-/// let (requests, connection) = ngnet_h2::http::handshake::<Duplex, Empty>(transport)?;
+/// let (transport, _peer) = duplex();
+/// let (requests, connection) = ngnet_h2::http::handshake::<Duplex<Coalesced>, Empty>(transport)?;
 /// # let _ = (requests, connection);
 /// # Ok(())
 /// # }

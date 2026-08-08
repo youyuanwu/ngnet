@@ -114,6 +114,7 @@ use std::sync::Arc;
 use std::task::Wake;
 
 use core::future::{Future, poll_fn};
+use core::marker::PhantomData;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
@@ -124,7 +125,10 @@ use ngnet_h2::http::testing::{
     Empty, Full, bytes_crate as bytes, http_body_crate as http_body, http_crate as http,
     pool_high_water, pool_size,
 };
-use ngnet_h2::http::transport::{Transport, TransportRead, TransportWrite};
+use ngnet_h2::http::transport::{
+    BorrowedWrite, Coalesced, Gathering, OwnedRegions, PerRegion, RegionWrite, Transport,
+    TransportRead, TransportWrite, VectoredWrite,
+};
 use ngnet_h2::{
     BytesBody, FrameType, Header, HeaderAction, HeaderCategory, Session, SessionBuilder, StreamId,
 };
@@ -231,43 +235,35 @@ struct Meter {
     bytes: usize,
 }
 
-/// Which of the three drain strategies a recording transport advertises.
+/// Which of the four drain strategies a recording transport advertises, expressed as the
+/// writer's strategy marker.
 ///
-/// The shape is fixed when the transport is built, exactly as a real transport's is: which
-/// strategy runs is a property of the transport, not a per-pass decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Shape {
-    /// Overrides nothing, so the driver coalesces each pass into one owned write.
-    Owned,
-    /// Overrides `write_borrowed`: one write per session block, nothing copied.
-    Borrowed,
-    /// Overrides `write_vectored`: small blocks gathered with the driver's own buffer.
-    Vectored,
-    /// Overrides `gathers_owned_regions`/`write_regions`: the completion strategy, one
-    /// gathering write over an owned `Vec<Bytes>`. On a push-model connection every block is
-    /// coalesced into the driver's minting buffer, so the pass reaches this as a single owned
-    /// region — one write, and no allocation once that buffer has grown.
-    OwnedRegions,
-}
-
-struct Recording {
+/// The strategy is fixed when the transport is built, exactly as a real transport's is: a
+/// writer carries exactly one strategy in its type, so which path the driver takes is settled
+/// by the marker `S` at construction rather than by a run-time flag. [`Coalesced`] overrides
+/// nothing and coalesces each pass into one owned write; [`PerRegion`] overrides
+/// [`BorrowedWrite`] for one write per session block; [`Gathering`] overrides [`VectoredWrite`]
+/// to gather small blocks with the driver's own buffer; [`OwnedRegions`] overrides
+/// [`RegionWrite`] for the completion strategy — one gathering write over an owned
+/// `Vec<Bytes>`.
+struct Recording<S> {
     inbound: Wire,
     outbound: Wire,
-    shape: Shape,
     meter: Rc<RefCell<Meter>>,
+    _marker: PhantomData<S>,
 }
 
 struct RecReader {
     inbound: Wire,
 }
 
-struct RecWriter {
+struct RecWriter<S> {
     outbound: Wire,
-    shape: Shape,
     meter: Rc<RefCell<Meter>>,
+    _marker: PhantomData<S>,
 }
 
-impl RecWriter {
+impl<S> RecWriter<S> {
     fn record(&self, data: &[u8]) {
         let mut meter = self.meter.borrow_mut();
         meter.writes += 1;
@@ -275,25 +271,108 @@ impl RecWriter {
         drop(meter);
         self.outbound.borrow_mut().buf.extend(data.iter().copied());
     }
-}
 
-impl Transport for Recording {
-    type Reader = RecReader;
-    type Writer = RecWriter;
+    /// The shared body of every strategy's [`write`](TransportWrite::write): one coalesced
+    /// owned write, metered and delivered.
+    async fn do_write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
+        self.record(&buf);
+        let written = buf.len();
+        (Ok(written), buf)
+    }
 
-    fn split(self) -> (RecReader, RecWriter) {
-        (
-            RecReader {
-                inbound: self.inbound,
-            },
-            RecWriter {
-                outbound: self.outbound,
-                shape: self.shape,
-                meter: self.meter,
-            },
-        )
+    /// The shared body of the borrowed path: one metered write per block, nothing copied.
+    ///
+    /// A real fallback rather than a stub: the [`Gathering`] writer supplies it too, since
+    /// [`VectoredWrite`] requires [`BorrowedWrite`] and the driver writes here when a stream
+    /// does not really scatter-gather. In these tests `gathers` is left at its `true` default,
+    /// so the [`Gathering`] writer never reaches this — but it must still be live.
+    fn do_write_borrowed<'w>(
+        &'w mut self,
+        data: &'w [u8],
+    ) -> impl Future<Output = io::Result<usize>> + 'w {
+        self.record(data);
+        core::future::ready(Ok(data.len()))
+    }
+
+    /// The shared body of the vectored path: an inert future that meters and delivers when
+    /// polled.
+    ///
+    /// Nothing is recorded at construction, and no octet moves: the driver may build one of
+    /// these speculatively and drop it unpolled, so recording here would charge a phantom
+    /// write and a phantom pile of octets on every pass. An `async` block is inert until
+    /// polled, which is exactly the property needed.
+    async fn do_write_vectored<'w>(
+        &'w mut self,
+        regions: &'w [io::IoSlice<'w>],
+    ) -> io::Result<usize> {
+        let mut written = 0;
+        for region in regions {
+            written += region.len();
+        }
+        // One call, one write, however many regions it gathered: the whole point of the
+        // strategy is that the gathering is free and the syscall is what costs.
+        let mut meter = self.meter.borrow_mut();
+        meter.writes += 1;
+        meter.bytes += written;
+        drop(meter);
+        let mut outbound = self.outbound.borrow_mut();
+        for region in regions {
+            outbound.buf.extend(region.iter().copied());
+        }
+        drop(outbound);
+        Ok(written)
+    }
+
+    /// The shared body of the owned-region path: one metered write over the owned list.
+    ///
+    /// The ownership round-trip a completion API needs is visible here: the `Vec` comes in and
+    /// goes back out, so the driver can reuse its allocation.
+    async fn do_write_regions(&mut self, regions: Vec<Bytes>) -> (io::Result<usize>, Vec<Bytes>) {
+        let written: usize = regions.iter().map(Bytes::len).sum();
+        let mut meter = self.meter.borrow_mut();
+        meter.writes += 1;
+        meter.bytes += written;
+        drop(meter);
+        let mut outbound = self.outbound.borrow_mut();
+        for region in &regions {
+            outbound.buf.extend(region.iter().copied());
+        }
+        drop(outbound);
+        (Ok(written), regions)
     }
 }
+
+/// Emits the `Transport` impl for a [`Recording`] over one strategy marker.
+///
+/// One impl per marker rather than a blanket one over `S`: a blanket impl cannot name a
+/// concrete `Writer` that is itself `TransportWrite` for a generic `S`, the same limitation
+/// the crate's own testing duplex works around.
+macro_rules! recording_transport {
+    ($marker:ty) => {
+        impl Transport for Recording<$marker> {
+            type Reader = RecReader;
+            type Writer = RecWriter<$marker>;
+
+            fn split(self) -> (RecReader, RecWriter<$marker>) {
+                (
+                    RecReader {
+                        inbound: self.inbound,
+                    },
+                    RecWriter {
+                        outbound: self.outbound,
+                        meter: self.meter,
+                        _marker: PhantomData,
+                    },
+                )
+            }
+        }
+    };
+}
+
+recording_transport!(Coalesced);
+recording_transport!(PerRegion);
+recording_transport!(Gathering);
+recording_transport!(OwnedRegions);
 
 impl TransportRead for RecReader {
     async fn read(&mut self, mut buf: BytesMut) -> (io::Result<usize>, BytesMut) {
@@ -319,81 +398,56 @@ impl TransportRead for RecReader {
     }
 }
 
-impl TransportWrite for RecWriter {
-    async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
-        self.record(&buf);
-        let written = buf.len();
-        (Ok(written), buf)
-    }
+/// Emits the `TransportWrite` impl for a [`RecWriter`] over one strategy marker.
+macro_rules! recording_transport_write {
+    ($marker:ty) => {
+        impl TransportWrite for RecWriter<$marker> {
+            type Strategy = $marker;
 
-    fn write_borrowed<'w>(
-        &'w mut self,
-        data: &'w [u8],
-    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
-        // Which override answers decides the drain strategy, and which shape this writer is
-        // was fixed when it was built.
-        if self.shape != Shape::Borrowed {
-            return None;
+            fn write(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
+                self.do_write(buf)
+            }
         }
-        self.record(data);
-        Some(core::future::ready(Ok(data.len())))
-    }
+    };
+}
 
+recording_transport_write!(Coalesced);
+recording_transport_write!(PerRegion);
+recording_transport_write!(Gathering);
+recording_transport_write!(OwnedRegions);
+
+/// Emits the `BorrowedWrite` impl for the readiness strategies that supply it.
+macro_rules! recording_borrowed_write {
+    ($marker:ty) => {
+        impl BorrowedWrite for RecWriter<$marker> {
+            fn write_borrowed<'w>(
+                &'w mut self,
+                data: &'w [u8],
+            ) -> impl Future<Output = io::Result<usize>> + 'w {
+                self.do_write_borrowed(data)
+            }
+        }
+    };
+}
+
+recording_borrowed_write!(PerRegion);
+recording_borrowed_write!(Gathering);
+
+impl VectoredWrite for RecWriter<Gathering> {
     fn write_vectored<'w>(
         &'w mut self,
         regions: &'w [io::IoSlice<'w>],
-    ) -> Option<impl Future<Output = io::Result<usize>> + 'w> {
-        if self.shape != Shape::Vectored {
-            return None;
-        }
-        // Nothing is recorded here, and no octet moves. The driver learns which path a
-        // transport offers by building one of these with no regions at all and dropping it
-        // unpolled — so recording at construction would charge this harness a phantom write
-        // and a phantom pile of octets on every single pass, and the write counts below
-        // would be measuring the election rather than the drain. An `async` block is inert
-        // until polled, which is exactly the property needed.
-        Some(async move {
-            let mut written = 0;
-            for region in regions {
-                written += region.len();
-            }
-            // One call, one write, however many regions it gathered: the whole point of the
-            // strategy is that the gathering is free and the syscall is what costs.
-            let mut meter = self.meter.borrow_mut();
-            meter.writes += 1;
-            meter.bytes += written;
-            drop(meter);
-            let mut outbound = self.outbound.borrow_mut();
-            for region in regions {
-                outbound.buf.extend(region.iter().copied());
-            }
-            drop(outbound);
-            Ok(written)
-        })
+    ) -> impl Future<Output = io::Result<usize>> + 'w {
+        self.do_write_vectored(regions)
     }
+}
 
-    fn gathers_owned_regions(&self) -> bool {
-        // The completion election, fixed at construction like the readiness ones. Only the
-        // owned-region shape advertises it; the default `false` holds for every other shape.
-        self.shape == Shape::OwnedRegions
-    }
-
-    async fn write_regions(&mut self, regions: Vec<Bytes>) -> (io::Result<usize>, Vec<Bytes>) {
-        // One gathering write, one meter tick, however many regions it carried — the same
-        // accounting the vectored path uses, since both spend a single syscall on a list.
-        // The ownership round-trip a completion API needs is visible here: the `Vec` comes in
-        // and goes back out, so the driver can reuse it.
-        let written: usize = regions.iter().map(Bytes::len).sum();
-        let mut meter = self.meter.borrow_mut();
-        meter.writes += 1;
-        meter.bytes += written;
-        drop(meter);
-        let mut outbound = self.outbound.borrow_mut();
-        for region in &regions {
-            outbound.buf.extend(region.iter().copied());
-        }
-        drop(outbound);
-        (Ok(written), regions)
+impl RegionWrite for RecWriter<OwnedRegions> {
+    fn write_regions(
+        &mut self,
+        regions: Vec<Bytes>,
+    ) -> impl Future<Output = (io::Result<usize>, Vec<Bytes>)> {
+        self.do_write_regions(regions)
     }
 }
 
@@ -491,15 +545,15 @@ struct Receive {
 fn run_receive() -> Receive {
     let c2s = wire(1 << 20);
     let s2c = wire(1 << 20);
-    let transport = Recording {
+    let transport = Recording::<PerRegion> {
         inbound: Rc::clone(&s2c),
         outbound: Rc::clone(&c2s),
-        shape: Shape::Borrowed,
         meter: Rc::new(RefCell::new(Meter::default())),
+        _marker: PhantomData,
     };
 
     let (requests, connection) =
-        ngnet_h2::http::handshake::<Recording, Empty>(transport).expect("handshake");
+        ngnet_h2::http::handshake::<Recording<PerRegion>, Empty>(transport).expect("handshake");
 
     let mut peer = peer_session();
     let mut ctx = PeerCtx::default();
@@ -563,19 +617,22 @@ struct Send {
     bytes: Vec<usize>,
 }
 
-fn run_send(shape: Shape) -> Send {
+fn run_send<S>() -> Send
+where
+    Recording<S>: Transport,
+{
     let c2s = wire(1 << 22);
     let s2c = wire(1 << 20);
     let meter = Rc::new(RefCell::new(Meter::default()));
-    let transport = Recording {
+    let transport = Recording::<S> {
         inbound: Rc::clone(&s2c),
         outbound: Rc::clone(&c2s),
-        shape,
         meter: Rc::clone(&meter),
+        _marker: PhantomData,
     };
 
     let (requests, connection) =
-        ngnet_h2::http::handshake::<Recording, Full>(transport).expect("handshake");
+        ngnet_h2::http::handshake::<Recording<S>, Full>(transport).expect("handshake");
 
     let mut peer = peer_session();
     let mut ctx = PeerCtx::default();
@@ -667,7 +724,7 @@ fn the_read_buffer_pool_settles_to_a_fixed_size() {
 
 #[test]
 fn steady_state_send_allocates_nothing_on_the_borrowed_path() {
-    let measured = run_send(Shape::Borrowed);
+    let measured = run_send::<PerRegion>();
 
     assert!(
         measured.allocations.iter().all(|&count| count == 0),
@@ -678,7 +735,7 @@ fn steady_state_send_allocates_nothing_on_the_borrowed_path() {
 
 #[test]
 fn the_owned_write_path_coalesces_a_pass_into_one_write() {
-    let measured = run_send(Shape::Owned);
+    let measured = run_send::<Coalesced>();
 
     assert!(
         measured.writes.iter().all(|&count| count == 1),
@@ -698,8 +755,8 @@ fn the_owned_write_path_coalesces_a_pass_into_one_write() {
 
 #[test]
 fn the_borrowed_write_path_writes_each_block_separately() {
-    let borrowed = run_send(Shape::Borrowed);
-    let owned = run_send(Shape::Owned);
+    let borrowed = run_send::<PerRegion>();
+    let owned = run_send::<Coalesced>();
 
     // Same traffic, driven identically: the two shapes differ only in how they drain it.
     assert_eq!(
@@ -737,8 +794,8 @@ fn the_owned_write_path_reuses_its_coalescing_buffer() {
     // every outgoing octet — that is inherent, because the transport takes ownership — but it
     // must not reallocate to do so. A regression to `freeze()`, or to declaring the buffer
     // inside `flush`, would restore the per-pass allocation and fail here.
-    let owned = run_send(Shape::Owned);
-    let borrowed = run_send(Shape::Borrowed);
+    let owned = run_send::<Coalesced>();
+    let borrowed = run_send::<PerRegion>();
 
     assert!(
         owned.allocations.iter().all(|&count| count == 0),
@@ -774,7 +831,7 @@ fn the_owned_region_write_path_coalesces_a_pass_into_one_write() {
     // uncopied, every block is coalesced into the minting buffer and the whole pass reaches
     // the transport as a single owned region. So it looks exactly like the owned path from
     // the write-count side — one gathering write per pass — which is what this pins.
-    let measured = run_send(Shape::OwnedRegions);
+    let measured = run_send::<OwnedRegions>();
 
     assert!(
         measured.writes.iter().all(|&count| count == 1),
@@ -799,7 +856,7 @@ fn steady_state_send_allocates_nothing_on_the_owned_region_path() {
     // `bytes` reclaims the capacity and the steady state allocates nothing. A regression to
     // `freeze()` in place of `split().freeze()`, or to building the buffers inside `flush`,
     // would restore a per-pass allocation and fail here.
-    let measured = run_send(Shape::OwnedRegions);
+    let measured = run_send::<OwnedRegions>();
 
     assert!(
         measured.allocations.iter().all(|&count| count == 0),
@@ -860,19 +917,22 @@ impl Body for Trickle {
 
 /// Drives several long-lived streams that each trickle, and measures the same two things
 /// per pass as [`run_send`]: what the connection allocated, and what it cost in writes.
-fn run_multiplexed(shape: Shape) -> Send {
+fn run_multiplexed<S>() -> Send
+where
+    Recording<S>: Transport,
+{
     let c2s = wire(1 << 22);
     let s2c = wire(1 << 20);
     let meter = Rc::new(RefCell::new(Meter::default()));
-    let transport = Recording {
+    let transport = Recording::<S> {
         inbound: Rc::clone(&s2c),
         outbound: Rc::clone(&c2s),
-        shape,
         meter: Rc::clone(&meter),
+        _marker: PhantomData,
     };
 
     let (requests, connection) =
-        ngnet_h2::http::handshake::<Recording, Trickle>(transport).expect("handshake");
+        ngnet_h2::http::handshake::<Recording<S>, Trickle>(transport).expect("handshake");
 
     let mut peer = peer_session();
     let mut ctx = PeerCtx::default();
@@ -939,7 +999,7 @@ fn steady_state_send_allocates_nothing_on_the_vectored_path() {
     // buffer that were reallocated each pass would have traded one recurring cost for
     // another. It is not: the driver holds it across passes and clears rather than drops it,
     // so once it has grown to what a pass needs it stops allocating entirely.
-    let measured = run_send(Shape::Vectored);
+    let measured = run_send::<Gathering>();
 
     assert!(
         measured.allocations.iter().all(|&count| count == 0),
@@ -953,7 +1013,7 @@ fn steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path() {
     // The claim that matters, and the one the body workload cannot make: passes whose blocks
     // all land *in* the accumulation buffer, so its reuse from one pass to the next is what
     // is being measured rather than its emptiness.
-    let measured = run_multiplexed(Shape::Vectored);
+    let measured = run_multiplexed::<Gathering>();
 
     assert!(
         measured.allocations.iter().all(|&count| count == 0),
@@ -979,8 +1039,8 @@ fn the_vectored_write_path_coalesces_a_multiplexed_pass_into_one_write() {
     // The syscall property the whole change exists to deliver, measured against the traffic
     // it was measured to matter for. Every block a trickling stream produces is below the
     // threshold, so the pass accumulates all of them and pays for exactly one write.
-    let vectored = run_multiplexed(Shape::Vectored);
-    let borrowed = run_multiplexed(Shape::Borrowed);
+    let vectored = run_multiplexed::<Gathering>();
+    let borrowed = run_multiplexed::<PerRegion>();
 
     assert_eq!(
         vectored.bytes, borrowed.bytes,
@@ -1009,9 +1069,9 @@ fn the_vectored_write_path_writes_once_per_large_block_and_no_more() {
     // So an upload costs one write per DATA frame — the same count the borrowed path pays,
     // and for the same reason, but with the frame's header and any control frames riding
     // along instead of costing writes of their own.
-    let vectored = run_send(Shape::Vectored);
-    let borrowed = run_send(Shape::Borrowed);
-    let owned = run_send(Shape::Owned);
+    let vectored = run_send::<Gathering>();
+    let borrowed = run_send::<PerRegion>();
+    let owned = run_send::<Coalesced>();
 
     assert_eq!(
         vectored.bytes, borrowed.bytes,
@@ -1098,11 +1158,11 @@ fn run_handlers() -> Vec<usize> {
 
     let to_server = wire(1 << 20);
     let from_server = wire(1 << 20);
-    let transport = Recording {
+    let transport = Recording::<PerRegion> {
         inbound: Rc::clone(&to_server),
         outbound: Rc::clone(&from_server),
-        shape: Shape::Borrowed,
         meter: Rc::new(RefCell::new(Meter::default())),
+        _marker: PhantomData,
     };
 
     let wakers: Rc<RefCell<Vec<WakerSlot>>> = Rc::new(RefCell::new(Vec::new()));

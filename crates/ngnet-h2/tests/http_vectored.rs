@@ -38,12 +38,15 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
 use ngnet_h2::http::testing::{
-    Duplex, DuplexReader, Full, bytes_crate as bytes, duplex, duplex_offering_both,
-    duplex_owned_regions, duplex_vectored, http_crate as http,
+    Duplex, DuplexReader, Full, bytes_crate as bytes, duplex, duplex_owned_regions,
+    duplex_vectored, duplex_vectored_non_gathering, http_crate as http,
 };
-use ngnet_h2::http::transport::{Transport, TransportRead, TransportWrite};
+use ngnet_h2::http::transport::{
+    Coalesced, Gathering, OwnedRegions, Transport, TransportRead, TransportWrite,
+};
 
 use bytes::BytesMut;
+use core::marker::PhantomData;
 
 /// The driver's threshold, restated here so the expectations below say what they mean.
 ///
@@ -106,39 +109,46 @@ fn drain(reader: &mut DuplexReader, waker: &Waker) -> Vec<u8> {
     }
 }
 
-/// Which of the transport shapes a run uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Shape {
-    /// Neither fast path: the driver coalesces the pass into one owned write.
-    Owned,
-    /// The vectored path alone.
-    Vectored,
-    /// Both fast paths, so the driver's precedence rule has something to decide.
-    Both,
-    /// The owned-region (completion) path: a gathering write over an owned `Vec<Bytes>`.
-    OwnedRegions,
+/// Which of the transport shapes a run uses, expressed as the writer's strategy marker.
+///
+/// The strategy is no longer dispatched at run time through an enum: a writer carries
+/// exactly one strategy in its type, settled at construction, so a run names the marker and
+/// this trait maps it to the constructor that builds a duplex over it. [`Coalesced`] is the
+/// coalescing (owned-write) path, [`Gathering`] the vectored path, and [`OwnedRegions`] the
+/// completion path.
+trait TestShape: Sized {
+    /// Builds a connected duplex pair over this strategy marker.
+    fn pair() -> (Duplex<Self>, Duplex<Self>);
 }
 
-impl Shape {
-    fn pair(self) -> (Duplex, Duplex) {
-        match self {
-            Self::Owned => duplex(false),
-            Self::Vectored => duplex_vectored(),
-            Self::Both => duplex_offering_both(),
-            Self::OwnedRegions => duplex_owned_regions(),
-        }
+impl TestShape for Coalesced {
+    fn pair() -> (Duplex<Coalesced>, Duplex<Coalesced>) {
+        duplex()
+    }
+}
+
+impl TestShape for Gathering {
+    fn pair() -> (Duplex<Gathering>, Duplex<Gathering>) {
+        duplex_vectored()
+    }
+}
+
+impl TestShape for OwnedRegions {
+    fn pair() -> (Duplex<OwnedRegions>, Duplex<OwnedRegions>) {
+        duplex_owned_regions()
     }
 }
 
 /// How a run is set up, and what it is allowed to do.
-struct Run {
-    shape: Shape,
+///
+/// Generic over the strategy marker `S`: the driver elects the drain path from the writer's
+/// declared strategy at compile time, so a run names that marker on `Run` rather than
+/// choosing a shape at run time.
+struct Run<S> {
     /// Length of the request body, in octets.
     body: usize,
     /// Per-call acceptance caps handed to [`Duplex::accept_at_most`], in order.
     caps: Vec<usize>,
-    /// After this many performed vectored writes the transport stops offering the path.
-    decline_after: Option<usize>,
     /// How many times the connection is polled.
     passes: usize,
     /// Whether the body is handed over (`handshake_shared`) rather than copied
@@ -150,28 +160,23 @@ struct Run {
     /// the flow-control window admits a whole body in one pass and the region list is driven
     /// past `MAX_REGIONS`. Empty for the silent-peer runs that are the norm here.
     prelude: Vec<u8>,
+    _marker: PhantomData<S>,
 }
 
-impl Run {
-    fn new(shape: Shape, body: usize) -> Self {
+impl<S> Run<S> {
+    fn new(body: usize) -> Self {
         Self {
-            shape,
             body,
             caps: Vec::new(),
-            decline_after: None,
             passes: 1,
             shared: false,
             prelude: Vec::new(),
+            _marker: PhantomData,
         }
     }
 
     fn caps(mut self, caps: impl IntoIterator<Item = usize>) -> Self {
         self.caps = caps.into_iter().collect();
-        self
-    }
-
-    fn decline_after(mut self, writes: usize) -> Self {
-        self.decline_after = Some(writes);
         self
     }
 
@@ -202,21 +207,37 @@ struct Observed {
     peer: Vec<u8>,
     /// The connection's verdict, if it reached one within the run's passes.
     outcome: Option<Result<(), ngnet_h2::http::Error>>,
+    /// Times the driver consulted [`VectoredWrite::gathers`] over the run. Nonzero only on
+    /// the gathering path; the once-per-connection guarantee is asserted against it.
+    gathers_consultations: usize,
 }
 
-/// Drives one client request over the shape a run names, polling the connection by hand.
+/// Drives one client request over the strategy a run names, polling the connection by hand.
 ///
 /// The request future is stepped alongside the connection so a completed response is
 /// collected rather than left to strand the stream, but its value is not of interest here:
 /// with a silent peer it never completes, and everything asserted on is on the write side.
-fn observe(run: Run) -> Observed {
-    let (client_side, server_side) = run.shape.pair();
+fn observe<S>(run: Run<S>) -> Observed
+where
+    S: TestShape,
+    Duplex<S>: Transport<Reader = DuplexReader>,
+{
+    observe_over(S::pair(), run)
+}
+
+/// The body of [`observe`] over an already-constructed duplex pair.
+///
+/// Split out so a run over a duplex the [`TestShape`] mapping does not build — the
+/// non-gathering [`Gathering`] duplex from [`duplex_vectored_non_gathering`] — can share the
+/// same driving, capping and recording rather than duplicating it.
+fn observe_over<S>((client_side, server_side): (Duplex<S>, Duplex<S>), run: Run<S>) -> Observed
+where
+    Duplex<S>: Transport<Reader = DuplexReader>,
+{
     let log = client_side.vectored_log();
+    let elections = client_side.election_log();
     if !run.caps.is_empty() {
         client_side.accept_at_most(run.caps.iter().copied());
-    }
-    if let Some(limit) = run.decline_after {
-        client_side.decline_vectored_after(limit);
     }
     // Split rather than dropped: a dropped writing half closes the pipe, and a closed pipe
     // is a peer that hung up, which ends the connection before the pass under test.
@@ -259,6 +280,7 @@ fn observe(run: Run) -> Observed {
         retries: log.retries(),
         peer: drain(&mut peer_reader, &waker),
         outcome,
+        gathers_consultations: elections.gathers_consultations(),
     }
 }
 
@@ -300,7 +322,7 @@ const SMALL_BODY: usize = THRESHOLD - FRAME_HEADER - 1;
 fn a_pass_of_only_small_blocks_costs_one_write() {
     // SC-006. Every block the session produces here is below the threshold, so all of them
     // accumulate and the pass ends with a single gathering call carrying the lot.
-    let observed = observe(Run::new(Shape::Vectored, SMALL_BODY));
+    let observed = observe(Run::<Gathering>::new(SMALL_BODY));
 
     assert_eq!(
         observed.calls.len(),
@@ -325,8 +347,8 @@ fn a_pass_of_only_small_blocks_costs_one_write() {
 fn the_same_pass_over_the_coalescing_transport_produces_the_same_octets() {
     // SC-008 for the all-small case: gathering is a syscall-count optimisation, not a
     // change of what goes on the wire.
-    let vectored = observe(Run::new(Shape::Vectored, SMALL_BODY));
-    let owned = observe(Run::new(Shape::Owned, SMALL_BODY));
+    let vectored = observe(Run::<Gathering>::new(SMALL_BODY));
+    let owned = observe(Run::<Coalesced>::new(SMALL_BODY));
 
     assert_eq!(
         vectored.peer, owned.peer,
@@ -339,9 +361,9 @@ fn a_block_at_the_threshold_takes_the_large_path_and_one_below_it_does_not() {
     // SC-012b. The frame header is nine octets, so a body of `THRESHOLD - 9` is a block of
     // exactly the threshold. Three bodies, one octet apart, pin the comparison as `>=`:
     // were it ever weakened to `>`, the middle case would collapse into the first.
-    let below = observe(Run::new(Shape::Vectored, THRESHOLD - FRAME_HEADER - 1));
-    let at = observe(Run::new(Shape::Vectored, THRESHOLD - FRAME_HEADER));
-    let above = observe(Run::new(Shape::Vectored, THRESHOLD - FRAME_HEADER + 1));
+    let below = observe(Run::<Gathering>::new(THRESHOLD - FRAME_HEADER - 1));
+    let at = observe(Run::<Gathering>::new(THRESHOLD - FRAME_HEADER));
+    let above = observe(Run::<Gathering>::new(THRESHOLD - FRAME_HEADER + 1));
 
     assert_eq!(
         below.calls.len(),
@@ -384,7 +406,7 @@ fn large_blocks_cost_one_write_each_and_no_more() {
     // SC-007, the "exactly L" half. The body fills the initial flow-control window to the
     // octet, so the pass stops with a large block and never reaches the stream's
     // terminator — there is no trailing small block to pay an extra write for.
-    let observed = observe(Run::new(Shape::Vectored, WINDOW_FILLING_BODY));
+    let observed = observe(Run::<Gathering>::new(WINDOW_FILLING_BODY));
 
     let large = observed
         .calls
@@ -424,7 +446,7 @@ fn a_trailing_small_block_costs_one_extra_write_and_only_one() {
     // large-then-small orderings in a single pass: the head accumulates and rides with the
     // first frame, three full frames follow, and the stream's nine-octet terminator is left
     // over at the end.
-    let observed = observe(Run::new(Shape::Vectored, BOUNDARY_BODY));
+    let observed = observe(Run::<Gathering>::new(BOUNDARY_BODY));
 
     let large = BOUNDARY_BODY / MAX_FRAME;
     assert_eq!(
@@ -462,8 +484,8 @@ fn every_ordering_puts_the_same_octets_on_the_wire_as_coalescing_would() {
         BOUNDARY_BODY,
         WINDOW_FILLING_BODY,
     ] {
-        let vectored = observe(Run::new(Shape::Vectored, body));
-        let owned = observe(Run::new(Shape::Owned, body));
+        let vectored = observe(Run::<Gathering>::new(body));
+        let owned = observe(Run::<Coalesced>::new(body));
         assert_eq!(
             vectored.peer, owned.peer,
             "a {body}-octet body reached the peer differently on the two paths",
@@ -505,7 +527,7 @@ fn no_call_is_offered_an_empty_region_or_more_than_its_path_permits() {
         WINDOW_FILLING_BODY,
     ] {
         for caps in [vec![], vec![1], vec![74], vec![3, 17, 1, 20_000]] {
-            let pushed = observe(Run::new(Shape::Vectored, body).caps(caps.clone()).passes(4));
+            let pushed = observe(Run::<Gathering>::new(body).caps(caps.clone()).passes(4));
             for regions in &pushed.calls {
                 assert!(
                     (1..=2).contains(&regions.len()),
@@ -521,7 +543,7 @@ fn no_call_is_offered_an_empty_region_or_more_than_its_path_permits() {
             }
 
             let shared = observe(
-                Run::new(Shape::Vectored, body)
+                Run::<Gathering>::new(body)
                     .caps(caps.clone())
                     .passes(4)
                     .shared(),
@@ -595,7 +617,7 @@ fn a_pass_driven_past_the_region_cap_holds_the_bound_and_stays_correct() {
     prelude.extend(window_update(0x0080_0000));
 
     let vectored = observe(
-        Run::new(Shape::Vectored, REGION_CAP_BODY)
+        Run::<Gathering>::new(REGION_CAP_BODY)
             .shared()
             .prelude(prelude.clone())
             .passes(16),
@@ -604,7 +626,7 @@ fn a_pass_driven_past_the_region_cap_holds_the_bound_and_stays_correct() {
     // the owned path copies every octet, so its flat wire is libnghttp2's own serialisation
     // with no gathering decision of the driver's in it.
     let owned = observe(
-        Run::new(Shape::Owned, REGION_CAP_BODY)
+        Run::<Coalesced>::new(REGION_CAP_BODY)
             .shared()
             .prelude(prelude)
             .passes(16),
@@ -656,7 +678,7 @@ fn a_partial_acceptor_across_a_multi_region_write_drops_and_duplicates_nothing()
     // the transport's acceptance at awkward points — inside a payload, exactly on a region
     // boundary, one octet short of the whole — and the retry-and-resume path must put every
     // octet on the wire once, in order, matching what the coalescing path would have sent.
-    let unlimited = observe(Run::new(Shape::Vectored, BOUNDARY_BODY).shared().passes(8));
+    let unlimited = observe(Run::<Gathering>::new(BOUNDARY_BODY).shared().passes(8));
     assert!(
         unlimited.calls.iter().any(|regions| regions.len() > 2),
         "the workload never produced a multi-region write, so nothing multi-region was tested, \
@@ -668,7 +690,7 @@ fn a_partial_acceptor_across_a_multi_region_write_drops_and_duplicates_nothing()
 
     // The oracle: the same handed-over body over the coalescing transport, which copies the
     // lot into one owned write. Its octets are what a partial acceptor must reproduce.
-    let coalesced = observe(Run::new(Shape::Owned, BOUNDARY_BODY).shared().passes(8));
+    let coalesced = observe(Run::<Coalesced>::new(BOUNDARY_BODY).shared().passes(8));
 
     for caps in [
         vec![1],
@@ -679,7 +701,7 @@ fn a_partial_acceptor_across_a_multi_region_write_drops_and_duplicates_nothing()
         vec![head, 1, MAX_FRAME, 5],
     ] {
         let observed = observe(
-            Run::new(Shape::Vectored, BOUNDARY_BODY)
+            Run::<Gathering>::new(BOUNDARY_BODY)
                 .shared()
                 .caps(caps.clone())
                 .passes(8),
@@ -709,7 +731,7 @@ fn an_owned_region_pass_driven_past_the_region_cap_holds_the_bound_and_stays_cor
     prelude.extend(window_update(0x0080_0000));
 
     let owned_regions = observe(
-        Run::new(Shape::OwnedRegions, REGION_CAP_BODY)
+        Run::<OwnedRegions>::new(REGION_CAP_BODY)
             .shared()
             .prelude(prelude.clone())
             .passes(16),
@@ -717,7 +739,7 @@ fn an_owned_region_pass_driven_past_the_region_cap_holds_the_bound_and_stays_cor
     // The coalescing path as the independent oracle: it copies every octet, so its flat wire
     // is libnghttp2's own serialisation with no gathering decision of the driver's in it.
     let owned = observe(
-        Run::new(Shape::Owned, REGION_CAP_BODY)
+        Run::<Coalesced>::new(REGION_CAP_BODY)
             .shared()
             .prelude(prelude)
             .passes(16),
@@ -768,11 +790,7 @@ fn an_owned_region_partial_acceptor_drops_and_duplicates_nothing() {
     // fully written regions from the front and `Bytes::advance`s the first partial one (both
     // free, since `Bytes` is a view), and must put every octet on the wire once, in order,
     // matching what the coalescing path would have sent.
-    let unlimited = observe(
-        Run::new(Shape::OwnedRegions, BOUNDARY_BODY)
-            .shared()
-            .passes(8),
-    );
+    let unlimited = observe(Run::<OwnedRegions>::new(BOUNDARY_BODY).shared().passes(8));
     assert!(
         unlimited.calls.iter().any(|regions| regions.len() > 2),
         "the workload never produced a multi-region write, so nothing multi-region was tested, \
@@ -795,7 +813,7 @@ fn an_owned_region_partial_acceptor_drops_and_duplicates_nothing() {
 
     // The oracle: the same handed-over body over the coalescing transport, which copies the
     // lot into one owned write. Its octets are what a partial acceptor must reproduce.
-    let coalesced = observe(Run::new(Shape::Owned, BOUNDARY_BODY).shared().passes(8));
+    let coalesced = observe(Run::<Coalesced>::new(BOUNDARY_BODY).shared().passes(8));
 
     for caps in [
         vec![1],
@@ -806,7 +824,7 @@ fn an_owned_region_partial_acceptor_drops_and_duplicates_nothing() {
         vec![head, 1, MAX_FRAME, 5],
     ] {
         let observed = observe(
-            Run::new(Shape::OwnedRegions, BOUNDARY_BODY)
+            Run::<OwnedRegions>::new(BOUNDARY_BODY)
                 .shared()
                 .caps(caps.clone())
                 .passes(8),
@@ -829,7 +847,7 @@ fn an_owned_region_transport_accepting_nothing_fails_the_connection_rather_than_
     // will never make progress; the owned-region path must turn it into a `Transport` error
     // exactly as the vectored and borrowed paths do, rather than spin re-offering the list.
     let observed = observe(
-        Run::new(Shape::OwnedRegions, MAX_FRAME)
+        Run::<OwnedRegions>::new(MAX_FRAME)
             .shared()
             .caps([0])
             .passes(2),
@@ -848,7 +866,7 @@ fn a_short_write_landing_on_the_region_boundary_retries_with_one_region() {
     // region alone to re-offer; offering it beside a now-empty first would hand the
     // transport a zero-length `IoSlice` — legal to write, but a region counted for nothing,
     // and a shape the trait's contract promises never to produce.
-    let unlimited = observe(Run::new(Shape::Vectored, MAX_FRAME));
+    let unlimited = observe(Run::<Gathering>::new(MAX_FRAME));
     let head = unlimited.calls[0][0];
     assert!(
         head > 0 && unlimited.calls[0].len() == 2,
@@ -856,7 +874,7 @@ fn a_short_write_landing_on_the_region_boundary_retries_with_one_region() {
         unlimited.calls,
     );
 
-    let observed = observe(Run::new(Shape::Vectored, MAX_FRAME).caps([head]).passes(4));
+    let observed = observe(Run::<Gathering>::new(MAX_FRAME).caps([head]).passes(4));
 
     assert_eq!(
         observed.calls[0],
@@ -883,7 +901,7 @@ fn an_arbitrary_prefix_acceptor_still_delivers_every_octet_in_order() {
     // SC-009. A real socket accepts what it feels like; the caps make the interesting cuts
     // reachable on purpose — one octet, a cut inside the first region, a cut exactly on the
     // boundary, and all but one octet of the whole offer.
-    let unlimited = observe(Run::new(Shape::Vectored, BOUNDARY_BODY));
+    let unlimited = observe(Run::<Gathering>::new(BOUNDARY_BODY));
     let head = unlimited.calls[0][0];
     let first_call: usize = unlimited.calls[0].iter().sum();
 
@@ -896,7 +914,7 @@ fn an_arbitrary_prefix_acceptor_still_delivers_every_octet_in_order() {
         vec![head, 1, MAX_FRAME, 3],
     ] {
         let observed = observe(
-            Run::new(Shape::Vectored, BOUNDARY_BODY)
+            Run::<Gathering>::new(BOUNDARY_BODY)
                 .caps(caps.clone())
                 .passes(8),
         );
@@ -917,7 +935,7 @@ fn a_transport_accepting_nothing_fails_the_connection_rather_than_spinning() {
     // SC-013. A successful write of zero octets is a transport that will never make
     // progress; treating it as anything but an error is an infinite loop, and the two
     // pre-existing drain paths already guard it the same way.
-    let observed = observe(Run::new(Shape::Vectored, MAX_FRAME).caps([0]).passes(2));
+    let observed = observe(Run::<Gathering>::new(MAX_FRAME).caps([0]).passes(2));
 
     let outcome = observed
         .outcome
@@ -927,113 +945,88 @@ fn a_transport_accepting_nothing_fails_the_connection_rather_than_spinning() {
 }
 
 #[test]
-fn a_transport_offering_both_paths_takes_the_gathering_one() {
-    // SC-012. With either override alone there is nothing to arbitrate; the precedence rule
-    // is only observable against a transport that genuinely offers both. Were the borrowed
-    // path to win, the vectored record would be empty.
-    let both = observe(Run::new(Shape::Both, BOUNDARY_BODY));
-    let vectored = observe(Run::new(Shape::Vectored, BOUNDARY_BODY));
+fn a_non_gathering_stream_falls_back_to_the_borrowed_path_and_delivers_identical_octets() {
+    // The tokio non-gathering fallback, pinned. A `Gathering` writer whose
+    // `VectoredWrite::gathers` reports `false` — a stream that only emulates a gathering
+    // write by writing the first region — must not lose the rest: the driver reads that
+    // capability once, sees it is false, and writes each region on its own borrowed path
+    // instead. The octets on the wire must be exactly what the true gathering path and the
+    // coalescing path put there; only the number of writes differs.
+    let gathering = observe(Run::<Gathering>::new(BOUNDARY_BODY).shared().passes(8));
+    let coalesced = observe(Run::<Coalesced>::new(BOUNDARY_BODY).shared().passes(8));
 
-    assert!(
-        !both.calls.is_empty(),
-        "offering both paths took neither gathering call: the borrowed path won",
+    let non_gathering = observe_over(
+        duplex_vectored_non_gathering(),
+        Run::<Gathering>::new(BOUNDARY_BODY).shared().passes(8),
+    );
+
+    assert_eq!(
+        non_gathering.peer, coalesced.peer,
+        "the non-gathering fallback put different octets on the wire than coalescing would",
     );
     assert_eq!(
-        both.calls, vectored.calls,
-        "offering both must drain exactly as offering gathering alone does",
+        non_gathering.peer, gathering.peer,
+        "the non-gathering fallback and the true gathering path disagreed on the octets",
     );
-    assert_eq!(both.peer, vectored.peer);
-}
-
-#[test]
-fn a_transport_that_declines_part_way_through_still_delivers_every_octet() {
-    // SC-012a. The election is meant to be a fixed property of the transport, but nothing
-    // in the signature enforces it. Failing the connection over a transport that reneges
-    // would be a worse answer than paying the copy, so the driver falls back to coalescing:
-    // the remainder joins the owned buffer, in order, and the pass finishes.
-    let unlimited = observe(Run::new(Shape::Vectored, BOUNDARY_BODY));
-
-    for after in [1usize, 2, 3] {
-        let observed = observe(
-            Run::new(Shape::Vectored, BOUNDARY_BODY)
-                .decline_after(after)
-                .passes(4),
-        );
-        assert_eq!(
-            observed.calls.len(),
-            after,
-            "the transport stopped offering the path after {after} writes, so no more \
-             happened, saw {:?}",
-            observed.calls,
-        );
-        assert_eq!(
-            observed.peer, unlimited.peer,
-            "declining after {after} writes lost or reordered octets",
-        );
-    }
-}
-
-#[test]
-fn declining_on_the_retry_after_a_short_write_recovers_both_regions() {
-    // The other end of SC-012a, and the branch a decline alone cannot reach: the transport
-    // reneges *while* the driver's accumulation buffer still holds unwritten octets and the
-    // block in hand is untouched. The fallback has to recover the remainder of the buffer
-    // and then the whole block, in that order — an off-by-one in either would drop or
-    // duplicate octets, and only this ordering can tell.
-    let unlimited = observe(Run::new(Shape::Vectored, BOUNDARY_BODY));
-    let head = unlimited.calls[0][0];
     assert!(
-        head > 1,
-        "this test needs an accumulation the short write can land inside, saw {head}",
+        !non_gathering.peer.is_empty(),
+        "the body never left, so the comparison proved nothing",
     );
-
-    // The cut is taken inside the accumulation, exactly on the boundary between the two
-    // regions, and inside the block, so both arms of the fallback's arithmetic are driven.
-    for accepted in [1usize, head / 2, head - 1, head, head + 100] {
-        let observed = observe(
-            Run::new(Shape::Vectored, BOUNDARY_BODY)
-                .caps([accepted])
-                .decline_after(1)
-                .passes(4),
-        );
-        assert_eq!(
-            observed.calls,
-            vec![vec![head, MAX_FRAME + FRAME_HEADER]],
-            "accepting {accepted} then declining should leave exactly one performed call",
-        );
-        assert_eq!(
-            observed.peer, unlimited.peer,
-            "declining on the retry after accepting {accepted} octets lost or reordered the \
-             rest",
-        );
-    }
+    // The fallback writes each region on its own borrowed path, so every recorded call is a
+    // single region — never a gathered one. This is the structural evidence the driver took
+    // the per-region path rather than the vectored one.
+    assert!(
+        !non_gathering.calls.is_empty(),
+        "the fallback wrote nothing, so the per-region path was never exercised",
+    );
+    assert!(
+        non_gathering.calls.iter().all(|regions| regions.len() == 1),
+        "the non-gathering fallback issued a multi-region write, so it did not fall back to \
+         the borrowed path, saw {:?}",
+        non_gathering.calls,
+    );
 }
 
 #[test]
-fn declining_before_a_single_gathering_write_leaves_the_pass_to_the_owned_path() {
-    // The degenerate end of SC-012a: the transport offers the path to the election probe
-    // and then refuses the very first real call, with the driver's accumulation buffer
-    // already holding the head of the pass. That makes it the `done == 0` case of the
-    // fallback — nothing of the offer was accepted, so the whole accumulation *and* the
-    // whole block have to be recovered into the coalescing buffer, in that order.
-    //
-    // The fixture can express this only because it recognises the probe by its empty region
-    // list; counting it as a write would decline the election itself and quietly turn this
-    // into a second test of the plain owned path.
-    let unlimited = observe(Run::new(Shape::Vectored, BOUNDARY_BODY));
-    let observed = observe(
-        Run::new(Shape::Vectored, BOUNDARY_BODY)
-            .decline_after(0)
-            .passes(4),
-    );
-
+fn the_gathering_capability_is_consulted_exactly_once_per_connection() {
+    // One of the two headline guarantees of the refactor: whether a stream really
+    // scatter-gathers is read `once per connection`, immediately after the transport is
+    // split, and held for the connection's life — never re-asked per pass or per write. The
+    // body fills the initial window, so it goes out as one large `DATA` frame per gathering
+    // write — several writes over the pass — and the connection is polled several times; a
+    // driver that re-consulted the capability per pass or per write would run the count far
+    // past one, so a count of exactly one is the structural proof it was settled once.
+    let gathering = observe(Run::<Gathering>::new(WINDOW_FILLING_BODY).passes(8));
     assert!(
-        observed.calls.is_empty(),
-        "no gathering call should have been performed, saw {:?}",
-        observed.calls,
+        gathering.calls.len() >= 4,
+        "the run drove fewer than four gathering writes, so once-per-connection is not \
+         meaningfully distinguished from once-per-write, saw {:?}",
+        gathering.calls,
     );
     assert_eq!(
-        observed.peer, unlimited.peer,
-        "falling back before the first write lost or reordered octets",
+        gathering.gathers_consultations,
+        1,
+        "the driver consulted the gathering capability {} times across {} writes; it must \
+         read it exactly once per connection and hold the answer",
+        gathering.gathers_consultations,
+        gathering.calls.len(),
+    );
+
+    // The same holds when the answer is `false`: the fallback is chosen once, not re-elected
+    // per region it writes.
+    let non_gathering = observe_over(
+        duplex_vectored_non_gathering(),
+        Run::<Gathering>::new(WINDOW_FILLING_BODY).passes(8),
+    );
+    assert!(
+        non_gathering.calls.len() >= 4,
+        "the non-gathering run drove fewer than four writes, saw {:?}",
+        non_gathering.calls,
+    );
+    assert_eq!(
+        non_gathering.gathers_consultations, 1,
+        "the driver consulted the gathering capability {} times on the non-gathering \
+         transport; it must read it exactly once per connection",
+        non_gathering.gathers_consultations,
     );
 }

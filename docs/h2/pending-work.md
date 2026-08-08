@@ -128,9 +128,9 @@ test, and no more.
   the new plumbing seam. (6) The API did change, additively — the opt-in is a parallel set of
   entry points, and the no-copy source trait stayed crate-private.
 
-  **The completion transport now gathers.** `CompioIo` overrides an owned-region strategy whose
-  regions are owned `Bytes`, which satisfies compio's `IoVectoredBuf: 'static` bound and reaches
-  a real `IORING_OP_SENDMSG`. The structural reason it could not gather — that borrowed
+  **The completion transport now gathers.** `CompioIo` declares the owned-region strategy,
+  whose regions are owned `Bytes`, which satisfies compio's `IoVectoredBuf: 'static` bound and
+  reaches a real `IORING_OP_SENDMSG`. The structural reason it could not gather — that borrowed
   `IoSlice`s can never be `'static` — was correctly diagnosed here, and handing bodies over is
   what removed it.
 
@@ -223,8 +223,10 @@ These are not gaps. They are decisions, recorded so they are not mistaken for ov
   may want them tighter.
 
 - **Which write strategy a transport should elect.** Settled for the two that ship: the tokio
-  adapter gathers, and the completion adapter coalesces because a completion API needs the
-  kernel to own the buffer. Gathering was measured to dominate rather than trade — zero
+  adapter declares `Gathering`, and the completion adapter declares `OwnedRegions` because a
+  completion API needs the kernel to own the buffer. Since the strategy split this is no longer
+  even a choice a shipped adapter re-litigates per call — it is one line of type declaration,
+  checked by the compiler. Gathering was measured to dominate rather than trade — zero
   steady-state allocation *and* one write per pass — so there is no longer a knob-shaped
   question here for a readiness transport. What remains open is narrower: `VECTORED_THRESHOLD`
   is 256 bytes, untuned, and deliberately so. Dumping real block sizes shows the distribution
@@ -233,6 +235,31 @@ These are not gaps. They are decisions, recorded so they are not mistaken for ov
   threshold between roughly 128 and 16384 partitions real traffic identically. `h2` picks the
   same 256 for the same reason. A peer advertising a small `MAX_FRAME_SIZE`, or a workload of
   many medium-sized frames, would be the reason to revisit it.
+
+- **`CompioWriter` leaves `commit` at its no-op default, but accepts buffering writers.**
+  The bound is `W: AsyncWrite`, and compio's `BufWriter` satisfies it — as does any
+  `(R, W)` pair through `Splittable` — so a caller can construct a `CompioIo` whose writes
+  sit in a user-space buffer while the driver parks awaiting a response that never comes.
+  The module doc's claim that "a completion write is committed when it completes" is true of
+  a raw socket and false of a buffered wrapper. The tokio adapter already flushes in `commit`
+  for exactly this reason. Pre-existing — it predates the strategy split and is unchanged by
+  it — and deliberately not fixed there, because adding a flush per pass to the completion
+  path is a behaviour change that would perturb the owned-region measurements that refactor
+  had to hold constant. Fix wants its own change and its own before/after numbers, plus a
+  bounded-budget regression test of the kind `http_flush.rs` already uses for tokio.
+
+- **Whether `ngnet-h3` and `ngnet-quic` should adopt the strategy split.** Transport traits
+  exist only in `ngnet-h2`; neither of the other crates has an equivalent, so the split was
+  deliberately scoped to h2. If either grows an I/O abstraction, the shape is worth copying
+  rather than reinventing: an associated `type Strategy` naming one of a sealed set, with the
+  operations on separate traits bounded by the strategy's I/O model, so a backend implements
+  exactly one model and the compiler enforces it. The two things that were not obvious and
+  would have to be rediscovered otherwise are that the `ReadinessStrategy`/`CompletionStrategy`
+  marker traits are load-bearing — without them one type can implement both models and it
+  compiles — and that resolving a capability once per connection needs an explicit `prepare`
+  step, because a driver generic over the base trait has no capability method in scope and
+  will otherwise re-read it per pass. Not worth doing speculatively; recorded so it is not
+  re-derived.
 
 ## Testing gaps worth closing eventually
 

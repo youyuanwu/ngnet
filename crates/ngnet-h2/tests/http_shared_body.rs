@@ -33,10 +33,10 @@ use core::future::Future;
 
 use ngnet_h2::http::testing::{
     Duplex, DuplexReader, DuplexWriter, Empty, Failing, Full, Scripted, VectoredLog, alongside,
-    block_on, bytes_crate as bytes, duplex, duplex_owned_regions, duplex_vectored, failing,
-    failing_borrowed, failing_vectored, http_crate as http, scripted, serve,
+    block_on, bytes_crate as bytes, duplex, duplex_borrowed, duplex_owned_regions, duplex_vectored,
+    failing, failing_borrowed, failing_vectored, http_crate as http, scripted, serve,
 };
-use ngnet_h2::http::transport::{Transport, TransportWrite};
+use ngnet_h2::http::transport::{Coalesced, Transport, TransportWrite};
 use ngnet_h2::http::{
     Error as HttpError, IncomingBody, ResponseFuture, SendRequest, handshake, handshake_shared,
 };
@@ -345,7 +345,7 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake_shared::<_, B>(client_side).expect("handshake");
     let response = requests.send_request(upload(path, body));
@@ -421,7 +421,7 @@ fn a_body_delivered_in_ragged_chunks_reassembles_exactly() {
     }
     script.finish();
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake_shared::<_, Scripted>(client_side).expect("handshake");
     let response = requests.send_request(upload("/ragged", body));
@@ -452,7 +452,7 @@ fn the_copying_fallback_transport_still_delivers_every_octet() {
     // A transport that lends neither fast path takes ownership of what it is handed, so the
     // driver coalesces the whole pass — records included — into one owned write, paying one
     // copy. That copy is expected here and is not what this test is about: it pins that the
-    // owned path is *correct* for a handed-over body, not that it is cheap. `duplex(false)`
+    // owned path is *correct* for a handed-over body, not that it is cheap. `duplex()`
     // is exactly that transport, and `upload_shared` runs over it, so a large multi-frame
     // body arriving intact is the whole assertion.
     let expected = payload(300 * 1024);
@@ -533,7 +533,14 @@ impl Body for TrackingBody {
 /// what the peer received. The transport shape `client_side` was built with — vectored,
 /// borrowed or owned — is what decides which write strategy the driver takes, so the same
 /// helper drives all three.
-fn upload_tracked(client_side: Duplex, server_side: Duplex, body: TrackingBody) -> ServerPeer {
+fn upload_tracked<S>(
+    client_side: Duplex<S>,
+    server_side: Duplex<S>,
+    body: TrackingBody,
+) -> ServerPeer
+where
+    Duplex<S>: Transport,
+{
     let (requests, connection) =
         ngnet_h2::http::handshake_shared::<_, TrackingBody>(client_side).expect("handshake");
     let response = requests.send_request(upload("/coverage", body));
@@ -665,7 +672,7 @@ fn the_readiness_paths_hand_over_the_whole_payload_from_caller_memory() {
 
     // Borrowed: each payload is its own single-region uncopied write, logged the same way.
     {
-        let (client_side, server_side) = duplex(true);
+        let (client_side, server_side) = duplex_borrowed();
         let log = client_side.vectored_log();
         let (body, ranges, expected) = make_body();
         let peer = upload_tracked(client_side, server_side, body);
@@ -713,7 +720,7 @@ fn the_readiness_paths_hand_over_the_whole_payload_from_caller_memory() {
     // owned buffer by construction, so pointer coverage does not apply — the point of the
     // contrast is that correctness holds on all three while only the first two are copy-free.
     {
-        let (client_side, server_side) = duplex(false);
+        let (client_side, server_side) = duplex();
         let (body, _ranges, expected) = make_body();
         let peer = upload_tracked(client_side, server_side, body);
         assert_eq!(
@@ -743,12 +750,12 @@ fn the_readiness_paths_hand_over_the_whole_payload_from_caller_memory() {
 /// `GatheringBuffer` local: it exists to make one point in one file, and the crate's public
 /// testing surface is pinned by `compat_surface.rs`, not a place to add things casually.
 struct Recording {
-    inner: Duplex,
+    inner: Duplex<Coalesced>,
     passes: Rc<RefCell<Vec<Vec<u8>>>>,
 }
 
 struct RecordingWriter {
-    inner: DuplexWriter,
+    inner: DuplexWriter<Coalesced>,
     passes: Rc<RefCell<Vec<Vec<u8>>>>,
 }
 
@@ -758,7 +765,7 @@ impl Recording {
     /// The handle is shared rather than reachable through the transport because
     /// [`Transport::split`] consumes the transport and moves the writer out of reach, and
     /// the recorded passes are exactly what the test must read afterwards.
-    fn over(inner: Duplex) -> (Self, Rc<RefCell<Vec<Vec<u8>>>>) {
+    fn over(inner: Duplex<Coalesced>) -> (Self, Rc<RefCell<Vec<Vec<u8>>>>) {
         let passes = Rc::new(RefCell::new(Vec::new()));
         (
             Self {
@@ -787,6 +794,8 @@ impl Transport for Recording {
 }
 
 impl TransportWrite for RecordingWriter {
+    type Strategy = Coalesced;
+
     fn write(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
         // Recorded before the write is forwarded, so the group order is the pass order.
         // Overriding neither `write_borrowed` nor `write_vectored` keeps the driver on the
@@ -907,7 +916,7 @@ fn push_oracle_octets() -> Vec<u8> {
 /// Runs the *same* exchange over the no-copy path, returning the flat wire and the per-pass
 /// octet groups the [`Recording`] transport captured.
 fn shared_ordering_capture() -> (Vec<u8>, Vec<Vec<u8>>) {
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (transport, passes) = Recording::over(client_side);
     let (requests, connection) =
         ngnet_h2::http::handshake_shared::<_, Full>(transport).expect("handshake");
@@ -1088,12 +1097,14 @@ fn request_with_large_head<B>(body: B) -> http::Request<B> {
 /// `WINDOW_UPDATE`s of its own. Generic over the connection future so the copying and
 /// handed-over entry points share it; `requests` is moved in and dropped last so the request
 /// half stays open until the exchange is done.
-fn drive_mixed(
+fn drive_mixed<S>(
     requests: SendRequest<Full>,
     connection: impl Future<Output = Result<(), HttpError>>,
     response: ResponseFuture,
-    server_side: Duplex,
-) {
+    server_side: Duplex<S>,
+) where
+    Duplex<S>: Transport,
+{
     let exchange = async move {
         let head = response.await.expect("a response");
         let mut body = head.into_body();
@@ -1208,7 +1219,7 @@ fn a_deferred_handed_over_body_resumes_and_arrives() {
     // body parks and then, once woken with content, hands it over correctly.
     let (body, script) = scripted();
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake_shared::<_, Scripted>(client_side).expect("handshake");
     let response = requests.send_request(upload("/deferred", body));
@@ -1261,7 +1272,7 @@ fn trailers_follow_the_final_handed_over_data() {
     trailers.insert("x-checksum", http::HeaderValue::from_static("42"));
     script.finish_with_trailers(trailers);
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake_shared::<_, Scripted>(client_side).expect("handshake");
     let response = requests.send_request(upload("/trailed", body));
@@ -1306,7 +1317,7 @@ fn a_failing_source_resets_the_stream_and_surfaces_its_error() {
     script.send(payload(200));
     script.fail("the disk went away");
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake_shared::<_, Scripted>(client_side).expect("handshake");
     let response = requests.send_request(upload("/failing", body));
@@ -1347,7 +1358,7 @@ fn a_stream_reset_while_handing_over_a_body_is_observed() {
     let (body, script) = scripted();
     script.send(payload(400 * 1024));
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake_shared::<_, Scripted>(client_side).expect("handshake");
     let response = requests.send_request(upload("/reset", body));
@@ -1427,7 +1438,7 @@ fn a_handed_over_payload_is_released_once_written() {
         "the witness should see the payload held before the exchange begins",
     );
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake_shared::<_, Full>(client_side).expect("handshake");
     let response = requests.send_request(upload("/released", Full::new(bytes)));
@@ -1483,7 +1494,7 @@ fn a_payload_is_released_when_its_stream_is_reset_before_it_is_sent() {
     script.send(bytes);
     script.finish();
 
-    let (client_side, server_side) = duplex(false);
+    let (client_side, server_side) = duplex();
     let (requests, connection) =
         ngnet_h2::http::handshake_shared::<_, Scripted>(client_side).expect("handshake");
     let response = requests.send_request(upload("/reset-release", body));
@@ -1622,13 +1633,16 @@ fn a_transport_failure_while_writing_a_payload_closes_the_connection() {
 /// the capture dance — the connection surfaces the broken transport, the request only learns
 /// its connection went away, so the connection's verdict is taken from a background future
 /// while the request future is the main one — lives here once.
-fn broken_fast_path_exchange(
-    client_side: Failing,
+fn broken_fast_path_exchange<S>(
+    client_side: Failing<S>,
     bytes: Bytes,
 ) -> (
     Result<(), HttpError>,
     Result<http::Response<IncomingBody>, HttpError>,
-) {
+)
+where
+    Failing<S>: Transport,
+{
     let (requests, connection) =
         ngnet_h2::http::handshake_shared::<_, Full>(client_side).expect("handshake");
     let response = requests.send_request(upload("/broken-fast-path", Full::new(bytes)));
@@ -1767,13 +1781,14 @@ fn a_borrowed_transport_failure_while_writing_a_payload_closes_the_connection_an
 // ---------------------------------------------------------------------------
 
 /// Drives a bodyless client exchange to completion, returning the octets the peer received.
-fn drive_nobody<Conn>(
+fn drive_nobody<Conn, S>(
     requests: ngnet_h2::http::SendRequest<Empty>,
     connection: Conn,
-    server_side: Duplex,
+    server_side: Duplex<S>,
 ) -> Vec<u8>
 where
     Conn: core::future::Future<Output = Result<(), ngnet_h2::http::Error>>,
+    Duplex<S>: Transport,
 {
     let response = requests.send_request(
         http::Request::builder()
@@ -1898,7 +1913,7 @@ fn a_no_copy_server_hands_its_response_body_back_intact() {
         let expected = payload(len);
         let answer = expected.clone();
 
-        let (server_side, client_side) = duplex(false);
+        let (server_side, client_side) = duplex();
         let body = answer.clone();
         let connection = ngnet_h2::http::serve_shared(server_side, move |_request| {
             let body = body.clone();

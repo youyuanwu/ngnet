@@ -47,7 +47,7 @@ use bytes::Bytes;
 use compio::net::{TcpListener, TcpStream};
 use core::future::Future;
 use http_body::{Body, Frame};
-use ngnet_h2::http::transport::{CompioIo, Transport, TransportWrite};
+use ngnet_h2::http::transport::{CompioIo, CompioWriter, OwnedRegions, TransportWrite};
 use ngnet_h2::http::{IncomingBody, server};
 
 /// A body already held in memory.
@@ -182,19 +182,18 @@ fn an_exchange_completes_over_the_shipped_compio_transport() {
 ///
 /// The echo alone is *not* evidence that the gathering path ran. An earlier version of this
 /// test asserted only the echo while its documentation claimed the path taken was the
-/// gathering one, and that claim was false: flipping
-/// [`TransportWrite::gathers_owned_regions`] to `false` on the shipped transport sends every
-/// octet down the coalescing fallback and the echo is still correct — verified by mutation,
-/// which passed this test *and the entire workspace suite* unchanged.
+/// gathering one, and that claim was false: flipping the shipped transport's election to
+/// `false` sent every octet down the coalescing fallback and the echo was still correct —
+/// verified by mutation, which passed this test *and the entire workspace suite* unchanged.
 ///
 /// The path is pinned in two independent halves, neither sufficient alone:
 ///
-/// 1. **The shipped transport advertises the path** —
-///    `the_shipped_compio_transport_elects_the_owned_region_path` below.
-/// 2. **The driver honours the advertisement** — pinned in memory by
-///    `http_transport.rs::a_transport_can_elect_the_owned_region_path` (the transport-side
-///    contract) and `the_owned_region_election_is_read_once_a_pass_not_once_a_write` (the
-///    driver actually electing it), the latter mutation-verified.
+/// 1. **The shipped transport declares the strategy** —
+///    `the_shipped_compio_transport_elects_the_owned_region_path` below, now a compile-time
+///    assertion on the writer's associated `Strategy` type.
+/// 2. **The driver honours the declaration** — pinned by
+///    `http_transport.rs::a_transport_can_elect_the_owned_region_path`, which counts the
+///    region writes the driver actually performs.
 ///
 /// Together those give what the echo cannot: this exchange really did leave through
 /// `write_regions`. The echo remains worth asserting for a different reason — it is what
@@ -257,37 +256,32 @@ fn a_shared_body_exchange_gathers_over_the_shipped_compio_transport() {
 /// `a_shared_body_exchange_gathers_over_the_shipped_compio_transport`, and it exists because
 /// that test cannot supply it: an exchange over the coalescing fallback echoes just as
 /// correctly as one over the gathering write, so no end-to-end assertion on a real socket can
-/// tell the two apart. Before this test existed, flipping
-/// [`TransportWrite::gathers_owned_regions`] to `false` in `transport/compio.rs` left the
-/// whole workspace suite green — the entire completion fast path could have regressed to
-/// copying every octet without a single failure.
+/// tell the two apart. Before this test existed, flipping the shipped transport's election to
+/// `false` in `transport/compio.rs` left the whole workspace suite green — the entire
+/// completion fast path could have regressed to copying every octet without a single failure.
 ///
-/// The election is a plain predicate rather than a fallible call precisely so it can be
-/// asserted like this, which is design decision D5: an `Option`-returning `write_regions`
-/// that declined *after* being handed the owned `Vec<Bytes>` would consume and lose the
-/// regions, so the choice is split from the write. That split is what makes the property
-/// observable here without a socket write.
+/// The election is now the writer's declared
+/// [`Strategy`](ngnet_h2::http::transport::TransportWrite::Strategy), so this assertion is
+/// made **at compile time** rather than by calling a predicate. That is strictly stronger
+/// than what stood here before: the old flag could be read `true` by this test while some
+/// other part of the contract went unimplemented, whereas declaring
+/// [`OwnedRegions`](ngnet_h2::http::transport::OwnedRegions) is inseparable from supplying
+/// [`RegionWrite`](ngnet_h2::http::transport::RegionWrite) — the compiler will not accept one
+/// without the other.
+///
+/// Mutation-verified: changing `CompioWriter`'s `type Strategy` to `Coalesced` fails this
+/// file to compile, with `expected `OwnedRegions`, found `Coalesced``.
 #[test]
 fn the_shipped_compio_transport_elects_the_owned_region_path() {
-    let runtime = compio::runtime::Runtime::new().expect("compio needs io_uring to start");
+    /// Compiles only if `W` declares exactly `OwnedRegions`. A different strategy is a type
+    /// error, not a failed assertion, so this cannot go vacuously green.
+    fn elects_owned_regions<W>()
+    where
+        W: TransportWrite<Strategy = OwnedRegions>,
+    {
+    }
 
-    runtime.block_on(async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binding");
-        let addr = listener.local_addr().expect("an address");
-        let accepting = compio::runtime::spawn(async move { listener.accept().await });
-
-        let stream = TcpStream::connect(addr).await.expect("connecting");
-        let (_reader, writer) = CompioIo::new(stream).split();
-
-        assert!(
-            writer.gathers_owned_regions(),
-            "the shipped compio transport must elect the owned-region path; without it every \
-             handed-over body is coalesced into a fresh buffer and the copy this work exists \
-             to remove comes straight back, silently and with every test still passing",
-        );
-
-        accepting.detach();
-    });
+    elects_owned_regions::<CompioWriter<compio::net::TcpStream>>();
 }
 
 ///

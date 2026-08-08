@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use http_body::{Body, Frame};
-use ngnet_h2::http::transport::{Transport, TransportRead, TransportWrite};
+use ngnet_h2::http::transport::{Coalesced, Transport, TransportRead, TransportWrite};
 use ngnet_h2::http::{IncomingBody, server, transport::TokioIo};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -318,6 +318,11 @@ impl TransportRead for CompletionReader {
 }
 
 impl TransportWrite for CompletionWriter {
+    // Only `write`, so the simplest strategy: the driver coalesces each pass into one owned
+    // write. Naming it is the whole election — there is nothing else to declare and nothing
+    // for the driver to ask.
+    type Strategy = Coalesced;
+
     async fn write(&mut self, buf: Bytes) -> (std::io::Result<usize>, Bytes) {
         let result = tokio::io::AsyncWriteExt::write(&mut self.half, &buf).await;
         (result, buf)
@@ -413,6 +418,8 @@ impl TransportRead for ThreadBoundReader {
 }
 
 impl TransportWrite for ThreadBoundWriter {
+    type Strategy = Coalesced;
+
     fn write(&mut self, buf: Bytes) -> impl Future<Output = (std::io::Result<usize>, Bytes)> {
         self.peer.borrow_mut().extend_from_slice(&buf);
         core::future::ready((Ok(buf.len()), buf))
