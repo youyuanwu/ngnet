@@ -237,15 +237,25 @@ async fn trailers_arrive_after_the_body() {
     server.shutdown().await;
 }
 
-/// Several requests share one connection, and their responses may complete out of order
+/// Several requests share one connection, and the one that arrived first completes last
 /// (SC-010).
 ///
-/// Completing them out of order is what makes this a multiplexing test. If responses were
-/// serialised onto the connection in arrival order, holding the first one open would block
-/// the others and the test would time out. Each response also carries its own identifier, so
-/// a mix-up between streams fails an assertion rather than passing quietly.
+/// The synchronisation here is load-bearing and was got wrong once, so it is worth stating.
+/// The `/slow` request must be *received and parked at the server* before `/fast` is sent;
+/// otherwise the test proves nothing. hyper enqueues a request when `send_request` is
+/// called, and a `#[tokio::test]` runs on a current-thread runtime, so simply spawning the
+/// slow request and then sending the fast one puts `/fast` on the wire first -- measured,
+/// not assumed. A server that serialised streams in arrival order would then answer `/fast`,
+/// whose handler releases the gate, and go on to answer `/slow`, passing every assertion
+/// without ever having two streams in flight.
+///
+/// So the test waits for the slow handler to announce that it has entered and parked. From
+/// that point a serialising server cannot answer `/fast` at all: its only stream is occupied
+/// by a handler that will not return until `/fast` releases it. The test deadlocks against
+/// it and fails on its timeout, which is what a test of multiplexing should do.
 #[tokio::test]
 async fn requests_are_multiplexed_and_may_finish_out_of_order() {
+    let (slow_entered, mut slow_is_parked) = mpsc::unbounded_channel::<()>();
     let (release_first, first_released) = oneshot::channel::<()>();
     let release_first = std::sync::Arc::new(std::sync::Mutex::new(Some(release_first)));
     let first_released = std::sync::Arc::new(tokio::sync::Mutex::new(Some(first_released)));
@@ -255,8 +265,10 @@ async fn requests_are_multiplexed_and_may_finish_out_of_order() {
             "/slow",
             get(move || {
                 let first_released = std::sync::Arc::clone(&first_released);
+                let slow_entered = slow_entered.clone();
                 async move {
                     let gate = first_released.lock().await.take().expect("one request");
+                    let _ = slow_entered.send(());
                     let _ = gate.await;
                     "slow"
                 }
@@ -291,8 +303,12 @@ async fn requests_are_multiplexed_and_may_finish_out_of_order() {
         }
     });
 
-    // The slow request is in flight and its handler is parked. If the connection could only
-    // carry one exchange at a time, this second request would never be answered.
+    // The slow request is now genuinely in flight with its handler parked. Everything the
+    // test claims depends on this having happened before the next line runs.
+    within("the slow handler to park", slow_is_parked.recv())
+        .await
+        .expect("the slow handler to park");
+
     let (fast_head, fast_body) = client.exchange(get_request(server.address, "/fast")).await;
     assert_eq!(fast_head.status, http::StatusCode::OK);
     assert_eq!(text(&fast_body), "fast");
