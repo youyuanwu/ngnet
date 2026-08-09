@@ -51,7 +51,11 @@ frames, not the one-off cost of standing a stream up.
 | `steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path` | And still zero when eight streams are multiplexed, which is where the driver's own buffer would be tempted to grow. |
 | `steady_state_send_allocates_nothing_on_the_owned_region_path` | Likewise on the owned-region path — the completion transport's gathering allocates nothing in steady state either. |
 | `the_read_buffer_pool_settles_to_a_fixed_size` | The pool reaches a high-water mark during warm-up and does not grow afterwards. |
-| `the_coalesced_write_path_coalesces_a_pass_into_one_write` | Under `WritePolicy::Coalesced`, one write per pass, with more than one frame's worth of bytes — so the single write is not trivially single. |
+| `the_coalesced_write_path_coalesces_a_pass_into_one_write` | On a transport declaring `is_write_vectored() == false`, one write per pass, with more than one frame's worth of bytes — so the single write is not trivially single. |
+| `an_honest_emulating_transport_now_costs_one_write_per_upload_pass` | The one count this change moved: an emulating readiness transport declaring `false` costs **1** write per upload pass where it previously cost 4, because it now takes the coalesced drain instead of reaching the emulating loop. Named for what moved, so the move cannot be quietly re-absorbed. |
+| `the_completion_coalescing_drain_costs_one_write_and_no_allocation` | New coverage, not a moved number: before the capability existed nothing in the workspace put a completion transport on the coalescing drain, and replacing that drain's body with `panic!` left all 844 tests green. |
+| `a_native_transport_that_declares_false_is_taken_at_its_word` | A transport that overrides `write_vectored` natively but declares `false` is coalesced anyway — the driver believes the declaration and cannot see the override. |
+| `every_shape_moves_the_same_octet_count_per_pass` | All six shapes move the same number of octets per pass; only the write counts differ. Guards every count above against being a correctness change wearing a performance change's clothes. Compares totals, not the octets themselves — byte-for-byte identity is pinned in `http_vectored.rs` by `every_ordering_puts_the_same_octets_on_the_wire_as_coalescing_would` and `the_coalesced_readiness_drain_loses_no_octet_across_forced_short_writes`. |
 | `emulated_gathering_costs_no_more_writes_than_native_on_an_upload` | Emulated and native gathering cost the **same** write count on the copying upload path, because the driver offers one region per large block either way. Replaces `the_borrowed_write_path_writes_each_block_separately`, whose premise — a per-region drain — no longer exists. |
 | `a_multiplexed_pass_costs_one_write_natively_and_under_emulation_alike` | One write for a whole multiplexed pass, and **the same count** for a transport that only emulates gathering. Accumulation happens in the driver before any write, so 513 small blocks collapse into one region and the emulating loop runs once. This is the whole affordability argument for mandatory gathering. |
 | `the_vectored_write_path_writes_once_per_large_block_and_no_more` | A large block still costs exactly one write, so gathering never degenerates into a write per region. |
@@ -80,17 +84,37 @@ frames, not the one-off cost of standing a stream up.
   - implementing operations from both I/O models on one type;
   - an `Option`-returning `write_borrowed`, i.e. trying to decline a path mid-pass;
   - implementing `WriteModel` downstream, i.e. inventing a third I/O model.
-- **`the_write_policy_is_the_h2_layers_and_holds_for_the_connections_life`**
-  (`tests/http_vectored.rs`) — the *same* natively-gathering transport, driven under both
-  `WritePolicy` values, produces multi-region calls under one and only single-region calls
-  under the other, across
-  several passes, with identical octets on the wire. This replaces
-  `the_gathering_capability_is_consulted_exactly_once_per_connection`, which pinned that the
-  driver read `VectoredWrite::gathers` exactly once. There is no capability on the trait
-  surface to read any more, and the driver consults nothing on any path — strictly stronger
-  than reading it once. (`TokioWriter` still probes tokio's `is_write_vectored()` once at
-  construction, but that is a private field inside one adapter, invisible to the driver and to
-  every trait, and both branches deliver identical octets.)
+- **`the_declared_capability_picks_the_drain_and_holds_for_the_connections_life`**
+  (`tests/http_vectored.rs`) — two transports with **identical writing halves** and one
+  differing bit: both reach gathering only through the emulating default, one declares `true`
+  and one declares `false`. The first is offered the region list and its emulating loop issues
+  N calls; the second is coalesced into 1. The discriminator is the *call count*, not the
+  region count, and that is deliberate: an emulating half never receives a multi-region call
+  under either drain, because the gathered drain's offer is immediately looped into
+  single-region borrowed writes inside the transport. A `regions.len() > 1` discriminator
+  would therefore fail against an emulating half and pass vacuously against a native one.
+
+  This replaces `the_write_policy_is_the_h2_layers_and_holds_for_the_connections_life`, which
+  compared one transport under two `Config` values — a comparison that is no longer
+  expressible, since the drain now follows the transport. Before that it replaced
+  `the_gathering_capability_is_consulted_exactly_once_per_connection`. The property has
+  therefore been pinned by three successive tests under three designs; this one holds the most
+  constant.
+- **`the_capability_is_read_exactly_once_for_a_connections_whole_life`**
+  (`tests/http_vectored.rs`) — `ElectionLog::capability_reads()` counts every call to
+  `is_write_vectored` on a duplex half, and a multi-pass connection produces exactly one. The
+  successor to the old once-per-connection pin, restored because there is a capability to read
+  again. It is what makes "answerable without I/O" a testable claim rather than a docstring.
+- **`the_completion_side_selects_its_drain_from_the_declaration_too`**
+  (`tests/http_vectored.rs`) — the same selection on the completion model. It drives a
+  **handed-over** body deliberately: on the ordinary completion push path all three completion
+  shapes measure one call of one region, because the driver accumulates every sub-threshold
+  block into a single region before the drain sees it, so a write-count comparison there would
+  pass for both drains and distinguish neither. With `.shared()` each `DATA` frame is handed
+  over as its own record, and the shapes separate: 9 calls emulating, 1 call coalesced, 1 call
+  of 9 regions natively. Note that `ElectionLog::region_writes()` is *not* usable as the
+  discriminator here — that counter lives in the duplex's own `do_write_regions`, which only a
+  native override calls, so an emulating half never increments it whichever drain it takes.
 - **`an_emulating_transport_delivers_identical_octets_one_region_at_a_time`** and
   **`an_emulating_transport_delivers_every_octet_of_a_multi_region_offer_in_order`**
   (`tests/http_vectored.rs`) — the emulation contract. Both run on the handed-over body, the

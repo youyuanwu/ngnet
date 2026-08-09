@@ -53,8 +53,8 @@ the offset into a slice of the same buffer once the call returns. Zero-copy with
 somewhere else. A buffer returns to the pool only once no derived chunk still references it,
 so a retained chunk safely outlives the pass that read it.
 
-**4. The write policy is the h2 layer's choice, and the transport only says which I/O model
-it belongs to.**
+**4. The transport declares whether its gathering is real; the h2 layer decides what to do
+about the answer.**
 Two separate facts bound what any drain may do with the session's output blocks. The C
 library serialises from a reused buffer chain and recycles it at frame-item boundaries, so a
 block is invalidated by the *next* block being requested — earlier, in fact, than the
@@ -67,18 +67,34 @@ memory the driver already owns, and that is what the gathering drains do. A conn
 hands its bodies over (mechanism 6) loosens this further still: a handed-over payload is the
 caller's own `Bytes`, so it can be gathered as an owned region without being copied at all.
 
-**The decision is split in two, and neither half is where it used to be.** A transport
-declares its I/O model through `TransportWrite::Model` — `Readiness` or `Completion` — and
-nothing else about drains. How a pass drains is decided by the h2 layer, through
-`Config::write_policy`, once at handshake and for the connection's life. An earlier design had
-the transport name one of four *strategies* (`Coalesced`, `PerRegion`, `Gathering`,
-`OwnedRegions`); those markers are gone, and with them the idea that a backend *decides* how
-many syscalls a pass costs.
+**The decision is split in two, and the split has moved twice.** A transport declares two
+things and only two: its I/O model through `TransportWrite::Model` — `Readiness` or
+`Completion` — and whether its gathering is native, through `TransportWrite::is_write_vectored`.
+It names no drain. The h2 layer reads the second declaration once, immediately after
+`Transport::split`, and derives the drain from it: `true` takes the gathered drain, `false` the
+coalesced one.
 
-A transport-supplied *default* policy was specified and implemented alongside this change, and
-then deliberately dropped before shipping — see `pending-work.md` for the reasoning and the
-condition under which it should be revisited. The rule as it stands is unqualified: the
-transport does not vote.
+The first design had the transport name one of four *strategies* (`Coalesced`, `PerRegion`,
+`Gathering`, `OwnedRegions`). Those markers are gone and are not coming back. The design after
+that moved the choice to the *caller*, through `Config::write_policy`, on the rule that "the
+transport does not vote". That rule is now withdrawn, and it is worth being exact about why,
+because it was not wrong so much as aimed at the wrong target.
+
+What it correctly rejected was a transport *naming a drain* — declaring a decision about the h2
+layer's syscall budget that a backend has no standing to make. What it incorrectly swept up
+with that was the transport *describing itself*. Whether a given stream has a real `writev`
+behind it is a fact about the stream, knowable only by the stream: a caller configuring a
+`Config` cannot know whether the `AsyncWrite` it is about to hand over inherits tokio's
+first-region-only default. Asking the caller to answer it was asking the wrong party. The
+capability is therefore a *description*, one bit wide, with the h2 layer retaining the entire
+decision about what that description is worth — which is the shape hyper uses, and the shape
+tokio's own `AsyncWrite::is_write_vectored` has.
+
+The transport-supplied *default policy* that was specified, implemented, and dropped before
+shipping (see `pending-work.md`) is a third thing again, and it stays dropped: it let the
+transport supply an initial *decision* that the caller could override, which is the shape this
+one deliberately does not have. There is no override, because there is nothing to override —
+the caller no longer expresses an opinion at all.
 
 **The write primitive belongs to the model, not to the transport trait.** `TransportWrite`
 carries `Model` and `commit`, and no write at all. Readiness
@@ -89,17 +105,33 @@ shared trait, every readiness transport had to accept a buffer it could only bor
 `TokioWriter`'s implementation took ownership and immediately took a reference — and the
 driver *manufactured* that ownership out of its own reused coalescing buffer to feed it.
 
-**Every transport gathers.** `BorrowedWrite::write_vectored` and `RegionWrite::write_regions`
-are both *provided*, defaulting to a loop over the model's one required primitive
-(`write_borrowed` and `write_owned` respectively). A transport that cannot gather natively therefore
-gathers by emulation, and one that can does better by overriding. Naming a model obliges the
-writer to implement that model's trait, by compiler error — but not to implement its gathering
-operation, which is where the "cannot advertise what you have not supplied" property now
-lives: there is nothing left to advertise.
+**Every transport *can* gather; not every transport gathers *well*.**
+`BorrowedWrite::write_vectored` and `RegionWrite::write_regions` are both *provided*,
+defaulting to a loop over the model's one required primitive (`write_borrowed` and
+`write_owned` respectively). So the gathering operations are always callable, and always
+correct — a transport that cannot gather natively still gathers, by emulation, and one that can
+does better by overriding. Naming a model obliges the writer to implement that model's trait,
+by compiler error; it does not oblige the writer to implement that trait's gathering operation.
 
-The four drains, as the two policies × two models:
+What `is_write_vectored` adds is the *quality* of that gathering, which the type system cannot
+see. Overriding `write_vectored` is not detectable from outside, so the driver cannot infer the
+answer and does not try: it believes the declaration. A transport that overrides the operation
+and forgets the declaration is coalesced and its override is dead code; a transport that
+declares `true` without overriding gets the emulating loop, which is correct but is the
+transport's own choice to pay for. Neither is a bug the crate can catch, and both are the
+transport's to get right — which is the price of a one-bit description over an inferred one.
 
-- **`Readiness` under `WritePolicy::Gathered`** — the default, and what a real socket wants.
+**The default is `false`, and this inverts the crate's previous stance.** `gathers()` defaulted
+to `true`: a wrapper that forgot to forward the question inherited "yes, I gather" and then
+quietly wrote one region per pass through a stream that ignored all but the first. The new
+default matches tokio's conservatism instead. A wrapper that forgets inherits "no", and the
+driver coalesces: one write, one copy, bounded by the pass. Forgetting now costs a bounded copy
+rather than an unbounded number of syscalls, and the failure mode of the conservative default
+is a measurable slowdown rather than a silent one.
+
+The four drains, as the two declarations × two models:
+
+- **`Readiness` declaring `true`** — what a real socket with a real `writev` wants.
   The driver accumulates small blocks into a buffer it owns and reuses, and when a
   block exceeds `VECTORED_THRESHOLD` it emits `[accumulated, block]` through `write_vectored`
   — the large block is never copied. One syscall per pass in the common case, zero allocation
@@ -122,23 +154,41 @@ The four drains, as the two policies × two models:
   mark, and `h2` tops the buffer up from the head of a chained payload when the accumulation is
   smaller than the threshold, so its first region is never a runt. Neither difference has been
   measured to matter here, and the second is a refinement this driver does not make.
-- **`Completion` under `WritePolicy::Gathered`** — the same accumulation, expressed in owned
+- **`Completion` declaring `true`** — the same accumulation, expressed in owned
   buffers. A completion transport cannot lend the kernel a borrowed `IoSlice`: the kernel
   writes from the buffers after submission, so they must be owned. The driver coalesces the
   session's own blocks into a driver buffer, every one of them, and hands the pass out as a
   list of owned `Bytes` through `write_regions`, reaching a single `writev`. A block borrowed
   from the session cannot be owned without a copy, so all of them are copied; a *handed-over*
   payload is already the caller's own `Bytes` and rides uncopied as its own region.
-- **Either model under `WritePolicy::Coalesced`** — gathering off. One write per pass, bought
-  by copying every outgoing octet into a driver buffer, every pass. That buffer is reused
-  across passes, so it costs no allocation in steady state. The two models reach the single
-  write differently, and only one of them transfers anything: the readiness drain *lends* the
-  buffer through `write_borrowed` and clears it, while the completion drain must hand over an
-  owned `Bytes`, because a completion transport keeps the buffer until the operation
-  finishes. This is the successor to the old
-  `Coalesced` *strategy*, and the difference is who says so: it is now a caller's decision,
-  reachable wherever a connection is configured, rather than a fact baked into a transport
-  type.
+- **Either model declaring `false`** — gathering off. One write per pass, bought by copying
+  every outgoing octet into a driver buffer, every pass. That buffer is reused across passes,
+  so it costs no allocation in steady state. The two models reach the single write differently,
+  and only one of them transfers anything: the readiness drain *lends* the buffer through
+  `write_borrowed` and clears it, while the completion drain must hand over an owned `Bytes`,
+  because a completion transport keeps the buffer until the operation finishes.
+
+  This is the successor to the old `Coalesced` *strategy*, and it has now been said by three
+  different parties: baked into a transport type, then set by the caller on a `Config`, and now
+  *described* by the transport again. The difference between the first and the third is that
+  `Coalesced` named a drain while `is_write_vectored() == false` states a fact and lets the h2
+  layer draw the conclusion; the difference from the second is that the transport is the only
+  party who knows the fact.
+
+  **This drain is also where the change's one real cost lands, and the cost is not hypothetical.**
+  A readiness transport that cannot gather used to take the *gathered* drain — the caller's
+  default was `Gathered` and the transport had no say — and there reach `write_vectored`'s
+  emulating loop. Because the driver accumulates sub-`VECTORED_THRESHOLD` blocks into a single
+  region *before* any write, a multiplexed pass of hundreds of small blocks collapsed to one
+  region, so that loop typically ran **once**: one write, and a copy of only the small blocks,
+  with any handed-over payload riding uncopied as its own region. The same transport now
+  declares `false`, takes this drain, and gets one write and a copy of **every** outgoing octet,
+  handed-over payloads included. For the common low-region-count pass that is a regression —
+  same syscall count, strictly more copying — and it was accepted with the tradeoff visible. The
+  reasons are that it is hyper's shape, that the coalesced cost is bounded and predictable where
+  the emulating loop's is not, and that the transport paying it is the one that declined to
+  claim it could gather. A transport that *can* gather and says so is unaffected; a transport
+  that can gather and forgets to say so pays this and should fix its declaration.
 
 The old `PerRegion` strategy — the session's own blocks written one per call, without
 accumulation — has no successor and was removed. It is dominated on every measured workload:
@@ -161,36 +211,49 @@ through its result, a short count the driver re-offers or an error. Both are pin
 `compile_fail` doctests with error codes, each mutation-verified to fail when the guarded
 construct is made legal.
 
-**No capability is read on any path the driver or the trait surface can see.** The previous
-design read exactly one:
-`VectoredWrite::gathers()`, consulted once per connection through `Elects::prepare`, because
-whether a stream *really* scatter-gathers is a property of the stream rather than the backend —
-a tokio `AsyncWrite` whose `poll_write_vectored` is the default writes only the first region.
-Both the predicate and the once-per-connection machinery are gone.
+**Exactly one capability is read, exactly once, and the driver acts on it.** It is
+`TransportWrite::is_write_vectored`, read in `driver::run` immediately after
+`transport.split()` and held in a local for the connection's life. That placement is not
+incidental: the query has to happen where only the `TransportWrite` half is in scope, before
+either drain has been chosen, which is why the method lives on `TransportWrite` rather than on
+`BorrowedWrite` or `RegionWrite` — the driver holds neither of those at that point and cannot
+name them without first knowing the answer. It is a plain `&self -> bool` for the same reason:
+it is asked before any write, so it must be answerable without I/O, and it is asked once, so it
+must not change its mind.
 
-What remains is strictly private and strictly local. `TokioWriter` calls tokio's own
-`is_write_vectored()` once, at construction, and keeps the answer in a private field to choose
-between forwarding to `poll_write_vectored` and running the emulating default. That is not the
-old capability under another name: nothing outside the adapter can read it, no trait exposes
-it, the driver never branches on it, and both answers produce the same octets — it selects
-only which of two implementations of the *same* contract runs. The property that matters is
-that a transport can no longer change what the h2 layer does, and that holds.
+This section previously read "**No capability is read on any path the driver or the trait
+surface can see**", and described a design in which `TokioWriter` cached tokio's
+`is_write_vectored()` in a private field that "never leaves this adapter". That is now false in
+both halves, and the reasoning that produced it does not survive.
 
-That removal is safe, and it is worth being precise about why, because the obvious reason is
-wrong. Such a stream was never a *correctness* hazard: it writes the first region and returns
-the count it actually wrote, which is an ordinary short write, and the driver's gathering loop
-re-offers the remainder from the octets still outstanding. No octet was ever at risk. What
-`gathers()` avoided was the *cost* — one syscall per region with none of the gathering
-benefit. Removing it is affordable because accumulation happens in the driver, before any
-write: 513 small blocks from eight multiplexed streams collapse into a single region, so the
-emulating loop runs once. Emulation's cost is set by the regions the driver offers, never by
-the blocks the session produced.
+The reasoning was: `gathers()` was never a correctness mechanism, because a stream with the
+default `poll_write_vectored` writes the first region and returns the count it wrote, which the
+driver's gathering loop handles as an ordinary short write and re-offers from. No octet was
+ever at risk. That part is still true, and is why the emulating defaults are still correct and
+are kept. What `gathers()` avoided was *cost*, and the argument was that the cost had already
+been removed elsewhere: the driver accumulates before writing, so 513 small blocks from eight
+multiplexed streams collapse into a single region and the emulating loop runs once.
 
-Its removal also closed a footgun. `gathers()` defaulted to `true` while tokio's
-`is_write_vectored()` defaults to `false` — opposite conservatism — so a third-party wrapper
-that forgot to forward the question silently inherited the optimistic answer. There is now no
-question to forget: a wrapper that forwards nothing inherits the emulating default, which is
-correct and bounded.
+That argument holds for the common case and fails for the general one. Emulation's cost is set
+by the regions the driver offers — which is exactly the point, because the driver offers more
+than one region whenever a payload is handed over uncopied, and the region count then scales
+with the number of concurrent bodies rather than being pinned at one. At high region counts the
+emulating loop degenerates toward one syscall per region against a stream that will not gather,
+which is the pattern the crate spent a design revision removing. The old argument mistook "the
+loop usually runs once" for "the loop is bounded". It is not bounded, and the transport is the
+only party that knows whether the loop will do anything useful at all.
+
+The second half — that the tokio adapter's cached answer is private and invisible — was true
+when written and is now precisely the thing that changed. The same cached field feeds
+`TransportWrite::is_write_vectored`, so it leaves the adapter, reaches the driver, and selects
+a drain. Nothing about how it is obtained changed; what changed is that somebody now listens.
+
+The footgun that removing `gathers()` closed is closed differently rather than reopened.
+`gathers()` defaulted to `true` while tokio's `is_write_vectored()` defaults to `false`, so a
+third-party wrapper that forgot to forward the question inherited the *optimistic* answer and
+wrote one region per pass. `is_write_vectored` defaults to `false`, so a wrapper that forgets
+inherits the *pessimistic* answer and is coalesced: one write and one bounded copy. The
+question is back, but the cost of failing to answer it went from unbounded to bounded.
 
 **Where mandatory gathering is genuinely worse — and what is actually measured.** An earlier
 version of this passage read "gathering loses to coalescing outright — the benchmarks measure
@@ -199,9 +262,10 @@ roughly 68 Kelem/s against 152 at N=64". **That was a misreading and is correcte
 accumulation at all. It is not gathering, and it is not emulated gathering. Gathering on a
 natively-gathering `TcpStream` at N=64 measured **166.0** Kelem/s, against roughly 152 for the
 coalescing arms: gathering *won*. On that workload a natively-gathering readiness transport
-therefore does not prefer `WritePolicy::Coalesced`, and this document previously implied the
-opposite. The scope is one measured workload, not a universal claim — which is why
-`WritePolicy::Gathered` is a *default a caller can change*, not a conclusion.
+therefore does not prefer coalescing, and this document previously implied the opposite. The
+scope is one measured workload, not a universal claim — which is why a transport that gathers
+natively is *asked to say so* rather than being assumed to, and why the answer for a transport
+that says nothing is the conservative one.
 
 The case where coalescing genuinely wins is narrower and, importantly, **is not measured
 anywhere**: *emulated* gathering at high region counts, where `write_vectored`'s provided
@@ -211,9 +275,15 @@ copy. The reasoning is structural — the loop's call count is visible in the co
 `http_zero_alloc.rs` — but no benchmark has swept it, and no number should be quoted for it
 until one has.
 
-That case is why `WritePolicy::Coalesced` exists and is public rather than being a private
-fallback: a caller whose traffic looks like that has a real reason to turn gathering off, and
-must be able to.
+That case is why the coalesced drain exists rather than gathering being unconditional, and it
+is now reached by the party that can actually recognise it: a transport whose gathering is a
+loop reports `false` and is coalesced. Under the previous design this required the *caller* to
+diagnose a property of a socket it did not own; under this one the socket answers for itself.
+Note that the transport still cannot ask for coalescing on region-count grounds — it answers
+"is my gathering real", not "would coalescing suit my traffic" — so a natively-gathering
+transport whose traffic happens to fit the crossover has no way to say so. That is a
+deliberate narrowing: the question a transport is asked is one it can always answer correctly,
+which a traffic-shape question would not be.
 
 Two per-call costs an earlier design replaced are worth recording, because both were invisible.
 The driver used to discover the vectored capability by calling `write_vectored(&[])` and
@@ -221,8 +291,12 @@ dropping the resulting future unpolled, once per flush pass — which forced the
 to be widened to require implementations tolerate that. And `TokioWriter::write_vectored` used
 to call `AsyncWrite::is_write_vectored`, a virtual call whose answer never changes for a given
 stream, on every write. The first has no successor; the second is asked once, in `split`, and
-cached in a field — which is now a purely private optimisation choosing between the native
-`writev` and the emulating default, invisible in the trait surface.
+cached in a field. That field now does double duty: it still chooses between the native
+`writev` and the emulating default *inside* the adapter, and it is also what the adapter
+returns from `TransportWrite::is_write_vectored`. The internal branch is kept even though the
+driver will not call `write_vectored` on a writer reporting `false` — `BorrowedWrite` is a
+public trait and a direct caller may invoke the operation regardless of the declaration, and
+the branch is what keeps that call correct rather than first-region-only.
 
 **5. Commands reach the driver through a queue, and wakes never re-enter a held lock.** The
 session lives in the driver and is `!Sync`, so handles and bodies cannot touch it directly.
@@ -350,24 +424,32 @@ Two properties are pinned as tests rather than described (see [`invariants.md`](
 
 | Path | Writes per driver pass | Allocation per pass in steady state |
 | --- | --- | --- |
-| Readiness, `Gathered`, native `write_vectored` | **one**, or one per large block | **zero** |
-| Readiness, `Gathered`, emulated | **one**, or one per region offered | **zero** |
-| Completion, `Gathered` | **one**, or one per region-cap flush | **zero**, copies each session block but no handed-over payload |
-| Either model, `Coalesced` | **one**, coalesced | **zero**, but copies every octet |
+| Readiness, declares `true`, native `write_vectored` | **one**, or one per large block | **zero** |
+| Readiness, declares `true`, emulated gathering | **one**, or one per region offered | **zero** |
+| Completion, declares `true` | **one**, or one per region-cap flush | **zero**, copies each session block but no handed-over payload |
+| Either model, declares `false` | **one**, coalesced | **zero**, but copies every octet |
 
 All four reach zero steady-state allocation; both driver buffers are reused across passes
 rather than rebuilt. What separates them is the write count — a syscall count — and the
-copy. Among the three readiness shapes the gathering path dominates: it reaches the borrowed
+copy. Among the readiness shapes the native gathering path dominates: it reaches the borrowed
 path's zero allocation and zero copy of large blocks while matching or beating the coalesced
-path's write count, which is why the tokio adapter now takes it. The owned-region path is its
-completion-transport counterpart — one write per pass, copying each borrowed session block but
-never a handed-over payload — and looks identical to the owned path on a push-model workload,
-which is why `http_zero_alloc.rs` pins it on an upload rather than a multiplexed pass. Counted
-by `tests/http_zero_alloc.rs` on eight multiplexed streams, the three readiness shapes come
-out at 0 allocations and 1 write (owned, having copied every octet), 0 allocations and 513
-writes (borrowed), and 0 allocations and 1 write (gathering). Per-stream setup is deliberately
-excluded from the measurement and documented as such — the recurring cost of moving frames is
-the claim, not the one-off cost of standing a stream up.
+path's write count, which is why the tokio adapter declares `true` whenever the stream beneath
+it does. The owned-region path is its completion-transport counterpart — one write per pass,
+copying each borrowed session block but never a handed-over payload — and looks identical to
+the owned path on a push-model workload, which is why `http_zero_alloc.rs` pins it on an upload
+rather than a multiplexed pass.
+
+Counted by `tests/http_zero_alloc.rs` on eight multiplexed streams, every shape now comes out
+at 0 allocations and 1 write, because the driver accumulates sub-`VECTORED_THRESHOLD` blocks
+into a single region before any write, and a single region collapses the difference between
+the drains. The write counts separate only on an upload: 4 for a gathering declaration against
+1 for a coalescing one. A **513**-write figure appears in this repository's history for
+multiplexed traffic; it belongs to the removed per-block borrowed drain, which wrote each
+block separately and no longer exists in any form. It is not the count of any current shape,
+and quoting it as one is a mistake made before.
+
+Per-stream setup is deliberately excluded from the measurement and documented as such — the
+recurring cost of moving frames is the claim, not the one-off cost of standing a stream up.
 
 ## Constraints that shape contributions
 

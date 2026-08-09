@@ -217,40 +217,32 @@ These are not gaps. They are decisions, recorded so they are not mistaken for ov
 
 ## Judgement calls worth revisiting with real traffic
 
-- **A transport-supplied default write policy: specified, implemented, and deliberately
-  dropped.** Recorded here so it is a decision rather than an omission.
+- **A transport-supplied default write policy: specified, implemented, dropped — and then
+  superseded by something narrower.** Recorded here so the sequence is legible, because the
+  outcome resembles the dropped design closely enough to be mistaken for it.
 
-  The design was a `TransportWrite::DEFAULT_WRITE_POLICY` associated constant with a default
-  of `WritePolicy::Gathered`, supplying the initial value when the caller set none, with
-  `Config::write_policy` overriding it outright. It reached a complete, green, mutation-
-  verified implementation — including a structural guard pinning that it was resolved once at
-  connection start-up and that no third drain shape appeared behind it — and was then removed
-  before shipping.
+  The dropped design was a `TransportWrite::DEFAULT_WRITE_POLICY` associated constant with a
+  default of `WritePolicy::Gathered`, supplying the initial value when the caller set none,
+  with `Config::write_policy` overriding it outright. It reached a complete, green,
+  mutation-verified implementation and was removed before shipping, because all four
+  declarations in the workspace were `Gathered` and so the constant had zero behavioural
+  effect, at the price of permanent public API surface.
 
-  **Why it was dropped.** The trait default, `TokioIo`'s declaration, `CompioIo`'s declaration
-  and `Config`'s own default were *all four* `Gathered` — which is what `Config` already
-  defaulted to. So the constant had **zero behavioural effect**: no shipped transport differed
-  from the default, no downstream user existed, and the one case where a transport would
-  genuinely want to differ — emulated gathering at high region counts, where `Coalesced` is
-  expected to win — has never been measured. Against that, it was permanent public API surface
-  and a partial reversal of the rule that a transport does not vote on the drain, introduced
-  in a breaking change. Sound, but not worth its cost.
+  **What shipped instead is not that design.** `TransportWrite::is_write_vectored` is a
+  *description*, not a *default decision*: it says whether the transport's gathering is real,
+  not which drain the h2 layer ought to use, and there is nothing for a caller to override
+  because the caller no longer has a say at all. The distinction is the whole point. A
+  transport can answer "is my `write_vectored` a real syscall" correctly and always; it cannot
+  answer "would coalescing suit this connection's traffic", which is what a default *policy*
+  asked it to guess at. `Config` lost `write_policy` rather than gaining a fallback behind it.
 
-  **What would justify revisiting it.** Either of two things, and neither is present today:
-
-  1. A transport that genuinely wants a different default from `Gathered` — most plausibly one
-     that emulates gathering and expects many regions per pass. A shipped or credible
-     third-party transport, not a hypothetical.
-  2. A measurement showing emulated gathering actually losing to coalescing at high region
-     counts. That is the unmeasured claim the whole idea rests on, and it is cheap to settle;
-     see the drain-selection entry above.
-
-  Absent both, the honest position is that `Config::write_policy` is sufficient: a caller who
-  knows their transport wants coalescing can say so in one call, and nothing about the current
-  design makes that awkward. If it is revisited, the prior implementation's shape — an
-  associated const with a default, an `Option` in `Config` so "the caller said nothing" stays
-  distinguishable, a single resolution point at start-up, and a structural guard against a
-  third drain shape — is the one to return to; the difficulty was never the mechanism.
+  **What is still open, and is not answered by this.** The drain choice remains keyed on
+  capability alone. A transport whose gathering is genuinely native but whose traffic sits past
+  the region-count crossover — where coalescing is expected to win — has no way to say so, and
+  neither does its caller. That is deliberate: the question would be one no party can answer
+  reliably in advance. If it ever needs answering it should be answered by the driver, from
+  observed region counts, not by a declaration; and the prerequisite is a measurement that does
+  not exist yet (see the drain-selection entry below).
 
 - **`Config` defaults: 128 concurrent streams, 64 KiB header list.** Chosen because
   libnghttp2's own local defaults are effectively unlimited, and something conservative had
@@ -258,25 +250,34 @@ These are not gaps. They are decisions, recorded so they are not mistaken for ov
   not physics. h2c on a trusted network may well want them looser, and a public-facing server
   may want them tighter.
 
-- **Which drain a connection should use.** Not a transport decision at all: a transport
-  declares its I/O model, and the drain comes from `Config::write_policy`. The default,
-  `WritePolicy::Gathered`, was measured to dominate on realistic traffic over a
-  natively-gathering `TcpStream` — zero steady-state allocation, one write per pass, 166.0
-  against ~152 Kelem/s for the coalescing arms at N=64. `WritePolicy::Coalesced` exists for
-  the case where it does not, and that case is **emulated** gathering at high region counts,
-  where the emulating loop degenerates toward one syscall per region.
+- **Which drain a connection should use.** Keyed on one bit the transport declares about
+  itself: `TransportWrite::is_write_vectored`. `true` takes the gathered drain, `false` the
+  coalesced one, read once per connection. Gathering was measured to dominate on realistic
+  traffic over a natively-gathering `TcpStream` — zero steady-state allocation, one write per
+  pass, 166.0 against ~152 Kelem/s for the coalescing arms at N=64 — which is why a transport
+  that gathers natively should say so, and why the two shipped adapters do.
 
-  That case is **identified structurally and has never been measured.** No number in this
-  repository belongs to it. In particular the 68.3 Kelem/s that appears in `benchmarks.md` is
-  the removed *per-block* drain, not emulated gathering, and citing it here would be the same
-  conflation this document corrected once already. Emulated gathering accumulates in the
-  driver first, so small blocks collapse into one region before the emulating loop sees them.
+  The case where coalescing is expected to win is **emulated** gathering at high region counts,
+  where the emulating loop degenerates toward one syscall per region. That case is **identified
+  structurally and has never been measured on this machine.** No number in this repository
+  belongs to it. In particular the 68.3 Kelem/s that appears in `benchmarks.md` is the removed
+  *per-block* drain, not emulated gathering, and citing it here would be the same conflation
+  this document corrected once already. Emulated gathering accumulates in the driver first, so
+  small blocks collapse into one region before the emulating loop sees them.
 
-  Whether the crossover deserves an automatic policy rather than a caller-set one is genuinely
-  open, and deliberately not attempted: it would need a region-count predictor in the driver,
-  which would be the capability branch that removing `VectoredWrite::gathers()` got rid of.
-  Measuring the emulated crossover is the cheaper open item and the prerequisite for any of
-  it. What else remains open is narrower: `VECTORED_THRESHOLD`
+  **What the capability does not settle.** It routes a transport whose gathering is a loop onto
+  the coalesced drain, which is the right answer at high region counts and, for the same
+  transport at *low* region counts, arguably the wrong one: a pass that was already a single
+  region previously cost one write and copied only the accumulated small blocks, and now costs
+  one write and copies everything. That regression is real, accepted, and pinned by
+  `an_honest_emulating_transport_now_costs_one_write_per_upload_pass`. Whether the crossover
+  deserves a driver-side region-count predictor rather than a single bit is genuinely open and
+  deliberately not attempted; measuring the emulated crossover is the cheaper open item and the
+  prerequisite for any of it. A transport that wants the old behaviour today can have it by
+  declaring `true` — it then reaches the emulating default, which is kept precisely so that
+  answer stays meaningful.
+
+  What else remains open is narrower: `VECTORED_THRESHOLD`
   is 256 bytes, untuned, and deliberately so. Dumping real block sizes shows the distribution
   is sharply bimodal with nothing in between — control and `HEADERS` blocks at 9–73 bytes,
   DATA blocks at 16392–16393 (a 16 KiB payload with its 9-byte header already joined) — so any
@@ -294,20 +295,28 @@ These are not gaps. They are decisions, recorded so they are not mistaken for ov
   policy, and is unchanged by either — and deliberately not fixed there, because adding a flush
   per pass to the completion
   path is a behaviour change that would perturb the owned-region measurements that refactor
-  had to hold constant. Fix wants its own change and its own before/after numbers, plus a
+  had to hold constant. Unchanged again by the capability change, which does not touch
+  `commit` on either side. Fix wants its own change and its own before/after numbers, plus a
   bounded-budget regression test of the kind `http_flush.rs` already uses for tokio.
 
 - **Whether `ngnet-h3` and `ngnet-quic` should adopt the transport-trait shape.** Transport
   traits exist only in `ngnet-h2`; neither of the other crates has an equivalent, so the shape
-  was deliberately scoped to h2. **The answer to what is worth copying changed** when the write
-  policy moved to the h2 layer, and the change is a simplification, so the advice is shorter
-  than it was:
+  was deliberately scoped to h2. **The answer to what is worth copying has changed twice**, and
+  the second change partly reverses the first, so the advice is worth stating carefully:
 
   Copy the *model* split, not a strategy split. An associated `type Model` naming one of a
   sealed pair — readiness or completion — with the operations on separate traits bounded by
-  that model, so a backend implements exactly one and the compiler enforces it. Do **not**
-  give the backend a say in how the layer drains a pass; that is the layer's business, and a
-  backend that is asked will answer about itself rather than about the traffic.
+  that model, so a backend implements exactly one and the compiler enforces it.
+
+  Then copy one capability bit, and copy it in tokio's shape: a plain `&self -> bool`
+  describing whether the backend's gathering is native, defaulting to `false`, read once at
+  start-up. The previous advice here was "do **not** give the backend a say in how the layer
+  drains a pass ... a backend that is asked will answer about itself rather than about the
+  traffic." The observation is correct and the conclusion drawn from it was wrong. A backend
+  answering about itself is exactly what is wanted, because "do I have a real `writev`" *is* a
+  fact about the backend and about nothing else, and no other party can know it. What must not
+  be copied is a backend saying which drain to use, or supplying a default the caller
+  overrides — that is asking the backend about the traffic, and it will guess.
 
   Three things were not obvious and would have to be rediscovered otherwise:
 
@@ -315,13 +324,36 @@ These are not gaps. They are decisions, recorded so they are not mistaken for ov
      type can implement both models and it compiles, which was verified by building exactly
      that.
   2. Make the gathering operation a *provided* default that loops over the model's required
-     primitive. Every backend then gathers by construction, one that can do better overrides,
-     and there is no capability to consult, no `prepare` step, and no once-per-connection
-     machinery — all of which the previous design needed and none of which survived.
+     primitive. Every backend then gathers by construction, and one that can do better
+     overrides. Note the deliberate asymmetry with the capability bit above: the *operation*
+     needs no opt-in and no `prepare` step, because a backend that says nothing still gathers
+     correctly; the *capability* is a separate, optional declaration about efficiency, read
+     once per connection, whose default is the conservative `false`. An earlier revision of
+     this list claimed there was "no capability to consult and no once-per-connection
+     machinery" — that was true of that revision and is no longer true of this one. What
+     survives from it is the narrower and more useful point: correctness must never depend on
+     the declaration, only the write count should.
   3. A defaulted operation cannot be detected by the compiler when it is deleted, so a test
      that means to pin a native override has to find a workload where native and emulated
      genuinely differ. Most workloads do not, because accumulation collapses the region list
      before the write; the handed-over no-copy path is the one that does.
+
+- **`CompioWriter`'s native `write_regions` override is not pinned by any test.** Measured,
+  not assumed: replacing its body with a per-region loop over `write_owned` — which is what
+  the provided default does — leaves the whole suite green. This is the concrete instance of
+  the general problem recorded just above. It is not a defect introduced by the capability
+  change, and the change did not make it worse: the override predates it, and no test at any
+  point has distinguished one `IORING_OP_SENDMSG` from N. It is hard for a specific reason
+  worth recording rather than rediscovering — the loop is *behaviourally identical*. Every
+  octet arrives, in order, with the same return value; only the number of submissions differs.
+  So no correctness oracle can catch it, and the only discriminator is a count that lives
+  inside compio, below the seam this workspace can observe. The tokio side of the same
+  question *is* now pinned, by
+  `a_direct_vectored_call_on_a_non_gathering_tokio_writer_still_writes_every_region`, and only
+  because there the emulated and forwarded paths differ observably — tokio's default drops
+  regions after the first, so the difference is octets rather than syscalls. Closing the
+  compio gap needs a fake `AsyncWrite` at the compio seam that counts submissions, which is a
+  fixture, not a one-line test.
 
   Not worth doing speculatively; recorded so it is not re-derived.
 

@@ -161,9 +161,13 @@ coalescing arms, and the slow arm was the one writing per block — a cost invis
 duplex, dominant over a socket, and growing with the number of multiplexed streams because
 each stream adds blocks to the pass.
 
-This was confirmed directly rather than inferred. Flipping *only* `TokioWriter`'s borrowed write off — at the time, by returning `None`;
-since the write policy moved to the h2 layer, by setting `WritePolicy::Coalesced` instead of the default `WritePolicy::Gathered` — changing nothing else, moved `ngnet-h2-tokio` by **+95% at N=8 and +128% at
-N=64** (to ~152 Kelem/s), putting it level with compio and ahead of hyper.
+This was confirmed directly rather than inferred. Flipping *only* `TokioWriter`'s borrowed
+write off — at the time, by returning `None`; later, by setting `WritePolicy::Coalesced`
+instead of the default `WritePolicy::Gathered`; and now, since the drain follows the transport,
+by making `TokioWriter::is_write_vectored` return `false` — changing nothing else, moved
+`ngnet-h2-tokio` by **+95% at N=8 and +128% at N=64** (to ~152 Kelem/s), putting it level with
+compio and ahead of hyper. The numbers are the original measurement and are not re-measured
+here; only the way the same arm is reached has changed.
 
 #### What that framing got wrong, and the gathering path
 
@@ -209,17 +213,20 @@ and slightly ahead of hyper**, having been 2.1× and 2.4× slower than compio at
 > Read together with the 166.0 for gathering against ~152 for the coalescing arms, the
 > ordering at N=64 on a natively-gathering `TcpStream` is: gathering **166.0**, coalescing
 > ~152, per-block 68.3. **On this workload a natively-gathering readiness transport does not
-> prefer `Coalesced`**, which is why `WritePolicy::Gathered` is the `Config` default. That is
-> one workload — 64 concurrent streams of small blocks over a loopback `TcpStream` — and it is
-> the workload the default is chosen for, not a proof about every readiness transport or every
-> traffic shape. It is a *default* precisely because it can be wrong somewhere unmeasured, and
-> `Config::write_policy` overrides it. Note also that this run swept a readiness `TcpStream`
-> and never swept compio's policies, so the completion side of the question is unmeasured
-> here too.
+> prefer coalescing**, which is why a natively-gathering transport is asked to declare itself
+> and both shipped adapters do. That is one workload — 64 concurrent streams of small blocks
+> over a loopback `TcpStream` — and it is the workload the declaration is *worth making* for,
+> not a proof about every readiness transport or every traffic shape. Note also that this run
+> swept a readiness `TcpStream` and never swept compio, so the completion side of the question
+> is unmeasured here too.
 >
 > These are pre-existing measurements. Nothing here was re-measured for the write-primitive
-> split or for the transport-supplied policy default; both were argued structurally and pinned
-> by counts, which for these questions is the stronger evidence.
+> split, for the transport-supplied policy default, or for the capability change that replaced
+> `Config::write_policy` with `TransportWrite::is_write_vectored`; all three were argued
+> structurally and pinned by counts, which for these questions is the stronger evidence. The
+> capability change does move a *count* — see the allocation table below — but it moves no
+> number on this page, because the two shipped adapters both declare `true` and therefore
+> occupy exactly the arms measured here.
 At 1 MiB the three arms measured 547 (gathering tokio), 531 (hyper) and 482 (coalescing
 compio) MiB/s in the same runs — but see the caveat below before reading an ordering into the
 first two, which are within this arm's run-to-run spread of each other.
@@ -312,19 +319,37 @@ rather than treated as a proxy for time.
 
 From `crates/ngnet-h2/tests/http_zero_alloc.rs`, exact counts per driver pass in steady state:
 
-| Shape (transport × policy) | Single upload | 8 multiplexed streams |
+| Shape (write behaviour × declaration → drain) | Single upload | 8 multiplexed streams |
 | --- | --- | --- |
-| `WritePolicy::Coalesced`, either model | 0 allocs / 1 write | 0 allocs / 1 write |
-| `WritePolicy::Gathered`, natively gathering | **0 allocs / 4 writes** | **0 allocs / 1 write** |
-| `WritePolicy::Gathered`, emulating | **0 allocs / 4 writes** | **0 allocs / 1 write** |
+| declares `false`, either model → coalesced | 0 allocs / 1 write | 0 allocs / 1 write |
+| natively gathering, declares `true` → gathered | **0 allocs / 4 writes** | **0 allocs / 1 write** |
+| emulating, declares `true` → gathered | **0 allocs / 4 writes** | **0 allocs / 1 write** |
+| emulating, declares `false` → coalesced | **0 allocs / 1 write** *(was 4)* | **0 allocs / 1 write** |
 | *(removed)* `PerRegion` — per-block, no accumulation | 0 allocs / 4 writes | 0 allocs / **513 writes** |
 
+**One number in this table moved when `TransportWrite::is_write_vectored` replaced
+`Config::write_policy`, and it is the fourth row's upload column: 4 → 1.** Its mechanism is the
+drain switch and nothing else. Under the old design that row did not exist as a separate shape:
+an emulating transport had no way to decline, so it took the gathered drain and measured
+identically to the native one — which is now the *third* row, still measured, by a transport
+that declares `true` against its own nature precisely so the old row survives. The fourth row
+is the same transport telling the truth. It buys the one write with a copy of every outgoing
+octet, where the gathered drain's emulation issued its writes without copying the regions, so
+for an upload that was already one region this is a cost rather than a saving. It is pinned
+under a name that says so — `an_honest_emulating_transport_now_costs_one_write_per_upload_pass`
+— so the move cannot be quietly re-absorbed as a new baseline.
+
+The multiplexed column moved nowhere, which is the more important half. A multiplexed pass is
+hundreds of sub-threshold blocks that the driver accumulates into a *single region* before any
+write, so gathered and coalesced both cost one write.
+
 The last row is history, kept because the 513 is the number the whole gathering argument turns
-on. That drain no longer exists. A transport that cannot gather natively now emulates instead,
-and emulation is **not** the 513-write cliff: accumulation happens in the driver *before* any
-write, so the 512 small blocks collapse into one region and the emulating loop runs once. That
-is why the emulating row is identical to the native one on both workloads, and it is the
-structural reason mandatory gathering was affordable.
+on. That drain no longer exists, and **the 68.3 Kelem/s figure quoted earlier on this page
+belongs to it, not to emulated gathering**. Emulation is **not** the 513-write cliff:
+accumulation happens in the driver *before* any write, so the 512 small blocks collapse into
+one region and the emulating loop runs once. That is why the two `true`-declaring rows are
+identical on both workloads, and it is the structural reason the provided gathering defaults
+are affordable.
 
 The coalesced row read `4 allocs` and `12 allocs` when gathering was introduced, and that
 recurring cost was part of the argument for it. It has since been removed in two steps. First,
