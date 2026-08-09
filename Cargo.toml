@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/ngnet-axum",
     "crates/ngnet-h2",
     "crates/ngnet-h2-sys",
     "crates/ngnet-h3-sys",
@@ -22,6 +23,17 @@ repository = "https://github.com/youyuanwu/ngnet"
 # `workspace = true`, so a version is chosen once rather than per crate.
 # Paths are relative to this file, not to the crate that uses them.
 [workspace.dependencies]
+# `default-features = false` is load-bearing rather than tidiness. Two of axum's default
+# features pull in the very engine this integration replaces: `http1` enables `dep:hyper`,
+# and `tokio` enables `dep:hyper-util`. With both off, a `Router` is just a `tower` service
+# from an `http::Request` to an `http::Response`, which is all `ngnet-axum` needs and all it
+# can use -- there is no HTTP/1 to serve over an h2c-only stack anyway.
+#
+# The cost is `ConnectInfo`, axum's peer-address extractor, which is gated behind that same
+# `tokio` feature because upstream it is populated by hyper-util's listener. `ngnet-axum`
+# supplies its own extension instead; see `crates/ngnet-axum/src/peer.rs` for why the
+# substitution is not quite like for like.
+axum = { version = "0.8", default-features = false }
 bindgen = "0.72"
 bytes = "1"
 # `io-uring` and deliberately *not* `polling`: with both, compio compiles a fusion driver
@@ -50,6 +62,7 @@ hyper = { version = "1", features = ["client", "server", "http2"] }
 # Only for the tokio glue the bench needs: `TokioExecutor` for hyper's http2 spawns and its
 # own `TokioIo` stream adapter. Distinct from this crate's `TokioIo`; the bench aliases both.
 hyper-util = { version = "0.1", features = ["tokio"] }
+ngnet-axum = { path = "crates/ngnet-axum" }
 ngnet-h2 = { path = "crates/ngnet-h2" }
 ngnet-h2-sys = { path = "crates/ngnet-h2-sys" }
 ngnet-h3 = { path = "crates/ngnet-h3" }
@@ -86,3 +99,9 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
+# The trait that makes the axum integration possible, taken directly rather than through
+# `tower`. axum does not re-export it, so `Router::call` cannot be named without declaring
+# it here; and `tower` itself would add the combinator layer -- `ServiceBuilder`, retries,
+# timeouts -- when what is wanted is the one trait definition those are all written against.
+# Same trait either way: `tower::Service` *is* `tower_service::Service`.
+tower-service = "0.3"
