@@ -41,6 +41,21 @@ pub struct Vectored;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Emulating;
 
+/// Write behaviour of a [`Duplex`]: readiness, emulating, and **honest about it**.
+///
+/// Structurally identical to [`Emulating`] — it overrides nothing beyond the borrowed
+/// primitive — and different in the one respect that matters to the layer above: it answers
+/// [`TransportWrite::is_write_vectored`](super::transport::TransportWrite::is_write_vectored)
+/// with `false`, which is the truth about a writer whose only gathering is the provided
+/// loop. The h2 layer therefore routes it to the coalescing drain, and it is how a test
+/// reaches that drain on the readiness side now that there is no configuration knob for it.
+///
+/// [`Emulating`] declares `true` instead, *against its own nature*, so that the emulating
+/// default stays reachable from the driver at all. The pair exists to separate the two
+/// questions the old design conflated: what a writer can do, and what it says it can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Unvectored;
+
 /// Write behaviour of a [`Duplex`]: completion, gathering natively over owned regions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Regions;
@@ -60,6 +75,22 @@ pub struct Regions;
 /// until this marker was added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct RegionEmulating;
+
+/// Write behaviour of a [`Duplex`]: completion, emulating, and **honest about it**.
+///
+/// The completion-side counterpart of [`Unvectored`]: it supplies only
+/// [`RegionWrite::write_owned`](super::transport::RegionWrite::write_owned) and answers
+/// [`TransportWrite::is_write_vectored`](super::transport::TransportWrite::is_write_vectored)
+/// with `false`, so the h2 layer coalesces its passes into a single owned buffer.
+///
+/// This is the only thing in the workspace that reaches the completion coalescing drain. At
+/// the commit before the capability existed, replacing that drain's body with `panic!` left
+/// the entire suite green: nothing in the workspace put a completion transport on the
+/// coalescing drain, so a whole limb of the driver was live code with no test behind it. It
+/// is the fifth vacuous-coverage hole this crate has found, and the reason this marker is not
+/// optional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct UnvectoredRegions;
 
 /// The ecosystem crates the async layer is built on, re-exported for tests.
 ///
@@ -160,15 +191,23 @@ fn notifying(pipe: &Mutex<Pipe>, act: impl FnOnce(&mut Pipe) -> Option<Waker>) {
 /// than by silently reading zero and treating it as a clean close.
 ///
 /// Generic over a *behaviour* marker its writing half carries — [`Vectored`], [`Emulating`],
-/// or [`Regions`] — so the same in-memory plumbing exercises every write path. Note what this
-/// marker is **not**: it does not name a drain, and the transport does not choose one. It says
-/// only what the writer can do — gather natively, reach gathering through
-/// [`BorrowedWrite::write_vectored`](super::transport::BorrowedWrite::write_vectored)'s
-/// emulating default, or take owned regions. Which drain runs is
-/// [`Config::write_policy`](super::Config::write_policy)'s answer, set per connection by the
-/// caller, and the two are deliberately independent: every combination of behaviour and policy
-/// is constructible, which is what lets a test show that an emulating transport and a natively
-/// gathering one produce the same octets and the same write count.
+/// [`Unvectored`], [`Regions`], [`RegionEmulating`], or [`UnvectoredRegions`] — so the same
+/// in-memory plumbing exercises every write path.
+///
+/// A marker fixes two independent things: what the writer *can* do (gather natively, reach
+/// gathering only through the provided emulating default, take owned regions) and what it
+/// *declares* through
+/// [`TransportWrite::is_write_vectored`](super::transport::TransportWrite::is_write_vectored).
+/// The declaration is what picks the drain — `true` gathers, `false` coalesces — so a test
+/// selects a drain by choosing a transport, not by configuring one. There is no longer a
+/// configuration knob for it.
+///
+/// The two are kept separate on purpose, because separating them is what the markers are for.
+/// [`Emulating`] can only emulate but declares `true`, which is the one way to reach the
+/// emulating default *from the driver*; [`Unvectored`] can only emulate and declares `false`,
+/// which is the honest pairing and the one a real non-gathering stream produces. Comparing
+/// the two is how a test shows the drains put the same octets on the wire in the same order
+/// while costing different numbers of writes.
 #[derive(Debug)]
 pub struct Duplex<S> {
     incoming: Arc<Mutex<Pipe>>,
@@ -181,16 +220,22 @@ pub struct Duplex<S> {
     _marker: PhantomData<S>,
 }
 
-/// How often the owned-region write was taken.
-///
-/// Earlier revisions also counted consultations of a `gathers()` capability. There is no such
-/// capability now — a transport is never asked whether it gathers — so only the write remains
-/// to count.
+/// How often the owned-region write was taken, and how often the capability was asked for.
 #[derive(Debug, Default)]
 struct ElectionRecord {
     /// Times [`RegionWrite::write_regions`] actually ran — the owned-region *write*. Retries
     /// within a pass count, since each is a real call to the transport.
     region_writes: usize,
+    /// Times
+    /// [`TransportWrite::is_write_vectored`](super::transport::TransportWrite::is_write_vectored)
+    /// was called on this half.
+    ///
+    /// The h2 layer promises to ask exactly once per connection, before the first write, and
+    /// to hold the answer for the connection's life. That promise is only worth making if it
+    /// is checked: an implementation that re-asked per pass would be indistinguishable by
+    /// octets, by write counts, and by every other observation this crate makes. This counter
+    /// is the one thing that can tell the difference.
+    capability_reads: usize,
 }
 
 /// What a vectored duplex half saw, recorded as the writes actually happened.
@@ -217,12 +262,11 @@ struct VectoredRecord {
 }
 /// Creates a connected pair for a test that does not care how writes are shaped.
 ///
-/// A readiness half that gathers natively — the ordinary case, and the same behaviour as
-/// [`duplex_vectored`] without the expectation that the test reads the log. A test that wants
-/// one copied write per pass sets
-/// [`WritePolicy::Coalesced`](crate::http::WritePolicy::Coalesced) on its `Config` rather than
-/// choosing a different transport: coalescing is a policy of this layer now, not a property a
-/// transport declares.
+/// A readiness half that gathers natively and declares so — the ordinary case, and the same
+/// behaviour as [`duplex_vectored`] without the expectation that the test reads the log. A
+/// test that wants one copied write per pass uses [`duplex_unvectored`] instead: which drain
+/// runs follows from what the transport declares, so it is chosen by picking a transport, not
+/// by configuring one.
 pub fn duplex() -> (Duplex<Vectored>, Duplex<Vectored>) {
     pair()
 }
@@ -262,6 +306,33 @@ pub fn duplex_emulating() -> (Duplex<Emulating>, Duplex<Emulating>) {
 /// [`Duplex::accept_at_most`] the same way, so owned-region short writes are driven
 /// deterministically rather than hoped for.
 pub fn duplex_owned_regions() -> (Duplex<Regions>, Duplex<Regions>) {
+    pair()
+}
+
+/// Creates a connected pair whose halves emulate gathering and say so.
+///
+/// The honest counterpart of [`duplex_emulating`]: the same writing half — borrowed primitive
+/// only, no `write_vectored` override — declaring the truth about itself rather than the
+/// override it does not have. Because it answers `false`, the h2 layer coalesces each pass
+/// into one contiguous buffer and lends it in a single borrowed write, so this is how a test
+/// reaches the readiness coalescing drain.
+///
+/// It models the ordinary non-gathering readiness stream: a tokio `AsyncWrite` whose
+/// `poll_write_vectored` is the inherited first-region-only default, which
+/// `TokioIo` reports as `false` for exactly this reason. (Named in prose rather than linked:
+/// that adapter is behind the `tokio` feature and this item is not.)
+pub fn duplex_unvectored() -> (Duplex<Unvectored>, Duplex<Unvectored>) {
+    pair()
+}
+
+/// Creates a connected pair whose halves emulate owned-region gathering and say so.
+///
+/// The completion-side counterpart of [`duplex_unvectored`], and the only route in the
+/// workspace to the completion coalescing drain — a drain that, before this transport
+/// existed, was reachable in principle and unreached in practice by every test in the suite.
+/// Its writing half supplies [`RegionWrite::write_owned`] and nothing more, and declares
+/// `false`, so each pass becomes one minted owned buffer and one owned write.
+pub fn duplex_unvectored_regions() -> (Duplex<UnvectoredRegions>, Duplex<UnvectoredRegions>) {
     pair()
 }
 
@@ -394,10 +465,11 @@ pub struct VectoredLog {
 /// Which run-time write-strategy consultations a transport half was asked for, and how often.
 ///
 /// Distinct from [`VectoredLog`], which records the *writes*: this records the *choosing* that
-/// precedes them. In the new design a strategy is elected at compile time by the writer's
-/// declared marker, so the only capability still read at run time is
-/// the owned-region write — the only write worth
-/// counting apart from its regions is [`RegionWrite::write_regions`].
+/// precedes them. Which *family* of drain runs is elected at compile time by the writer's
+/// declared model; which drain *within* the family runs is elected once per connection from
+/// the writer's answer to
+/// [`TransportWrite::is_write_vectored`](super::transport::TransportWrite::is_write_vectored),
+/// and [`capability_reads`](ElectionLog::capability_reads) counts that asking.
 #[derive(Debug, Clone)]
 pub struct ElectionLog {
     record: Arc<Mutex<ElectionRecord>>,
@@ -409,6 +481,19 @@ impl ElectionLog {
     /// reaches it.
     pub fn region_writes(&self) -> usize {
         self.record.lock().expect("election record").region_writes
+    }
+
+    /// Times the h2 layer asked this half whether its gathering write is efficient.
+    ///
+    /// Exactly `1` over the life of a driven connection, and `0` before the driver runs. The
+    /// answer is a property of the underlying I/O rather than of connection state, so asking
+    /// again could only cost time or — worse — let the drain change mid-connection. This is
+    /// the only observation that can catch either.
+    pub fn capability_reads(&self) -> usize {
+        self.record
+            .lock()
+            .expect("election record")
+            .capability_reads
     }
 }
 
@@ -596,8 +681,10 @@ macro_rules! duplex_transport {
 
 duplex_transport!(Vectored);
 duplex_transport!(Emulating);
+duplex_transport!(Unvectored);
 duplex_transport!(Regions);
 duplex_transport!(RegionEmulating);
+duplex_transport!(UnvectoredRegions);
 
 impl TransportRead for DuplexReader {
     fn read(&mut self, mut buf: BytesMut) -> impl Future<Output = (io::Result<usize>, BytesMut)> {
@@ -815,20 +902,48 @@ impl<S> Drop for DuplexWriter<S> {
 /// Emits the `TransportWrite` impl for a [`DuplexWriter`] over one strategy marker.
 ///
 /// One impl per marker rather than a blanket one over `S`: see [`DuplexWriter`] for why the
-/// blanket form cannot be proven. Nothing but the model is left to declare — the write
-/// primitives moved to the model traits, so each marker supplies its own below.
+/// blanket form cannot be proven. Each marker declares its model — the write primitives moved
+/// to the model traits, so each supplies its own below — and its gathering capability, which
+/// is what the h2 layer reads once to pick a drain.
+///
+/// The capability is recorded as it is read, so a test can assert the h2 layer asked exactly
+/// once. Recording it means this cannot be the trait's provided default even for the markers
+/// that answer `false`: the default would answer correctly and count nothing.
 macro_rules! duplex_transport_write {
-    ($marker:ty, $model:ty) => {
+    ($marker:ty, $model:ty, $vectored:expr) => {
         impl TransportWrite for DuplexWriter<$marker> {
             type Model = $model;
+
+            fn is_write_vectored(&self) -> bool {
+                self.elections
+                    .lock()
+                    .expect("election record")
+                    .capability_reads += 1;
+                $vectored
+            }
         }
     };
 }
 
-duplex_transport_write!(Vectored, Readiness);
-duplex_transport_write!(Emulating, Readiness);
-duplex_transport_write!(Regions, Completion);
-duplex_transport_write!(RegionEmulating, Completion);
+// Truthful: overrides its model's gathering operation with a real one.
+duplex_transport_write!(Vectored, Readiness, true);
+duplex_transport_write!(Regions, Completion, true);
+
+// Truthful: overrides nothing, so its only gathering is the provided emulation.
+duplex_transport_write!(Unvectored, Readiness, false);
+duplex_transport_write!(UnvectoredRegions, Completion, false);
+
+// **Deliberately over-declaring.** Neither of these overrides its model's gathering
+// operation, so `false` would be the honest answer and is what a real transport shaped like
+// them should give. They answer `true` anyway, because a `false` answer sends the driver to
+// the coalescing drain, which never calls the gathering operation at all — and these two
+// markers are the only route the crate has to the *provided emulating defaults* from a driven
+// connection. Declaring honestly here would not make the emulation wrong, it would make it
+// unreached, and a provided default no test exercises is a provided default that rots. The
+// pairing is the point: `Emulating` reaches the emulation, `Unvectored` reaches the drain a
+// transport like it actually gets.
+duplex_transport_write!(Emulating, Readiness, true);
+duplex_transport_write!(RegionEmulating, Completion, true);
 
 /// The emulating completion half: its owned write records and caps, because that is the
 /// primitive [`RegionWrite::write_regions`]'s default loops over.
@@ -841,6 +956,17 @@ duplex_transport_write!(RegionEmulating, Completion);
 /// The `write_regions` override is **deliberately absent**, and is the point of the marker:
 /// every gathering write goes through the trait's default.
 impl RegionWrite for DuplexWriter<RegionEmulating> {
+    fn write_owned(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
+        self.do_write_recording(buf)
+    }
+}
+
+/// The honest emulating completion half: no `write_regions` override, and it says `false`.
+///
+/// Records through the same path as [`RegionEmulating`], because the owned write is again the
+/// only write it serves — but here it serves exactly one per pass, holding the whole
+/// coalesced pass, rather than one per region.
+impl RegionWrite for DuplexWriter<UnvectoredRegions> {
     fn write_owned(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
         self.do_write_recording(buf)
     }
@@ -872,6 +998,21 @@ impl BorrowedWrite for DuplexWriter<Vectored> {
 ///
 /// Adding an override here would silently make several tests vacuous rather than fail them.
 impl BorrowedWrite for DuplexWriter<Emulating> {
+    fn write_borrowed<'w>(
+        &'w mut self,
+        data: &'w [u8],
+    ) -> impl Future<Output = io::Result<usize>> + 'w {
+        self.do_write_borrowed(data)
+    }
+}
+
+/// The honest emulating readiness half: no `write_vectored` override, and it says `false`.
+///
+/// Identical in what it implements to [`Emulating`] above. The whole of the difference is the
+/// declaration, and the whole of the consequence is which drain the h2 layer runs: this half
+/// is coalesced, so its `write_borrowed` receives one contiguous buffer holding the entire
+/// pass, where `Emulating`'s receives one call per region from the emulation.
+impl BorrowedWrite for DuplexWriter<Unvectored> {
     fn write_borrowed<'w>(
         &'w mut self,
         data: &'w [u8],
@@ -1131,10 +1272,21 @@ impl TransportRead for FailingReader {
 }
 
 /// Emits the `TransportWrite` impl for a [`FailingWriter`] over one strategy marker.
+///
+/// The gathering declaration is *forwarded* from the wrapped [`DuplexWriter`] rather than
+/// restated here. A [`Failing`] is a decorator: it changes when a write fails, never how one
+/// is performed, so its answer to "can you gather?" has to be the wrapped writer's answer.
+/// Restating it — or, worse, leaving it to the trait's `false` default — would silently move
+/// every failing fixture onto the coalesced drain, and the coalesced drain issues a single
+/// write, which is precisely the shape these fixtures exist to fail *part-way through*.
 macro_rules! failing_transport_write {
     ($marker:ty, $model:ty) => {
         impl TransportWrite for FailingWriter<$marker> {
             type Model = $model;
+
+            fn is_write_vectored(&self) -> bool {
+                self.inner.is_write_vectored()
+            }
         }
     };
 }
@@ -1262,7 +1414,10 @@ impl BufferingWriter {
 
 impl TransportWrite for BufferingWriter {
     /// The point this transport makes is about `commit`, not about which write path carries
-    /// the octets, so it takes the readiness model and lets the policy decide the shape.
+    /// the octets, so it takes the readiness model and leaves `is_write_vectored` at its
+    /// `false` default — the honest answer, since it overrides no gathering operation. The
+    /// driver therefore coalesces each pass into one `write_borrowed`, which this type
+    /// buffers; the buffering is what the test is about and is unaffected by the drain.
     type Model = Readiness;
 
     async fn commit(&mut self) -> io::Result<()> {

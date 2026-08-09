@@ -37,13 +37,14 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
+use ngnet_h2::http::Config;
 use ngnet_h2::http::testing::{
-    Duplex, DuplexReader, Emulating, Full, PeerWrite, RegionEmulating, Regions, Vectored, block_on,
-    bytes_crate as bytes, duplex, duplex_emulating, duplex_owned_regions, duplex_region_emulating,
+    Duplex, DuplexReader, Emulating, Full, PeerWrite, RegionEmulating, Regions, Unvectored,
+    UnvectoredRegions, Vectored, block_on, bytes_crate as bytes, duplex_emulating,
+    duplex_owned_regions, duplex_region_emulating, duplex_unvectored, duplex_unvectored_regions,
     duplex_vectored, http_crate as http,
 };
 use ngnet_h2::http::transport::{Transport, TransportRead, TransportWrite};
-use ngnet_h2::http::{Config, WritePolicy};
 
 use bytes::BytesMut;
 use core::marker::PhantomData;
@@ -109,31 +110,32 @@ fn drain(reader: &mut DuplexReader, waker: &Waker) -> Vec<u8> {
     }
 }
 
-/// Which drain a run exercises — a *pair* of a transport shape and a write policy.
+/// Which drain a run exercises.
 ///
-/// Under the strategy-election design a run named one marker, because the transport declared
-/// the drain. It no longer does: the transport declares only its I/O model and whether it
-/// gathers natively, and the h2 layer picks the drain from [`WritePolicy`]. A drain is
-/// therefore two independent choices, and this trait names each combination the tests use so
-/// a run can still be written as one type parameter.
+/// Under the strategy-election design a run named one marker because the transport declared
+/// the drain outright. Under the design after that a run named a *pair*, because the drain
+/// came from the caller's `Config` and was independent of the transport. It is one marker
+/// again, for a third reason: the transport declares a *capability* — whether its gathering
+/// operation is efficient — and the h2 layer derives the drain from that, so naming the
+/// transport names the drain and there is nothing left for a run to configure.
 ///
-/// | Shape | Transport | Policy | Drain exercised |
+/// | Shape | Transport | Declares | Drain exercised |
 /// |---|---|---|---|
-/// | [`Gathered`] | natively gathering | `Gathered` | one `write_vectored` per pass |
-/// | [`Emulated`] | emulating only | `Gathered` | the trait default, one borrowed write per region |
-/// | [`Coalescing`] | natively gathering | `Coalesced` | one *borrowed* write per pass, carrying one region |
-/// | [`OwnedRegionsShape`] | completion | `Gathered` | one `write_regions` per pass |
+/// | [`Gathered`] | natively gathering | `true` | one `write_vectored` per pass |
+/// | [`Emulated`] | emulating only, **over-declaring** | `true` | the trait default, one borrowed write per region |
+/// | [`Coalescing`] | emulating only, honest | `false` | one *borrowed* write per pass, carrying one region |
+/// | [`OwnedRegionsShape`] | completion, native regions | `true` | one `write_regions` per pass |
+/// | [`RegionEmulatedShape`] | completion, emulating, **over-declaring** | `true` | the trait default, one owned write per region |
+/// | [`RegionCoalescing`] | completion, emulating, honest | `false` | one minted owned buffer per pass |
 trait TestShape {
     /// The duplex behaviour marker the pair is built over.
     type Half;
-    /// The policy the connection is configured with.
-    const POLICY: WritePolicy;
 
     /// Builds a connected duplex pair over this shape's transport behaviour.
     fn pair() -> (Duplex<Self::Half>, Duplex<Self::Half>);
 }
 
-/// A natively-gathering readiness transport under the default policy — the fast path.
+/// A natively-gathering readiness transport that declares the capability — the fast path.
 struct Gathered;
 
 /// A readiness transport that reaches gathering only through the trait's looping default.
@@ -143,10 +145,19 @@ struct Gathered;
 /// default's loop inside the transport and the driver never learns the difference.
 struct Emulated;
 
-/// A natively-gathering transport with gathering turned **off** at the h2 layer.
+/// A transport that reaches the coalescing drain, by declaring `false`.
 ///
-/// The successor to the old `Coalesced` strategy marker. The transport is identical to
-/// [`Gathered`]'s; only the policy differs, which is the whole point of the inversion.
+/// The successor to the old `Coalesced` strategy marker, and before that to the same
+/// transport as [`Gathered`] with `WritePolicy::Coalesced` configured. Neither route exists
+/// now: a run reaches this drain by using a transport that declares it cannot gather
+/// efficiently, which is [`Unvectored`] — structurally [`Emulating`], honest about it.
+///
+/// Note what changed with this revision and what did not. The *drain* under test is the same
+/// coalescing drain, driven by the same octets; what changed is that selecting it is now the
+/// transport's statement about itself rather than the caller's instruction. Comparing this
+/// shape against [`Emulated`] — same writing half, opposite declaration — is therefore the
+/// sharpest test in the file: everything is held constant except the one bit this change
+/// introduced.
 ///
 /// Since the write primitive split by I/O model, this shape's writes appear in the vectored
 /// log like any other readiness write — the coalesced drain lends the driver's buffer through
@@ -160,7 +171,6 @@ struct OwnedRegionsShape;
 
 impl TestShape for Gathered {
     type Half = Vectored;
-    const POLICY: WritePolicy = WritePolicy::Gathered;
 
     fn pair() -> (Duplex<Vectored>, Duplex<Vectored>) {
         duplex_vectored()
@@ -169,7 +179,6 @@ impl TestShape for Gathered {
 
 impl TestShape for Emulated {
     type Half = Emulating;
-    const POLICY: WritePolicy = WritePolicy::Gathered;
 
     fn pair() -> (Duplex<Emulating>, Duplex<Emulating>) {
         duplex_emulating()
@@ -177,17 +186,15 @@ impl TestShape for Emulated {
 }
 
 impl TestShape for Coalescing {
-    type Half = Vectored;
-    const POLICY: WritePolicy = WritePolicy::Coalesced;
+    type Half = Unvectored;
 
-    fn pair() -> (Duplex<Vectored>, Duplex<Vectored>) {
-        duplex()
+    fn pair() -> (Duplex<Unvectored>, Duplex<Unvectored>) {
+        duplex_unvectored()
     }
 }
 
 impl TestShape for OwnedRegionsShape {
     type Half = Regions;
-    const POLICY: WritePolicy = WritePolicy::Gathered;
 
     fn pair() -> (Duplex<Regions>, Duplex<Regions>) {
         duplex_owned_regions()
@@ -202,17 +209,31 @@ struct RegionEmulatedShape;
 
 impl TestShape for RegionEmulatedShape {
     type Half = RegionEmulating;
-    const POLICY: WritePolicy = WritePolicy::Gathered;
 
     fn pair() -> (Duplex<RegionEmulating>, Duplex<RegionEmulating>) {
         duplex_region_emulating()
     }
 }
 
+/// A completion transport that emulates region gathering and **declares so**.
+///
+/// The honest counterpart of [`RegionEmulatedShape`], and the only route in the workspace to
+/// the completion coalescing drain — which, before the capability existed, no test reached at
+/// all.
+struct RegionCoalescing;
+
+impl TestShape for RegionCoalescing {
+    type Half = UnvectoredRegions;
+
+    fn pair() -> (Duplex<UnvectoredRegions>, Duplex<UnvectoredRegions>) {
+        duplex_unvectored_regions()
+    }
+}
+
 /// How a run is set up, and what it is allowed to do.
 ///
-/// Generic over the [`TestShape`] marker `S`, which names both the transport the run is built
-/// over and the [`WritePolicy`] its connection is configured with.
+/// Generic over the [`TestShape`] marker `S`, which names the transport the run is built over
+/// — and thereby, through what that transport declares, the drain the run exercises.
 struct Run<S> {
     /// Length of the request body, in octets.
     body: usize,
@@ -308,9 +329,9 @@ where
         PeerWrite<<Duplex<S::Half> as Transport>::Writer>,
 {
     let log = client_side.vectored_log();
-    // The policy is the run's, not the transport's: the h2 layer decides, so it arrives
-    // through `Config` at handshake rather than being read off the writer.
-    let config = Config::default().write_policy(S::POLICY);
+    // Nothing about the drain arrives through `Config`. It follows from what this shape's
+    // transport declares, which the driver reads once when it splits the transport.
+    let config = Config::default();
     if !run.caps.is_empty() {
         client_side.accept_at_most(run.caps.iter().copied());
     }
@@ -1037,7 +1058,7 @@ fn an_emulating_transport_delivers_identical_octets_one_region_at_a_time() {
     // path. A transport that cannot gather natively no longer *declines*: it inherits
     // `BorrowedWrite::write_vectored`'s default, which loops the offer region by region. The
     // octets on the wire must be exactly what a natively-gathering transport and a coalescing
-    // policy put there; only the number of writes differs.
+    // transport put there; only the number of writes differs.
     //
     // The body is handed over (`shared`), which is deliberate and load-bearing: that is the
     // only workload where the driver offers more than one region, so it is the only one where
@@ -1226,7 +1247,7 @@ fn an_emulating_partial_acceptor_leaves_no_gap_between_the_regions_it_wrote() {
     );
     let head = uncapped.calls[0][0];
 
-    // The oracle: the same handed-over body over the coalescing policy, which copies the lot
+    // The oracle: the same handed-over body over the coalescing drain, which copies the lot
     // into one owned write. Its octets are what a partial acceptor must reproduce exactly.
     let coalesced = observe(Run::<Coalescing>::new(BOUNDARY_BODY).shared().passes(8));
     assert!(
@@ -1261,56 +1282,59 @@ fn an_emulating_partial_acceptor_leaves_no_gap_between_the_regions_it_wrote() {
 }
 
 #[test]
-fn the_write_policy_is_the_h2_layers_and_holds_for_the_connections_life() {
-    // The inversion itself, pinned. The transport is the *same* natively-gathering duplex in
-    // both runs — `Gathered` and `Coalescing` differ only in the `WritePolicy` handed to
-    // `handshake_with`. So any difference below is attributable to the h2 layer's decision
-    // and to nothing the transport said, which is exactly what "the h2 layer decides" means.
+fn the_declared_capability_picks_the_drain_and_holds_for_the_connections_life() {
+    // The selection itself, pinned. `Emulated` and `Coalescing` have **the same writing
+    // half**: `DuplexWriter<Emulating>` and `DuplexWriter<Unvectored>` implement exactly the
+    // same operations — the borrowed primitive and nothing else — and differ in one bit, the
+    // value each returns from `is_write_vectored`. So every difference below is attributable
+    // to the declaration and to nothing else about the transport, which is what "the
+    // transport declares and the h2 layer routes" has to mean if it means anything.
+    //
+    // **This test replaced `the_write_policy_is_the_h2_layers_and_holds_for_the_connections_life`,**
+    // which compared the same natively-gathering transport under two `WritePolicy` values.
+    // That comparison is no longer expressible — there is no policy to hand to
+    // `handshake_with` — and its subject has moved: what holds for the connection's life is
+    // now an answer read from the writer once, not a value carried in from `Config`.
     //
     // The body fills the initial window, so it goes out as several writes over several polls.
-    // A driver that re-derived the drain per pass — or read anything off the transport — could
-    // not keep these two runs cleanly separated across all of them.
-    let gathered = observe(Run::<Gathered>::new(WINDOW_FILLING_BODY).passes(8));
+    // A driver that re-asked the writer per pass, or that ignored the answer, could not keep
+    // these two runs cleanly separated across all of them.
+    let gathered = observe(Run::<Emulated>::new(WINDOW_FILLING_BODY).passes(8));
     let coalesced = observe(Run::<Coalescing>::new(WINDOW_FILLING_BODY).passes(8));
 
-    // **This guard used to read `coalesced.calls.is_empty()`, and that reading is now wrong.**
-    // It worked only because the coalesced drain went through an owned `write` that the
-    // vectored log did not record, so "log empty" stood in for "no gathering write". The
-    // readiness coalesced drain now lends the driver's buffer through `write_borrowed`, which
-    // *is* logged — so an empty log would mean the connection wrote nothing at all, and the
-    // assertion would have gone vacuous rather than failing. The discriminator is therefore
-    // re-expressed as the shape of the calls, which is what "gathering" and "coalescing"
-    // actually mean:
+    // **The discriminator is the number of calls, not the regions per call.** An emulating
+    // transport never receives a multi-region call in the first place: the gathered drain
+    // hands it a region list and `write_vectored`'s provided default loops that list through
+    // `write_borrowed` one region at a time, so the log shows N single-region calls. The
+    // coalesced drain hands the same pass over as one contiguous buffer, so the log shows one
+    // call. That difference — N against 1 — is precisely the cost the declaration is choosing
+    // between, and it is what these two runs are told apart by.
     //
-    //   - a gathering write offers several regions in one call;
-    //   - a coalescing write offers exactly one region, whatever it had to copy to get there.
+    // An earlier form of this test compared regions-per-call, which worked when the two runs
+    // used a *natively* gathering transport on one side. It does not survive the move to a
+    // pair that differs only in the declared bit, because both halves of that pair emulate.
     assert!(
         gathered.calls.len() >= 4,
-        "the gathered run drove fewer than four writes, so holding for the connection's life \
-         is not meaningfully distinguished from holding for one pass, saw {:?}",
+        "the over-declaring run drove fewer than four writes, so holding for the connection's \
+         life is not meaningfully distinguished from holding for one pass, saw {:?}",
         gathered.calls,
-    );
-    assert!(
-        gathered.calls.iter().any(|regions| regions.len() > 1),
-        "the gathered policy never offered more than one region in a call, so nothing was \
-         gathered and the comparison below is between two coalescing runs, saw {:?}",
-        gathered.calls,
-    );
-    assert!(
-        coalesced.calls.iter().all(|regions| regions.len() == 1),
-        "the coalesced policy offered a multi-region write; turning gathering off must turn \
-         it off for the whole connection, saw {:?}",
-        coalesced.calls,
     );
     assert!(
         !coalesced.calls.is_empty(),
-        "the coalesced run logged no write at all, so the single-region claim above is \
-         vacuous — every octet must still have crossed the transport",
+        "the coalescing run logged no write at all, so the comparison below is vacuous — \
+         every octet must still have crossed the transport",
+    );
+    assert!(
+        coalesced.calls.iter().all(|regions| regions.len() == 1),
+        "a coalescing write offers exactly one region, whatever it had to copy to get there, \
+         saw {:?}",
+        coalesced.calls,
     );
     assert!(
         coalesced.calls.len() < gathered.calls.len(),
-        "coalescing did not merge anything: it took {} writes against gathering's {}, so the \
-         two policies are not being told apart, saw {:?} against {:?}",
+        "the two declarations were not told apart: coalescing took {} writes against the \
+         over-declaring run's {}. The writing halves are identical, so if these match then \
+         `is_write_vectored` did not select the drain, saw {:?} against {:?}",
         coalesced.calls.len(),
         gathered.calls.len(),
         coalesced.calls,
@@ -1318,26 +1342,160 @@ fn the_write_policy_is_the_h2_layers_and_holds_for_the_connections_life() {
     );
     assert_eq!(
         gathered.peer, coalesced.peer,
-        "the two policies put different octets on the wire; the policy chooses how the \
+        "the two declarations put different octets on the wire; a declaration chooses how the \
          octets are written, never which octets",
     );
     assert!(
         !gathered.peer.is_empty(),
         "the body never left, so the comparison proved nothing",
     );
+
+    // And the natively-gathering transport, which declares `true` truthfully, must reach a
+    // genuinely multi-region write — otherwise `true` would be selecting a drain that never
+    // gathers, and the whole distinction would be nominal.
+    let native = observe(Run::<Gathered>::new(WINDOW_FILLING_BODY).passes(8));
+    assert!(
+        native.calls.iter().any(|regions| regions.len() > 1),
+        "the natively-gathering run never offered more than one region in a call, so a `true` \
+         declaration bought no gathering at all, saw {:?}",
+        native.calls,
+    );
+    assert_eq!(
+        native.peer, coalesced.peer,
+        "the natively-gathering run put different octets on the wire than the coalescing one",
+    );
+}
+
+#[test]
+fn the_capability_is_read_exactly_once_for_a_connections_whole_life() {
+    // The "once" in "asked once" is not observable from octets, from write counts, or from
+    // anything else this file measures: a driver that re-asked the writer before every pass
+    // would produce a byte-identical wire and identical logs. The election log's capability
+    // counter exists for this one assertion, and this is the only test that makes it.
+    //
+    // It matters because the answer is cached. If it were re-read, a writer whose answer
+    // depended on connection state could change the drain mid-connection — and the trait
+    // documents that it must not, so the driver must not give it the chance.
+    let (client, server) = duplex_unvectored();
+    let elections = client.election_log();
+
+    assert_eq!(
+        elections.capability_reads(),
+        0,
+        "the capability was read before the connection was driven at all",
+    );
+
+    // Caps force the coalescing drain to short-write and re-offer, which spreads the body
+    // over several polls. Without them the whole pass leaves in one call, and a driver that
+    // re-asked once per pass would be indistinguishable from one that asked once in total.
+    let observed = observe_over(
+        (client, server),
+        Run::<Coalescing>::new(WINDOW_FILLING_BODY)
+            .caps([1024, 4096, 128, 16384])
+            .passes(16),
+    );
+
+    assert!(
+        !observed.peer.is_empty(),
+        "the run wrote nothing, so a read count of one would be trivially satisfied",
+    );
+    assert!(
+        observed.calls.len() > 1,
+        "the run drove a single write, so a per-pass re-read would be indistinguishable from \
+         a single read, saw {:?}",
+        observed.calls,
+    );
+    assert_eq!(
+        elections.capability_reads(),
+        1,
+        "the driver asked the writer for its gathering capability {} times over a connection \
+         that drove {} writes; it must ask exactly once, before the first of them",
+        elections.capability_reads(),
+        observed.calls.len(),
+    );
+}
+
+#[test]
+fn the_completion_side_selects_its_drain_from_the_declaration_too() {
+    // The completion counterpart of the readiness selection above, and the same construction:
+    // `RegionEmulatedShape` and `RegionCoalescing` have identical writing halves — the owned
+    // primitive and no `write_regions` override — differing only in the declared bit.
+    //
+    // Worth its own test rather than folding into the readiness one because the two drains
+    // are separate code. `flush_coalesced_owned` is the one this reaches, and before the
+    // capability existed *nothing in the workspace reached it*: replacing its body with
+    // `panic!` left the entire 844-test suite green.
+    // **The run must hand the body over, and that is not incidental.** On the push path this
+    // file's other completion runs take, the driver mints owned buffers from the session's
+    // blocks and accumulates every sub-threshold one into a single region *before* the drain
+    // sees it — so the gathered drain offers one region, the emulation loops once, and both
+    // drains cost exactly one write of the same length. Measured: `[[65653]]` for all three
+    // completion shapes. A comparison on that workload would have passed for both drains and
+    // told them apart for neither, which is the shape of a vacuous guard.
+    //
+    // `shared()` hands each `DATA` frame over as its own record, so the pass carries nine
+    // regions the driver must not copy. That is where the drains separate: the over-declaring
+    // run pays nine `write_owned` calls through `write_regions`' provided default, and the
+    // coalescing run pays one — having copied all nine regions, handed-over payloads and all,
+    // into a single minted buffer. That copy is the cost of a `false` declaration on the
+    // completion side, and this is the test that makes it visible.
+    let over_declaring = observe(
+        Run::<RegionEmulatedShape>::new(WINDOW_FILLING_BODY)
+            .passes(8)
+            .shared(),
+    );
+    let coalescing = observe(
+        Run::<RegionCoalescing>::new(WINDOW_FILLING_BODY)
+            .passes(8)
+            .shared(),
+    );
+
+    assert_eq!(
+        over_declaring.peer, coalescing.peer,
+        "the two declarations put different octets on the wire on the completion side",
+    );
+    assert!(
+        !coalescing.peer.is_empty(),
+        "the completion coalescing run wrote nothing, so this proves nothing",
+    );
+    assert!(
+        over_declaring.calls.len() > 1,
+        "the over-declaring completion run took a single write, so the region list it was \
+         handed had one entry and there is nothing for coalescing to have merged, saw {:?}",
+        over_declaring.calls,
+    );
+    assert_eq!(
+        coalescing.calls.len(),
+        1,
+        "the completion coalescing drain must mint one owned buffer for the pass and write it \
+         once, saw {:?}",
+        coalescing.calls,
+    );
+    assert!(
+        coalescing.calls.iter().all(|regions| regions.len() == 1),
+        "a completion coalescing write offers one region, whatever it had to copy to get \
+         there, saw {:?}",
+        coalescing.calls,
+    );
 }
 
 #[test]
 fn the_coalesced_readiness_drain_loses_no_octet_across_forced_short_writes() {
-    // SC-008. The readiness coalescing drain is new code: it lends the driver's own buffer
-    // through `write_borrowed` and advances an offset over whatever prefix the transport
-    // accepted, where the old shared drain froze the buffer into a `Bytes` and handed it over.
-    // An offset loop is exactly the kind of code that loses octets at a boundary, so it is
-    // driven here against caps chosen to land mid-buffer.
+    // SC-008. Restored from the revision this file was rewritten in, where it was lost rather
+    // than retired: nothing about the capability change makes its property less true, and it
+    // is the only test that drives the readiness coalescing drain against caps chosen to land
+    // mid-buffer. What changed is only how the drain is reached — `Run::<Coalescing>` now
+    // names a transport that declares it cannot gather, where it used to name a configured
+    // policy — so the run below is the same traffic over the same drain.
     //
-    // The oracle is the *same* traffic over the same transport with gathering on. Both
-    // policies must put identical octets on the wire — that is what a policy means — so any
-    // divergence is the coalescing loop dropping, duplicating or reordering something.
+    // The readiness coalescing drain lends the driver's own buffer through `write_borrowed`
+    // and advances an offset over whatever prefix the transport accepted. An offset loop is
+    // exactly the kind of code that loses octets at a boundary, so it is driven here against
+    // caps chosen to land mid-buffer.
+    //
+    // The oracle is the *same* traffic over a gathering transport. Both drains must put
+    // identical octets on the wire — that is what a drain is — so any divergence is the
+    // coalescing loop dropping, duplicating or reordering something.
     let oracle = observe(Run::<Gathered>::new(BOUNDARY_BODY).shared().passes(8));
     assert!(
         !oracle.peer.is_empty(),
@@ -1373,7 +1531,7 @@ fn the_coalesced_readiness_drain_loses_no_octet_across_forced_short_writes() {
         );
         // Every call this drain makes carries exactly one region, whatever the caps did to
         // how many calls there were. Without this the equality above would still pass if the
-        // policy had silently stopped being honoured under caps.
+        // declaration had silently stopped being honoured under caps.
         assert!(
             observed.calls.iter().all(|regions| regions.len() == 1),
             "caps {caps:?} made the coalesced drain offer a multi-region call, saw {:?}",
@@ -1383,25 +1541,29 @@ fn the_coalesced_readiness_drain_loses_no_octet_across_forced_short_writes() {
 }
 
 #[test]
-fn a_readiness_transport_supplies_no_owned_write_under_either_policy() {
-    // SC-006. The point of the split, driven rather than merely compiled.
+fn a_readiness_transport_supplies_no_owned_write_under_either_capability() {
+    // SC-006. The point of the split, driven rather than merely compiled. Restored from the
+    // revision this file was rewritten in, and renamed as the plan's Phase 4 required:
+    // "either policy" is now "either capability", because the two runs below differ in what
+    // the transport declares about itself rather than in what the caller asked for.
     //
-    // `DuplexWriter<Vectored>` implements `TransportWrite` (model only) and `BorrowedWrite`,
-    // and has no owned write anywhere — there is no `write_owned` on it and `RegionWrite` is
-    // unreachable for a readiness model. Before the split, that transport could not have
-    // existed: `TransportWrite::write` was required of everyone. So the fact that this
-    // compiles at all is half the assertion.
+    // `DuplexWriter<Vectored>` and `DuplexWriter<Unvectored>` implement `TransportWrite`
+    // (model only) and `BorrowedWrite`, and have no owned write anywhere — there is no
+    // `write_owned` on either and `RegionWrite` is unreachable for a readiness model. Before
+    // the split, such a transport could not have existed: `TransportWrite::write` was
+    // required of everyone. So the fact that this compiles at all is half the assertion.
     //
-    // The other half is that *both* policies work over it. `Coalesced` is the interesting
-    // one: coalescing is where an owned buffer used to be manufactured, and it is the drain
-    // that would need one if the ownership requirement had merely moved rather than gone.
+    // The other half is that *both* drains work over a transport of that shape. The coalesced
+    // one is the interesting one: coalescing is where an owned buffer used to be
+    // manufactured, and it is the drain that would need one if the ownership requirement had
+    // merely moved rather than gone.
     let gathered = observe(Run::<Gathered>::new(WINDOW_FILLING_BODY).passes(8));
     let coalesced = observe(Run::<Coalescing>::new(WINDOW_FILLING_BODY).passes(8));
 
     assert_eq!(
         gathered.peer, coalesced.peer,
-        "a transport with no owned write put different octets on the wire under the two \
-         policies",
+        "two transports with no owned write put different octets on the wire under the two \
+         drains their declarations selected",
     );
     assert!(
         !gathered.peer.is_empty(),
@@ -1409,6 +1571,6 @@ fn a_readiness_transport_supplies_no_owned_write_under_either_policy() {
     );
     assert!(
         gathered.outcome.is_none() && coalesced.outcome.is_none(),
-        "a policy ended the connection over a transport that supplies only a borrowed write",
+        "a drain ended the connection over a transport that supplies only a borrowed write",
     );
 }

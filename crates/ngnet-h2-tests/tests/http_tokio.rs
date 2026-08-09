@@ -17,7 +17,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use http_body::{Body, Frame};
 use ngnet_h2::http::transport::{
-    Completion, RegionWrite, Transport, TransportRead, TransportWrite,
+    BorrowedWrite, Completion, RegionWrite, Transport, TransportRead, TransportWrite,
 };
 use ngnet_h2::http::{IncomingBody, server, transport::TokioIo};
 use tokio::net::{TcpListener, TcpStream};
@@ -183,6 +183,202 @@ async fn a_no_copy_exchange_crosses_a_real_socket_intact() {
     .expect("the exchange stalled");
 }
 
+/// The shipped tokio transport forwards the stream's own answer, and a real `TcpStream` says
+/// yes.
+///
+/// This test exists because its absence was a hole. `TokioWriter::is_write_vectored` returns a
+/// field cached from `tokio::io::AsyncWrite::is_write_vectored` at `split` time, and replacing
+/// the whole method body with a constant `false` left the **entire workspace suite green** —
+/// verified by mutation. Every other pin on the capability is on a test duplex, so the shipped
+/// adapter's declaration was inferred rather than measured, and the one number the change was
+/// supposed to preserve on a real socket — one gathered `writev` per pass — rested on nothing.
+///
+/// Two properties, and the second is what makes the first non-vacuous:
+///
+/// 1. A `TokioIo<TcpStream>` reports `true`. A Linux `TcpStream` implements
+///    `poll_write_vectored` with a real `writev`, so `false` would be a lie that costs every
+///    tokio user a full copy per pass.
+/// 2. The answer is the *stream's*, not a constant. A `TokioIo` over a writer that inherits
+///    tokio's first-region-only default reports `false` through the same code path. A constant
+///    `true` passes part 1 and fails here; a constant `false` fails part 1. Neither survives.
+///
+/// Part 2 needs a stream that *inherits* tokio's `poll_write_vectored` default, and finding
+/// one is harder than it looks: `tokio::io::DuplexStream` was tried first and reports `true`,
+/// because it overrides `poll_write_vectored` itself. So the negative half uses a hand-written
+/// `AsyncWrite` that implements only `poll_write` — which is precisely the third-party wrapper
+/// the conservative default exists for, and a more honest fixture than a tokio type that
+/// happens to be well-behaved.
+/// A tokio stream that implements only `poll_write`, and so inherits
+/// `is_write_vectored() == false` from `AsyncWrite`'s provided default.
+///
+/// The reads and writes go nowhere: nothing is ever driven over this: it exists solely to be
+/// asked one question at `split` time.
+struct NoVectoredWrite;
+
+impl tokio::io::AsyncRead for NoVectoredWrite {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl tokio::io::AsyncWrite for NoVectoredWrite {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    // No `is_write_vectored`, and no `poll_write_vectored`. That omission is the fixture.
+}
+
+#[tokio::test]
+async fn the_shipped_tokio_transport_forwards_the_streams_own_gathering_answer() {
+    tokio::time::timeout(PATIENCE, async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binding");
+        let addr = listener.local_addr().expect("an address");
+        let accepting = tokio::spawn(async move {
+            let _ = listener.accept().await.expect("accepting");
+        });
+
+        let stream = TcpStream::connect(addr).await.expect("connecting");
+        let (_reader, writer) = Transport::split(TokioIo::new(stream));
+        assert!(
+            writer.is_write_vectored(),
+            "a real `TcpStream` gathers through `writev`, and the shipped adapter must say so \
+             or every tokio connection pays a copy of every outgoing octet",
+        );
+
+        // The same adapter over a stream that does not gather. If this also reported `true`
+        // the assertion above would be satisfied by a constant and would pin nothing.
+        let (_reader, writer) = Transport::split(TokioIo::new(NoVectoredWrite));
+        assert!(
+            !writer.is_write_vectored(),
+            "the adapter reported gathering for a stream that inherits tokio's \
+             first-region-only default, so it is answering from a constant rather than from \
+             the stream",
+        );
+
+        accepting.await.expect("the acceptor");
+    })
+    .await
+    .expect("the probe stalled");
+}
+
+/// A stream that records the length of every `poll_write` and never gathers.
+///
+/// Distinct from [`NoVectoredWrite`] only in that it counts, which is what lets a caller tell
+/// an emulated gathering write (one call per region) from a first-region-only forward (one
+/// call, one region's worth of octets).
+#[derive(Default)]
+struct CountingUnvectoredWrite(std::rc::Rc<std::cell::RefCell<Vec<usize>>>);
+
+impl tokio::io::AsyncWrite for CountingUnvectoredWrite {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.0.borrow_mut().push(buf.len());
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    // No `poll_write_vectored`: this stream inherits tokio's provided default, which writes
+    // the first region and silently ignores the rest.
+}
+
+impl tokio::io::AsyncRead for CountingUnvectoredWrite {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn a_direct_vectored_call_on_a_non_gathering_tokio_writer_still_writes_every_region() {
+    // Decision D-2, made load-bearing. `TokioWriter::write_vectored` keeps a branch that
+    // emulates gathering when the wrapped stream does not gather natively. Since the
+    // capability change that branch is unreachable *from the driver* — the adapter reports
+    // `false` for such a stream, and `false` routes to the coalescing drain, which calls
+    // `write_borrowed` and never this method. D-2 kept the branch anyway, justified as a
+    // defence for direct callers of the public `BorrowedWrite` trait.
+    //
+    // That justification was an assertion with nothing behind it: replacing the branch
+    // condition with `true`, so that every writer forwards natively, left the entire suite
+    // green. This test is what makes the justification true. It is deliberately a *direct*
+    // call, because a direct call is exactly the situation D-2 claims to protect, and no
+    // driven connection can reach it.
+    //
+    // The discriminator is sharp: tokio's provided `poll_write_vectored` writes the first
+    // region and ignores the rest, so a forward would produce ONE call of 5 octets and lose
+    // ten. Emulation produces THREE calls totalling fifteen.
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let stream = CountingUnvectoredWrite(std::rc::Rc::clone(&log));
+    let (_reader, mut writer) = Transport::split(TokioIo::new(stream));
+
+    assert!(
+        !writer.is_write_vectored(),
+        "the fixture is meant to be a non-gathering stream; if it reports `true` the branch \
+         under test is not the one being taken and this test proves nothing",
+    );
+
+    let written = writer
+        .write_vectored(&[
+            std::io::IoSlice::new(b"alpha"),
+            std::io::IoSlice::new(b"bravo"),
+            std::io::IoSlice::new(b"delta"),
+        ])
+        .await
+        .expect("the emulated gathering write");
+
+    assert_eq!(
+        written, 15,
+        "a direct `write_vectored` on a non-gathering tokio stream reported {written} octets \
+         for three five-octet regions; forwarding to tokio's first-region-only default would \
+         report exactly 5, which is the bug the retained branch exists to prevent",
+    );
+    assert_eq!(
+        *log.borrow(),
+        vec![5, 5, 5],
+        "the emulation must reach the underlying stream once per region; a single call means \
+         the regions after the first were dropped",
+    );
+}
+
 #[tokio::test]
 async fn a_request_and_response_cross_a_real_socket() {
     tokio::time::timeout(PATIENCE, async {
@@ -320,18 +516,27 @@ impl TransportRead for CompletionReader {
 }
 
 impl TransportWrite for CompletionWriter {
-    // Owned throughout, so the completion model. That is now the *only* declaration a
-    // transport makes about its writes: how it does I/O, never which drain the h2 layer
-    // should use.
+    // Owned throughout, so the completion model.
     type Model = Completion;
+
+    // And no scatter-gather write behind it: `tokio::io::AsyncWriteExt::write` on an owned
+    // half takes one buffer. Saying so is not decoration — it is what routes this connection
+    // onto the completion *coalescing* drain, which until this transport declared itself had
+    // no end-to-end coverage anywhere in the workspace. Leaving the method off would give the
+    // same `false` by default; it is spelled out because being on that drain is the point.
+    fn is_write_vectored(&self) -> bool {
+        false
+    }
 }
 
 /// The whole write obligation, discharged by the one owned primitive.
 ///
 /// `write_regions` is provided: its default loops the owned regions through `write_owned`
-/// below. So this transport gathers — as every transport now must — without naming a single
-/// extra method, which is the shape that makes "mandatory" affordable for a backend that has
-/// nothing better to offer.
+/// below. So this transport *can* gather — as every transport can — without naming a single
+/// extra method, which is the shape that makes the provided default affordable for a backend
+/// that has nothing better to offer. It does not *claim* to gather, though, and the driver
+/// believes the claim rather than the capability: because `is_write_vectored` is `false`, the
+/// driver coalesces each pass into one owned buffer and `write_regions` is never reached.
 ///
 /// The owned primitive lives *here*, on the completion model's trait, and not on
 /// `TransportWrite`. A tokio transport built on the readiness model — the one in
@@ -435,6 +640,9 @@ impl TransportRead for ThreadBoundReader {
 
 impl TransportWrite for ThreadBoundWriter {
     type Model = Completion;
+    // No override of `write_regions`, so `false` by default is the honest answer. This
+    // fixture exists to prove a non-`Send` connection compiles and runs; which drain carries
+    // its octets is immaterial to that, and the default is the one that needs no line.
 }
 
 impl RegionWrite for ThreadBoundWriter {

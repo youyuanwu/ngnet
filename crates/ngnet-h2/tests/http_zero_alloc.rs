@@ -45,9 +45,11 @@
 //! rank differently on each, which is exactly why one of them alone would have answered the
 //! question wrongly.
 //!
-//! A *shape* is no longer one thing the transport declares. It is a pair: what the transport
-//! can do — gather natively, or only through `write_vectored`'s looping default — and what the
-//! h2 layer decided, through [`WritePolicy`]. The rows below name both.
+//! A *shape* is one thing again: a transport behaviour together with the capability that
+//! transport declares. Those two are independent — a transport that overrides its gathering
+//! operation may still declare `false`, and one that does not may still declare `true` — and
+//! the table names both, because the declaration is what selects the drain and the behaviour
+//! is what the drain then costs.
 //!
 //! The allocation and write columns are asserted by the tests named in the final column;
 //! the parenthesised counts are illustrative — they are the values observed at the default
@@ -55,16 +57,60 @@
 //! incidental numbers, which move with the window size, the stream count and `bytes`'
 //! growth policy.
 //!
-//! | shape (transport × policy) | upload: allocations / writes | multiplexed: allocations / writes | pinned by |
+//! | shape (behaviour × declaration → drain) | upload: allocations / writes | multiplexed: allocations / writes | pinned by |
 //! |-------|------------------------------|-----------------------------------|-----------|
-//! | `CoalescedShape` — any readiness transport, gathering **off** | `0` / `1` | `0` / `1` | `the_coalesced_write_path_coalesces_a_pass_into_one_write`, `the_coalesced_write_path_reuses_its_coalescing_buffer` |
-//! | `EmulatedShape` — emulating transport, gathering on | `0` / one per frame (4) | `0` / `1` | `steady_state_send_allocates_nothing_on_the_borrowed_path`, `emulated_gathering_costs_no_more_writes_than_native_on_an_upload` |
-//! | `GatheredShape` — natively-gathering transport, gathering on | `0` / one per frame (4) | `0` / `1` | `steady_state_send_allocates_nothing_on_the_vectored_path`, `steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path`, `a_multiplexed_pass_costs_one_write_natively_and_under_emulation_alike`, `the_vectored_write_path_writes_once_per_large_block_and_no_more` |
-//! | `RegionShape` — completion transport | `0` / `1` | `0` / `1` | `the_owned_region_write_path_coalesces_a_pass_into_one_write`, `steady_state_send_allocates_nothing_on_the_owned_region_path`, `a_multiplexed_pass_costs_the_completion_path_one_write_and_no_allocation` |
+//! | `GatheredShape` — native override, declares `true` → gathered | `0` / one per frame (4) | `0` / `1` | `steady_state_send_allocates_nothing_on_the_vectored_path`, `steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path`, `a_multiplexed_pass_costs_one_write_natively_and_under_emulation_alike`, `the_vectored_write_path_writes_once_per_large_block_and_no_more` |
+//! | `CoalescedShape` — native override, declares `false` → coalesced | `0` / `1` | `0` / `1` | `the_coalesced_write_path_coalesces_a_pass_into_one_write`, `the_coalesced_write_path_reuses_its_coalescing_buffer`, `a_native_transport_that_declares_false_is_taken_at_its_word` |
+//! | `OverDeclaringEmulatedShape` — no override, declares `true` → gathered | `0` / one per frame (4) | `0` / `1` | `steady_state_send_allocates_nothing_on_the_borrowed_path`, `emulated_gathering_costs_no_more_writes_than_native_on_an_upload` |
+//! | `HonestEmulatedShape` — no override, declares `false` → coalesced | `0` / **`1`** | `0` / `1` | `an_honest_emulating_transport_now_costs_one_write_per_upload_pass` |
+//! | `RegionShape` — native `write_regions`, declares `true` → gathered | `0` / `1` | `0` / `1` | `the_owned_region_write_path_coalesces_a_pass_into_one_write`, `steady_state_send_allocates_nothing_on_the_owned_region_path`, `a_multiplexed_pass_costs_the_completion_path_one_write_and_no_allocation` |
+//! | `RegionCoalescedShape` — no `write_regions`, declares `false` → coalesced | `0` / `1` | `0` / `1` | `the_completion_coalescing_drain_costs_one_write_and_no_allocation` |
+//!
+//! Every shape moves the same octets in the same order; only the write count and how much is
+//! copied differ. `every_shape_moves_the_same_octet_count_per_pass` pins the octet *count*
+//! across all six; `http_vectored.rs` compares the octets themselves.
+//!
+//! # Exactly one number moved when the capability replaced the config knob, and it is in bold
+//!
+//! Before that change the drain came from `Config::write_policy`, whose default was
+//! `Gathered`, and a transport had no way to decline. So an emulating readiness transport —
+//! a tokio stream with the inherited `poll_write_vectored`, the commonest non-socket case —
+//! took the gathered drain and reached `write_vectored`'s emulating default: **one write per
+//! region, and no copy of the regions**. On an upload of four full-sized `DATA` frames that
+//! is four writes. That measurement is the old `EmulatedShape` row, and it is still measured,
+//! under the name `OverDeclaringEmulatedShape`, by a transport that keeps declaring `true`
+//! against its own nature precisely so the row survives.
+//!
+//! The same transport declaring the truth is `HonestEmulatedShape`, and it is coalesced:
+//! **one write, and a copy of every outgoing octet**. `4 → 1` in the upload write column is
+//! the entire behavioural movement of that change, and its mechanism is the drain switch and
+//! nothing else. Every other row is unchanged to the digit:
+//!
+//! - `GatheredShape` and `RegionShape` declare `true` and take the same gathered drain they
+//!   always did. A real `TcpStream` and a completion transport must not pay anything for a
+//!   decision taken elsewhere, which was true when the decision moved *to* the config and is
+//!   true again now that it has moved away.
+//! - `OverDeclaringEmulatedShape` is the old `EmulatedShape` renamed. Same transport, same
+//!   drain, same counts; only the name now says why it keeps reaching the emulation.
+//! - `CoalescedShape` was the natively-gathering transport with the policy set to `Coalesced`.
+//!   That combination is no longer expressible through configuration, so it is expressed the
+//!   only way left: the same transport, declaring `false`. Same counts, and it now pins
+//!   something it could not before — that the h2 layer believes the declaration rather than
+//!   inferring from the override, which it cannot see.
+//! - `RegionCoalescedShape` is new, and is not a moved number but a first measurement. The
+//!   completion coalescing drain had no test before this: nothing paired a completion
+//!   transport with the coalescing policy, and putting `panic!` in that drain left all 844
+//!   tests green.
+//!
+//! The multiplexed write column does not move anywhere, and that is worth stating rather than
+//! passing over. A multiplexed pass is hundreds of sub-threshold blocks, which the driver
+//! accumulates into a *single region* before any write happens — so the gathered drain offers
+//! one region and the emulation loops once. One write either way. The whole of this change's
+//! cost falls on traffic with large blocks, which is uploads.
 //!
 //! # The emulated row used to read `513`
 //!
-//! Before the write policy moved to the h2 layer there was a fourth *drain*, `PerRegion`,
+//! Before the write policy moved to the h2 layer there was a further *drain*, `PerRegion`,
 //! which wrote each session block on its own — 513 writes on the multiplexed pass. It is gone,
 //! and with it that number. What replaced it is not a cheaper drain but the absence of one:
 //! the driver accumulates sub-threshold blocks into a single region *before* any write
@@ -72,10 +118,7 @@
 //! once. Its cost is set by the regions the driver offers, never by the blocks the session
 //! produced, which is the entire reason mandatory gathering is affordable.
 //!
-//! The `GatheredShape` and `RegionShape` rows are unchanged from before that move, deliberately
-//! and to the digit: a real `TcpStream` and a completion transport must not pay anything for a
-//! decision that was taken away from them.
-//!
+
 //! The owned-region row carried no multiplexed column until review noticed the gap. It does
 //! now, and it reads the same as the readiness rows, for the same reason: this file's
 //! push-model workload never hands over a payload, so the completion path accumulates every
@@ -83,7 +126,7 @@
 //! distinguishing property, that a *handed-over* payload rides uncopied in its own region,
 //! needs a shared body to exercise and is proven in `http_shared_body.rs`.
 //!
-//! All four shapes reach zero steady-state allocation, but they arrived there at different
+//! All six shapes reach zero steady-state allocation, but they arrived there at different
 //! times and for different reasons, and the history is worth keeping because the table above
 //! was once the argument for a design decision.
 //!
@@ -96,10 +139,13 @@
 //! remains inherent to that shape is the *copy* of every outgoing octet, which the transport
 //! taking ownership genuinely requires.
 //!
-//! So the column that still separates the three is the write count, and it is a syscall
-//! count — which is what the benchmarks in `crates/ngnet-h2-bench` measure as the dominant
-//! cost on a real socket. The borrowed shape pays one per block: four on an upload, and 513
-//! on multiplexed traffic.
+//! So the column that separated the shapes of that era was the write count, and it is a
+//! syscall count — which is what the benchmarks in `crates/ngnet-h2-bench` measure as the
+//! dominant cost on a real socket. The per-block borrowed drain of that era paid one write
+//! per block: four on an upload, and 513 on multiplexed traffic. **That drain no longer
+//! exists** — it was removed before the capability change, and neither figure is the count of
+//! any shape in the table above. The 513 in particular has been misattributed to emulated
+//! gathering more than once; it is not that, and no current shape produces it.
 //!
 //! The gathering shape does not make that trade. It costs no allocation on either workload
 //! and the *lower* of the two write counts on both, because the two things being traded were
@@ -111,15 +157,14 @@
 //! and a large block rides out beside that accumulation without being copied.
 //!
 //! So the answer to the question this section used to ask is: neither of the two shapes it
-//! was choosing between. `TokioWriter` elects the gathering path, and falls back to the
-//! borrowed one only where `is_write_vectored()` reports that the underlying stream would
-//! emulate `writev` by copying — in which case the emulation would reintroduce exactly the
-//! copy the strategy exists to avoid, and one write per block is the better bargain.
+//! was choosing between. `TokioWriter` forwards its stream's own `is_write_vectored`, so a
+//! stream that really scatter-gathers takes the gathered drain and one that does not is
+//! coalesced — the second of which is what `HonestEmulatedShape` above measures.
 //!
 //! The crate's headline commitment — steady-state zero allocation — was once reachable only
 //! on the borrowed path, and that fact was the argument for the tokio adapter taking it. It
-//! is now reachable on all three, the owned path included: what remained there was never the
-//! allocation but the *copy* of every outgoing octet, which a transport taking ownership
+//! is now reachable on all of them, the owned path included: what remained there was never
+//! the allocation but the *copy* of every outgoing octet, which a transport taking ownership
 //! genuinely requires and which no reuse can remove.
 //!
 #![cfg(feature = "http")]
@@ -140,6 +185,7 @@ use core::task::{Context, Poll, Waker};
 use bytes::{Bytes, BytesMut};
 
 use http_body::Body;
+use ngnet_h2::http::Config;
 use ngnet_h2::http::testing::{
     Empty, Full, bytes_crate as bytes, http_body_crate as http_body, http_crate as http,
     pool_high_water, pool_size,
@@ -147,60 +193,99 @@ use ngnet_h2::http::testing::{
 use ngnet_h2::http::transport::{
     BorrowedWrite, Completion, Readiness, RegionWrite, Transport, TransportRead, TransportWrite,
 };
-use ngnet_h2::http::{Config, WritePolicy};
 
-/// A recording transport that gathers natively — the fast path a real `TcpStream` takes.
+/// A recording transport that gathers natively and declares it — the fast path a real
+/// `TcpStream` takes.
 struct Native;
 
+/// A recording transport that gathers natively and **declares `false` anyway**.
+///
+/// Structurally `Native`: the same `write_vectored` override, the same real gathering. The
+/// only difference is the answer it gives, and the point of the marker is that the answer is
+/// what counts. The h2 layer cannot see an override — a provided method and an overridden one
+/// are the same call from a generic context — so it must take the declaration at its word,
+/// and this is the transport that proves it does. It also preserves this file's old
+/// "native transport, coalescing" row, which had been reachable only by configuring the
+/// connection and would otherwise have become inexpressible.
+struct NativeUnvec;
+
 /// A recording transport that reaches gathering only through `write_vectored`'s provided
-/// default, which loops the offer through `write_borrowed` one region at a time.
+/// default, which loops the offer through `write_borrowed` one region at a time — and
+/// **declares `true` anyway**, against its own nature.
+///
+/// The over-declaration is deliberate: a `false` answer routes to the coalescing drain, which
+/// never calls the gathering operation, so this is the only way a driven connection reaches
+/// the emulating default at all. See `Unvec` for the honest pairing.
 struct Emul;
 
-/// A recording completion transport, which writes owned regions.
+/// The honest emulating readiness transport: no `write_vectored` override, and it says so.
+///
+/// What a real non-gathering stream looks like — a tokio `AsyncWrite` with the inherited
+/// `poll_write_vectored` — and therefore the row that says what such a stream now costs.
+struct Unvec;
+
+/// A recording completion transport, which writes owned regions natively and declares it.
 struct Owned;
 
-/// A shape a measured run uses: a transport behaviour paired with the [`WritePolicy`] the h2
-/// layer is configured with.
+/// The honest emulating completion transport: no `write_regions` override, and it says so.
 ///
-/// Under the strategy-election design one marker named both, because the transport declared
-/// the drain. It no longer does — the transport declares only its I/O model and whether it
-/// gathers natively, and the policy is the h2 layer's — so a shape is a pair, and this trait
-/// is what lets a run still be written as one type parameter.
+/// The only route in this workspace to the completion coalescing drain. Before the capability
+/// existed that drain had no test at all — replacing its body with `panic!` left all 844
+/// tests green — so this row is new coverage rather than a re-keying of an old one.
+struct OwnedUnvec;
+
+/// A shape a measured run uses: one recording transport behaviour.
+///
+/// Under the strategy-election design one marker named the drain, because the transport
+/// declared it. Under the design after that a shape was a *pair* — a transport behaviour and
+/// the `WritePolicy` the caller configured — because the two were independent. It is one
+/// thing again, for a third reason: the transport declares a *capability* and the h2 layer
+/// derives the drain from it, so naming the transport names the drain, and there is nothing
+/// left for a caller to configure.
 trait Shape {
     /// The transport behaviour marker the run is measured over.
     type Half;
-    /// The policy the connection is configured with.
-    const POLICY: WritePolicy;
 }
 
-/// Native transport, gathering on: one `write_vectored` per pass.
+/// Native transport declaring `true`: the gathered drain, one `write_vectored` per pass.
 struct GatheredShape;
-/// Native transport, gathering off: one *borrowed* write per pass, every octet copied into
-/// the driver's buffer but nothing handed over.
+/// Native transport declaring `false`: the coalesced drain, one *borrowed* write per pass,
+/// every octet copied into the driver's buffer and nothing handed over.
 struct CoalescedShape;
-/// Emulating transport, gathering on: the default's loop, one `write_borrowed` per region.
-struct EmulatedShape;
-/// Completion transport: one `write_regions` per pass.
+/// Emulating transport declaring `true`: the gathered drain reaching the provided default's
+/// loop, one `write_borrowed` per region.
+struct OverDeclaringEmulatedShape;
+/// Emulating transport declaring `false`: the coalesced drain. What an ordinary
+/// non-gathering readiness stream now gets, and the row this change moved.
+struct HonestEmulatedShape;
+/// Completion transport declaring `true`: one `write_regions` per pass.
 struct RegionShape;
+/// Completion transport declaring `false`: the completion coalescing drain, one minted owned
+/// buffer and one `write_owned` per pass.
+struct RegionCoalescedShape;
 
 impl Shape for GatheredShape {
     type Half = Native;
-    const POLICY: WritePolicy = WritePolicy::Gathered;
 }
 
 impl Shape for CoalescedShape {
-    type Half = Native;
-    const POLICY: WritePolicy = WritePolicy::Coalesced;
+    type Half = NativeUnvec;
 }
 
-impl Shape for EmulatedShape {
+impl Shape for OverDeclaringEmulatedShape {
     type Half = Emul;
-    const POLICY: WritePolicy = WritePolicy::Gathered;
+}
+
+impl Shape for HonestEmulatedShape {
+    type Half = Unvec;
 }
 
 impl Shape for RegionShape {
     type Half = Owned;
-    const POLICY: WritePolicy = WritePolicy::Gathered;
+}
+
+impl Shape for RegionCoalescedShape {
+    type Half = OwnedUnvec;
 }
 use ngnet_h2::{
     BytesBody, FrameType, Header, HeaderAction, HeaderCategory, Session, SessionBuilder, StreamId,
@@ -447,8 +532,11 @@ macro_rules! recording_transport {
 }
 
 recording_transport!(Native);
+recording_transport!(NativeUnvec);
 recording_transport!(Emul);
+recording_transport!(Unvec);
 recording_transport!(Owned);
+recording_transport!(OwnedUnvec);
 
 impl TransportRead for RecReader {
     async fn read(&mut self, mut buf: BytesMut) -> (io::Result<usize>, BytesMut) {
@@ -479,16 +567,23 @@ impl TransportRead for RecReader {
 /// The trait now carries the model and nothing else; the write primitive lives on whichever
 /// model trait the marker's model admits.
 macro_rules! recording_transport_write {
-    ($marker:ty, $model:ty) => {
+    ($marker:ty, $model:ty, $vectored:expr) => {
         impl TransportWrite for RecWriter<$marker> {
             type Model = $model;
+
+            fn is_write_vectored(&self) -> bool {
+                $vectored
+            }
         }
     };
 }
 
-recording_transport_write!(Native, Readiness);
-recording_transport_write!(Emul, Readiness);
-recording_transport_write!(Owned, Completion);
+recording_transport_write!(Native, Readiness, true);
+recording_transport_write!(NativeUnvec, Readiness, false);
+recording_transport_write!(Emul, Readiness, true);
+recording_transport_write!(Unvec, Readiness, false);
+recording_transport_write!(Owned, Completion, true);
+recording_transport_write!(OwnedUnvec, Completion, false);
 
 /// Emits the `BorrowedWrite` impl for the readiness behaviours.
 ///
@@ -509,26 +604,34 @@ macro_rules! recording_borrowed_write {
 }
 
 recording_borrowed_write!(Emul);
+recording_borrowed_write!(Unvec);
 
 /// The natively-gathering writer, spelled out rather than macro-emitted because it is the one
 /// that overrides `write_vectored`. Deleting that override would not fail to compile — it
 /// would silently fall back to the loop — so the tests below have to catch it instead, which
 /// is what `the_native_override_costs_fewer_writes_than_emulation` is for.
-impl BorrowedWrite for RecWriter<Native> {
-    fn write_borrowed<'w>(
-        &'w mut self,
-        data: &'w [u8],
-    ) -> impl Future<Output = io::Result<usize>> + 'w {
-        self.do_write_borrowed(data)
-    }
+macro_rules! recording_native_borrowed_write {
+    ($marker:ty) => {
+        impl BorrowedWrite for RecWriter<$marker> {
+            fn write_borrowed<'w>(
+                &'w mut self,
+                data: &'w [u8],
+            ) -> impl Future<Output = io::Result<usize>> + 'w {
+                self.do_write_borrowed(data)
+            }
 
-    fn write_vectored<'w>(
-        &'w mut self,
-        regions: &'w [io::IoSlice<'w>],
-    ) -> impl Future<Output = io::Result<usize>> + 'w {
-        self.do_write_vectored(regions)
-    }
+            fn write_vectored<'w>(
+                &'w mut self,
+                regions: &'w [io::IoSlice<'w>],
+            ) -> impl Future<Output = io::Result<usize>> + 'w {
+                self.do_write_vectored(regions)
+            }
+        }
+    };
 }
+
+recording_native_borrowed_write!(Native);
+recording_native_borrowed_write!(NativeUnvec);
 
 impl RegionWrite for RecWriter<Owned> {
     fn write_owned(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
@@ -540,6 +643,17 @@ impl RegionWrite for RecWriter<Owned> {
         regions: Vec<Bytes>,
     ) -> impl Future<Output = (io::Result<usize>, Vec<Bytes>)> {
         self.do_write_regions(regions)
+    }
+}
+
+/// The honest emulating completion writer: **deliberately** no `write_regions` override.
+///
+/// It declares `false`, so the h2 layer coalesces and never offers it a region list at all.
+/// The override's absence is therefore belt and braces — but it is the shape a minimal
+/// completion transport actually has, and measuring the minimal shape is the point.
+impl RegionWrite for RecWriter<OwnedUnvec> {
+    fn write_owned(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
+        self.do_write(buf)
     }
 }
 
@@ -724,13 +838,11 @@ where
         _marker: PhantomData,
     };
 
-    // The drain is the h2 layer's choice now, so it arrives through `Config` rather than
-    // being read off the transport the run was built over.
-    let (requests, connection) = ngnet_h2::http::handshake_with::<Recording<S::Half>, Full>(
-        transport,
-        Config::default().write_policy(S::POLICY),
-    )
-    .expect("handshake");
+    // The drain follows from what the transport declares, so it is settled by the shape's
+    // `Half` and there is nothing here to configure.
+    let (requests, connection) =
+        ngnet_h2::http::handshake_with::<Recording<S::Half>, Full>(transport, Config::default())
+            .expect("handshake");
 
     let mut peer = peer_session();
     let mut ctx = PeerCtx::default();
@@ -821,8 +933,137 @@ fn the_read_buffer_pool_settles_to_a_fixed_size() {
 }
 
 #[test]
+fn an_honest_emulating_transport_now_costs_one_write_per_upload_pass() {
+    // **This is the number this change moved, and the only one.**
+    //
+    // At the commit before the capability existed, a readiness transport that could only
+    // emulate gathering was still handed the gathered drain — because the drain came from the
+    // caller's `Config`, whose default was `Gathered`, and the transport had no way to say
+    // otherwise. An upload pass of four full-sized `DATA` frames is offered as four regions,
+    // and the emulation writes each in turn: **4 writes, and no copy of the frame payloads**.
+    //
+    // It now declares `false`, and the h2 layer coalesces: **1 write, and a copy of every
+    // octet**. The transport is unchanged; the declaration is the whole of the difference.
+    // `OverDeclaringEmulatedShape` still measures the old path — that is what its
+    // over-declaration is for — so the pair below is the before and after side by side rather
+    // than a number replaced by another number.
+    //
+    // This is not unambiguously an improvement, and the table above says so. Three syscalls
+    // were traded for a copy of the body. On a transport with real per-write overhead — a TLS
+    // record layer, a userspace stack — that is a good trade; on a plain non-gathering socket
+    // it may not be. It is the trade tokio's own `is_write_vectored` contract prescribes for a
+    // writer that answers `false`, and taking it is the point of adopting that contract.
+    let honest = run_send::<HonestEmulatedShape>();
+    let over_declaring = run_send::<OverDeclaringEmulatedShape>();
+
+    assert_eq!(
+        honest.bytes, over_declaring.bytes,
+        "the two shapes were not compared on the same traffic",
+    );
+    assert!(
+        honest.writes.iter().all(|&count| count == 1),
+        "an honestly-declaring emulating transport must be coalesced into one write per pass,          saw {:?}",
+        honest.writes,
+    );
+    assert!(
+        over_declaring.writes.iter().all(|&count| count > 1),
+        "the over-declaring shape must still reach the gathered drain and pay one write per          large block, or this comparison has nothing on either side of it, saw {:?}",
+        over_declaring.writes,
+    );
+    assert!(
+        honest.allocations.iter().all(|&count| count == 0),
+        "coalescing reuses its buffer, so the octet copy must cost no allocation in steady          state, saw {:?}",
+        honest.allocations,
+    );
+}
+
+#[test]
+fn the_completion_coalescing_drain_costs_one_write_and_no_allocation() {
+    // New coverage rather than a moved number. This drain had *no test at all* before the
+    // capability existed: nothing in the workspace put a completion transport on the
+    // coalescing drain, and replacing that drain's body with `panic!` left all 844 tests
+    // green. It is the fifth vacuous-coverage hole found in this crate, and the reason the
+    // honestly-declaring completion transport is not optional.
+    let measured = run_send::<RegionCoalescedShape>();
+
+    assert!(
+        measured.writes.iter().all(|&count| count == 1),
+        "the completion coalescing drain mints one owned buffer per pass and writes it once,          saw {:?}",
+        measured.writes,
+    );
+    assert!(
+        measured.bytes.iter().all(|&bytes| bytes > MAX_FRAME),
+        "each measured pass must carry more than one frame, or the single write coalesced          nothing, saw byte counts {:?}",
+        measured.bytes,
+    );
+    assert!(
+        measured.allocations.iter().all(|&count| count == 0),
+        "minting the pass's owned buffer must reuse retained capacity rather than allocate,          saw {:?}",
+        measured.allocations,
+    );
+}
+
+#[test]
+fn every_shape_moves_the_same_octet_count_per_pass() {
+    // The drains differ in write count and in how much they copy; they must not differ in a
+    // single octet. This file's harness records byte *totals* per pass, not the octets
+    // themselves, so that is what is compared here and the name says so rather than claiming
+    // an identity it does not check — `http_vectored.rs` compares the octets themselves, in
+    // `every_ordering_puts_the_same_octets_on_the_wire_as_coalescing_would` and in the
+    // restored `the_coalesced_readiness_drain_loses_no_octet_across_forced_short_writes`. A
+    // shape that dropped or duplicated a region would still show here first, and cheaply.
+    let gathered = run_send::<GatheredShape>();
+    for (name, other) in [
+        ("CoalescedShape", run_send::<CoalescedShape>()),
+        (
+            "OverDeclaringEmulatedShape",
+            run_send::<OverDeclaringEmulatedShape>(),
+        ),
+        ("HonestEmulatedShape", run_send::<HonestEmulatedShape>()),
+        ("RegionShape", run_send::<RegionShape>()),
+        ("RegionCoalescedShape", run_send::<RegionCoalescedShape>()),
+    ] {
+        assert_eq!(
+            gathered.bytes, other.bytes,
+            "{name} moved a different number of octets per pass than GatheredShape; the drain              a transport's declaration selects must not change what goes on the wire",
+        );
+    }
+}
+
+#[test]
+fn a_native_transport_that_declares_false_is_taken_at_its_word() {
+    // `CoalescedShape` is `NativeUnvec`: a transport with a real `write_vectored` override
+    // that reports `false` anyway. It must be coalesced regardless, because the h2 layer
+    // cannot see an override — from a generic context a provided method and an overridden one
+    // are the same call — and so has nothing to go on but the declaration.
+    //
+    // Without this, an implementation that somehow sniffed the override would be
+    // indistinguishable from one that read the declaration, and the capability would be
+    // decorative.
+    let declared_false = run_send::<CoalescedShape>();
+    let declared_true = run_send::<GatheredShape>();
+
+    assert_eq!(
+        declared_false.bytes, declared_true.bytes,
+        "the two shapes were not compared on the same traffic",
+    );
+    assert!(
+        declared_false.writes.iter().all(|&count| count == 1),
+        "a transport declaring `false` must be coalesced even though it overrides \
+         `write_vectored`, saw {:?}",
+        declared_false.writes,
+    );
+    assert!(
+        declared_true.writes.iter().all(|&count| count > 1),
+        "the same transport declaring `true` must reach the gathered drain, or the \
+         declaration is not what selected the drain, saw {:?}",
+        declared_true.writes,
+    );
+}
+
+#[test]
 fn steady_state_send_allocates_nothing_on_the_borrowed_path() {
-    let measured = run_send::<EmulatedShape>();
+    let measured = run_send::<OverDeclaringEmulatedShape>();
 
     assert!(
         measured.allocations.iter().all(|&count| count == 0),
@@ -864,7 +1105,7 @@ fn emulated_gathering_costs_no_more_writes_than_native_on_an_upload() {
     // on the same count as `writev`, and the comparison worth pinning is that equality rather
     // than a difference.
     let native = run_send::<GatheredShape>();
-    let emulated = run_send::<EmulatedShape>();
+    let emulated = run_send::<OverDeclaringEmulatedShape>();
     let coalesced = run_send::<CoalescedShape>();
 
     // Same traffic, driven identically: the shapes differ only in how they drain it.
@@ -927,7 +1168,7 @@ fn the_coalesced_write_path_reuses_its_coalescing_buffer() {
     // reallocate to do so. A regression to declaring the buffer inside `flush` would restore
     // the per-pass allocation and fail here.
     let owned = run_send::<CoalescedShape>();
-    let borrowed = run_send::<EmulatedShape>();
+    let borrowed = run_send::<OverDeclaringEmulatedShape>();
 
     assert!(
         owned.allocations.iter().all(|&count| count == 0),
@@ -1064,13 +1305,11 @@ where
         _marker: PhantomData,
     };
 
-    // The drain is the h2 layer's choice now, so it arrives through `Config` rather than
-    // being read off the transport the run was built over.
-    let (requests, connection) = ngnet_h2::http::handshake_with::<Recording<S::Half>, Trickle>(
-        transport,
-        Config::default().write_policy(S::POLICY),
-    )
-    .expect("handshake");
+    // The drain follows from what the transport declares, so it is settled by the shape's
+    // `Half` and there is nothing here to configure.
+    let (requests, connection) =
+        ngnet_h2::http::handshake_with::<Recording<S::Half>, Trickle>(transport, Config::default())
+            .expect("handshake");
 
     let mut peer = peer_session();
     let mut ctx = PeerCtx::default();
@@ -1227,7 +1466,7 @@ fn a_multiplexed_pass_costs_one_write_natively_and_under_emulation_alike() {
     // gathering is affordable: emulation's cost is set by how many regions the driver
     // *offers*, not by how many blocks the session produced.
     let native = run_multiplexed::<GatheredShape>();
-    let emulated = run_multiplexed::<EmulatedShape>();
+    let emulated = run_multiplexed::<OverDeclaringEmulatedShape>();
 
     assert_eq!(
         native.bytes, emulated.bytes,
@@ -1263,7 +1502,7 @@ fn the_vectored_write_path_writes_once_per_large_block_and_no_more() {
     // and for the same reason, but with the frame's header and any control frames riding
     // along instead of costing writes of their own.
     let vectored = run_send::<GatheredShape>();
-    let borrowed = run_send::<EmulatedShape>();
+    let borrowed = run_send::<OverDeclaringEmulatedShape>();
     let owned = run_send::<CoalescedShape>();
 
     assert_eq!(
@@ -1435,4 +1674,29 @@ fn the_counter_notices_a_deliberate_allocation() {
         counted >= 1,
         "the allocation counter must observe a deliberate heap allocation",
     );
+}
+
+/// Prints every shape's steady-state counts, so the module table above is transcribed from a
+/// measurement rather than predicted. Ignored: it asserts nothing and exists to be run by
+/// hand with `--ignored --nocapture` when a row is in question.
+#[test]
+#[ignore = "reporting only; run with --ignored --nocapture to regenerate the table"]
+fn report_every_shape() {
+    fn row<S: Shape>(name: &str)
+    where
+        Recording<S::Half>: Transport,
+    {
+        let up = run_send::<S>();
+        let mx = run_multiplexed::<S>();
+        println!(
+            "{name}: upload alloc={:?} writes={:?} | multiplexed alloc={:?} writes={:?}",
+            up.allocations, up.writes, mx.allocations, mx.writes
+        );
+    }
+    row::<GatheredShape>("GatheredShape");
+    row::<CoalescedShape>("CoalescedShape");
+    row::<OverDeclaringEmulatedShape>("OverDeclaringEmulatedShape");
+    row::<HonestEmulatedShape>("HonestEmulatedShape");
+    row::<RegionShape>("RegionShape");
+    row::<RegionCoalescedShape>("RegionCoalescedShape");
 }

@@ -170,6 +170,15 @@ impl TransportRead for VectoredOnly {
 
 impl TransportWrite for VectoredOnly {
     type Model = Readiness;
+
+    /// Declared truthfully: `write_vectored` below is a real gathering call, not the trait's
+    /// loop. This fixture is driven directly rather than through a driver, so the declaration
+    /// changes nothing it measures — it is here because a transport that overrides a
+    /// gathering operation and omits the declaration is a transport whose override is dead,
+    /// and a fixture in this file should not model that mistake.
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
 }
 
 impl BorrowedWrite for VectoredOnly {
@@ -211,11 +220,19 @@ struct OwnedRegionsOnly {
 
 impl TransportWrite for OwnedRegionsOnly {
     type Model = Completion;
+
+    /// Declared truthfully, for the same reason [`VectoredOnly`] does: `write_regions` below
+    /// is a real one-call gathering write rather than the default's loop.
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
 }
 
 /// The minimal completion transport: `write_owned` is `RegionWrite`'s only obligation, and
 /// `write_regions`' default loops the owned regions through it — which is what makes "every
-/// transport gathers" true without asking this one to do any gathering work.
+/// transport *can* gather" true without asking this one to do any gathering work. It leaves
+/// `is_write_vectored` at `false`, which is the honest answer for a transport whose gathering
+/// is a loop, and the answer that would put it on the coalesced drain were it driven.
 impl RegionWrite for CompletionWriter {
     async fn write_owned(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
         self.written.extend_from_slice(&buf);

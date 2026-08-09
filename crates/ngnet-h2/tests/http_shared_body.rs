@@ -744,11 +744,12 @@ fn the_readiness_paths_hand_over_the_whole_payload_from_caller_memory() {
 ///
 /// It wraps an ordinary [`Duplex`] and forwards every write on unchanged, so the connection it
 /// drives is a real one talking to a real peer. All it adds is a tap: each write's octets are
-/// cloned into `passes` before being handed on. The driver emits one write per pass on both
-/// readiness policies — one owned `write` under [`WritePolicy::Coalesced`], one gathered
-/// `write_vectored` under [`WritePolicy::Gathered`] — so both are tapped and exactly one of
-/// them runs for a given connection. Either way one entry in `passes` is one driver pass, in
-/// order. That is what lets the ordering test speak about *passes* rather than only about the
+/// cloned into `passes` before being handed on. The driver emits one write per pass on either
+/// readiness drain — one `write_borrowed` when the transport declares it cannot gather, one
+/// gathered `write_vectored` when it declares it can — so both are tapped and exactly one of
+/// them runs for a given connection. This writer declares `true`, so it is the gathered one
+/// that runs; the tap on the other is kept because the shape of `passes` must not depend on
+/// which. Either way one entry in `passes` is one driver pass, in order. That is what lets the ordering test speak about *passes* rather than only about the
 /// flat wire — which frames the driver chose to emit together, and in what order within the
 /// pass.
 ///
@@ -801,6 +802,13 @@ impl Transport for Recording {
 
 impl TransportWrite for RecordingWriter {
     type Model = Readiness;
+
+    /// This writer overrides `write_vectored` with a real gathering implementation, so it
+    /// declares the capability and the driver takes the gathered drain — which is what puts
+    /// one whole driver pass into one `write_vectored` call, the shape `passes` records.
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
 }
 
 impl BorrowedWrite for RecordingWriter {
@@ -809,7 +817,7 @@ impl BorrowedWrite for RecordingWriter {
         data: &'w [u8],
     ) -> impl Future<Output = io::Result<usize>> + 'w {
         // Untapped on purpose: `write_vectored` below is overridden, so the gathering default
-        // never loops through here. This file leaves the policy at its default, so the
+        // never loops through here. This writer declares the gathering capability, so the
         // coalesced drain — which would reach this method, one call per whole pass — is never
         // selected either. The former owned-write tap that sat here was dead for the same
         // reason and was removed with the primitive.
@@ -820,9 +828,9 @@ impl BorrowedWrite for RecordingWriter {
         &'w mut self,
         regions: &'w [io::IoSlice<'w>],
     ) -> impl Future<Output = io::Result<usize>> + 'w {
-        // The tap for `WritePolicy::Gathered` — the default on this transport. The regions of
-        // one gathered write are one driver pass, so they are flattened into one entry, which
-        // keeps `passes` the same shape it has on the coalesced path.
+        // The tap for the gathered drain, which this writer's declaration selects. The regions
+        // of one gathered write are one driver pass, so they are flattened into one entry,
+        // which keeps `passes` the same shape it would have on the coalesced path.
         let mut pass = Vec::new();
         for region in regions {
             pass.extend_from_slice(region);

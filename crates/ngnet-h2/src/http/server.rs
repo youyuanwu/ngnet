@@ -89,10 +89,12 @@ where
 
 /// Serves requests over `transport` with an explicit [`Config`].
 ///
-/// Identical to [`serve`] but for the limits advertised to the peer and enforced locally, and
-/// for the local [`WritePolicy`](crate::http::WritePolicy), which decides how this connection
-/// drains a pass to the transport — this is the entry point through which a server turns
-/// gathering off.
+/// Identical to [`serve`] but for the limits advertised to the peer and enforced locally.
+///
+/// How this connection drains a pass to the transport is *not* configured here. It is asked
+/// of the transport itself, once, through
+/// [`TransportWrite::is_write_vectored`](crate::http::transport::TransportWrite::is_write_vectored).
+///
 /// The concurrency limit in particular is the ceiling on how many handler futures one peer
 /// can have running at once — including handlers retained after their stream was reset —
 /// so it is a real bound on this connection's memory, not merely advice to the peer. See
@@ -211,12 +213,7 @@ where
 
     let guard = DriverGuard::new(Arc::clone(&shared), Arc::clone(&registry), role);
     Ok(Connection::new(driver::run(
-        transport,
-        session,
-        shared,
-        registry,
-        guard,
-        config.policy(),
+        transport, session, shared, registry, guard,
     )))
 }
 
