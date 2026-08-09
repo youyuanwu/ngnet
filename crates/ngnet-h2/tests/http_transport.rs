@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Wake;
 
 use ngnet_h2::http::testing::{
-    Duplex, DuplexReader, Full, block_on, duplex, duplex_emulating, duplex_owned_regions,
-    duplex_vectored, http_crate as http,
+    Duplex, DuplexReader, Full, PeerWrite, block_on, duplex, duplex_emulating,
+    duplex_owned_regions, duplex_region_emulating, duplex_vectored, http_crate as http,
 };
 use ngnet_h2::http::transport::{BorrowedWrite, Completion, Readiness, RegionWrite};
 use ngnet_h2::http::{Transport, TransportRead, TransportWrite};
@@ -80,12 +80,6 @@ impl TransportRead for CompletionReader {
 
 impl TransportWrite for CompletionWriter {
     type Model = Completion;
-
-    async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
-        self.written.extend_from_slice(&buf);
-        let written = buf.len();
-        (Ok(written), buf)
-    }
 }
 
 /// A readiness-based transport: overrides the borrowed path and advertises it.
@@ -118,11 +112,6 @@ impl TransportRead for ReadinessHalf {
 
 impl TransportWrite for ReadinessHalf {
     type Model = Readiness;
-
-    async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
-        let written = buf.len();
-        (Ok(written), buf)
-    }
 }
 
 impl BorrowedWrite for ReadinessHalf {
@@ -181,11 +170,6 @@ impl TransportRead for VectoredOnly {
 
 impl TransportWrite for VectoredOnly {
     type Model = Readiness;
-
-    async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
-        let written = buf.len();
-        (Ok(written), buf)
-    }
 }
 
 impl BorrowedWrite for VectoredOnly {
@@ -227,19 +211,25 @@ struct OwnedRegionsOnly {
 
 impl TransportWrite for OwnedRegionsOnly {
     type Model = Completion;
+}
 
-    async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
+/// The minimal completion transport: `write_owned` is `RegionWrite`'s only obligation, and
+/// `write_regions`' default loops the owned regions through it — which is what makes "every
+/// transport gathers" true without asking this one to do any gathering work.
+impl RegionWrite for CompletionWriter {
+    async fn write_owned(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
+        self.written.extend_from_slice(&buf);
         let written = buf.len();
         (Ok(written), buf)
     }
 }
 
-/// The minimal completion transport: `RegionWrite` has no required methods, so an empty impl
-/// is the whole obligation. The default loops the owned regions through `write` above, which
-/// is what makes "every transport gathers" true without asking this one to do any work.
-impl RegionWrite for CompletionWriter {}
-
 impl RegionWrite for OwnedRegionsOnly {
+    async fn write_owned(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
+        let written = buf.len();
+        (Ok(written), buf)
+    }
+
     fn write_regions(
         &mut self,
         regions: Vec<Bytes>,
@@ -408,9 +398,11 @@ fn a_completion_transport_needs_no_borrowed_write_path() {
     assert_eq!(read.unwrap(), b"from the peer".len());
     assert_eq!(&buf[..], b"from the peer");
 
-    // The one write path a coalesced transport supplies, and the only one the driver reaches
-    // for it: everything is copied into the owned buffer and written whole.
-    let (written, _buf) = block_on(writer.write(Bytes::from_static(b"to the peer")));
+    // The one write path a coalesced *completion* transport supplies, and the only one the
+    // driver reaches for it: everything is copied into the owned buffer and written whole.
+    // It lives on `RegionWrite` now, not on `TransportWrite` — a readiness transport is never
+    // asked for it.
+    let (written, _buf) = block_on(writer.write_owned(Bytes::from_static(b"to the peer")));
     assert_eq!(written.unwrap(), b"to the peer".len());
     assert_eq!(writer.written, b"to the peer");
 }
@@ -691,7 +683,7 @@ fn the_in_memory_duplex_carries_bytes_both_ways() {
     let (mut server_reader, _server_writer) = server.split();
 
     block_on(async {
-        let (result, _buf) = client_writer.write(Bytes::from_static(b"ping")).await;
+        let result = client_writer.write_borrowed(b"ping").await;
         assert_eq!(result.unwrap(), 4);
 
         let (read, buf) = server_reader.read(BytesMut::with_capacity(16)).await;
@@ -734,10 +726,8 @@ fn write_counts_stay_observable_across_a_split() {
     assert_eq!(counter.get(), 0, "nothing written yet");
 
     block_on(async {
-        let (result, _buf) = writer.write(Bytes::from_static(b"one")).await;
-        result.unwrap();
-        let (result, _buf) = writer.write(Bytes::from_static(b"two")).await;
-        result.unwrap();
+        writer.write_borrowed(b"one").await.unwrap();
+        writer.write_borrowed(b"two").await.unwrap();
 
         let (read, buf) = server_reader.read(BytesMut::with_capacity(16)).await;
         assert_eq!(read.unwrap(), 6);
@@ -779,5 +769,100 @@ fn a_borrowed_write_duplex_takes_the_zero_copy_path_and_still_counts() {
         counter.get(),
         1,
         "a borrowed write is still a write, and must be counted as one"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// `PeerWrite` — the model-dispatched write that peer scaffolding generic over an unknown
+// transport uses in place of a primitive it cannot name.
+//
+// Its contract is stronger than what the driver asks of a transport: it writes the *whole*
+// buffer, looping over short writes, and treats an accepted zero as an error rather than
+// spinning. Neither clause is exercised by the protocol tests that use it, because those
+// drive it over cooperative peers — and faulty scaffolding is not a benign failure here.
+// `serve` and `observe_over` use it to feed the connection under test, so a silent
+// truncation surfaces as an unrelated protocol test failing, or worse, quietly passing.
+// ---------------------------------------------------------------------------------------
+
+/// Writes `buf` through whichever primitive `W`'s model supplies. Mirrors what `serve` does.
+fn peer_write_all<W>(writer: &mut W, buf: &[u8]) -> io::Result<()>
+where
+    W: TransportWrite,
+    W::Model: PeerWrite<W>,
+{
+    block_on(<W::Model as PeerWrite<W>>::write_all(
+        writer,
+        BytesMut::from(buf),
+    ))
+}
+
+#[test]
+fn the_peer_write_helper_delivers_every_octet_through_a_readiness_short_writer() {
+    let (client, server) = duplex_vectored();
+    // Three octets at a time, so the eight-octet payload cannot land in one call. A helper
+    // that wrote once and returned would deliver a prefix and report success.
+    client.accept_at_most([3, 3, 3, 3]);
+    let (_reader, mut writer) = client.split();
+    let (mut server_reader, _server_writer) = server.split();
+
+    peer_write_all(&mut writer, b"abcdefgh").expect("writing the whole buffer");
+
+    block_on(async {
+        let (read, buf) = server_reader.read(BytesMut::with_capacity(64)).await;
+        assert_eq!(
+            read.unwrap(),
+            8,
+            "every octet must arrive, not just a prefix"
+        );
+        assert_eq!(&buf[..], b"abcdefgh", "and in order, with no gap or repeat");
+    });
+}
+
+#[test]
+fn the_peer_write_helper_delivers_every_octet_through_a_completion_short_writer() {
+    // The same contract on the other model, where the loop has to re-offer the *remainder*
+    // of an owned buffer rather than advance an offset into a borrowed one — the place an
+    // off-by-one duplicates or drops octets instead of merely truncating.
+    //
+    // `duplex_region_emulating`, not `duplex_owned_regions`: only the emulating half's owned
+    // write consults `accept_at_most` (`do_write_recording`); the native one accepts every
+    // buffer whole (`do_write`), so over it this test would never reach a second iteration
+    // and both the loop and the remainder arithmetic would go untested. Verified by
+    // mutation — over `duplex_owned_regions` an off-by-one in the remainder still passed.
+    let (client, server) = duplex_region_emulating();
+    client.accept_at_most([3, 3, 3, 3]);
+    let (_reader, mut writer) = client.split();
+    let (mut server_reader, _server_writer) = server.split();
+
+    peer_write_all(&mut writer, b"abcdefgh").expect("writing the whole buffer");
+
+    block_on(async {
+        let (read, buf) = server_reader.read(BytesMut::with_capacity(64)).await;
+        assert_eq!(
+            read.unwrap(),
+            8,
+            "every octet must arrive, not just a prefix"
+        );
+        assert_eq!(&buf[..], b"abcdefgh", "and in order, with no gap or repeat");
+    });
+}
+
+#[test]
+fn the_peer_write_helper_reports_an_accepted_zero_rather_than_spinning() {
+    // A peer that accepts nothing, forever. The helper's loop makes no progress, so it must
+    // report rather than run. If this test hangs, it has failed: the whole point of the
+    // clause is that an unproductive peer ends the write instead of the process.
+    let (client, server) = duplex_vectored();
+    client.accept_at_most([0]);
+    let (_reader, mut writer) = client.split();
+    let (_server_reader, _server_writer) = server.split();
+
+    let error = peer_write_all(&mut writer, b"abcdefgh")
+        .expect_err("a peer that accepts nothing must not be written to forever");
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::WriteZero,
+        "and it must say why, so the scaffolding's failure is not mistaken for the \
+         connection under test misbehaving"
     );
 }

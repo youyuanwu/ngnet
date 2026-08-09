@@ -9,8 +9,11 @@
 //!
 //! compio is completion-based: an operation hands the kernel a buffer and gets it back when
 //! the operation finishes, so the buffer must be *owned* for the duration. That is exactly
-//! what [`TransportRead::read`] and [`TransportWrite::write`] pass — ownership in, ownership
-//! back — so the adapter below is a destructuring and nothing more. compio's
+//! what [`TransportRead::read`] and [`RegionWrite::write_owned`] pass — ownership in,
+//! ownership back — so the adapter below is a destructuring and nothing more. That the write
+//! primitive lives on [`RegionWrite`] rather than on [`TransportWrite`] is the point: owning
+//! the buffer is a *completion* requirement, so only the completion model asks for it, and a
+//! readiness transport is never made to fake it. compio's
 //! `BufResult<usize, B>` is `(io::Result<usize>, B)` with a different name.
 //!
 //! The traits were shaped from this side deliberately. A readiness runtime can always
@@ -54,8 +57,8 @@
 //!
 //! That method is *provided* rather than required: a completion transport with no vectored
 //! submission of its own inherits a default that hands each region to
-//! [`write`](TransportWrite::write) in turn, so `impl RegionWrite for MyWriter {}` is a
-//! complete implementation. This transport overrides it, because compio has a real one.
+//! [`RegionWrite::write_owned`] in turn, so supplying that one owned primitive is a complete
+//! implementation. This transport overrides it, because compio has a real one.
 //!
 //! Ownership is exactly what the owned-region path provides, and this transport takes it. The
 //! writer declares [`Completion`](super::Completion) as its
@@ -191,16 +194,19 @@ impl<W: AsyncWrite> TransportWrite for CompioWriter<W> {
     /// documentation for why the borrowed path is unavailable here.
     type Model = Completion;
 
-    async fn write(&mut self, buf: Bytes) -> (std::io::Result<usize>, Bytes) {
-        let BufResult(result, buf) = self.half.write(buf).await;
-        (result, buf)
-    }
-
     // `commit` is deliberately left at its default; see the module documentation for why a
     // completion runtime has nothing to flush.
 }
 
 impl<W: AsyncWrite> RegionWrite for CompioWriter<W> {
+    /// The completion model's primitive. compio's `write` takes the buffer by value and
+    /// returns it inside `BufResult`, which is the ownership round-trip the trait asks for
+    /// spelled in the runtime's own types — the reason this model exists.
+    async fn write_owned(&mut self, buf: Bytes) -> (std::io::Result<usize>, Bytes) {
+        let BufResult(result, buf) = self.half.write(buf).await;
+        (result, buf)
+    }
+
     /// Overrides the provided default, which would write each region separately, with
     /// compio's real vectored submission.
     async fn write_regions(&mut self, regions: Vec<Bytes>) -> (std::io::Result<usize>, Vec<Bytes>) {

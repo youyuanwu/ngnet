@@ -160,29 +160,29 @@ impl Transport for GatheringBuffer {
 impl TransportWrite for GatheringBufferWriter {
     type Model = Readiness;
 
-    fn write(
-        &mut self,
-        buf: bytes::Bytes,
-    ) -> impl Future<Output = (io::Result<usize>, bytes::Bytes)> {
-        self.buffer.extend_from_slice(&buf);
-        let written = buf.len();
-        core::future::ready((Ok(written), buf))
-    }
-
     async fn commit(&mut self) -> io::Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
         let data = core::mem::take(&mut self.buffer);
-        let (result, _buf) = self.inner.write(bytes::Bytes::from(data)).await;
-        result.map(|_| ())
+        // The inner half is a readiness duplex, so the flush lends the buffer rather than
+        // freezing it into a `Bytes` — the same ownership saving the driver's coalesced drain
+        // now makes. `write_borrowed` may accept a prefix, so drain to empty.
+        let mut offset = 0;
+        while offset < data.len() {
+            match self.inner.write_borrowed(&data[offset..]).await? {
+                0 => return Ok(()),
+                n => offset += n,
+            }
+        }
+        Ok(())
     }
 }
 
 impl BorrowedWrite for GatheringBufferWriter {
     async fn write_borrowed<'w>(&'w mut self, data: &'w [u8]) -> io::Result<usize> {
-        // Buffers exactly as this transport's `write` does, so every path into it lands in
-        // the same user-space buffer that `commit` flushes.
+        // Buffers exactly as `write_vectored` below does, so every path into this transport
+        // lands in the same user-space buffer that `commit` flushes.
         self.buffer.extend_from_slice(data);
         Ok(data.len())
     }
@@ -313,7 +313,27 @@ impl Transport for GatheringRegionBuffer {
 impl TransportWrite for GatheringRegionBufferWriter {
     type Model = Completion;
 
-    fn write(
+    async fn commit(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let data = core::mem::take(&mut self.buffer);
+        // This transport is `Completion`, but the half it wraps is a readiness duplex — the
+        // model that governs a call is the model of the writer being *called*, not the
+        // model of the caller.
+        let mut offset = 0;
+        while offset < data.len() {
+            match self.inner.write_borrowed(&data[offset..]).await? {
+                0 => return Ok(()),
+                n => offset += n,
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RegionWrite for GatheringRegionBufferWriter {
+    fn write_owned(
         &mut self,
         buf: bytes::Bytes,
     ) -> impl Future<Output = (io::Result<usize>, bytes::Bytes)> {
@@ -322,17 +342,6 @@ impl TransportWrite for GatheringRegionBufferWriter {
         core::future::ready((Ok(written), buf))
     }
 
-    async fn commit(&mut self) -> io::Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-        let data = core::mem::take(&mut self.buffer);
-        let (result, _buf) = self.inner.write(bytes::Bytes::from(data)).await;
-        result.map(|_| ())
-    }
-}
-
-impl RegionWrite for GatheringRegionBufferWriter {
     fn write_regions(
         &mut self,
         regions: Vec<bytes::Bytes>,

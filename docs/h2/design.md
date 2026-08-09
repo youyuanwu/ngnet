@@ -33,9 +33,12 @@ wake costs exactly one extra consultation rather than a spin. The driver's waker
 refreshed on every poll, because a waker captured at submission goes stale the moment the
 runtime moves the driver to another thread.
 
-**2. The transport traits are completion-shaped and split at construction.** Buffer
-ownership passes into `read`/`write` and comes back out. A completion API (io_uring, IOCP)
-requires that; a readiness API satisfies it without copying. `Transport::split` divides the
+**2. The read trait is completion-shaped; the write primitive belongs to the I/O model; both
+are split at construction.** Buffer ownership passes into `read` and comes back out — a
+completion API (io_uring, IOCP) requires that, and a readiness API satisfies it without
+copying. Writing is not universal: `TransportWrite` carries no write at all, and the
+primitive comes from `BorrowedWrite` (lends) or `RegionWrite` (owns), because a readiness
+transport can never use ownership it is handed. `Transport::split` divides the
 stream once so the two directions hold separate borrows rather than contending for one.
 There is no `Send` bound anywhere — auto traits propagate, so a driver over a `Send`
 transport is `Send` by inference, and one over an `Rc`-based transport is not, without the
@@ -66,15 +69,29 @@ caller's own `Bytes`, so it can be gathered as an owned region without being cop
 
 **The decision is split in two, and neither half is where it used to be.** A transport
 declares its I/O model through `TransportWrite::Model` — `Readiness` or `Completion` — and
-nothing else. How a pass drains is decided by the h2 layer, from `Config::write_policy`,
-settled at handshake and held for the connection's life. An earlier design had the transport
-name one of four *strategies* (`Coalesced`, `PerRegion`, `Gathering`, `OwnedRegions`); those
-markers are gone, and with them the idea that a backend has a say in how many syscalls a pass
-costs. It does not: it knows how its I/O works, not what the traffic looks like.
+nothing else about drains. How a pass drains is decided by the h2 layer, through
+`Config::write_policy`, once at handshake and for the connection's life. An earlier design had
+the transport name one of four *strategies* (`Coalesced`, `PerRegion`, `Gathering`,
+`OwnedRegions`); those markers are gone, and with them the idea that a backend *decides* how
+many syscalls a pass costs.
+
+A transport-supplied *default* policy was specified and implemented alongside this change, and
+then deliberately dropped before shipping — see `pending-work.md` for the reasoning and the
+condition under which it should be revisited. The rule as it stands is unqualified: the
+transport does not vote.
+
+**The write primitive belongs to the model, not to the transport trait.** `TransportWrite`
+carries `Model` and `commit`, and no write at all. Readiness
+transports supply `BorrowedWrite::write_borrowed`; completion transports supply
+`RegionWrite::write_owned`. This is what "who owns the buffer" means, and putting the
+primitive anywhere else forced the wrong answer on somebody: when the owned write sat on the
+shared trait, every readiness transport had to accept a buffer it could only borrow from —
+`TokioWriter`'s implementation took ownership and immediately took a reference — and the
+driver *manufactured* that ownership out of its own reused coalescing buffer to feed it.
 
 **Every transport gathers.** `BorrowedWrite::write_vectored` and `RegionWrite::write_regions`
 are both *provided*, defaulting to a loop over the model's one required primitive
-(`write_borrowed` and `write` respectively). A transport that cannot gather natively therefore
+(`write_borrowed` and `write_owned` respectively). A transport that cannot gather natively therefore
 gathers by emulation, and one that can does better by overriding. Naming a model obliges the
 writer to implement that model's trait, by compiler error — but not to implement its gathering
 operation, which is where the "cannot advertise what you have not supplied" property now
@@ -114,7 +131,11 @@ The four drains, as the two policies × two models:
   payload is already the caller's own `Bytes` and rides uncopied as its own region.
 - **Either model under `WritePolicy::Coalesced`** — gathering off. One write per pass, bought
   by copying every outgoing octet into a driver buffer, every pass. That buffer is reused
-  across passes, so it costs no allocation in steady state. This is the successor to the old
+  across passes, so it costs no allocation in steady state. The two models reach the single
+  write differently, and only one of them transfers anything: the readiness drain *lends* the
+  buffer through `write_borrowed` and clears it, while the completion drain must hand over an
+  owned `Bytes`, because a completion transport keeps the buffer until the operation
+  finishes. This is the successor to the old
   `Coalesced` *strategy*, and the difference is who says so: it is now a caller's decision,
   reachable wherever a connection is configured, rather than a fact baked into a transport
   type.
@@ -171,10 +192,26 @@ that forgot to forward the question silently inherited the optimistic answer. Th
 question to forget: a wrapper that forwards nothing inherits the emulating default, which is
 correct and bounded.
 
-**Where mandatory gathering is genuinely worse.** At high region counts gathering loses to
-coalescing outright — the benchmarks measure roughly 68 Kelem/s against 152 at N=64 — because
-`writev` with many descriptors costs more than one `write` of the same octets copied. That
-ordering is why `WritePolicy::Coalesced` exists and is public rather than being a private
+**Where mandatory gathering is genuinely worse — and what is actually measured.** An earlier
+version of this passage read "gathering loses to coalescing outright — the benchmarks measure
+roughly 68 Kelem/s against 152 at N=64". **That was a misreading and is corrected here.** The
+68.3 Kelem/s figure is the *removed `PerRegion` drain* — one write per session block, with no
+accumulation at all. It is not gathering, and it is not emulated gathering. Gathering on a
+natively-gathering `TcpStream` at N=64 measured **166.0** Kelem/s, against roughly 152 for the
+coalescing arms: gathering *won*. On that workload a natively-gathering readiness transport
+therefore does not prefer `WritePolicy::Coalesced`, and this document previously implied the
+opposite. The scope is one measured workload, not a universal claim — which is why
+`WritePolicy::Gathered` is a *default a caller can change*, not a conclusion.
+
+The case where coalescing genuinely wins is narrower and, importantly, **is not measured
+anywhere**: *emulated* gathering at high region counts, where `write_vectored`'s provided
+default loops one borrowed write per region and so degenerates toward the per-region syscall
+pattern that produced the 68.3. Coalescing collapses that to one write for the cost of one
+copy. The reasoning is structural — the loop's call count is visible in the code and pinned by
+`http_zero_alloc.rs` — but no benchmark has swept it, and no number should be quoted for it
+until one has.
+
+That case is why `WritePolicy::Coalesced` exists and is public rather than being a private
 fallback: a caller whose traffic looks like that has a real reason to turn gathering off, and
 must be able to.
 

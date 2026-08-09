@@ -73,7 +73,8 @@ test, and no more.
   is live at a time — which forecloses gathering blocks **with each other**, and nothing
   more. One live block gathers perfectly well with memory the driver already owns.
 
-  So `TransportWrite::write_vectored` accumulates small blocks into a driver-owned reused
+  So `BorrowedWrite::write_vectored` — on `TransportWrite` at the time, moved to the readiness
+  trait when the write primitive split by I/O model — accumulates small blocks into a driver-owned reused
   buffer and emits `[accumulated, large_block]` as a two-region `writev`, copying nothing
   large. It reaches zero steady-state allocation *and* one write per pass: on eight
   multiplexed streams, 0 allocations and 1 write, against the borrowed path's 0 and 513.
@@ -216,21 +217,66 @@ These are not gaps. They are decisions, recorded so they are not mistaken for ov
 
 ## Judgement calls worth revisiting with real traffic
 
+- **A transport-supplied default write policy: specified, implemented, and deliberately
+  dropped.** Recorded here so it is a decision rather than an omission.
+
+  The design was a `TransportWrite::DEFAULT_WRITE_POLICY` associated constant with a default
+  of `WritePolicy::Gathered`, supplying the initial value when the caller set none, with
+  `Config::write_policy` overriding it outright. It reached a complete, green, mutation-
+  verified implementation — including a structural guard pinning that it was resolved once at
+  connection start-up and that no third drain shape appeared behind it — and was then removed
+  before shipping.
+
+  **Why it was dropped.** The trait default, `TokioIo`'s declaration, `CompioIo`'s declaration
+  and `Config`'s own default were *all four* `Gathered` — which is what `Config` already
+  defaulted to. So the constant had **zero behavioural effect**: no shipped transport differed
+  from the default, no downstream user existed, and the one case where a transport would
+  genuinely want to differ — emulated gathering at high region counts, where `Coalesced` is
+  expected to win — has never been measured. Against that, it was permanent public API surface
+  and a partial reversal of the rule that a transport does not vote on the drain, introduced
+  in a breaking change. Sound, but not worth its cost.
+
+  **What would justify revisiting it.** Either of two things, and neither is present today:
+
+  1. A transport that genuinely wants a different default from `Gathered` — most plausibly one
+     that emulates gathering and expects many regions per pass. A shipped or credible
+     third-party transport, not a hypothetical.
+  2. A measurement showing emulated gathering actually losing to coalescing at high region
+     counts. That is the unmeasured claim the whole idea rests on, and it is cheap to settle;
+     see the drain-selection entry above.
+
+  Absent both, the honest position is that `Config::write_policy` is sufficient: a caller who
+  knows their transport wants coalescing can say so in one call, and nothing about the current
+  design makes that awkward. If it is revisited, the prior implementation's shape — an
+  associated const with a default, an `Option` in `Config` so "the caller said nothing" stays
+  distinguishable, a single resolution point at start-up, and a structural guard against a
+  third drain shape — is the one to return to; the difficulty was never the mechanism.
+
 - **`Config` defaults: 128 concurrent streams, 64 KiB header list.** Chosen because
   libnghttp2's own local defaults are effectively unlimited, and something conservative had
   to be picked; 128 matches nginx's default and sits below hyper's 200. These are policy,
   not physics. h2c on a trusted network may well want them looser, and a public-facing server
   may want them tighter.
 
-- **Which drain a connection should use.** No longer a transport question at all: a transport
-  declares only its I/O model, and the drain comes from `Config::write_policy`. The default,
-  `WritePolicy::Gathered`, was measured to dominate on realistic traffic — zero steady-state
-  allocation *and* one write per pass — and `WritePolicy::Coalesced` exists for the case where
-  it does not: at high region counts `writev` loses to a single copied `write` outright
-  (roughly 68 Kelem/s against 152 at N=64). Whether that crossover deserves an automatic
-  policy rather than a manual one is genuinely open, and deliberately not attempted: it would
-  need a region-count predictor in the driver, and the honest per-connection knob is available
-  now. What else remains open is narrower: `VECTORED_THRESHOLD`
+- **Which drain a connection should use.** Not a transport decision at all: a transport
+  declares its I/O model, and the drain comes from `Config::write_policy`. The default,
+  `WritePolicy::Gathered`, was measured to dominate on realistic traffic over a
+  natively-gathering `TcpStream` — zero steady-state allocation, one write per pass, 166.0
+  against ~152 Kelem/s for the coalescing arms at N=64. `WritePolicy::Coalesced` exists for
+  the case where it does not, and that case is **emulated** gathering at high region counts,
+  where the emulating loop degenerates toward one syscall per region.
+
+  That case is **identified structurally and has never been measured.** No number in this
+  repository belongs to it. In particular the 68.3 Kelem/s that appears in `benchmarks.md` is
+  the removed *per-block* drain, not emulated gathering, and citing it here would be the same
+  conflation this document corrected once already. Emulated gathering accumulates in the
+  driver first, so small blocks collapse into one region before the emulating loop sees them.
+
+  Whether the crossover deserves an automatic policy rather than a caller-set one is genuinely
+  open, and deliberately not attempted: it would need a region-count predictor in the driver,
+  which would be the capability branch that removing `VectoredWrite::gathers()` got rid of.
+  Measuring the emulated crossover is the cheaper open item and the prerequisite for any of
+  it. What else remains open is narrower: `VECTORED_THRESHOLD`
   is 256 bytes, untuned, and deliberately so. Dumping real block sizes shows the distribution
   is sharply bimodal with nothing in between — control and `HEADERS` blocks at 9–73 bytes,
   DATA blocks at 16392–16393 (a 16 KiB payload with its 9-byte header already joined) — so any

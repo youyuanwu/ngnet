@@ -198,6 +198,28 @@ code and serve as drift controls.
 In the same runs `ngnet-h2-compio` measured 61.85 µs at N=8 and 379.83 µs at N=64, and
 `hyper-tokio` 67.78 µs and 391.27 µs — so **the tokio transport is now at parity with io_uring
 and slightly ahead of hyper**, having been 2.1× and 2.4× slower than compio at those points.
+
+> **What the 68.3 in that table is, and is not.** It is the *per-block* drain — the removed
+> `PerRegion` shape, one `write(2)` per session block, no accumulation. It is **not** emulated
+> gathering, and quoting it as gathering's cost is a mistake this document made once and
+> corrects here and in `design.md`. Emulated gathering accumulates in the driver *first*, so
+> the small blocks collapse into one region before the emulating loop sees them; that is why
+> `http_zero_alloc.rs` measures the emulating and native rows identically.
+>
+> Read together with the 166.0 for gathering against ~152 for the coalescing arms, the
+> ordering at N=64 on a natively-gathering `TcpStream` is: gathering **166.0**, coalescing
+> ~152, per-block 68.3. **On this workload a natively-gathering readiness transport does not
+> prefer `Coalesced`**, which is why `WritePolicy::Gathered` is the `Config` default. That is
+> one workload — 64 concurrent streams of small blocks over a loopback `TcpStream` — and it is
+> the workload the default is chosen for, not a proof about every readiness transport or every
+> traffic shape. It is a *default* precisely because it can be wrong somewhere unmeasured, and
+> `Config::write_policy` overrides it. Note also that this run swept a readiness `TcpStream`
+> and never swept compio's policies, so the completion side of the question is unmeasured
+> here too.
+>
+> These are pre-existing measurements. Nothing here was re-measured for the write-primitive
+> split or for the transport-supplied policy default; both were argued structurally and pinned
+> by counts, which for these questions is the stronger evidence.
 At 1 MiB the three arms measured 547 (gathering tokio), 531 (hyper) and 482 (coalescing
 compio) MiB/s in the same runs — but see the caveat below before reading an ordering into the
 first two, which are within this arm's run-to-run spread of each other.
@@ -304,12 +326,29 @@ write, so the 512 small blocks collapse into one region and the emulating loop r
 is why the emulating row is identical to the native one on both workloads, and it is the
 structural reason mandatory gathering was affordable.
 
-The owned row read `4 allocs` and `12 allocs` when gathering was introduced, and that
-recurring cost was part of the argument for it. It has since been removed independently: the
-coalescing buffer was a local handed away whole with `freeze()`, so every pass rebuilt it;
-hoisting it and handing over `split().freeze()` lets `bytes` reclaim the capacity. What the
-owned path still pays, inherently, is a **copy** of every outgoing octet, because the
-transport takes ownership.
+The coalesced row read `4 allocs` and `12 allocs` when gathering was introduced, and that
+recurring cost was part of the argument for it. It has since been removed in two steps. First,
+the coalescing buffer was a local handed away whole with `freeze()`, so every pass rebuilt it;
+hoisting it and handing over `split().freeze()` let `bytes` reclaim the capacity, which is
+what brought the row to zero.
+
+Second — and this changes no number in the table — the write primitive split by I/O model, and
+the readiness coalesced drain stopped transferring ownership at all: it lends the driver's
+buffer through `write_borrowed` and clears it, so there is no `split().freeze()` on that path
+and no `is_empty()` guard around one. **The allocation count does not move**, because
+`split().freeze()` never heap-allocated in steady state — it split a handle out of capacity
+the buffer already had. What its removal drops is the pair of atomic refcount operations that
+creating and dropping that handle cost, which an allocation counter cannot see and which no
+benchmark here isolates. The claim is structural, not measured, and is recorded as such in
+`the_coalesced_write_path_reuses_its_coalescing_buffer`.
+
+The *completion* coalesced drain keeps both the transfer and the `is_empty()` guard, because a
+completion transport genuinely needs to own the buffer for the duration of the operation. The
+guard's original rationale — dodging atomics on passes that do not use the path — is therefore
+still true where it now lives, and false only where it no longer is.
+
+What the coalesced path still pays, inherently and on both models, is a **copy** of every
+outgoing octet into the driver's buffer.
 
 So the separating column is the write count, and it is a syscall count. Gathering reaches the
 old borrowed path's zero allocation and zero copy of large blocks at the coalescing path's

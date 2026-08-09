@@ -32,10 +32,10 @@ use std::sync::{Arc, Mutex};
 use core::future::Future;
 
 use ngnet_h2::http::testing::{
-    Duplex, DuplexReader, DuplexWriter, Empty, Failing, Full, Scripted, Vectored, VectoredLog,
-    alongside, block_on, bytes_crate as bytes, duplex, duplex_emulating, duplex_owned_regions,
-    duplex_vectored, failing, failing_borrowed, failing_vectored, http_crate as http, scripted,
-    serve,
+    Duplex, DuplexReader, DuplexWriter, Empty, Failing, Full, PeerWrite, Scripted, Vectored,
+    VectoredLog, alongside, block_on, bytes_crate as bytes, duplex, duplex_emulating,
+    duplex_owned_regions, duplex_vectored, failing, failing_borrowed, failing_vectored,
+    http_crate as http, scripted, serve,
 };
 use ngnet_h2::http::transport::{BorrowedWrite, Readiness, Transport, TransportWrite};
 use ngnet_h2::http::{
@@ -541,6 +541,8 @@ fn upload_tracked<S>(
 ) -> ServerPeer
 where
     Duplex<S>: Transport,
+    <<Duplex<S> as Transport>::Writer as TransportWrite>::Model:
+        PeerWrite<<Duplex<S> as Transport>::Writer>,
 {
     let (requests, connection) =
         ngnet_h2::http::handshake_shared::<_, TrackingBody>(client_side).expect("handshake");
@@ -799,13 +801,6 @@ impl Transport for Recording {
 
 impl TransportWrite for RecordingWriter {
     type Model = Readiness;
-
-    fn write(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
-        // Recorded before the write is forwarded, so the group order is the pass order. This
-        // is the tap for `WritePolicy::Coalesced`, where one call is one whole pass.
-        self.passes.borrow_mut().push(buf.to_vec());
-        self.inner.write(buf)
-    }
 }
 
 impl BorrowedWrite for RecordingWriter {
@@ -814,7 +809,10 @@ impl BorrowedWrite for RecordingWriter {
         data: &'w [u8],
     ) -> impl Future<Output = io::Result<usize>> + 'w {
         // Untapped on purpose: `write_vectored` below is overridden, so the gathering default
-        // never loops through here and a recorded entry could not be a whole pass anyway.
+        // never loops through here. This file leaves the policy at its default, so the
+        // coalesced drain — which would reach this method, one call per whole pass — is never
+        // selected either. The former owned-write tap that sat here was dead for the same
+        // reason and was removed with the primitive.
         self.inner.write_borrowed(data)
     }
 
@@ -1132,6 +1130,8 @@ fn drive_mixed<S>(
     server_side: Duplex<S>,
 ) where
     Duplex<S>: Transport,
+    <<Duplex<S> as Transport>::Writer as TransportWrite>::Model:
+        PeerWrite<<Duplex<S> as Transport>::Writer>,
 {
     let exchange = async move {
         let head = response.await.expect("a response");
@@ -1817,6 +1817,8 @@ fn drive_nobody<Conn, S>(
 where
     Conn: core::future::Future<Output = Result<(), ngnet_h2::http::Error>>,
     Duplex<S>: Transport,
+    <<Duplex<S> as Transport>::Writer as TransportWrite>::Model:
+        PeerWrite<<Duplex<S> as Transport>::Writer>,
 {
     let response = requests.send_request(
         http::Request::builder()
