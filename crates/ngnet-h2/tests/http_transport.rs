@@ -80,12 +80,6 @@ impl TransportRead for CompletionReader {
 
 impl TransportWrite for CompletionWriter {
     type Model = Completion;
-
-    async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
-        self.written.extend_from_slice(&buf);
-        let written = buf.len();
-        (Ok(written), buf)
-    }
 }
 
 /// A readiness-based transport: overrides the borrowed path and advertises it.
@@ -118,11 +112,6 @@ impl TransportRead for ReadinessHalf {
 
 impl TransportWrite for ReadinessHalf {
     type Model = Readiness;
-
-    async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
-        let written = buf.len();
-        (Ok(written), buf)
-    }
 }
 
 impl BorrowedWrite for ReadinessHalf {
@@ -181,11 +170,6 @@ impl TransportRead for VectoredOnly {
 
 impl TransportWrite for VectoredOnly {
     type Model = Readiness;
-
-    async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
-        let written = buf.len();
-        (Ok(written), buf)
-    }
 }
 
 impl BorrowedWrite for VectoredOnly {
@@ -227,19 +211,25 @@ struct OwnedRegionsOnly {
 
 impl TransportWrite for OwnedRegionsOnly {
     type Model = Completion;
+}
 
-    async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
+/// The minimal completion transport: `write_owned` is `RegionWrite`'s only obligation, and
+/// `write_regions`' default loops the owned regions through it — which is what makes "every
+/// transport gathers" true without asking this one to do any gathering work.
+impl RegionWrite for CompletionWriter {
+    async fn write_owned(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
+        self.written.extend_from_slice(&buf);
         let written = buf.len();
         (Ok(written), buf)
     }
 }
 
-/// The minimal completion transport: `RegionWrite` has no required methods, so an empty impl
-/// is the whole obligation. The default loops the owned regions through `write` above, which
-/// is what makes "every transport gathers" true without asking this one to do any work.
-impl RegionWrite for CompletionWriter {}
-
 impl RegionWrite for OwnedRegionsOnly {
+    async fn write_owned(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
+        let written = buf.len();
+        (Ok(written), buf)
+    }
+
     fn write_regions(
         &mut self,
         regions: Vec<Bytes>,
@@ -408,9 +398,11 @@ fn a_completion_transport_needs_no_borrowed_write_path() {
     assert_eq!(read.unwrap(), b"from the peer".len());
     assert_eq!(&buf[..], b"from the peer");
 
-    // The one write path a coalesced transport supplies, and the only one the driver reaches
-    // for it: everything is copied into the owned buffer and written whole.
-    let (written, _buf) = block_on(writer.write(Bytes::from_static(b"to the peer")));
+    // The one write path a coalesced *completion* transport supplies, and the only one the
+    // driver reaches for it: everything is copied into the owned buffer and written whole.
+    // It lives on `RegionWrite` now, not on `TransportWrite` — a readiness transport is never
+    // asked for it.
+    let (written, _buf) = block_on(writer.write_owned(Bytes::from_static(b"to the peer")));
     assert_eq!(written.unwrap(), b"to the peer".len());
     assert_eq!(writer.written, b"to the peer");
 }
@@ -691,7 +683,7 @@ fn the_in_memory_duplex_carries_bytes_both_ways() {
     let (mut server_reader, _server_writer) = server.split();
 
     block_on(async {
-        let (result, _buf) = client_writer.write(Bytes::from_static(b"ping")).await;
+        let result = client_writer.write_borrowed(b"ping").await;
         assert_eq!(result.unwrap(), 4);
 
         let (read, buf) = server_reader.read(BytesMut::with_capacity(16)).await;
@@ -734,10 +726,8 @@ fn write_counts_stay_observable_across_a_split() {
     assert_eq!(counter.get(), 0, "nothing written yet");
 
     block_on(async {
-        let (result, _buf) = writer.write(Bytes::from_static(b"one")).await;
-        result.unwrap();
-        let (result, _buf) = writer.write(Bytes::from_static(b"two")).await;
-        result.unwrap();
+        writer.write_borrowed(b"one").await.unwrap();
+        writer.write_borrowed(b"two").await.unwrap();
 
         let (read, buf) = server_reader.read(BytesMut::with_capacity(16)).await;
         assert_eq!(read.unwrap(), 6);

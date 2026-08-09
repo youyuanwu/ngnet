@@ -38,7 +38,7 @@
 
 use core::future::Future;
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 
 use super::{BorrowedWrite, Readiness, Transport, TransportRead, TransportWrite};
@@ -137,11 +137,6 @@ where
     /// tokio is a readiness runtime: it never needs to own the octets, so writes lend a
     /// borrowed buffer and the session's blocks can go out uncopied.
     type Model = Readiness;
-
-    async fn write(&mut self, buf: Bytes) -> (std::io::Result<usize>, Bytes) {
-        let result = self.half.write(&buf).await;
-        (result, buf)
-    }
 
     async fn commit(&mut self) -> std::io::Result<()> {
         // The bound is `AsyncWrite` alone, which admits buffering wrappers (`BufWriter`,

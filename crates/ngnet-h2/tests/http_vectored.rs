@@ -121,7 +121,7 @@ fn drain(reader: &mut DuplexReader, waker: &Waker) -> Vec<u8> {
 /// |---|---|---|---|
 /// | [`Gathered`] | natively gathering | `Gathered` | one `write_vectored` per pass |
 /// | [`Emulated`] | emulating only | `Gathered` | the trait default, one borrowed write per region |
-/// | [`Coalescing`] | natively gathering | `Coalesced` | one owned `write` per pass |
+/// | [`Coalescing`] | natively gathering | `Coalesced` | one *borrowed* write per pass, carrying one region |
 /// | [`OwnedRegionsShape`] | completion | `Gathered` | one `write_regions` per pass |
 trait TestShape {
     /// The duplex behaviour marker the pair is built over.
@@ -147,6 +147,12 @@ struct Emulated;
 ///
 /// The successor to the old `Coalesced` strategy marker. The transport is identical to
 /// [`Gathered`]'s; only the policy differs, which is the whole point of the inversion.
+///
+/// Since the write primitive split by I/O model, this shape's writes appear in the vectored
+/// log like any other readiness write — the coalesced drain lends the driver's buffer through
+/// `write_borrowed` rather than freezing it into a `Bytes` the log never saw. Tests that used
+/// to tell this shape apart by an *empty* log must tell it apart by call shape instead: a
+/// coalescing write carries exactly one region, a gathering write may carry several.
 struct Coalescing;
 
 /// The completion transport, which gathers owned regions.
@@ -1267,6 +1273,17 @@ fn the_write_policy_is_the_h2_layers_and_holds_for_the_connections_life() {
     let gathered = observe(Run::<Gathered>::new(WINDOW_FILLING_BODY).passes(8));
     let coalesced = observe(Run::<Coalescing>::new(WINDOW_FILLING_BODY).passes(8));
 
+    // **This guard used to read `coalesced.calls.is_empty()`, and that reading is now wrong.**
+    // It worked only because the coalesced drain went through an owned `write` that the
+    // vectored log did not record, so "log empty" stood in for "no gathering write". The
+    // readiness coalesced drain now lends the driver's buffer through `write_borrowed`, which
+    // *is* logged — so an empty log would mean the connection wrote nothing at all, and the
+    // assertion would have gone vacuous rather than failing. The discriminator is therefore
+    // re-expressed as the shape of the calls, which is what "gathering" and "coalescing"
+    // actually mean:
+    //
+    //   - a gathering write offers several regions in one call;
+    //   - a coalescing write offers exactly one region, whatever it had to copy to get there.
     assert!(
         gathered.calls.len() >= 4,
         "the gathered run drove fewer than four writes, so holding for the connection's life \
@@ -1274,15 +1291,30 @@ fn the_write_policy_is_the_h2_layers_and_holds_for_the_connections_life() {
         gathered.calls,
     );
     assert!(
-        !gathered.calls.is_empty(),
-        "the gathered policy issued no gathering write at all",
+        gathered.calls.iter().any(|regions| regions.len() > 1),
+        "the gathered policy never offered more than one region in a call, so nothing was \
+         gathered and the comparison below is between two coalescing runs, saw {:?}",
+        gathered.calls,
     );
     assert!(
-        coalesced.calls.is_empty(),
-        "the coalesced policy issued {} gathering writes; turning gathering off must turn it \
-         off for the whole connection, saw {:?}",
-        coalesced.calls.len(),
+        coalesced.calls.iter().all(|regions| regions.len() == 1),
+        "the coalesced policy offered a multi-region write; turning gathering off must turn \
+         it off for the whole connection, saw {:?}",
         coalesced.calls,
+    );
+    assert!(
+        !coalesced.calls.is_empty(),
+        "the coalesced run logged no write at all, so the single-region claim above is \
+         vacuous — every octet must still have crossed the transport",
+    );
+    assert!(
+        coalesced.calls.len() < gathered.calls.len(),
+        "coalescing did not merge anything: it took {} writes against gathering's {}, so the \
+         two policies are not being told apart, saw {:?} against {:?}",
+        coalesced.calls.len(),
+        gathered.calls.len(),
+        coalesced.calls,
+        gathered.calls,
     );
     assert_eq!(
         gathered.peer, coalesced.peer,

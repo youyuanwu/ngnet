@@ -69,11 +69,20 @@
 //! A write in flight is not cancellable piecemeal. The driver awaits each write within a
 //! pass, and a stream reset goes out as a later frame rather than by tearing the transport
 //! out from under an outstanding write. The only thing that cancels a write is dropping
-//! the whole driver, which drops the in-flight write future — and because ownership of the
-//! buffer passed *into* the transport for the duration of the call, dropping the future
-//! never leaves the kernel writing into memory this crate has reclaimed. That safety is
-//! the whole reason [`TransportWrite::write`] takes an owned [`bytes::Bytes`] rather than a
-//! borrow.
+//! the whole driver, which drops the in-flight write future.
+//!
+//! The two models reach the same safety by opposite routes, which is why the write primitive
+//! belongs to the model rather than to the transport trait. On the completion model,
+//! ownership of the buffer passes *into* the transport for the duration of the call
+//! ([`RegionWrite::write_owned`](transport::RegionWrite::write_owned) takes an owned
+//! [`bytes::Bytes`]), so dropping the future
+//! never leaves the kernel writing into memory this crate has reclaimed — the operation may
+//! outlive the future, so the buffer must too. On the readiness model nothing outlives the
+//! future: [`BorrowedWrite::write_borrowed`](transport::BorrowedWrite::write_borrowed) lends a
+//! slice, the runtime copies out of it or
+//! registers interest and returns, and there is no submitted operation left holding the
+//! memory when the future is dropped. A borrow is sound there precisely because the model
+//! guarantees the write is over when the future is.
 //!
 //! # Writing a transport for another runtime
 //!
@@ -116,7 +125,7 @@
 //! | old declaration | new declaration | operations move to |
 //! | --- | --- | --- |
 //! | `type Strategy = Coalesced;` (readiness) | `type Model = Readiness;` | [`BorrowedWrite`](transport::BorrowedWrite), whose `write_borrowed` is now **required** |
-//! | `type Strategy = Coalesced;` (completion) | `type Model = Completion;` | `impl RegionWrite for X {}` — no methods required |
+//! | `type Strategy = Coalesced;` (completion) | `type Model = Completion;` | [`RegionWrite`](transport::RegionWrite), whose `write_owned` is now **required** — move the old `write` body there verbatim |
 //! | `type Strategy = PerRegion;` | `type Model = Readiness;` | unchanged: keep `write_borrowed`, drop the marker |
 //! | `type Strategy = Gathering;` | `type Model = Readiness;` | `write_vectored` moves from `VectoredWrite` onto [`BorrowedWrite`](transport::BorrowedWrite); delete `gathers()` |
 //! | `type Strategy = OwnedRegions;` | `type Model = Completion;` | unchanged: keep `write_regions`, drop the marker |
@@ -144,11 +153,6 @@
 //! struct Simple(Sink);
 //! impl TransportWrite for Simple {
 //!     type Model = Readiness;
-//!     async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
-//!         self.0.put(&buf);
-//!         let n = buf.len();
-//!         (Ok(n), buf)
-//!     }
 //! }
 //! impl BorrowedWrite for Simple {
 //!     async fn write_borrowed<'w>(&'w mut self, data: &'w [u8]) -> io::Result<usize> {
@@ -163,11 +167,6 @@
 //! struct PerBlock(Sink);
 //! impl TransportWrite for PerBlock {
 //!     type Model = Readiness;
-//!     async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
-//!         self.0.put(&buf);
-//!         let n = buf.len();
-//!         (Ok(n), buf)
-//!     }
 //! }
 //! impl BorrowedWrite for PerBlock {
 //!     async fn write_borrowed<'w>(&'w mut self, data: &'w [u8]) -> io::Result<usize> {
@@ -182,11 +181,6 @@
 //! struct Vectoring(Sink);
 //! impl TransportWrite for Vectoring {
 //!     type Model = Readiness;
-//!     async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
-//!         self.0.put(&buf);
-//!         let n = buf.len();
-//!         (Ok(n), buf)
-//!     }
 //! }
 //! impl BorrowedWrite for Vectoring {
 //!     async fn write_borrowed<'w>(&'w mut self, data: &'w [u8]) -> io::Result<usize> {
@@ -207,13 +201,13 @@
 //! struct Owned(Sink);
 //! impl TransportWrite for Owned {
 //!     type Model = Completion;
-//!     async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
+//! }
+//! impl RegionWrite for Owned {
+//!     async fn write_owned(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
 //!         self.0.put(&buf);
 //!         let n = buf.len();
 //!         (Ok(n), buf)
 //!     }
-//! }
-//! impl RegionWrite for Owned {
 //!     async fn write_regions(&mut self, regions: Vec<Bytes>) -> (io::Result<usize>, Vec<Bytes>) {
 //!         let mut written = 0;
 //!         for region in &regions {
@@ -224,20 +218,21 @@
 //!     }
 //! }
 //!
-//! // 5. Was `Coalesced`, completion-based. The whole obligation is an empty impl: the
-//! //    `write_regions` default loops the owned regions through `write`.
+//! // 5. Was `Coalesced`, completion-based. The whole obligation is the owned primitive: the
+//! //    `write_regions` default loops the owned regions through it.
 //! struct MinimalCompletion(Sink);
 //! impl TransportWrite for MinimalCompletion {
 //!     type Model = Completion;
-//!     async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
+//! }
+//! impl RegionWrite for MinimalCompletion {
+//!     async fn write_owned(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
 //!         self.0.put(&buf);
 //!         let n = buf.len();
 //!         (Ok(n), buf)
 //!     }
 //! }
-//! impl RegionWrite for MinimalCompletion {}
-//! // That empty block is the whole completion-side obligation: `write_regions` is provided,
-//! // and loops one owned `write` per region. Override it only if the runtime has a real
+//! // That one method is the whole completion-side obligation: `write_regions` is provided,
+//! // and loops one `write_owned` per region. Override it only if the runtime has a real
 //! // vectored write, as `CompioWriter` does.
 //! ```
 //!

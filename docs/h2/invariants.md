@@ -75,8 +75,8 @@ frames, not the one-off cost of standing a stream up.
   construct legal and confirming the doctest then fails. The count is unchanged at five, but
   two were retargeted when the strategy markers went away:
   - declaring `Readiness` without implementing `BorrowedWrite`;
-  - declaring `Completion` without implementing `RegionWrite` — which bites even though
-    `RegionWrite` has no required methods, because the empty impl block is still required;
+  - declaring `Completion` without implementing `RegionWrite` — which means a missing
+    `write_owned`, the completion model's required write primitive;
   - implementing operations from both I/O models on one type;
   - an `Option`-returning `write_borrowed`, i.e. trying to decline a path mid-pass;
   - implementing `WriteModel` downstream, i.e. inventing a third I/O model.

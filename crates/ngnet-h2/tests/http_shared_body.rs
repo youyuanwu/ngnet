@@ -801,13 +801,6 @@ impl Transport for Recording {
 
 impl TransportWrite for RecordingWriter {
     type Model = Readiness;
-
-    fn write(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
-        // Recorded before the write is forwarded, so the group order is the pass order. This
-        // is the tap for `WritePolicy::Coalesced`, where one call is one whole pass.
-        self.passes.borrow_mut().push(buf.to_vec());
-        self.inner.write(buf)
-    }
 }
 
 impl BorrowedWrite for RecordingWriter {
@@ -816,7 +809,10 @@ impl BorrowedWrite for RecordingWriter {
         data: &'w [u8],
     ) -> impl Future<Output = io::Result<usize>> + 'w {
         // Untapped on purpose: `write_vectored` below is overridden, so the gathering default
-        // never loops through here and a recorded entry could not be a whole pass anyway.
+        // never loops through here. This file leaves the policy at its default, so the
+        // coalesced drain — which would reach this method, one call per whole pass — is never
+        // selected either. The former owned-write tap that sat here was dead for the same
+        // reason and was removed with the primitive.
         self.inner.write_borrowed(data)
     }
 

@@ -51,8 +51,17 @@
 //!
 //! | [`Model`](TransportWrite::Model) | primitive the writer must supply | gathering operation | under [`Gathered`](crate::http::WritePolicy::Gathered) | under [`Coalesced`](crate::http::WritePolicy::Coalesced) |
 //! | --- | --- | --- | --- | --- |
-//! | [`Readiness`] | [`write`](TransportWrite::write) + [`write_borrowed`](BorrowedWrite::write_borrowed) | [`write_vectored`](BorrowedWrite::write_vectored), **defaulted** | one per large block and per region-cap flush, plus at most one for the remainder | one per pass, copying every octet |
-//! | [`Completion`] | `write` + [`RegionWrite`] (whose method is **defaulted**) | [`write_regions`](RegionWrite::write_regions) | one per region-cap flush, plus one for the remainder | one per pass, copying every octet |
+//! | [`Readiness`] | [`write_borrowed`](BorrowedWrite::write_borrowed) | [`write_vectored`](BorrowedWrite::write_vectored), **defaulted** | one per large block and per region-cap flush, plus at most one for the remainder | one per pass, lending the buffer |
+//! | [`Completion`] | [`write_owned`](RegionWrite::write_owned) | [`write_regions`](RegionWrite::write_regions), **defaulted** | one per region-cap flush, plus one for the remainder | one per pass, handing the buffer over |
+//!
+//! Each model asks for exactly one write primitive, and it is the one that model can
+//! actually use: a readiness transport borrows, a completion transport owns. Neither is
+//! offered the other's. The owned write used to sit on [`TransportWrite`] where both
+//! inherited it, which obliged every readiness transport to accept a buffer it could only
+//! take a reference to — and obliged the coalescing drain to manufacture that ownership out
+//! of a buffer the driver already owned. [`commit`](TransportWrite::commit) is the one
+//! write-side operation still common to both, because when octets become peer-visible is a
+//! question about buffering rather than about ownership.
 //!
 //! Gathering exists because the two extremes are each wrong for half of the traffic: under
 //! multiplexing a pass is dozens of tiny blocks, where one write per block is the dominant
@@ -249,7 +258,7 @@ where
 }
 
 /// Emulates a gathering write of owned regions by writing each in turn through
-/// [`TransportWrite::write`].
+/// [`RegionWrite::write_owned`].
 ///
 /// The completion-side counterpart of [`emulate_gathering`], backing
 /// [`RegionWrite::write_regions`]'s default body. Same contract: in order, short write stops,
@@ -262,19 +271,19 @@ pub(crate) async fn emulate_region_gathering<W>(
     mut regions: Vec<Bytes>,
 ) -> (std::io::Result<usize>, Vec<Bytes>)
 where
-    W: TransportWrite + ?Sized,
+    W: RegionWrite + ?Sized,
     W::Model: CompletionModel,
 {
     let mut total = 0;
     for index in 0..regions.len() {
-        // Take the region out so `write` can own it, and put it back where it came from.
+        // Take the region out so `write_owned` can own it, and put it back where it came from.
         let region = core::mem::replace(&mut regions[index], Bytes::new());
         if region.is_empty() {
             regions[index] = region;
             continue;
         }
         let len = region.len();
-        let (result, region) = writer.write(region).await;
+        let (result, region) = writer.write_owned(region).await;
         regions[index] = region;
         match result {
             Ok(written) => {
@@ -291,45 +300,34 @@ where
 
 /// The writing half of a transport.
 ///
-/// Every writer supplies [`write`](TransportWrite::write) and names a
-/// [`Model`](TransportWrite::Model). Naming a model obliges it to implement that model's
-/// trait too — see the [module documentation](self#how-a-pass-gets-drained) for the table.
-/// It does *not* oblige it to implement that trait's gathering operation, which is provided.
+/// Every writer names a [`Model`](TransportWrite::Model), and that is what obliges it to
+/// implement that model's trait — which is where its write primitive lives. See the
+/// [module documentation](self#how-a-pass-gets-drained) for the table. Naming a model does
+/// *not* oblige a writer to implement that trait's gathering operation, which is provided.
 ///
 /// # Declaring a model whose trait you have not implemented will not compile
 ///
 /// ```compile_fail,E0277
 /// use ngnet_h2::http::transport::{Readiness, TransportWrite};
-/// use ngnet_h2::http::testing::bytes_crate::Bytes;
 ///
 /// struct ClaimsWithoutWriting;
 /// impl TransportWrite for ClaimsWithoutWriting {
 ///     // `Readiness` requires `BorrowedWrite`, which this type does not implement.
 ///     type Model = Readiness;
-///     async fn write(&mut self, buf: Bytes) -> (std::io::Result<usize>, Bytes) {
-///         let n = buf.len();
-///         (Ok(n), buf)
-///     }
 /// }
 /// ```
 ///
 /// The same holds on the completion side, so neither model has a way to declare itself
-/// without supplying what it needs. Note that this bites even though
-/// [`RegionWrite`]'s only method is provided: the *impl block* is still required, and
-/// `impl RegionWrite for MyType {}` is what declares the model satisfied.
+/// without supplying what it needs — there, the missing impl also means a missing
+/// [`write_owned`](RegionWrite::write_owned).
 ///
 /// ```compile_fail,E0277
 /// use ngnet_h2::http::transport::{Completion, TransportWrite};
-/// use ngnet_h2::http::testing::bytes_crate::Bytes;
 ///
 /// struct ClaimsRegionsWithoutWriting;
 /// impl TransportWrite for ClaimsRegionsWithoutWriting {
 ///     // `Completion` requires `RegionWrite`, which this type does not implement.
 ///     type Model = Completion;
-///     async fn write(&mut self, buf: Bytes) -> (std::io::Result<usize>, Bytes) {
-///         let n = buf.len();
-///         (Ok(n), buf)
-///     }
 /// }
 /// ```
 ///
@@ -341,7 +339,6 @@ where
 ///
 /// ```compile_fail,E0053
 /// use ngnet_h2::http::transport::{BorrowedWrite, Readiness, TransportWrite};
-/// use ngnet_h2::http::testing::bytes_crate::Bytes;
 /// use core::future::Future;
 ///
 /// struct Withdraws {
@@ -349,10 +346,6 @@ where
 /// }
 /// impl TransportWrite for Withdraws {
 ///     type Model = Readiness;
-///     async fn write(&mut self, buf: Bytes) -> (std::io::Result<usize>, Bytes) {
-///         let n = buf.len();
-///         (Ok(n), buf)
-///     }
 /// }
 /// impl BorrowedWrite for Withdraws {
 ///     // The trait's return type is the future, not an `Option` of one.
@@ -388,33 +381,34 @@ pub trait TransportWrite {
     ///
     /// Stable Rust has no defaults for associated types, so even the simplest transport
     /// writes this line — `type Model = Readiness;` — costing one line for the guarantee
-    /// that a declared model is always a supplied one. The model's trait costs a second line
-    /// on the completion side, where `impl RegionWrite for MyType {}` needs no body at all,
-    /// and a short method on the readiness side, where the borrowed write is the primitive
-    /// everything else is built from.
+    /// that a declared model is always a supplied one. Beyond it each model asks for one
+    /// write method and no more: the borrowed primitive on the readiness side, the owned one
+    /// on the completion side. Both models' gathering operations are provided in terms of
+    /// that primitive.
+    ///
+    /// This trait itself carries no write at all. It used to carry the owned one, which
+    /// meant every readiness transport had to accept a buffer it could only borrow from —
+    /// `TokioWriter`'s implementation took ownership and immediately took a reference. The
+    /// write primitive belongs to the model because *who owns the buffer* is what the model
+    /// is; only [`commit`](TransportWrite::commit), which is about buffering rather than
+    /// ownership, is common to both.
     type Model: WriteModel + Drains<Self>;
-
-    /// Writes `buf`, returning it along with how many octets were written.
-    ///
-    /// "Written" does not have to mean "handed to the peer" the instant this returns: a
-    /// buffering transport may hold the octets, so long as it releases them no later than
-    /// [`commit`](TransportWrite::commit), which the driver calls before it waits on the
-    /// peer.
-    ///
-    /// As with [`TransportRead::read`], ownership passes in and comes back, and comes back
-    /// even on failure.
-    fn write(&mut self, buf: Bytes) -> impl Future<Output = (std::io::Result<usize>, Bytes)>;
 
     /// Commits everything written so far to the peer-visible byte stream.
     ///
     /// The driver guarantees it calls this once it has drained a write pass and before it
     /// parks awaiting readable input: it never waits on the peer while octets it has
     /// produced are still sitting in a transport-side buffer. An implementation whose
-    /// writes are peer-visible the moment [`write`](TransportWrite::write) returns — a raw
+    /// writes are peer-visible the moment the model's write returns — a raw
     /// socket, a completion transport, the in-memory duplex — has nothing to do here, which
     /// is why the default does nothing. One that buffers, such as a `BufWriter` or a
     /// `BufStream`, must flush that buffer here; otherwise the driver awaits a response to a
     /// request the peer never received, and the connection silently hangs.
+    ///
+    /// This is the one write-side operation both models share, which is why it lives here
+    /// rather than on either model's trait: when the octets become peer-visible is a
+    /// property of the transport's buffering, not of who owns the buffer they were written
+    /// from.
     fn commit(&mut self) -> impl Future<Output = std::io::Result<()>> {
         async { Ok(()) }
     }
@@ -442,12 +436,13 @@ pub trait TransportWrite {
 /// struct BothModels;
 /// impl TransportWrite for BothModels {
 ///     type Model = Completion;
-///     async fn write(&mut self, buf: Bytes) -> (std::io::Result<usize>, Bytes) {
+/// }
+/// impl RegionWrite for BothModels {
+///     async fn write_owned(&mut self, buf: Bytes) -> (std::io::Result<usize>, Bytes) {
 ///         let n = buf.len();
 ///         (Ok(n), buf)
 ///     }
 /// }
-/// impl RegionWrite for BothModels {}
 /// // `Completion` is not a `ReadinessModel`, so this impl cannot exist.
 /// impl BorrowedWrite for BothModels {
 ///     async fn write_borrowed<'w>(&'w mut self, data: &'w [u8]) -> std::io::Result<usize> {
@@ -531,17 +526,43 @@ where
 /// Ownership passes in and back out. The driver reuses one growable allocation across passes
 /// rather than building a fresh list each time, and never loses the regions to an error.
 ///
-/// # This trait has no required methods
+/// # What a completion transport must supply
 ///
-/// [`write_regions`](RegionWrite::write_regions) is provided, emulating the gathering write
-/// over [`TransportWrite::write`] exactly as [`BorrowedWrite::write_vectored`]'s default does
-/// over the borrowed primitive. So the minimal completion transport is
-/// `impl RegionWrite for MyType {}` — an empty impl block, whose job is to declare the model
-/// satisfied. A transport whose runtime submits a real vectored write overrides it.
+/// One method: [`write_owned`](RegionWrite::write_owned), the owned counterpart of
+/// [`BorrowedWrite::write_borrowed`]. [`write_regions`](RegionWrite::write_regions) is
+/// provided in terms of it, emulating the gathering write exactly as
+/// [`BorrowedWrite::write_vectored`]'s default does over the borrowed primitive. A transport
+/// whose runtime submits a real vectored write overrides it; one that does not need write
+/// nothing else.
+///
+/// This method used to live on [`TransportWrite`], where both models inherited it, and the
+/// minimal completion transport was correspondingly the empty block
+/// `impl RegionWrite for MyType {}`. That arrangement obliged every *readiness* transport to
+/// accept an owned buffer as well, which
+/// no readiness transport can use — it can only borrow from it — so the ownership transfer
+/// was manufactured for them and then thrown away. Moving the primitive here costs the
+/// completion side a method it was already writing under another name, and relieves the
+/// readiness side of one it never wanted.
 pub trait RegionWrite: TransportWrite
 where
     Self::Model: CompletionModel,
 {
+    /// Writes `buf`, returning it along with how many octets were written.
+    ///
+    /// The completion model's primitive, and the one operation a completion transport must
+    /// supply. Ownership passes in and comes back, and comes back even on failure — the
+    /// kernel may still be writing from the buffer after the submitting future is dropped,
+    /// which is why this model cannot borrow and why the buffer has to survive the call.
+    ///
+    /// "Written" does not have to mean "handed to the peer" the instant this returns: a
+    /// buffering transport may hold the octets, so long as it releases them no later than
+    /// [`commit`](TransportWrite::commit), which the driver calls before it waits on the
+    /// peer.
+    ///
+    /// A short write is normal and the driver re-offers the remainder. An accepted write of
+    /// zero octets is an error rather than something to spin on.
+    fn write_owned(&mut self, buf: Bytes) -> impl Future<Output = (std::io::Result<usize>, Bytes)>;
+
     /// Writes an owned list of regions as one gathering operation, returning the list so the
     /// driver can reuse its allocation.
     ///
@@ -564,7 +585,8 @@ where
     ///
     /// # The default emulates
     ///
-    /// If not overridden, this hands each region to [`TransportWrite::write`] in turn,
+    /// If not overridden, this hands each region to [`write_owned`](RegionWrite::write_owned)
+    /// in turn,
     /// stopping at the first short write and returning the running total. Every octet
     /// arrives, in order; the cost is one write per region rather than one per pass. Override
     /// it when the runtime offers a real vectored submission.

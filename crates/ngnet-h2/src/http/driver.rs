@@ -1368,7 +1368,9 @@ where
                 // both deliver the same octets in the same order, and the accumulation that
                 // collapses small blocks into one region happens before either.
                 WritePolicy::Gathered => flush_readiness(session, writer, events, buffers).await,
-                WritePolicy::Coalesced => flush_coalesced(session, writer, events, buffers).await,
+                WritePolicy::Coalesced => {
+                    flush_coalesced_borrowed(session, writer, events, buffers).await
+                }
             }
         }
     }
@@ -1401,28 +1403,30 @@ where
                     )
                     .await
                 }
-                WritePolicy::Coalesced => flush_coalesced(session, writer, events, buffers).await,
+                WritePolicy::Coalesced => {
+                    flush_coalesced_owned(session, writer, events, buffers).await
+                }
             }
         }
     }
 }
 
-/// Drains a pass on the [`Coalesced`] strategy: copy every octet into one driver-owned buffer
-/// and hand it over as a single [`write`](TransportWrite::write).
+/// Accumulates a whole pass into one driver-owned buffer, ready to be written.
 ///
-/// The simplest drain and the only one every transport can take, readiness or completion:
-/// records the send callback deposited are coalesced into `out` ahead of each call's block,
-/// then the whole buffer leaves in one write. `out` (the `coalesced` buffer) is reused across
-/// passes — split-frozen rather than frozen, so `bytes` reclaims its capacity once the
-/// transport drops the handed-over `Bytes`, and the steady state allocates nothing.
-async fn flush_coalesced<W: TransportWrite + ?Sized>(
+/// The shared half of the [`Coalesced`] strategy, which both models take: records the send
+/// callback deposited are coalesced into `out` ahead of each call's block, so that when this
+/// returns `out` holds every octet of the pass in wire order. Handing `out` to the transport
+/// is the half that differs, because *how* a buffer reaches a transport is exactly what the
+/// I/O model settles — see [`flush_coalesced_borrowed`] and [`flush_coalesced_owned`].
+///
+/// `out` (the `coalesced` buffer) is reused across passes, so the steady state allocates
+/// nothing here.
+fn accumulate_coalesced(
     session: &mut Session<Events>,
-    writer: &mut W,
     events: &mut Events,
-    buffers: &mut WriteBuffers,
+    send_records: &mut Vec<SendRecord>,
+    out: &mut BytesMut,
 ) -> Result<()> {
-    let out = &mut buffers.coalesced;
-    let send_records = &mut buffers.send_records;
     // Whatever a previous pass left has already been written; the clear keeps the capacity.
     // `send_records` is drained to empty every pass, so it already starts a pass empty.
     out.clear();
@@ -1454,18 +1458,85 @@ async fn flush_coalesced<W: TransportWrite + ?Sized>(
         out.extend_from_slice(block);
     }
 
-    // `split` rather than `freeze`: freezing `out` itself would give the allocation away and
-    // leave the next pass to build a new one. Splitting hands over the octets while leaving
-    // the allocation here, and `bytes` returns the capacity once the transport has dropped its
-    // handle, so the steady state allocates nothing. The empty case is taken first so a pass
-    // with nothing to say costs no atomics on `out`.
+    debug_assert!(
+        send_records.is_empty(),
+        "accumulate_coalesced left records in the sink; they would outlive the pass and be lost"
+    );
+    Ok(())
+}
+
+/// Drains a pass on the [`Coalesced`] strategy over the readiness model.
+///
+/// Coalesce into the driver's own buffer, then lend it. Nothing is transferred: the driver
+/// already owns every octet, and a readiness transport only ever borrows, so the buffer goes
+/// out as a slice and the driver keeps it.
+///
+/// This used to hand over an owned `Bytes` split off the same buffer, because the owned write
+/// was the one primitive both models shared and this drain serves both. That transfer was
+/// manufactured for a recipient that immediately took a reference to what it had just been
+/// given — `TokioWriter::write` took `buf` and called `self.half.write(&buf)` — and it cost
+/// two atomics a pass to set up and tear down the shared-buffer bookkeeping. Splitting the
+/// primitive by model removed the recipient, so it removed the transfer.
+///
+/// There is no empty-buffer guard here, unlike the owned drain below. A length-bounded loop
+/// over an empty slice is already a no-op, and lending costs nothing to set up; the guard on
+/// the owned path exists to dodge atomics that only ownership transfer incurs.
+async fn flush_coalesced_borrowed<W: BorrowedWrite + ?Sized>(
+    session: &mut Session<Events>,
+    writer: &mut W,
+    events: &mut Events,
+    buffers: &mut WriteBuffers,
+) -> Result<()>
+where
+    W::Model: ReadinessModel,
+{
+    let out = &mut buffers.coalesced;
+    accumulate_coalesced(session, events, &mut buffers.send_records, out)?;
+
+    let mut offset = 0;
+    while offset < out.len() {
+        let written = writer.write_borrowed(&out[offset..]).await?;
+        if written == 0 {
+            return Err(Error::new(
+                ErrorKind::Transport,
+                "the transport accepted no octets and reported no error",
+            ));
+        }
+        offset += written;
+    }
+    Ok(())
+}
+
+/// Drains a pass on the [`Coalesced`] strategy over the completion model.
+///
+/// Coalesce into the driver's own buffer, then hand it over. The transfer is real here: a
+/// completion transport keeps the buffer until the operation finishes, so it must own one.
+///
+/// `split` rather than `freeze`: freezing `out` itself would give the allocation away and
+/// leave the next pass to build a new one. Splitting hands over the octets while leaving the
+/// allocation here, and `bytes` returns the capacity once the transport has dropped its
+/// handle, so the steady state allocates nothing. The empty case is taken first so a pass
+/// with nothing to say costs no atomics on `out` — a guard that matters only on this path,
+/// because only this path transfers ownership.
+async fn flush_coalesced_owned<W: RegionWrite + ?Sized>(
+    session: &mut Session<Events>,
+    writer: &mut W,
+    events: &mut Events,
+    buffers: &mut WriteBuffers,
+) -> Result<()>
+where
+    W::Model: CompletionModel,
+{
+    let out = &mut buffers.coalesced;
+    accumulate_coalesced(session, events, &mut buffers.send_records, out)?;
+
     let mut pending = if out.is_empty() {
         Bytes::new()
     } else {
         out.split().freeze()
     };
     while !pending.is_empty() {
-        let (result, returned) = writer.write(pending).await;
+        let (result, returned) = writer.write_owned(pending).await;
         let written = result?;
         if written == 0 {
             return Err(Error::new(
@@ -1475,11 +1546,6 @@ async fn flush_coalesced<W: TransportWrite + ?Sized>(
         }
         pending = returned.slice(written..);
     }
-
-    debug_assert!(
-        send_records.is_empty(),
-        "flush_coalesced left records in the sink; they would outlive the pass and be lost"
-    );
     Ok(())
 }
 

@@ -48,9 +48,10 @@ pub struct Regions;
 /// Write behaviour of a [`Duplex`]: completion, gathering *only* through the provided default.
 ///
 /// The completion-side counterpart of [`Emulating`], and the only way to reach
-/// [`RegionWrite::write_regions`]'s default from a test. Its `RegionWrite` impl is the empty
-/// block the migration notes advertise — `impl RegionWrite for MyType {}` — so every gathering
-/// write it is offered is turned into one owned [`TransportWrite::write`] per region by
+/// [`RegionWrite::write_regions`]'s default from a test. Its `RegionWrite` impl supplies the
+/// owned primitive and nothing else — the minimal completion transport the migration notes
+/// advertise — so every gathering write it is offered is turned into one
+/// [`RegionWrite::write_owned`] per region by
 /// [`emulate_region_gathering`](super::transport).
 ///
 /// This exists because without it the completion emulation is *dead code under test*: every
@@ -268,9 +269,9 @@ pub fn duplex_owned_regions() -> (Duplex<Regions>, Duplex<Regions>) {
 /// provided default.
 ///
 /// The completion-side counterpart of [`duplex_emulating`]. Its writing half implements
-/// [`RegionWrite`] with an empty block, so every gathering write becomes one owned
-/// [`TransportWrite::write`] per region. Honours [`Duplex::accept_at_most`] on that write, so
-/// a short write can land between regions.
+/// [`RegionWrite`] without overriding `write_regions`, so every gathering write becomes one
+/// [`RegionWrite::write_owned`] per region. Honours [`Duplex::accept_at_most`] on that write,
+/// so a short write can land between regions.
 pub fn duplex_region_emulating() -> (Duplex<RegionEmulating>, Duplex<RegionEmulating>) {
     pair()
 }
@@ -649,7 +650,7 @@ impl<S> DuplexWriter<S> {
         *self.writes.lock().expect("write count")
     }
 
-    /// The shared body of every strategy's [`write`](TransportWrite::write): one coalesced
+    /// The shared body of the completion halves' [`write_owned`](RegionWrite::write_owned): one coalesced
     /// owned write, counted and delivered to the peer.
     fn do_write(&mut self, buf: Bytes) -> core::future::Ready<(io::Result<usize>, Bytes)> {
         *self.writes.lock().expect("write count") += 1;
@@ -814,15 +815,12 @@ impl<S> Drop for DuplexWriter<S> {
 /// Emits the `TransportWrite` impl for a [`DuplexWriter`] over one strategy marker.
 ///
 /// One impl per marker rather than a blanket one over `S`: see [`DuplexWriter`] for why the
-/// blanket form cannot be proven. Every strategy shares [`DuplexWriter::do_write`].
+/// blanket form cannot be proven. Nothing but the model is left to declare — the write
+/// primitives moved to the model traits, so each marker supplies its own below.
 macro_rules! duplex_transport_write {
     ($marker:ty, $model:ty) => {
         impl TransportWrite for DuplexWriter<$marker> {
             type Model = $model;
-
-            fn write(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
-                self.do_write(buf)
-            }
         }
     };
 }
@@ -830,25 +828,23 @@ macro_rules! duplex_transport_write {
 duplex_transport_write!(Vectored, Readiness);
 duplex_transport_write!(Emulating, Readiness);
 duplex_transport_write!(Regions, Completion);
+duplex_transport_write!(RegionEmulating, Completion);
 
-/// The emulating completion half: its `write` records and caps, because that is the primitive
-/// [`RegionWrite::write_regions`]'s default loops over.
+/// The emulating completion half: its owned write records and caps, because that is the
+/// primitive [`RegionWrite::write_regions`]'s default loops over.
 ///
-/// It cannot share the `duplex_transport_write` macro's body, which neither records nor caps — for the
-/// other markers `write` is the coalescing path's single owned write and the vectored log is
-/// filled elsewhere. Here it *is* the gathering path, one call per region, so it has to fill
-/// the same log the native completion half fills through `write_regions`.
-impl TransportWrite for DuplexWriter<RegionEmulating> {
-    type Model = Completion;
-
-    fn write(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
+/// It cannot share `do_write`, which neither records nor caps — for the
+/// natively-gathering half the owned write is the coalescing path's single write and the
+/// vectored log is filled through `write_regions`. Here the owned write *is* the gathering
+/// path, one call per region, so it has to fill the same log itself.
+///
+/// The `write_regions` override is **deliberately absent**, and is the point of the marker:
+/// every gathering write goes through the trait's default.
+impl RegionWrite for DuplexWriter<RegionEmulating> {
+    fn write_owned(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
         self.do_write_recording(buf)
     }
 }
-
-/// **Deliberately empty**, and the point of the marker: no `write_regions` override, so every
-/// gathering write goes through the trait's default.
-impl RegionWrite for DuplexWriter<RegionEmulating> {}
 
 /// The natively-gathering readiness half: a real vectored write, recorded region by region.
 impl BorrowedWrite for DuplexWriter<Vectored> {
@@ -885,6 +881,10 @@ impl BorrowedWrite for DuplexWriter<Emulating> {
 }
 
 impl RegionWrite for DuplexWriter<Regions> {
+    fn write_owned(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
+        self.do_write(buf)
+    }
+
     fn write_regions(
         &mut self,
         regions: Vec<Bytes>,
@@ -1130,38 +1130,11 @@ impl TransportRead for FailingReader {
     }
 }
 
-impl<S> FailingWriter<S> {
-    /// The shared body of [`write`](TransportWrite::write): forward to the inner duplex, then
-    /// apply the scripted failure to the returned result.
-    fn do_write<'a>(
-        &'a mut self,
-        buf: Bytes,
-    ) -> impl Future<Output = (io::Result<usize>, Bytes)> + 'a
-    where
-        DuplexWriter<S>: TransportWrite,
-    {
-        let failed = spent(&self.countdown, self.armed);
-        let inner = self.inner.write(buf);
-        async move {
-            let (result, buf) = inner.await;
-            if failed {
-                (Err(broken()), buf)
-            } else {
-                (result, buf)
-            }
-        }
-    }
-}
-
 /// Emits the `TransportWrite` impl for a [`FailingWriter`] over one strategy marker.
 macro_rules! failing_transport_write {
     ($marker:ty, $model:ty) => {
         impl TransportWrite for FailingWriter<$marker> {
             type Model = $model;
-
-            fn write(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
-                self.do_write(buf)
-            }
         }
     };
 }
@@ -1292,21 +1265,15 @@ impl TransportWrite for BufferingWriter {
     /// the octets, so it takes the readiness model and lets the policy decide the shape.
     type Model = Readiness;
 
-    fn write(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
-        // Buffered, not sent: the octets stay here until `commit`, exactly as a buffering
-        // wrapper's `write` fills its buffer without touching the socket.
-        self.buffer.extend_from_slice(&buf);
-        let written = buf.len();
-        core::future::ready((Ok(written), buf))
-    }
-
     async fn commit(&mut self) -> io::Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
         let data = core::mem::take(&mut self.buffer);
-        let (result, _buf) = self.inner.write(Bytes::from(data)).await;
-        result.map(|_| ())
+        // The inner half is readiness too, so the flush lends rather than transfers: no
+        // `Bytes::from` copy of the buffer just to hand it to something that borrows it.
+        self.inner.write_borrowed(&data).await?;
+        Ok(())
     }
 }
 
@@ -1315,9 +1282,9 @@ impl BorrowedWrite for BufferingWriter {
         &'w mut self,
         data: &'w [u8],
     ) -> impl Future<Output = io::Result<usize>> + 'w {
-        // Buffered exactly as `write` is: this transport's whole point is that nothing is
-        // peer-visible until `commit`, and that has to hold on every path into it — including
-        // the one the gathering default loops over.
+        // This transport's whole point is that nothing is peer-visible until `commit`, and
+        // that has to hold on every path into it — including the one the gathering default
+        // loops over.
         self.buffer.extend_from_slice(data);
         core::future::ready(Ok(data.len()))
     }
@@ -1653,7 +1620,7 @@ where
     async fn write_all(writer: &mut W, buf: BytesMut) -> io::Result<()> {
         let mut buf = buf.freeze();
         while !buf.is_empty() {
-            let (result, returned) = writer.write(buf).await;
+            let (result, returned) = writer.write_owned(buf).await;
             let written = result?;
             if written == 0 {
                 return Err(io::Error::new(

@@ -600,21 +600,16 @@ mod asynchronous {
     /// The writing half's base contract, pinned by the shape of its two always-present
     /// points.
     ///
-    /// Every writer, whatever its strategy, supplies `write` — ownership passing in and back
-    /// out — and `commit`, a future of `()`. Both are pinned as signatures rather than fn
-    /// pointers because a return-position `impl Future` has no nameable type. The fast paths
-    /// are no longer part of this base trait: each is its own model trait, named separately
-    /// below, so that a plain `W: TransportWrite` bound admits none of them.
+    /// Every writer, whatever its model, supplies `commit`, a future of `()`, and names its
+    /// `Model`. It is pinned as a signature rather than an fn pointer because a
+    /// return-position `impl Future` has no nameable type.
+    ///
+    /// **`write` is no longer here.** The write primitive belongs to the I/O model, not to
+    /// the base trait: `write_borrowed` on `BorrowedWrite` for readiness, `write_owned` on
+    /// `RegionWrite` for completion. A plain `W: TransportWrite` bound admits neither, which
+    /// is the point — the driver cannot ask an arbitrary transport for an owned write, and a
+    /// readiness transport can no longer be made to supply one.
     pub(super) fn write_half_surface<W: TransportWrite>() {
-        fn write_takes_and_returns_owned<W: TransportWrite>(writer: &mut W, buf: bytes::Bytes) {
-            fn assert_future<
-                F: core::future::Future<Output = (std::io::Result<usize>, bytes::Bytes)>,
-            >(
-                _: F,
-            ) {
-            }
-            assert_future(writer.write(buf));
-        }
         fn commit_returns_a_result_future<W: TransportWrite>(writer: &mut W) {
             fn assert_future<F: core::future::Future<Output = std::io::Result<()>>>(_: F) {}
             assert_future(writer.commit());
@@ -628,7 +623,6 @@ mod asynchronous {
             W::Model: WriteModel + Drains<W>,
         {
         }
-        let _ = write_takes_and_returns_owned::<W>;
         let _ = commit_returns_a_result_future::<W>;
         let _ = model_is_a_write_model::<W>;
     }
@@ -681,11 +675,6 @@ mod asynchronous {
 
         impl TransportWrite for Minimal {
             type Model = Readiness;
-
-            async fn write(&mut self, buf: bytes::Bytes) -> (std::io::Result<usize>, bytes::Bytes) {
-                let written = buf.len();
-                (Ok(written), buf)
-            }
         }
 
         impl BorrowedWrite for Minimal {
@@ -698,25 +687,28 @@ mod asynchronous {
         borrowed_write_surface::<Minimal>();
     }
 
-    /// The minimal completion transport, pinned by *compiling*: `write` is the only required
-    /// write operation, because `RegionWrite` has no required methods at all.
+    /// The minimal completion transport, pinned by *compiling*: `write_owned` is the only
+    /// required write operation, because `write_regions` is provided.
     ///
-    /// `impl RegionWrite for X {}` is the successor to the deleted `type Strategy = Coalesced;`
-    /// — the way a transport says "I have nothing special to offer" — and the default loops
-    /// the owned regions through `write`.
+    /// A `RegionWrite` impl carrying only `write_owned` is the successor to the deleted
+    /// `type Strategy = Coalesced;` — the way a transport says "I have nothing special to
+    /// offer" — and the default loops the owned regions through it.
     pub(super) fn minimal_completion_surface() {
         struct Minimal;
 
         impl TransportWrite for Minimal {
             type Model = Completion;
+        }
 
-            async fn write(&mut self, buf: bytes::Bytes) -> (std::io::Result<usize>, bytes::Bytes) {
+        impl RegionWrite for Minimal {
+            async fn write_owned(
+                &mut self,
+                buf: bytes::Bytes,
+            ) -> (std::io::Result<usize>, bytes::Bytes) {
                 let written = buf.len();
                 (Ok(written), buf)
             }
         }
-
-        impl RegionWrite for Minimal {}
 
         region_write_surface::<Minimal>();
     }
@@ -728,7 +720,10 @@ mod asynchronous {
     /// [`CompletionModel`] rather than a readiness one — the two are disjoint, so a writer
     /// carries exactly one of the fast paths, never this alongside the borrowed one. The
     /// `Vec` returns so the driver can reuse its allocation and never loses owned buffers to
-    /// an error. `write_regions` is now **provided**, so this trait has no required methods.
+    /// an error. `write_regions` is **provided**, in terms of `write_owned` — which is this
+    /// trait's one required method, and the whole of a minimal completion transport's
+    /// obligation. It is required *here*, on the completion model's trait, rather than on
+    /// `TransportWrite`, so that no readiness transport is ever asked for an owned write.
     pub(super) fn region_write_surface<W: RegionWrite>()
     where
         W::Model: CompletionModel,
@@ -895,8 +890,8 @@ fn the_asynchronous_surface_is_unchanged() {
     // borrowing slices.
     let _: fn() -> (Duplex<Regions>, Duplex<Regions>) =
         ngnet_h2::http::testing::duplex_owned_regions;
-    // The completion-side emulating transport: `impl RegionWrite for X {}` with no override,
-    // so its gathering writes go through `write_regions`' provided default. It is the only
+    // The completion-side emulating transport: a `RegionWrite` impl carrying only
+    // `write_owned`, so its gathering writes go through `write_regions`' provided default. It is the only
     // shape in the workspace that runs that default — every other completion writer, shipped
     // or test-only, overrides it — so without this the completion emulation is untested.
     let _: fn() -> (Duplex<RegionEmulating>, Duplex<RegionEmulating>) =

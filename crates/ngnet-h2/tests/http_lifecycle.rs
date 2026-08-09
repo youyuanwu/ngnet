@@ -13,13 +13,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ngnet_h2::http::testing::bytes_crate::{Bytes, BytesMut};
+use ngnet_h2::http::testing::bytes_crate::BytesMut;
 use ngnet_h2::http::testing::{
-    Empty, alongside, block_on, duplex, failing, http_crate as http, serve as drive_peer,
+    Empty, PeerWrite, alongside, block_on, duplex, failing, http_crate as http, serve as drive_peer,
 };
-use ngnet_h2::http::{
-    Cancelled, ErrorKind, IncomingBody, Transport, TransportRead, TransportWrite, server,
-};
+use ngnet_h2::http::transport::Readiness;
+use ngnet_h2::http::{Cancelled, ErrorKind, IncomingBody, Transport, TransportRead, server};
 use ngnet_h2::{
     BodyOutcome, BodySource, ErrorCode, FrameType, Header, HeaderAction, HeaderCategory, Session,
     SessionBuilder, StreamId,
@@ -489,10 +488,14 @@ fn end_of_file_part_way_through_a_frame_is_a_connection_error() {
         let (mut reader, mut writer) = server_side.split();
         // Read what the client sends first, so its preface does not sit unread.
         let (_result, _buf) = reader.read(BytesMut::with_capacity(4096)).await;
-        let truncated = Bytes::from_static(&[
-            0x00, 0x00, 0x08, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02,
-        ]);
-        let (_result, _buf) = writer.write(truncated).await;
+        let truncated = BytesMut::from(
+            &[
+                0x00, 0x00, 0x08, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02,
+            ][..],
+        );
+        // The peer half is a readiness writer, so it is lent the octets rather than handed
+        // them; `PeerWrite` picks the primitive from the writer's model and loops short writes.
+        let _ = Readiness::write_all(&mut writer, truncated).await;
         drop(writer);
         core::future::pending::<()>().await;
     };

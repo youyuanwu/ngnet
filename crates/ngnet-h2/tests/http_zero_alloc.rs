@@ -57,7 +57,7 @@
 //!
 //! | shape (transport × policy) | upload: allocations / writes | multiplexed: allocations / writes | pinned by |
 //! |-------|------------------------------|-----------------------------------|-----------|
-//! | `CoalescedShape` — any readiness transport, gathering **off** | `0` / `1` | `0` / `1` | `the_owned_write_path_coalesces_a_pass_into_one_write`, `the_owned_write_path_reuses_its_coalescing_buffer` |
+//! | `CoalescedShape` — any readiness transport, gathering **off** | `0` / `1` | `0` / `1` | `the_coalesced_write_path_coalesces_a_pass_into_one_write`, `the_coalesced_write_path_reuses_its_coalescing_buffer` |
 //! | `EmulatedShape` — emulating transport, gathering on | `0` / one per frame (4) | `0` / `1` | `steady_state_send_allocates_nothing_on_the_borrowed_path`, `emulated_gathering_costs_no_more_writes_than_native_on_an_upload` |
 //! | `GatheredShape` — natively-gathering transport, gathering on | `0` / one per frame (4) | `0` / `1` | `steady_state_send_allocates_nothing_on_the_vectored_path`, `steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path`, `a_multiplexed_pass_costs_one_write_natively_and_under_emulation_alike`, `the_vectored_write_path_writes_once_per_large_block_and_no_more` |
 //! | `RegionShape` — completion transport | `0` / `1` | — | `the_owned_region_write_path_coalesces_a_pass_into_one_write`, `steady_state_send_allocates_nothing_on_the_owned_region_path` |
@@ -174,7 +174,8 @@ trait Shape {
 
 /// Native transport, gathering on: one `write_vectored` per pass.
 struct GatheredShape;
-/// Native transport, gathering off: one owned `write` per pass, every octet copied.
+/// Native transport, gathering off: one *borrowed* write per pass, every octet copied into
+/// the driver's buffer but nothing handed over.
 struct CoalescedShape;
 /// Emulating transport, gathering on: the default's loop, one `write_borrowed` per region.
 struct EmulatedShape;
@@ -343,8 +344,12 @@ impl<S> RecWriter<S> {
         self.outbound.borrow_mut().buf.extend(data.iter().copied());
     }
 
-    /// The shared body of every strategy's [`write`](TransportWrite::write): one coalesced
-    /// owned write, metered and delivered.
+    /// The completion model's owned write: one coalesced write, metered and delivered.
+    ///
+    /// Only the [`Owned`] behaviour reaches this. The readiness behaviours coalesce through
+    /// [`do_write_borrowed`](Self::do_write_borrowed) instead — the driver lends them the
+    /// coalescing buffer rather than handing over a `Bytes`. Both funnel into
+    /// [`record`](Self::record), so the write counts below are comparable across models.
     async fn do_write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
         self.record(&buf);
         let written = buf.len();
@@ -353,10 +358,10 @@ impl<S> RecWriter<S> {
 
     /// The shared body of the borrowed path: one metered write per block, nothing copied.
     ///
-    /// A real fallback rather than a stub: the [`Gathering`] writer supplies it too, since
-    /// [`VectoredWrite`] requires [`BorrowedWrite`] and the driver writes here when a stream
-    /// does not really scatter-gather. In these tests `gathers` is left at its `true` default,
-    /// so the [`Gathering`] writer never reaches this — but it must still be live.
+    /// A real fallback rather than a stub, and now the readiness coalescing primitive as
+    /// well: the driver's coalesced drain lends its own buffer here instead of freezing it
+    /// into a `Bytes`. The [`Emul`] writer also reaches it once per region, because it takes
+    /// [`BorrowedWrite::write_vectored`]'s provided default.
     fn do_write_borrowed<'w>(
         &'w mut self,
         data: &'w [u8],
@@ -469,14 +474,13 @@ impl TransportRead for RecReader {
 }
 
 /// Emits the `TransportWrite` impl for a [`RecWriter`] over one strategy marker.
+///
+/// The trait now carries the model and nothing else; the write primitive lives on whichever
+/// model trait the marker's model admits.
 macro_rules! recording_transport_write {
     ($marker:ty, $model:ty) => {
         impl TransportWrite for RecWriter<$marker> {
             type Model = $model;
-
-            fn write(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
-                self.do_write(buf)
-            }
         }
     };
 }
@@ -526,6 +530,10 @@ impl BorrowedWrite for RecWriter<Native> {
 }
 
 impl RegionWrite for RecWriter<Owned> {
+    fn write_owned(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
+        self.do_write(buf)
+    }
+
     fn write_regions(
         &mut self,
         regions: Vec<Bytes>,
@@ -823,7 +831,7 @@ fn steady_state_send_allocates_nothing_on_the_borrowed_path() {
 }
 
 #[test]
-fn the_owned_write_path_coalesces_a_pass_into_one_write() {
+fn the_coalesced_write_path_coalesces_a_pass_into_one_write() {
     let measured = run_send::<CoalescedShape>();
 
     assert!(
@@ -897,19 +905,26 @@ fn emulated_gathering_costs_no_more_writes_than_native_on_an_upload() {
 }
 
 #[test]
-fn the_owned_write_path_reuses_its_coalescing_buffer() {
+fn the_coalesced_write_path_reuses_its_coalescing_buffer() {
     // This test used to assert the opposite — that the owned path allocates on every pass —
     // and that assertion was the stated justification for the tokio adapter preferring the
     // borrowed path. It was true, but it was never *inherent*: the cost came from `flush`
     // building its coalescing buffer as a local and handing the whole allocation away with
     // `freeze()`, so every pass began from nothing. Hoisting the buffer beside the gathering
-    // one and handing the octets over with `split().freeze()` instead lets `bytes` reclaim
-    // the capacity once the transport drops its handle, and the recurring cost disappears.
+    // one and handing the octets over with `split().freeze()` instead let `bytes` reclaim
+    // the capacity once the transport dropped its handle, and the recurring cost disappeared.
     //
-    // What is pinned here is therefore the reuse, not a count. The owned path still copies
-    // every outgoing octet — that is inherent, because the transport takes ownership — but it
-    // must not reallocate to do so. A regression to `freeze()`, or to declaring the buffer
-    // inside `flush`, would restore the per-pass allocation and fail here.
+    // The readiness drain no longer hands anything over at all: it lends the buffer with
+    // `write_borrowed` and clears it. `split().freeze()` never heap-allocated on the steady
+    // state — it split off a handle into capacity the buffer already had — so **this count
+    // does not move**; what its removal drops is the pair of atomic refcount operations that
+    // creating and dropping that handle cost, which this meter cannot see. The zero below is
+    // the same zero as before the split, and it is asserted for the same reason.
+    //
+    // What is pinned here is therefore the reuse, not a count. The coalesced path still
+    // copies every outgoing octet — that is inherent to coalescing — but it must not
+    // reallocate to do so. A regression to declaring the buffer inside `flush` would restore
+    // the per-pass allocation and fail here.
     let owned = run_send::<CoalescedShape>();
     let borrowed = run_send::<EmulatedShape>();
 
@@ -965,7 +980,7 @@ fn the_owned_region_write_path_coalesces_a_pass_into_one_write() {
 
 #[test]
 fn steady_state_send_allocates_nothing_on_the_owned_region_path() {
-    // The completion counterpart of `the_owned_write_path_reuses_its_coalescing_buffer`: the
+    // The completion counterpart of `the_coalesced_write_path_reuses_its_coalescing_buffer`: the
     // owned-region path mints each region by `split().freeze()`ing the minting buffer, and
     // `write_regions` returns the `Vec` so the transport's frozen handles are dropped before
     // the next pass. That leaves the minting buffer the unique owner of its allocation, so
