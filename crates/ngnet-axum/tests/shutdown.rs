@@ -146,3 +146,53 @@ async fn a_new_connection_is_not_served_after_the_stop_signal() {
         );
     }
 }
+
+/// A stop signal that is *already* resolved beats a connection that is already queued
+/// (FR-011).
+///
+/// This is about arbitration, not about sockets. A flat `select!` picks at random among
+/// ready branches, so a server told to stop while a client sits in the kernel's backlog
+/// would admit that client half the time -- and then, because stopping only quiesces, wait
+/// for a connection it should never have accepted.
+///
+/// The assertion is that the server finishes *while the peers are still connected*. That
+/// can only happen if none of them was served: a connection the loop accepted would keep
+/// the server alive until its peer went away, and these peers never do. Ten rounds because
+/// a random choice would have to lose every one of them to slip through.
+#[tokio::test]
+async fn an_already_stopped_server_admits_no_queued_connection() {
+    use std::net::Ipv4Addr;
+    use tokio::net::{TcpListener, TcpStream};
+
+    for round in 0..10 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("a bound listener");
+        let address = listener.local_addr().expect("a bound address");
+
+        // Queue peers *before* the server runs, so the accept branch is ready on the very
+        // first pass, at the same moment the stop signal is.
+        let mut queued = Vec::new();
+        for _ in 0..4 {
+            queued.push(TcpStream::connect(address).await.expect("a queued peer"));
+        }
+
+        let router = Router::new().route("/hello", get(|| async { "world" }));
+        let server = tokio::spawn(
+            ngnet_axum::serve(listener, router)
+                .with_stop_signal(std::future::ready(()))
+                .into_future(),
+        );
+
+        within(
+            &format!("round {round}: the server to finish without serving a queued peer"),
+            server,
+        )
+        .await
+        .expect("the server task not to panic");
+
+        // Held to the end on purpose: the peers must still be alive for the wait above to
+        // mean anything.
+        drop(queued);
+    }
+}

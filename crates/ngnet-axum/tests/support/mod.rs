@@ -123,12 +123,19 @@ impl TestServer {
     }
 
     /// Waits for the server future to resolve.
+    ///
+    /// The handle is *borrowed*, not taken, and cleared only once the wait succeeds. A
+    /// caller may legitimately wrap this in a `timeout` to assert the server has *not*
+    /// finished yet, and cancelling the returned future must not consume the handle: taking
+    /// it up front would detach the task and make every later call return instantly, which
+    /// silently turns the subsequent "and now it does finish" assertion into a no-op.
     pub async fn finished(&mut self) {
-        if let Some(task) = self.task.take() {
+        if let Some(task) = self.task.as_mut() {
             within("the server to finish", task)
                 .await
                 .expect("the server task not to panic");
         }
+        self.task = None;
     }
 }
 

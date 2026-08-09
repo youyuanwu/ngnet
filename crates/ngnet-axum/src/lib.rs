@@ -128,4 +128,21 @@ pub use server::{Serve, serve};
 /// Re-exported rather than wrapped: it is `ngnet-h2`'s type, a wrapper would have to be
 /// kept in step with it for no gain, and a caller should be able to pass one to
 /// [`Serve::config`] without naming a second crate in their manifest.
+///
+/// One setting behaves less strongly than its name suggests, and it is worth knowing
+/// before relying on it: `max_header_list_size` is *advertised* to the peer, not enforced
+/// on arrival. A client that ignores the advertised value and sends a larger header list
+/// is served normally, and the handler runs. It is a hint, not a limit, and it is not a
+/// defence against a hostile peer. The behaviour is pinned by a test rather than left to
+/// be rediscovered.
 pub use ngnet_h2::http::Config;
+
+/// The connection future type returned by [`serve_connection`], re-exported from
+/// `ngnet-h2`.
+///
+/// Without this a caller could call [`serve_connection`] but could not write down what it
+/// returned — the type is reachable only through a crate they need not otherwise depend
+/// on. `EngineError` is renamed on the way through because this crate already has an
+/// [`Error`] of its own, which is the one reported to [`Serve::on_error`]; the two are
+/// different types and silently sharing a name would be worse than the rename.
+pub use ngnet_h2::http::{Connection, Error as EngineError, Result as EngineResult};

@@ -12,6 +12,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
+use tokio::time::Instant;
 
 use axum::Router;
 use ngnet_h2::http::Config;
@@ -167,16 +168,22 @@ fn report(observer: &mut Option<Observer>, error: Error) {
 /// reporting the arbitrated loop exists to prevent. `axum::serve` puts its sleep in the
 /// same place for the same reason.
 ///
-/// One consequence of living in a `select!` branch: if another arm wins, this future is
-/// dropped and the wait restarts on the next pass. That is harmless here — a backoff is a
-/// floor on retry frequency, not a deadline — but it does mean the wait is at least
-/// `backoff`, not exactly it.
+/// Living in a `select!` branch has a consequence that makes the *deadline* here
+/// load-bearing rather than incidental. Whenever another arm wins, this future is dropped
+/// and rebuilt on the next pass, so a relative `sleep(backoff)` would start again from
+/// zero every time. On a busy server the other arm — a finished connection — wins often:
+/// measured against this loop's shape, one connection completing every 100ms stopped a
+/// one-second relative backoff from *ever* elapsing, so the listener was never retried at
+/// all while the server stayed busy. Precisely the wrong moment to stop accepting.
+///
+/// Sleeping until an absolute `Instant` is immune, because a rebuilt future recomputes the
+/// remaining time to the same instant and so inherits the progress already made.
 async fn accept(
     listener: &TcpListener,
-    backoff: Option<Duration>,
+    backoff: Option<Instant>,
 ) -> io::Result<(TcpStream, SocketAddr)> {
-    if let Some(backoff) = backoff {
-        tokio::time::sleep(backoff).await;
+    if let Some(deadline) = backoff {
+        tokio::time::sleep_until(deadline).await;
     }
     listener.accept().await
 }
@@ -214,11 +221,31 @@ async fn run(server: Serve) {
     let mut peers: HashMap<Id, SocketAddr> = HashMap::new();
     let mut stop = stop.unwrap_or_else(|| Box::pin(pending()));
     // Owed to the *listener*, not to any connection: set after a failure that will recur,
-    // and waited out at the start of the next accept rather than here. See `accept`.
-    let mut backoff: Option<Duration> = None;
+    // and waited out at the start of the next accept rather than here. Held as the instant
+    // the retry becomes due rather than as a duration, so that the wait survives this
+    // future being dropped and rebuilt by the loop. See `accept`.
+    let mut backoff: Option<Instant> = None;
 
     loop {
+        // Two levels, and the nesting is the point. The stop signal is given strict
+        // priority via `biased`, because a flat `select!` chooses *at random* among ready
+        // branches: with a stop signal already fired and a client already queued, half the
+        // time the loop would admit that connection and then, since stopping only quiesces,
+        // wait for it to finish. Serving a connection accepted after the stop signal is the
+        // one thing FR-011 forbids.
+        //
+        // Below that, accepting and harvesting arbitrate *unbiased* against each other. A
+        // single biased list would have to rank them, and either order starves the other
+        // under sustained load: accept-first leaves finished connections unreported while
+        // clients keep arriving, harvest-first stops accepting while connections keep
+        // ending.
         tokio::select! {
+            biased;
+
+            () = &mut stop => break,
+
+            () = async {
+                tokio::select! {
             accepted = accept(&listener, backoff) => match accepted {
                 Ok((stream, peer)) => {
                     backoff = None;
@@ -240,7 +267,7 @@ async fn run(server: Serve) {
                     }
                 }
                 Err(error) => {
-                    backoff = (!is_transient(&error)).then_some(ACCEPT_BACKOFF);
+                    backoff = (!is_transient(&error)).then(|| Instant::now() + ACCEPT_BACKOFF);
                     report(&mut observer, Error::accept(error));
                 }
             },
@@ -252,8 +279,8 @@ async fn run(server: Serve) {
             Some(joined) = connections.join_next_with_id(), if !connections.is_empty() => {
                 harvest(&mut observer, &mut peers, joined);
             }
-
-            () = &mut stop => break,
+                }
+            } => {}
         }
     }
 

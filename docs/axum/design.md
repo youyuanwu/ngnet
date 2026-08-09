@@ -93,6 +93,24 @@ finished connections for the whole second. `axum::serve` puts its own sleep in t
 place for the same reason. This was caught in review, not in testing, which is worth
 recording: the wrong version passed every test.
 
+Moving the sleep into the branch future then created a second, subtler bug, and the fix for
+it is why the backoff is stored as an *instant* rather than a duration. A branch future that
+loses the race is dropped and rebuilt on the next pass, so a relative `sleep(one second)`
+starts again from zero every time another arm wins — and on a busy server the other arm, a
+finished connection, wins constantly. Measured against this loop's shape, one connection
+completing every 100 ms stopped a one-second backoff from *ever* elapsing: zero retries in
+five seconds, against roughly forty for the same loop sleeping to an absolute deadline. The
+listener would have stopped being retried for exactly as long as the server stayed busy.
+`sleep_until` is immune because a rebuilt future recomputes the time remaining to the same
+instant, inheriting the progress already made.
+
+The other thing the loop does deliberately is rank its branches. The stop signal is
+`biased` ahead of everything else, because `select!` chooses at *random* among ready
+branches: with a stop signal already fired and a client already queued, an unranked loop
+would admit that client about half the time, and then wait for it, since stopping only
+quiesces. Accepting and harvesting, by contrast, arbitrate unbiased against each other on
+purpose — ranking those two would starve whichever came second under sustained load.
+
 ## Peer addresses, and the feature that would undo the crate
 
 Handlers read `PeerAddr` from the request extensions. The idiomatic axum answer is
