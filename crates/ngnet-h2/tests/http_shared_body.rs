@@ -32,10 +32,10 @@ use std::sync::{Arc, Mutex};
 use core::future::Future;
 
 use ngnet_h2::http::testing::{
-    Duplex, DuplexReader, DuplexWriter, Empty, Failing, Full, Scripted, Vectored, VectoredLog,
-    alongside, block_on, bytes_crate as bytes, duplex, duplex_emulating, duplex_owned_regions,
-    duplex_vectored, failing, failing_borrowed, failing_vectored, http_crate as http, scripted,
-    serve,
+    Duplex, DuplexReader, DuplexWriter, Empty, Failing, Full, PeerWrite, Scripted, Vectored,
+    VectoredLog, alongside, block_on, bytes_crate as bytes, duplex, duplex_emulating,
+    duplex_owned_regions, duplex_vectored, failing, failing_borrowed, failing_vectored,
+    http_crate as http, scripted, serve,
 };
 use ngnet_h2::http::transport::{BorrowedWrite, Readiness, Transport, TransportWrite};
 use ngnet_h2::http::{
@@ -541,6 +541,8 @@ fn upload_tracked<S>(
 ) -> ServerPeer
 where
     Duplex<S>: Transport,
+    <<Duplex<S> as Transport>::Writer as TransportWrite>::Model:
+        PeerWrite<<Duplex<S> as Transport>::Writer>,
 {
     let (requests, connection) =
         ngnet_h2::http::handshake_shared::<_, TrackingBody>(client_side).expect("handshake");
@@ -1132,6 +1134,8 @@ fn drive_mixed<S>(
     server_side: Duplex<S>,
 ) where
     Duplex<S>: Transport,
+    <<Duplex<S> as Transport>::Writer as TransportWrite>::Model:
+        PeerWrite<<Duplex<S> as Transport>::Writer>,
 {
     let exchange = async move {
         let head = response.await.expect("a response");
@@ -1817,6 +1821,8 @@ fn drive_nobody<Conn, S>(
 where
     Conn: core::future::Future<Output = Result<(), ngnet_h2::http::Error>>,
     Duplex<S>: Transport,
+    <<Duplex<S> as Transport>::Writer as TransportWrite>::Model:
+        PeerWrite<<Duplex<S> as Transport>::Writer>,
 {
     let response = requests.send_request(
         http::Request::builder()

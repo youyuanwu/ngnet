@@ -18,7 +18,8 @@ use std::task::Wake;
 use bytes::{Bytes, BytesMut};
 
 use super::transport::{
-    BorrowedWrite, Completion, Readiness, RegionWrite, Transport, TransportRead, TransportWrite,
+    BorrowedWrite, Completion, CompletionModel, Readiness, ReadinessModel, RegionWrite, Transport,
+    TransportRead, TransportWrite,
 };
 
 /// Write behaviour of a [`Duplex`]: readiness, gathering natively.
@@ -1599,6 +1600,73 @@ impl http_body::Body for Scripted {
     }
 }
 
+/// Writes a whole buffer through whichever write primitive a peer's I/O model supplies.
+///
+/// Test scaffolding that is generic over an unknown transport cannot name either primitive:
+/// the readiness model has no owned write and the completion model has no borrowed one, and
+/// a generic `W` is not known to be either. Resolving through the *model* rather than the
+/// writer is what makes such code expressible.
+///
+/// Parameterised over `W` rather than implemented blanket-wise for it, exactly as
+/// [`Drains`](super::transport::Drains) is, and for the same reason: a pair of blanket impls
+/// over `W: BorrowedWrite` and `W: RegionWrite` collides with `E0119`, because the compiler
+/// cannot prove through the associated type that no writer supplies both. With the model in
+/// `Self` position the two impls are disjoint by construction.
+///
+/// This is peer-side scaffolding, not a driver path. Its contract is stronger than what the
+/// driver asks of a transport: it loops until the whole buffer is gone, so a peer that short
+/// writes still delivers every octet, and it treats an accepted zero as an error rather than
+/// spinning.
+///
+/// Not part of the supported surface. It is `pub` only because it is named in the bound of a
+/// public function.
+#[doc(hidden)]
+pub trait PeerWrite<W: ?Sized> {
+    /// Writes all of `buf`, looping over short writes.
+    fn write_all(writer: &mut W, buf: BytesMut) -> impl Future<Output = io::Result<()>>;
+}
+
+impl<W: BorrowedWrite + ?Sized> PeerWrite<W> for Readiness
+where
+    W::Model: ReadinessModel,
+{
+    async fn write_all(writer: &mut W, buf: BytesMut) -> io::Result<()> {
+        let mut offset = 0;
+        while offset < buf.len() {
+            let written = writer.write_borrowed(&buf[offset..]).await?;
+            if written == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "peer accepted no octets",
+                ));
+            }
+            offset += written;
+        }
+        Ok(())
+    }
+}
+
+impl<W: RegionWrite + ?Sized> PeerWrite<W> for Completion
+where
+    W::Model: CompletionModel,
+{
+    async fn write_all(writer: &mut W, buf: BytesMut) -> io::Result<()> {
+        let mut buf = buf.freeze();
+        while !buf.is_empty() {
+            let (result, returned) = writer.write(buf).await;
+            let written = result?;
+            if written == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "peer accepted no octets",
+                ));
+            }
+            buf = returned.slice(written..);
+        }
+        Ok(())
+    }
+}
+
 /// Runs a sans-I/O session over a transport, as the peer of the connection under test.
 ///
 /// `step` runs until it has nothing more to add, then whatever the session produced is
@@ -1614,7 +1682,10 @@ pub async fn serve<T: Transport, C>(
     mut session: crate::Session<C>,
     context: &mut C,
     mut step: impl FnMut(&mut crate::Session<C>, &mut C),
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    <T::Writer as TransportWrite>::Model: PeerWrite<T::Writer>,
+{
     let (mut reader, mut writer) = transport.split();
 
     loop {
@@ -1628,8 +1699,11 @@ pub async fn serve<T: Transport, C>(
             if out.is_empty() {
                 break;
             }
-            let (result, _returned) = writer.write(out.freeze()).await;
-            result?;
+            <<T::Writer as TransportWrite>::Model as PeerWrite<T::Writer>>::write_all(
+                &mut writer,
+                out,
+            )
+            .await?;
         }
 
         let (result, buf) = reader.read(BytesMut::with_capacity(16 * 1024)).await;

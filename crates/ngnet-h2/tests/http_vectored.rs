@@ -38,7 +38,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
 use ngnet_h2::http::testing::{
-    Duplex, DuplexReader, Emulating, Full, RegionEmulating, Regions, Vectored,
+    Duplex, DuplexReader, Emulating, Full, PeerWrite, RegionEmulating, Regions, Vectored, block_on,
     bytes_crate as bytes, duplex, duplex_emulating, duplex_owned_regions, duplex_region_emulating,
     duplex_vectored, http_crate as http,
 };
@@ -281,6 +281,8 @@ fn observe<S>(run: Run<S>) -> Observed
 where
     S: TestShape,
     Duplex<S::Half>: Transport<Reader = DuplexReader>,
+    <<Duplex<S::Half> as Transport>::Writer as TransportWrite>::Model:
+        PeerWrite<<Duplex<S::Half> as Transport>::Writer>,
 {
     observe_over(S::pair(), run)
 }
@@ -296,6 +298,8 @@ fn observe_over<S>(
 where
     S: TestShape,
     Duplex<S::Half>: Transport<Reader = DuplexReader>,
+    <<Duplex<S::Half> as Transport>::Writer as TransportWrite>::Model:
+        PeerWrite<<Duplex<S::Half> as Transport>::Writer>,
 {
     let log = client_side.vectored_log();
     // The policy is the run's, not the transport's: the h2 layer decides, so it arrives
@@ -308,12 +312,20 @@ where
     // is a peer that hung up, which ends the connection before the pass under test.
     let (mut peer_reader, mut peer_writer) = server_side.split();
 
-    // Hand the client any crafted inbound the run supplies before it is polled. The duplex
-    // performs the write synchronously as the future is built, so the returned ready future
-    // can simply be dropped; the octets are in the client's inbound pipe by the time the
-    // first poll reads them.
+    // Hand the client any crafted inbound the run supplies before it is polled, so the octets
+    // are in the client's inbound pipe by the time the first poll reads them.
+    //
+    // Driven to completion rather than dropped. The old owned write could be dropped because
+    // the duplex performed it while building the future; the model-dispatched helper is an
+    // ordinary `async fn`, so its future does nothing at all until polled. Dropping it here
+    // would silently deliver no prelude — a behaviour change the compiler cannot catch.
     if !run.prelude.is_empty() {
-        drop(peer_writer.write(bytes::Bytes::from(run.prelude.clone())));
+        block_on(
+            <<<Duplex<S::Half> as Transport>::Writer as TransportWrite>::Model as PeerWrite<
+                <Duplex<S::Half> as Transport>::Writer,
+            >>::write_all(&mut peer_writer, bytes::BytesMut::from(&run.prelude[..])),
+        )
+        .expect("handing the client its prelude");
     }
 
     let request = http::Request::builder()

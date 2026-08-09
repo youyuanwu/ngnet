@@ -938,6 +938,22 @@ fn the_asynchronous_surface_is_unchanged() {
     ) = ngnet_h2::http::testing::failing_borrowed;
     let _: fn(&ngnet_h2::http::testing::Failing<Vectored>) -> ngnet_h2::http::testing::VectoredLog =
         ngnet_h2::http::testing::Failing::vectored_log;
+    // `PeerWrite`, the model-dispatched write for peer scaffolding that is generic over an
+    // unknown transport. `#[doc(hidden)]`, but `pub` and named in the bound of the public
+    // `serve`, so a downstream caller of `serve` has to satisfy it by name — which makes it
+    // surface whatever the docs say. Pinned by naming the trait and its one method through a
+    // concrete writer; the trait is not object safe and takes `Self` only in impl position,
+    // so there is nothing to pin as a `fn` pointer.
+    fn peer_write_surface<W>()
+    where
+        W: ngnet_h2::http::transport::TransportWrite,
+        W::Model: ngnet_h2::http::testing::PeerWrite<W>,
+    {
+    }
+    let _: fn() =
+        peer_write_surface::<<Duplex<Vectored> as ngnet_h2::http::transport::Transport>::Writer>;
+    let _: fn() =
+        peer_write_surface::<<Duplex<Regions> as ngnet_h2::http::transport::Transport>::Writer>;
     let _: fn() = asynchronous::config_surface;
     let _: fn(
         Duplex<Vectored>,
