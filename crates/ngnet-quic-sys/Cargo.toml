@@ -2,6 +2,8 @@
 name = "ngnet-quic-sys"
 version = "0.1.0"
 description = "Low level FFI bindings to libngtcp2, built from the vendored ngtcp2 submodule"
+# Withheld from release alongside `ngnet-quic`, whose API is still expected to change.
+publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

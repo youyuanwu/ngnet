@@ -13,13 +13,13 @@ Design notes, the invariants the test suite pins, and the tracked backlog live i
 | --- | --- |
 | [`ngnet-h2`](crates/ngnet-h2) | Safe, sans-I/O API driving a client or server connection, the caller owning the transport — plus an optional asynchronous `http`/`http-body` client and server built on it (default `http` feature). |
 | [`ngnet-h2-sys`](crates/ngnet-h2-sys) | Raw FFI bindings. Builds libnghttp2 from source and generates bindings with `bindgen`. |
-| [`ngnet-h2-tests`](crates/ngnet-h2-tests) | Not published. Drives `ngnet-h2` over a real async transport, so the wrapper needs no runtime dependency of its own. |
-| [`ngnet-h3`](crates/ngnet-h3) | Safe, sans-I/O API driving an HTTP/3 client or server connection over QUIC streams the caller owns — plus an optional asynchronous `http`/`http-body` client and server built on it (default `http` feature). No QUIC or TLS of its own. |
-| [`ngnet-h3-sys`](crates/ngnet-h3-sys) | Raw FFI bindings. Builds libnghttp3 from source and generates bindings with `bindgen`. |
-| [`ngnet-h3-tests`](crates/ngnet-h3-tests) | Not published. Drives `ngnet-h3` over a real QUIC connection using [quinn](https://github.com/quinn-rs/quinn), so the wrapper needs no transport dependency of its own. Contains the reference `QuicConnection` implementation. |
-| [`ngnet-quic`](crates/ngnet-quic) | Safe, sans-I/O API driving a QUIC client or server connection, the caller owning the socket and the clock. TLS is a backend seam with a default-on OpenSSL implementation. No async layer. |
-| [`ngnet-quic-sys`](crates/ngnet-quic-sys) | Raw FFI bindings to [ngtcp2](https://github.com/ngtcp2/ngtcp2), the QUIC transport. Builds libngtcp2 from source with `bindgen`, plus its OpenSSL crypto helper behind a default-on `crypto-ossl` feature. |
-| [`ngnet-quic-tests`](crates/ngnet-quic-tests) | Not published. Drives `ngnet-quic` through real TLS handshakes, in process and over loopback UDP, so the wrapper needs no certificate or runtime dependency of its own. |
+| [`ngnet-h2-tests`](tests/ngnet-h2-tests) | Not published. Drives `ngnet-h2` over a real async transport, so the wrapper needs no runtime dependency of its own. |
+| [`ngnet-h3`](crates/ngnet-h3) | Not published yet — the API is still expected to change; see [`docs/h3/pending-work.md`](docs/h3/pending-work.md). Safe, sans-I/O API driving an HTTP/3 client or server connection over QUIC streams the caller owns — plus an optional asynchronous `http`/`http-body` client and server built on it (default `http` feature). No QUIC or TLS of its own. |
+| [`ngnet-h3-sys`](crates/ngnet-h3-sys) | Not published yet, alongside `ngnet-h3`. Raw FFI bindings. Builds libnghttp3 from source and generates bindings with `bindgen`. |
+| [`ngnet-h3-tests`](tests/ngnet-h3-tests) | Not published. Drives `ngnet-h3` over a real QUIC connection using [quinn](https://github.com/quinn-rs/quinn), so the wrapper needs no transport dependency of its own. Contains the reference `QuicConnection` implementation. |
+| [`ngnet-quic`](crates/ngnet-quic) | Not published yet — the API is still expected to change; see [`docs/quic/pending-work.md`](docs/quic/pending-work.md). Safe, sans-I/O API driving a QUIC client or server connection, the caller owning the socket and the clock. TLS is a backend seam with a default-on OpenSSL implementation. No async layer. |
+| [`ngnet-quic-sys`](crates/ngnet-quic-sys) | Not published yet, alongside `ngnet-quic`. Raw FFI bindings to [ngtcp2](https://github.com/ngtcp2/ngtcp2), the QUIC transport. Builds libngtcp2 from source with `bindgen`, plus its OpenSSL crypto helper behind a default-on `crypto-ossl` feature. |
+| [`ngnet-quic-tests`](tests/ngnet-quic-tests) | Not published. Drives `ngnet-quic` through real TLS handshakes, in process and over loopback UDP, so the wrapper needs no certificate or runtime dependency of its own. |
 
 ### HTTP/3, and what it deliberately is not
 
@@ -102,7 +102,7 @@ worked answers ship with the repo:
 - [`tests/std_net.rs`](crates/ngnet-h2/tests/std_net.rs) — a client and a server
   exchanging requests over loopback TCP, covering multiplexed streams and bodies
   large enough to exercise flow control.
-- [`ngnet-h2-tests`](crates/ngnet-h2-tests) — the same exchanges over `tokio`,
+- [`ngnet-h2-tests`](tests/ngnet-h2-tests) — the same exchanges over `tokio`,
   plus many connections in flight at once. The adapter between session and
   socket is the same three functions in both cases; only the `.await` points
   differ.

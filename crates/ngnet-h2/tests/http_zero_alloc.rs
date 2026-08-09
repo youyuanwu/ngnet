@@ -140,7 +140,7 @@
 //! taking ownership genuinely requires.
 //!
 //! So the column that separated the shapes of that era was the write count, and it is a
-//! syscall count — which is what the benchmarks in `crates/ngnet-h2-bench` measure as the
+//! syscall count — which is what the benchmarks in `tests/ngnet-h2-bench` measure as the
 //! dominant cost on a real socket. The per-block borrowed drain of that era paid one write
 //! per block: four on an upload, and 513 on multiplexed traffic. **That drain no longer
 //! exists** — it was removed before the capability change, and neither figure is the count of

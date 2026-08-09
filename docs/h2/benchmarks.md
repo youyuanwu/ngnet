@@ -1,6 +1,6 @@
 # Benchmarks
 
-`crates/ngnet-h2-bench` holds two [Criterion](https://bheisler.github.io/criterion.rs/)
+`tests/ngnet-h2-bench` holds two [Criterion](https://bheisler.github.io/criterion.rs/)
 benchmark families, which answer different questions and must not be read as one:
 
 - **The duplex family** — this stack against [hyper](https://hyper.rs), both on tokio over a
