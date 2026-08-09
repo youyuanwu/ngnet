@@ -60,7 +60,7 @@
 //! | `CoalescedShape` — any readiness transport, gathering **off** | `0` / `1` | `0` / `1` | `the_coalesced_write_path_coalesces_a_pass_into_one_write`, `the_coalesced_write_path_reuses_its_coalescing_buffer` |
 //! | `EmulatedShape` — emulating transport, gathering on | `0` / one per frame (4) | `0` / `1` | `steady_state_send_allocates_nothing_on_the_borrowed_path`, `emulated_gathering_costs_no_more_writes_than_native_on_an_upload` |
 //! | `GatheredShape` — natively-gathering transport, gathering on | `0` / one per frame (4) | `0` / `1` | `steady_state_send_allocates_nothing_on_the_vectored_path`, `steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path`, `a_multiplexed_pass_costs_one_write_natively_and_under_emulation_alike`, `the_vectored_write_path_writes_once_per_large_block_and_no_more` |
-//! | `RegionShape` — completion transport | `0` / `1` | — | `the_owned_region_write_path_coalesces_a_pass_into_one_write`, `steady_state_send_allocates_nothing_on_the_owned_region_path` |
+//! | `RegionShape` — completion transport | `0` / `1` | `0` / `1` | `the_owned_region_write_path_coalesces_a_pass_into_one_write`, `steady_state_send_allocates_nothing_on_the_owned_region_path`, `a_multiplexed_pass_costs_the_completion_path_one_write_and_no_allocation` |
 //!
 //! # The emulated row used to read `513`
 //!
@@ -76,11 +76,12 @@
 //! and to the digit: a real `TcpStream` and a completion transport must not pay anything for a
 //! decision that was taken away from them.
 //!
-//! The owned-region row carries no multiplexed column: this file's push-model workload never
-//! hands over a payload, so the completion path coalesces every block into its minting
-//! buffer and looks exactly like the coalesced shape from here — one write per pass, no
-//! allocation. Its distinguishing property, that a *handed-over* payload rides uncopied in
-//! its own region, needs a shared body to exercise and is proven in `http_shared_body.rs`.
+//! The owned-region row carried no multiplexed column until review noticed the gap. It does
+//! now, and it reads the same as the readiness rows, for the same reason: this file's
+//! push-model workload never hands over a payload, so the completion path accumulates every
+//! sub-threshold block into one region and issues one write per pass, no allocation. Its
+//! distinguishing property, that a *handed-over* payload rides uncopied in its own region,
+//! needs a shared body to exercise and is proven in `http_shared_body.rs`.
 //!
 //! All four shapes reach zero steady-state allocation, but they arrived there at different
 //! times and for different reasons, and the history is worth keeping because the table above
@@ -1167,6 +1168,45 @@ fn steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path() {
             .all(|&bytes| bytes > TRICKLE * STREAMS),
         "each measured pass must carry more than one chunk from every stream, so the \
          accumulation is genuinely being filled, saw byte counts {:?}",
+        measured.bytes,
+    );
+}
+
+#[test]
+fn a_multiplexed_pass_costs_the_completion_path_one_write_and_no_allocation() {
+    // Added after review pointed out that the completion row's multiplexed column was a dash:
+    // the claim "the completion fast path is unchanged — 0 allocations, 1 write on a
+    // multiplexed pass" was being made in prose while only the *upload* workload pinned it.
+    // A dash in a table is not evidence, and the write primitive moved on exactly this path,
+    // so the gap sat precisely where the change was.
+    //
+    // The mechanism is the same one the readiness rows rely on: every block a trickling
+    // stream produces is below `VECTORED_THRESHOLD`, so the driver accumulates all of them
+    // into a single region *before* any write, and the completion transport is handed one
+    // region and issues one `write_regions`. What differs from the readiness path is only
+    // that the region is owned rather than borrowed.
+    let measured = run_multiplexed::<RegionShape>();
+
+    assert!(
+        measured.writes.iter().all(|&count| count == 1),
+        "a multiplexed pass of sub-threshold blocks costs the completion path one write          however many streams contributed, saw {:?}",
+        measured.writes,
+    );
+    assert!(
+        measured.allocations.iter().all(|&count| count == 0),
+        "a steady-state multiplexed pass on the completion path must allocate nothing, saw          {:?}",
+        measured.allocations,
+    );
+    // Anti-vacuity, in the same form the vectored multiplexed test uses: a pass that carried
+    // nothing would satisfy both assertions above without demonstrating anything. Requiring
+    // more than one chunk from every stream proves the accumulation buffer is genuinely
+    // being filled and reused across passes rather than merely staying empty.
+    assert!(
+        measured
+            .bytes
+            .iter()
+            .all(|&bytes| bytes > TRICKLE * STREAMS),
+        "each measured pass must carry more than one chunk from every stream, so the          accumulation is genuinely being filled, saw byte counts {:?}",
         measured.bytes,
     );
 }
