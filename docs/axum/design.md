@@ -1,0 +1,165 @@
+# Design
+
+Why `ngnet-axum` is shaped the way it is. Behaviour is documented with the code; this
+records the decisions, and in particular the two where the obvious answer was assumed first
+and turned out to be wrong.
+
+## What the crate is
+
+An axum `Router`, served over `ngnet-h2` instead of hyper. Server-side, h2c only, tokio
+only. Every one of those is a boundary rather than a stage on a roadmap:
+
+- **Server only.** There is no client surface. `ngnet-h2` has a client, but axum's `Router`
+  is a server-side abstraction and there is nothing to integrate on the other side.
+- **h2c only.** `ngnet-h2` is cleartext HTTP/2. There is no TLS, so there is no ALPN, so
+  there is no protocol negotiation and no HTTP/1.1 upgrade. A peer that is not speaking
+  HTTP/2 is a connection error, not a fallback.
+- **tokio only.** `ngnet-h2` also has a `completion` transport built on compio. A second
+  integration for it would differ only in which runtime spawns the accept loop, and would
+  test nothing about axum that this one does not.
+
+## The integration point is tower, not hyper
+
+axum is usually introduced as being built on hyper, which makes replacing hyper sound like
+replacing axum. It is not, and the reason is worth stating precisely because the whole crate
+rests on it.
+
+`Router<()>` implements `tower_service::Service<http::Request<B>>`, returning
+`http::Response<axum::body::Body>`. Routing, extractors, middleware, state and error
+handling are all defined against `http` types. hyper's contribution is turning socket bytes
+into an `http::Request` and an `http::Response` back into bytes — a job with no axum in it.
+`axum::serve` is a loop that accepts sockets and hands them to hyper along with the
+`Router`; this crate is a loop that accepts sockets and hands them to `ngnet-h2` along with
+the `Router`.
+
+`tower-service` is depended on directly rather than through `tower`. axum does not re-export
+the trait, so `Router::call` cannot be named without it, and `tower` itself would add the
+combinator layer — `ServiceBuilder`, retries, timeouts — when what is wanted is the one
+trait definition those are written against. It is the same trait either way:
+`tower::Service` *is* `tower_service::Service`.
+
+## Decisions that cost a wrong attempt first
+
+- **There are no body adapters, because none is needed.** The crate was planned around a
+  pair of them: something to wrap `ngnet-h2`'s incoming body so axum would accept it, and
+  something to wrap axum's outgoing body so `ngnet-h2` would send it. Both turned out to be
+  unnecessary, and finding that out changed what the crate is — from a translation layer to
+  a piece of wiring.
+
+  `ngnet-h2`'s `IncomingBody` is an `http_body::Body` with `Data = Bytes`, `Send + 'static`.
+  axum's runnable impl is
+  `impl<B> Service<Request<B>> for Router<()> where B: HttpBody<Data = Bytes> + Send + 'static`.
+  The request already fits, so it is passed through untouched. In the other direction axum's
+  `Body` also has `Data = Bytes`, which is what `ngnet-h2`'s response path requires, so the
+  response body is handed back without its payload being copied.
+
+  The qualification matters, because "zero conversion" is the kind of claim that quietly
+  becomes false: axum's own `call` boxes the request body internally, one allocation per
+  request, which `axum::serve` pays too. What is true is that no payload is copied. This was
+  verified by building the thing before writing the specification, not by reading the trait
+  bounds and hoping.
+
+- **The stop signal quiesces; it does not drain — and the name says so.** The plan was
+  `with_graceful_shutdown`, mirroring `axum::serve`. It is not implementable on the public
+  API. `ngnet-h2` has no server-side way to send `GOAWAY`: `shutdown()` exists only on the
+  client handle, and the server's completion signal is hard-wired never to fire, on the
+  reasoning that a server does not decide when it is finished. So there is no way to tell a
+  peer to wind up, and therefore no drain.
+
+  What is offered instead is honest about itself: `with_stop_signal` stops the accept loop
+  and waits for established connections to end of their peers' own accord. An idle peer
+  holds the server open. Calling it `with_graceful_shutdown` would have been the more
+  familiar name for behaviour that does not match it, and someone would eventually have
+  deployed a release believing connections were being drained. The gap and what would close
+  it are recorded in [`../h2/pending-work.md`](../h2/pending-work.md).
+
+## Errors go to a callback, not into the return type
+
+`Serve`'s future resolves to `()`. Connection failures are delivered to a closure given to
+`on_error`, defaulting to doing nothing.
+
+The alternative — resolving to `Result` — reads better and is wrong, because it forces a
+choice between ending the server on the first bad connection and inventing somewhere to put
+the errors it survives. A server that stops because one peer spoke HTTP/1.1 is useless, and
+this crate must survive that case: it is not an edge case but the ordinary behaviour of port
+scanners and misconfigured clients. Accept errors are treated the same way, with one
+addition — a transient accept failure such as `EMFILE` backs off before retrying, because
+retrying immediately turns a temporary shortage into a spin.
+
+The backoff lives *inside* the accept branch's future rather than in the `select!` arm that
+follows it. An `await` in an arm body runs to completion before the loop arbitrates again,
+so a backoff placed there would stop the server observing its stop signal or reaping
+finished connections for the whole second. `axum::serve` puts its own sleep in the same
+place for the same reason. This was caught in review, not in testing, which is worth
+recording: the wrong version passed every test.
+
+## Peer addresses, and the feature that would undo the crate
+
+Handlers read `PeerAddr` from the request extensions. The idiomatic axum answer is
+`ConnectInfo<SocketAddr>`, and it is deliberately not supported: `ConnectInfo` is gated
+behind axum's `tokio` feature, which depends on `hyper-util`. Enabling it to gain one
+extractor would reinstate hyper in the dependency graph — the single thing the crate exists
+to remove — and it would arrive transitively, where no manifest shows it and no reviewer
+would see it.
+
+That is why CI greps `cargo tree -p ngnet-axum -e normal` for hyper rather than trusting the
+manifest. The check reads the *normal* graph only, because hyper is a deliberate
+dev-dependency: the acceptance tests drive the server with an independent HTTP/2 client,
+since a client from this workspace could only show `ngnet-h2` agreeing with itself.
+
+## Connections are spawned; handlers are not
+
+Each accepted connection becomes a task in a `JoinSet`. Handlers are not spawned — they run
+inside their connection's future, concurrently with each other but on one task. That is
+`ngnet-h2`'s design, and it has two consequences a user must know, both stated on the crate
+front page: a handler that blocks the thread stalls its whole connection, and a handler that
+panics fails its whole connection rather than one request.
+
+Peer addresses are kept in a map keyed by `tokio::task::Id` rather than returned from the
+task, because a panicked task returns nothing — a `JoinError` carries no value of ours. So
+the two harvest arms take the id from different places: the success arm from the value, the
+failure arm from `JoinError::id()`. Without the map, the failure that most needs attributing
+would be the one that could not be attributed.
+
+**The number of simultaneously accepted connections is not capped.** There is no semaphore
+and no limit; the loop accepts what arrives. A caller who needs a bound has to impose it,
+and `Config::max_concurrent_streams` is not a substitute — it bounds streams within a
+connection, not connections.
+
+## Tests drive the wire
+
+The acceptance suite is built so that the plausible *wrong* implementation fails, not merely
+so the right one passes, which repeatedly turned out to be a distinction with teeth.
+
+- The streaming test deadlocks against a buffering implementation: the handler returns
+  having queued only the first chunk, and the second is queued only after the client reports
+  seeing the first. Nothing depends on timing.
+- The concurrency-limit test ships with its own control asserting that handlers *do* run
+  concurrently by default, without which it would pass against a server that was never
+  concurrent at all.
+- The multiplexing test originally proved nothing — hyper enqueues a request when
+  `send_request` is called, so a request spawned first still reached the server second, and
+  a stream-serialising server passed every assertion. It now waits for the first handler to
+  park before issuing the second request, and was verified by inversion: configured with
+  `max_concurrent_streams(1)`, it fails.
+- Body tests cross the 65 535-byte initial flow-control window, because anything smaller
+  passes without flow control being exercised at all.
+
+Panic tests panic in the *handler*. A panic inside a response body is pulled synchronously
+from an `extern "C"` callback and aborts the process, so a body-panic test would not fail —
+it would kill the test binary. The suite says so where someone might be tempted to simplify
+it.
+
+## Things the tests found that nobody predicted
+
+- **The header-list-size setting is advisory.** Advertising 256 octets and then sending a
+  64 KiB header field gets a normal 200. The specification had guessed that an over-limit
+  request would fail with no handler run; it was left as a spike to be measured rather than
+  assumed, and the measurement contradicted the guess. It must not be used as a defence.
+- **A client that vanishes mid-request is not an error**, and its in-flight handler is
+  *dropped* rather than resumed or cancelled. The second has a real consequence: handler
+  cleanup belongs in `Drop`, not after the `await`.
+- **An outstanding response body holds a connection open.** hyper's `Incoming` keeps its
+  connection alive while it exists, so a client that has not finished reading has not gone
+  away, and quiescence correctly waits for it. This cost an afternoon of debugging a
+  "hanging shutdown" that was the server being right.
