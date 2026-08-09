@@ -88,10 +88,25 @@
 //!
 //! A runtime this crate ships no adapter for is a short job, not a blocked one. Implement
 //! [`Transport`] — one method, [`split`](Transport::split), dividing the stream into a
-//! reader and a writer so the two directions can proceed at once — then [`TransportRead`]
-//! and [`TransportWrite`]. Both are ownership-passing: the buffer goes in and comes back,
-//! which a completion API (`io_uring`, IOCP) needs and a readiness API (tokio,
-//! `futures-io`) satisfies with no copy.
+//! reader and a writer so the two directions can proceed at once — then [`TransportRead`],
+//! [`TransportWrite`], and the write trait for your I/O model.
+//!
+//! [`TransportRead`] is ownership-passing: the buffer goes in and comes back, which a
+//! completion API (`io_uring`, IOCP) needs and a readiness API (tokio, `futures-io`)
+//! satisfies with no copy. **The read side was deliberately not split** — a read must be
+//! given somewhere to put the octets, and only the caller knows where, so ownership is the
+//! honest shape on both models.
+//!
+//! Writing is not, because a write already has its octets and the only question is who owns
+//! them for the duration. [`TransportWrite`] therefore carries no write primitive at all —
+//! only `type Model` and `commit`. The primitive comes
+//! from the model: implement
+//! [`BorrowedWrite::write_borrowed`](transport::BorrowedWrite::write_borrowed) for a
+//! readiness transport, which lends the driver's buffer and copies nothing, or
+//! [`RegionWrite::write_owned`](transport::RegionWrite::write_owned) for a completion one,
+//! which takes ownership because the kernel may still be reading the buffer after the future
+//! is dropped. Declaring a model obliges you to implement that model's trait, by compiler
+//! error.
 //!
 //! The writer additionally names its *I/O model* as an associated type — readiness or
 //! completion — and that is the **only** thing it declares about how its writes are shaped.
@@ -114,9 +129,38 @@
 //! peer-visible leaves it at its no-op default. Omitting it for a buffering transport is a
 //! silent hang, which is exactly what the driver's flush point exists to rule out.
 //!
+//! # Migrating a transport written against the shared owned write
+//!
+//! **This is the most recent migration, and the one most transports will hit.**
+//! [`TransportWrite`] used to require an owned
+//! `async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes)` from *every*
+//! transport. It no longer has a write at all. The primitive belongs to the I/O model,
+//! because who owns the buffer is what the model is:
+//!
+//! | if your transport declares | move the old `write` body to | leaving `TransportWrite` with |
+//! | --- | --- | --- |
+//! | `type Model = Readiness;` | **nowhere — delete it.** You already implement [`BorrowedWrite::write_borrowed`](transport::BorrowedWrite::write_borrowed), which is the readiness primitive, and the owned write was never used on this path | `Model`, and `commit` if you buffer |
+//! | `type Model = Completion;` | [`RegionWrite::write_owned`](transport::RegionWrite::write_owned) — **verbatim**, the signature is unchanged; only the trait and the name differ | `Model`, and `commit` if you buffer |
+//!
+//! Both cases are caught by the compiler and neither can be got wrong silently. A readiness
+//! transport that keeps its `write` gets `E0407` — not a member of `TransportWrite`. A
+//! completion transport that keeps it gets the same, *plus* `E0046` for the `write_owned` its
+//! `RegionWrite` impl now lacks.
+//!
+//! The reason is that a readiness transport can never use ownership. This crate's own tokio
+//! transport was the proof: its `write` took the `Bytes` and immediately took a reference to
+//! it. Worse, the driver had to *manufacture* that ownership out of its own reused coalescing
+//! buffer — a `split().freeze()` whose only purpose was to hand over something the driver
+//! already owned, at the cost of a pair of atomic refcount operations. Both are gone; the
+//! readiness coalescing drain now lends the buffer and clears it.
+//!
+//! Nothing else about a transport changes. In particular the write *policy* is still the
+//! caller's alone, through [`Config::write_policy`]: this change moves where the write
+//! primitive lives, not who chooses how many writes a pass costs.
+//!
 //! # Migrating a transport written against the strategy traits
 //!
-//! The immediately preceding design had the *transport* declare which of four drain
+//! The design *before* that had the *transport* declare which of four drain
 //! strategies the driver should use: `Coalesced`, `PerRegion`, `Gathering`, `OwnedRegions`,
 //! named through `TransportWrite::Strategy`. All four markers are gone, along with the
 //! `VectoredWrite` trait and its `gathers()` predicate. What replaces them is two markers
@@ -133,9 +177,9 @@
 //! Note the first two rows: `Coalesced` used to mean "I have nothing to offer", and it was
 //! one line either way. It is no longer a thing a transport can say, because whether a pass
 //! coalesces is not the transport's business. What a minimal transport says instead is which
-//! model it belongs to, and the minimum work is still one line — an empty `RegionWrite` impl
-//! on the completion side, and `write_borrowed` on the readiness side, which a readiness
-//! transport can always supply because that is what a readiness API *is*.
+//! model it belongs to, and the minimum work is one write method either way —
+//! `write_owned` on the completion side, `write_borrowed` on the readiness side, each of
+//! which that model's API already provides, because that is what the model *is*.
 //!
 //! ```
 //! use std::io;

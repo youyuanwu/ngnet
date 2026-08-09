@@ -51,12 +51,12 @@ frames, not the one-off cost of standing a stream up.
 | `steady_state_multiplexed_send_allocates_nothing_on_the_vectored_path` | And still zero when eight streams are multiplexed, which is where the driver's own buffer would be tempted to grow. |
 | `steady_state_send_allocates_nothing_on_the_owned_region_path` | Likewise on the owned-region path — the completion transport's gathering allocates nothing in steady state either. |
 | `the_read_buffer_pool_settles_to_a_fixed_size` | The pool reaches a high-water mark during warm-up and does not grow afterwards. |
-| `the_owned_write_path_coalesces_a_pass_into_one_write` | Under `WritePolicy::Coalesced`, one write per pass, with more than one frame's worth of bytes — so the single write is not trivially single. |
+| `the_coalesced_write_path_coalesces_a_pass_into_one_write` | Under `WritePolicy::Coalesced`, one write per pass, with more than one frame's worth of bytes — so the single write is not trivially single. |
 | `emulated_gathering_costs_no_more_writes_than_native_on_an_upload` | Emulated and native gathering cost the **same** write count on the copying upload path, because the driver offers one region per large block either way. Replaces `the_borrowed_write_path_writes_each_block_separately`, whose premise — a per-region drain — no longer exists. |
 | `a_multiplexed_pass_costs_one_write_natively_and_under_emulation_alike` | One write for a whole multiplexed pass, and **the same count** for a transport that only emulates gathering. Accumulation happens in the driver before any write, so 513 small blocks collapse into one region and the emulating loop runs once. This is the whole affordability argument for mandatory gathering. |
 | `the_vectored_write_path_writes_once_per_large_block_and_no_more` | A large block still costs exactly one write, so gathering never degenerates into a write per region. |
 | `the_owned_region_write_path_coalesces_a_pass_into_one_write` | The owned-region (completion) path coalesces a push-model pass into one write — indistinguishable from the owned path here, since a payload only rides its own region once a body is handed over. |
-| `the_owned_write_path_reuses_its_coalescing_buffer` | The owned path reuses its coalescing buffer rather than rebuilding it per pass, so it too allocates nothing in steady state — it pays a copy, not an allocation. |
+| `the_coalesced_write_path_reuses_its_coalescing_buffer` | The owned path reuses its coalescing buffer rather than rebuilding it per pass, so it too allocates nothing in steady state — it pays a copy, not an allocation. |
 | `waking_parked_handlers_allocates_nothing` | Waking parked server handlers repeatedly allocates nothing. |
 | `the_counter_notices_a_deliberate_allocation` | The measuring instrument works, guarding every test above against a false pass. |
 
@@ -82,7 +82,8 @@ frames, not the one-off cost of standing a stream up.
   - implementing `WriteModel` downstream, i.e. inventing a third I/O model.
 - **`the_write_policy_is_the_h2_layers_and_holds_for_the_connections_life`**
   (`tests/http_vectored.rs`) — the *same* natively-gathering transport, driven under both
-  `WritePolicy` values, produces gathered writes under one and none under the other, across
+  `WritePolicy` values, produces multi-region calls under one and only single-region calls
+  under the other, across
   several passes, with identical octets on the wire. This replaces
   `the_gathering_capability_is_consulted_exactly_once_per_connection`, which pinned that the
   driver read `VectoredWrite::gathers` exactly once. There is no capability on the trait

@@ -8,11 +8,19 @@
 //! the buffer to the kernel, which may still be writing into it after the future that
 //! submitted the operation is dropped; they must therefore *own* it.
 //!
-//! Completion-shaped traits are the superset. A readiness-based transport implements them
-//! with no copy at all: take the buffer, read into it, hand it back. The reverse does not
-//! work — a completion-based transport behind a borrowed-buffer trait needs a stable
-//! buffer of its own plus a copy out of it. So ownership is transferred here, and the
-//! readiness case is served by an override rather than by compromising the shape.
+//! For *reading*, completion-shaped traits are the superset, and [`TransportRead`] is
+//! shaped that way for every transport. A readiness-based transport implements it with no
+//! copy at all: take the buffer, read into it, hand it back. The reverse does not work — a
+//! completion-based transport behind a borrowed-buffer trait needs a stable buffer of its
+//! own plus a copy out of it.
+//!
+//! For *writing* that argument does not carry, and the traits no longer pretend it does.
+//! Being a superset made the owned write universal, but a readiness transport can never
+//! *use* the ownership: this crate's own tokio writer took the `Bytes` and immediately took
+//! a reference to it, and the driver had to manufacture that ownership out of its own reused
+//! coalescing buffer to feed it. So the write primitive belongs to the model rather than to
+//! [`TransportWrite`]: [`BorrowedWrite`] lends, [`RegionWrite`] owns, and neither transport
+//! is asked for a shape its API cannot produce.
 //!
 //! # What is deliberately absent
 //!
@@ -535,6 +543,31 @@ where
 /// whose runtime submits a real vectored write overrides it; one that does not need write
 /// nothing else.
 ///
+/// # The old shape does not silently compile
+///
+/// A completion transport written against the previous trait put its owned write on
+/// [`TransportWrite`] and left `impl RegionWrite for X {}` empty. That now fails twice over —
+/// `E0407` for a `write` that is not a member of `TransportWrite`, and the `E0046` below for
+/// the `write_owned` the `RegionWrite` impl no longer supplies. The migration is to move the
+/// body across verbatim and rename it; the signature is unchanged.
+///
+/// ```compile_fail,E0046
+/// use ngnet_h2::http::transport::{Completion, RegionWrite, TransportWrite};
+/// use ngnet_h2::http::testing::bytes_crate::Bytes;
+///
+/// struct OldShape;
+/// impl TransportWrite for OldShape {
+///     type Model = Completion;
+///     // The owned write no longer belongs here.
+///     async fn write(&mut self, buf: Bytes) -> (std::io::Result<usize>, Bytes) {
+///         let n = buf.len();
+///         (Ok(n), buf)
+///     }
+/// }
+/// // ...so this impl is missing `write_owned`.
+/// impl RegionWrite for OldShape {}
+/// ```
+///
 /// This method used to live on [`TransportWrite`], where both models inherited it, and the
 /// minimal completion transport was correspondingly the empty block
 /// `impl RegionWrite for MyType {}`. That arrangement obliged every *readiness* transport to
@@ -621,8 +654,9 @@ pub struct Pass<'a> {
 /// compile.
 ///
 /// It carries no per-connection state and asks the writer nothing. The one runtime input to a
-/// drain is [`WritePolicy`](crate::http::WritePolicy), which comes from this layer's own
-/// configuration rather than from the transport.
+/// drain is [`WritePolicy`](crate::http::WritePolicy), which the h2 layer settled at
+/// handshake from the caller's [`Config`](crate::http::Config) and which then holds for the
+/// connection's life. No drain consults the transport about it, and no drain re-derives it.
 ///
 /// Sealed, and not something to implement or call. It appears in the public API only because
 /// it is named in a public bound.

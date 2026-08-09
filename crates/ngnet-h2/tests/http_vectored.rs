@@ -1326,3 +1326,89 @@ fn the_write_policy_is_the_h2_layers_and_holds_for_the_connections_life() {
         "the body never left, so the comparison proved nothing",
     );
 }
+
+#[test]
+fn the_coalesced_readiness_drain_loses_no_octet_across_forced_short_writes() {
+    // SC-008. The readiness coalescing drain is new code: it lends the driver's own buffer
+    // through `write_borrowed` and advances an offset over whatever prefix the transport
+    // accepted, where the old shared drain froze the buffer into a `Bytes` and handed it over.
+    // An offset loop is exactly the kind of code that loses octets at a boundary, so it is
+    // driven here against caps chosen to land mid-buffer.
+    //
+    // The oracle is the *same* traffic over the same transport with gathering on. Both
+    // policies must put identical octets on the wire — that is what a policy means — so any
+    // divergence is the coalescing loop dropping, duplicating or reordering something.
+    let oracle = observe(Run::<Gathered>::new(BOUNDARY_BODY).shared().passes(8));
+    assert!(
+        !oracle.peer.is_empty(),
+        "the oracle sent nothing, so every comparison below is vacuous",
+    );
+
+    let head = 9 + 5;
+    for caps in [
+        vec![1],
+        vec![head],
+        vec![head - 1],
+        vec![1, head, 7, 3],
+        vec![head, 1, MAX_FRAME, 5],
+        // A cap of 1 repeated: the loop must make progress an octet at a time and still
+        // terminate, rather than treating a one-octet acceptance as a stall.
+        vec![1, 1, 1, 1, 1, 1, 1, 1],
+    ] {
+        let observed = observe(
+            Run::<Coalescing>::new(BOUNDARY_BODY)
+                .shared()
+                .caps(caps.clone())
+                .passes(8),
+        );
+        assert_eq!(
+            observed.peer, oracle.peer,
+            "caps {caps:?} changed the octets the peer received under the coalesced readiness \
+             drain; its offset loop dropped, duplicated or reordered something",
+        );
+        assert!(
+            observed.outcome.is_none(),
+            "caps {caps:?} ended the connection: {:?}",
+            observed.outcome.as_ref().map(Result::is_err),
+        );
+        // Every call this drain makes carries exactly one region, whatever the caps did to
+        // how many calls there were. Without this the equality above would still pass if the
+        // policy had silently stopped being honoured under caps.
+        assert!(
+            observed.calls.iter().all(|regions| regions.len() == 1),
+            "caps {caps:?} made the coalesced drain offer a multi-region call, saw {:?}",
+            observed.calls,
+        );
+    }
+}
+
+#[test]
+fn a_readiness_transport_supplies_no_owned_write_under_either_policy() {
+    // SC-006. The point of the split, driven rather than merely compiled.
+    //
+    // `DuplexWriter<Vectored>` implements `TransportWrite` (model only) and `BorrowedWrite`,
+    // and has no owned write anywhere — there is no `write_owned` on it and `RegionWrite` is
+    // unreachable for a readiness model. Before the split, that transport could not have
+    // existed: `TransportWrite::write` was required of everyone. So the fact that this
+    // compiles at all is half the assertion.
+    //
+    // The other half is that *both* policies work over it. `Coalesced` is the interesting
+    // one: coalescing is where an owned buffer used to be manufactured, and it is the drain
+    // that would need one if the ownership requirement had merely moved rather than gone.
+    let gathered = observe(Run::<Gathered>::new(WINDOW_FILLING_BODY).passes(8));
+    let coalesced = observe(Run::<Coalescing>::new(WINDOW_FILLING_BODY).passes(8));
+
+    assert_eq!(
+        gathered.peer, coalesced.peer,
+        "a transport with no owned write put different octets on the wire under the two \
+         policies",
+    );
+    assert!(
+        !gathered.peer.is_empty(),
+        "neither run wrote anything, so this proves nothing",
+    );
+    assert!(
+        gathered.outcome.is_none() && coalesced.outcome.is_none(),
+        "a policy ended the connection over a transport that supplies only a borrowed write",
+    );
+}
