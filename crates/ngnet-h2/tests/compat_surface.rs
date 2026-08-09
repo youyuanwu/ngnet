@@ -986,6 +986,19 @@ fn the_asynchronous_surface_is_unchanged() {
     let _: fn(&ngnet_h2::http::testing::VectoredLog) -> Vec<Vec<usize>> =
         ngnet_h2::http::testing::VectoredLog::bases;
     let _: fn(&Duplex<Vectored>, Vec<usize>) = |duplex, caps| duplex.accept_at_most(caps);
+    // The poll budget. Load-bearing rather than convenient: the transports above script their
+    // failures as an *operation count*, which is a property of the drain and not of the
+    // exchange, so a change to how many writes a pass becomes can push a scripted index past
+    // the end. When that happens the failure never fires, the harness has nothing to assert
+    // on, and the connection parks forever — a hung suite instead of a failing test. Bounding
+    // the wait is what converts that into a message. Pinned here because two separate
+    // integration crates depend on it and neither can reach the other's helpers.
+    let _ = |work: core::pin::Pin<Box<dyn core::future::Future<Output = u8>>>, budget: usize| async move {
+        // Pins the part of the contract that matters: it takes any future and a poll count,
+        // and reports absence rather than the output when the count runs out. A caller that
+        // got the output back unconditionally could not tell a stall from a success.
+        let _: Option<u8> = ngnet_h2::http::testing::within_budget(work, budget).await;
+    };
     // The failing transport's two readiness constructors and its log handle, so a transport
     // error can be driven through both the native and the emulated gathering path. Hidden
     // from the docs like the rest of `testing`, but public, so pinned here beside the duplex

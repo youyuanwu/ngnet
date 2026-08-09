@@ -297,7 +297,9 @@ These are not gaps. They are decisions, recorded so they are not mistaken for ov
   path is a behaviour change that would perturb the owned-region measurements that refactor
   had to hold constant. Unchanged again by the capability change, which does not touch
   `commit` on either side. Fix wants its own change and its own before/after numbers, plus a
-  bounded-budget regression test of the kind `http_flush.rs` already uses for tokio.
+  bounded-budget regression test built on `testing::within_budget`, which `http_flush.rs` and
+  `http_shared_body.rs` both already use for exactly this class of "the thing under test never
+  happened, so the connection parked forever" failure.
 
 - **Whether `ngnet-h3` and `ngnet-quic` should adopt the transport-trait shape.** Transport
   traits exist only in `ngnet-h2`; neither of the other crates has an equivalent, so the shape

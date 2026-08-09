@@ -1468,6 +1468,42 @@ pub async fn alongside<M: Future, B: Future>(main: M, background: B) -> M::Outpu
     .await
 }
 
+/// Drives `work`, but gives up after `budget` self-woken polls, returning [`None`].
+///
+/// [`block_on`] parks on a condvar once every future it holds returns `Pending`, which is
+/// the right behaviour for a connection genuinely waiting on input and the wrong behaviour
+/// for a test: a stall that should be a failure becomes a hung suite instead, with no
+/// message and no indication of which test stopped. Self-waking on each poll keeps the
+/// executor turning until either `work` finishes or the budget runs out, so the caller can
+/// fail deliberately.
+///
+/// # When a test needs this
+///
+/// Whenever the condition under test is *reached* rather than asserted — a scripted
+/// transport failure, a flush that must happen, a wake that must arrive. Such a test asserts
+/// on the aftermath, so if the condition never occurs there is nothing to assert on and the
+/// exchange simply never ends. Bounding turns that into a named failure.
+///
+/// The budget is a poll count rather than a duration deliberately: this executor is
+/// deterministic and single-threaded, so a poll count is reproducible across machines and a
+/// timeout is not.
+pub async fn within_budget<F: Future>(work: F, budget: usize) -> Option<F::Output> {
+    let mut work = Box::pin(work);
+    let mut left = budget;
+    core::future::poll_fn(move |cx: &mut Context<'_>| {
+        if let Poll::Ready(value) = work.as_mut().poll(cx) {
+            return Poll::Ready(Some(value));
+        }
+        if left == 0 {
+            return Poll::Ready(None);
+        }
+        left -= 1;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
+}
+
 /// Whether the session the client driver builds reports receive consumption itself.
 ///
 /// [`Session::consume`](crate::Session::consume) is rejected outright on a session that

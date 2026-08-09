@@ -15,8 +15,7 @@
 
 #![cfg(feature = "http")]
 
-use core::future::{Future, poll_fn};
-use core::task::{Context, Poll};
+use core::future::Future;
 
 use std::cell::Cell;
 use std::io;
@@ -24,35 +23,17 @@ use std::rc::Rc;
 
 use ngnet_h2::http::testing::{
     Duplex, DuplexReader, DuplexWriter, Empty, Full, Vectored, alongside, block_on, buffering,
-    bytes_crate as bytes, duplex, http_crate as http,
+    bytes_crate as bytes, duplex, http_crate as http, within_budget,
 };
 use ngnet_h2::http::transport::{
     BorrowedWrite, Completion, Readiness, RegionWrite, Transport, TransportWrite,
 };
 use ngnet_h2::http::{IncomingBody, server};
 
-/// Drives `work`, but gives up after `budget` self-woken polls.
-///
-/// The in-memory executor parks on a condvar when every future returns `Pending`, so a
-/// genuine deadlock would block the test thread forever. Self-waking each poll keeps the
-/// executor re-polling until either `work` finishes or the budget runs out, at which point
-/// this returns `None` and the caller can fail deliberately instead of hanging.
-async fn within_budget<F: Future>(work: F, budget: usize) -> Option<F::Output> {
-    let mut work = Box::pin(work);
-    let mut left = budget;
-    poll_fn(move |cx: &mut Context<'_>| {
-        if let Poll::Ready(value) = work.as_mut().poll(cx) {
-            return Poll::Ready(Some(value));
-        }
-        if left == 0 {
-            return Poll::Ready(None);
-        }
-        left -= 1;
-        cx.waker().wake_by_ref();
-        Poll::Pending
-    })
-    .await
-}
+// `within_budget` lives in `testing` rather than here because `http_shared_body.rs` needs the
+// same bound for the same reason — a condition that must be *reached* before anything can be
+// asserted — and an integration test is a separate crate that cannot borrow a helper from
+// another one.
 
 fn get(path: &str) -> http::Request<Empty> {
     http::Request::builder()

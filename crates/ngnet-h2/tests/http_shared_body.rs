@@ -35,7 +35,7 @@ use ngnet_h2::http::testing::{
     Duplex, DuplexReader, DuplexWriter, Empty, Failing, Full, PeerWrite, Scripted, Vectored,
     VectoredLog, alongside, block_on, bytes_crate as bytes, duplex, duplex_emulating,
     duplex_owned_regions, duplex_vectored, failing, failing_borrowed, failing_vectored,
-    http_crate as http, scripted, serve,
+    http_crate as http, scripted, serve, within_budget,
 };
 use ngnet_h2::http::transport::{BorrowedWrite, Readiness, Transport, TransportWrite};
 use ngnet_h2::http::{
@@ -1662,6 +1662,20 @@ fn a_transport_failure_while_writing_a_payload_closes_the_connection() {
     );
 }
 
+/// The poll budget the SC-013 fast-path harness gives an exchange before declaring it stuck.
+///
+/// These tests script a transport failure at a fixed operation index and then assert on the
+/// aftermath, so an exchange in which the failure never fires has nothing to assert on and
+/// would otherwise run forever.
+///
+/// The headroom here is enormous and deliberately so. Budget is spent only on a `Pending`
+/// poll, and all four healthy broken-path exchanges resolve on their **first** poll — the
+/// scripted failure fires while the connection is still being driven synchronously — so this
+/// bound was measured to be unreachable in the passing case at a budget of even zero. It is
+/// therefore pure headroom against a future exchange that legitimately needs to park, and
+/// cannot flake. It matches the budget `http_flush.rs` uses, for one number rather than two.
+const BROKEN_PATH_BUDGET: usize = 200_000;
+
 /// Drives a handed-over body over a failing transport and returns the connection's verdict,
 /// the request's verdict, and what the transport logged before it broke.
 ///
@@ -1669,6 +1683,14 @@ fn a_transport_failure_while_writing_a_payload_closes_the_connection() {
 /// the capture dance — the connection surfaces the broken transport, the request only learns
 /// its connection went away, so the connection's verdict is taken from a background future
 /// while the request future is the main one — lives here once.
+///
+/// # Why this is bounded
+///
+/// The failure is scripted as an operation count, and an operation count is a property of
+/// the *drain*, not of the exchange: change how many writes a pass becomes and the scripted
+/// index moves under the test. When it moves past the end, the transport never fails, the
+/// unread peer never answers, and the connection parks forever — a hung suite rather than a
+/// failing test. [`within_budget`] converts that into a named failure.
 fn broken_fast_path_exchange<S>(
     client_side: Failing<S>,
     bytes: Bytes,
@@ -1694,7 +1716,18 @@ where
         outcome
     };
 
-    let request_outcome = block_on(alongside(exchange, driven));
+    let request_outcome = block_on(within_budget(alongside(exchange, driven), BROKEN_PATH_BUDGET))
+        .unwrap_or_else(|| {
+            panic!(
+                "the scripted transport failure never fired, so the exchange never ended. \
+                 The failure is scripted as an *operation count*, which is a property of the \
+                 drain rather than of the exchange: if the write count a pass produces has \
+                 changed — a different drain, a different declaration of \
+                 `is_write_vectored`, a different region cap — the scripted index is now \
+                 unreachable and this harness has nothing to observe. Re-derive the index \
+                 from the writes the drain actually makes.",
+            )
+        });
     let connection_outcome = captured
         .lock()
         .expect("verdict")
