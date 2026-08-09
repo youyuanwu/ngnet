@@ -46,18 +46,28 @@
 //!
 //! # How a pass gets drained
 //!
-//! A writer names one **I/O model** as an associated type, and that is all it declares. The
-//! model says who owns the buffer — nothing about how many writes a pass should become.
-//! Naming a model obliges the writer, by compiler error, to supply that model's primitive:
-//! there is no probe and no capability flag to keep in step with a method.
+//! A writer names one **I/O model** as an associated type, and that is all the *model* costs
+//! it. The model says who owns the buffer — nothing about how many writes a pass should
+//! become. Naming a model obliges the writer, by compiler error, to supply that model's
+//! primitive: for the primitive there is no probe and no flag that could fall out of step
+//! with the method, because the compiler will not let the two disagree.
 //!
-//! *How many writes* is a policy question, and it belongs to this layer rather than to the
-//! transport. This layer owns the accumulation buffer, knows the region count, and is the
-//! thing being tuned; a transport knows only how to write. So the policy is
-//! [`WritePolicy`](crate::http::WritePolicy), set per connection on
-//! [`Config`](crate::http::Config), and the transport does not vote.
+//! *How many writes* is a separate question, and the transport answers it — once. A writer
+//! declares through [`is_write_vectored`](TransportWrite::is_write_vectored) whether its
+//! gathering operation is *efficient*, meaning it reaches a real scatter-gather write rather
+//! than a loop. This layer asks that question once per connection, when it splits the
+//! transport and before it writes an octet, and routes every pass of that connection's life
+//! on the answer. The caller is not consulted; there is no configuration knob for it,
+//! because the caller does not know the answer and the transport does.
 //!
-//! | [`Model`](TransportWrite::Model) | primitive the writer must supply | gathering operation | under [`Gathered`](crate::http::WritePolicy::Gathered) | under [`Coalesced`](crate::http::WritePolicy::Coalesced) |
+//! Unlike the model, this *is* a flag that can fall out of step with the method it describes:
+//! nothing makes a writer that overrides its gathering operation declare `true`, or stops one
+//! that does not from declaring it anyway. That is deliberate — the declaration is about
+//! *efficiency*, which the compiler cannot see, and an override is not proof of it — but it
+//! means a declaration is a claim to be checked by a test rather than a fact the type system
+//! guarantees.
+//!
+//! | [`Model`](TransportWrite::Model) | primitive the writer must supply | gathering operation | [`is_write_vectored`](TransportWrite::is_write_vectored) `== true` — **gathered** | `== false` — **coalesced** |
 //! | --- | --- | --- | --- | --- |
 //! | [`Readiness`] | [`write_borrowed`](BorrowedWrite::write_borrowed) | [`write_vectored`](BorrowedWrite::write_vectored), **defaulted** | one per large block and per region-cap flush, plus at most one for the remainder | one per pass, lending the buffer |
 //! | [`Completion`] | [`write_owned`](RegionWrite::write_owned) | [`write_regions`](RegionWrite::write_regions), **defaulted** | one per region-cap flush, plus one for the remainder | one per pass, handing the buffer over |
@@ -75,15 +85,23 @@
 //! multiplexing a pass is dozens of tiny blocks, where one write per block is the dominant
 //! cost, and with a large body it is a handful of 16 KiB blocks, where copying them all to
 //! save three syscalls is the dominant cost. Gathering small blocks into a buffer the driver
-//! owns while handing large ones to the socket uncopied gets both. That is what
-//! [`Gathered`](crate::http::WritePolicy::Gathered) does, and it is the default.
+//! owns while handing large ones to the socket uncopied gets both. That is the gathered
+//! drain, and it is what a writer declaring `true` receives.
 //!
-//! # Every transport gathers, and a transport that cannot is not asked to
+//! # Every transport can gather; not every transport gathers *well*
 //!
-//! Both gathering operations are **provided methods**. A writer that overrides neither still
-//! gathers: the default loops over the model's primitive, writing each region in turn, in
-//! order. A writer whose underlying I/O really does scatter-gather overrides the default and
-//! reaches one `writev`.
+//! Both gathering operations are **provided methods**. A writer that overrides neither can
+//! still be asked to gather, and will produce the right octets: the default loops over the
+//! model's primitive, writing each region in turn, in order. A writer whose underlying I/O
+//! really does scatter-gather overrides the default and reaches one `writev`.
+//!
+//! Correctness and efficiency therefore come apart, and
+//! [`is_write_vectored`](TransportWrite::is_write_vectored) is the seam. It does not ask
+//! *can you gather* — everyone can, that is what "provided" means — it asks *is your
+//! gathering worth calling*. A writer that leaves the emulation in place should answer `no`,
+//! and this layer will then coalesce the pass into one buffer and spend a single write,
+//! rather than paying the emulation's one-write-per-region for a gather that was never
+//! there.
 //!
 //! This is the same shape as [`std::io::Write`], where `write` is required and
 //! `write_vectored` is provided in terms of it — and the default here is the stricter one:
@@ -115,16 +133,32 @@
 //! advice at the point of declaration rather than arbitration at run time, because there is
 //! nothing left to arbitrate.
 //!
-//! # No capability is read at run time
+//! # One capability, read once
 //!
-//! Earlier revisions asked a gathering writer whether its stream *really* scatter-gathers,
-//! once per connection, and routed around it if not. That question is gone from this
-//! surface. It was never a correctness question — this layer re-offers the remainder of a
-//! short write, so a writer that moves only the first region and reports that honestly loses
-//! nothing, it is merely slow — and as a performance question it is the transport's own
-//! business, answered by whether it overrides the default. A transport that knows its stream
-//! does not gather can simply not override, or override with its own condition; either way
-//! this layer never asks.
+//! [`is_write_vectored`](TransportWrite::is_write_vectored) is the only thing this layer asks
+//! a transport at run time, and it asks it once per connection, before the first write. It is
+//! not a correctness question — this layer re-offers the remainder of a short write, so a
+//! writer that answers wrongly in either direction still moves every octet in order — it is a
+//! performance question, and the answer is cached for the connection's life because it cannot
+//! change: it is a property of the underlying I/O, not of the connection's state.
+//!
+//! A revision between the two asked nothing at all, on the reasoning that a transport's
+//! answer was already implicit in whether it overrode the default. That reasoning does not
+//! survive contact with the two drains. The override is invisible from here — a provided
+//! method and an overridden one are the same call — so "answered by whether it overrides"
+//! was an answer nobody could read. What the layer actually did in its absence was assume
+//! gathering was worth calling for everyone, and hand a non-gathering readiness transport to
+//! the emulation, which cost one write per region for a gather that did not exist. The
+//! capability makes that answer legible, and the default (`false`, see the method's own
+//! docs) makes the conservative reading the one you get for free.
+//!
+//! The question is deliberately shaped like [`AsyncWrite::is_write_vectored`]: a plain
+//! `&self` returning `bool`, answerable without I/O, meaning *efficient* rather than
+//! *available*. Callers of tokio's method coalesce when it returns `false`; so does this
+//! layer, for the same reason and to the same effect.
+//!
+//! [`AsyncWrite::is_write_vectored`]:
+//!     https://docs.rs/tokio/latest/tokio/io/trait.AsyncWrite.html#method.is_write_vectored
 //!
 //! [`AsyncWrite`]: https://docs.rs/tokio/latest/tokio/io/trait.AsyncWrite.html
 
@@ -197,8 +231,8 @@ pub struct Completion;
 /// One of the two I/O models a transport's writes can follow.
 ///
 /// Sealed: the two models in this module are all there are. Which of them a writer declares
-/// settles *who owns the buffer*; how many writes a pass becomes is
-/// [`WritePolicy`](crate::http::WritePolicy), and is not the transport's to choose.
+/// settles *who owns the buffer*; how many writes a pass becomes is settled separately, by
+/// the writer's answer to [`is_write_vectored`](TransportWrite::is_write_vectored).
 pub trait WriteModel: sealed::Sealed {}
 
 /// A model whose writes lend borrowed buffers, and so belong to a readiness-based transport.
@@ -383,9 +417,10 @@ where
 pub trait TransportWrite {
     /// Which I/O model this writer follows — who owns the buffer a write is given.
     ///
-    /// This settles ownership, and nothing else. How many writes a pass becomes is
-    /// [`WritePolicy`](crate::http::WritePolicy), chosen per connection by the layer that
-    /// owns the accumulation buffer rather than declared here.
+    /// This settles ownership, and nothing else. How many writes a pass becomes is settled
+    /// separately by [`is_write_vectored`](TransportWrite::is_write_vectored), which is a
+    /// statement about efficiency rather than about ownership; the two are orthogonal, and
+    /// each of the four combinations is reachable.
     ///
     /// Stable Rust has no defaults for associated types, so even the simplest transport
     /// writes this line — `type Model = Readiness;` — costing one line for the guarantee
@@ -419,6 +454,49 @@ pub trait TransportWrite {
     /// from.
     fn commit(&mut self) -> impl Future<Output = std::io::Result<()>> {
         async { Ok(()) }
+    }
+
+    /// Whether this writer has an *efficient* gathering implementation.
+    ///
+    /// This is the crate's counterpart to [`tokio::io::AsyncWrite::is_write_vectored`], and
+    /// it is deliberately the same question with the same contract. A writer that overrides
+    /// its model's gathering operation —
+    /// [`write_vectored`](BorrowedWrite::write_vectored) on the readiness side,
+    /// [`write_regions`](RegionWrite::write_regions) on the completion side — with one that
+    /// really does hand every region to the operating system in a single call should return
+    /// `true`. A writer that leaves the provided emulation in place should return `false`,
+    /// because that emulation is a loop over the single-buffer primitive: it is *correct*,
+    /// but it is not gathering, and a caller that believes otherwise pays one write per
+    /// region for nothing.
+    ///
+    /// The driver asks this exactly once per connection, immediately after splitting the
+    /// transport and before any octet is written, and routes every write pass for that
+    /// connection's whole life accordingly: `true` takes the gathered drain, `false` takes
+    /// the coalesced drain, which packs the pass into one contiguous buffer and spends a
+    /// single write on it. Because the answer is taken once and cached, it must not depend
+    /// on connection state, and it must be answerable without I/O — hence a plain `&self`
+    /// returning `bool` rather than a future or an `Option`.
+    ///
+    /// # Why the default is `false`
+    ///
+    /// The provided default returns `false`, which **inverts** this crate's previous stance:
+    /// the `gathers()` method of an earlier revision defaulted to `true`, on the reasoning
+    /// that every readiness transport gathers *somehow* because the emulation is always
+    /// available. That reasoning conflates availability with efficiency. The emulation is
+    /// always available, and it is never efficient; defaulting to `true` therefore told the
+    /// layer above that a loop of N single-buffer writes was a gather, and the layer above
+    /// believed it.
+    ///
+    /// Defaulting to `false` makes the wrong answer the conservative one. A transport that
+    /// forgets to override this gets one write and a copy — never optimal, always correct
+    /// and never surprising. A transport that overrides it wrongly, claiming an efficiency
+    /// it does not have, gets N writes where it was promised one. Of those two failure
+    /// modes the first is the one to make silent, which is the same judgement tokio makes.
+    ///
+    /// [`tokio::io::AsyncWrite::is_write_vectored`]:
+    ///     https://docs.rs/tokio/latest/tokio/io/trait.AsyncWrite.html#method.is_write_vectored
+    fn is_write_vectored(&self) -> bool {
+        false
     }
 }
 
@@ -653,19 +731,30 @@ pub struct Pass<'a> {
 /// implemented leaves this bound unsatisfiable, and the `TransportWrite` impl itself fails to
 /// compile.
 ///
-/// It carries no per-connection state and asks the writer nothing. The one runtime input to a
-/// drain is [`WritePolicy`](crate::http::WritePolicy), which the h2 layer settled at
-/// handshake from the caller's [`Config`](crate::http::Config) and which then holds for the
-/// connection's life. No drain consults the transport about it, and no drain re-derives it.
+/// It carries no per-connection state and does not ask the writer anything itself. Its one
+/// runtime input is the `vectored` flag: the answer the writer gave to
+/// [`TransportWrite::is_write_vectored`] when the driver split the transport, which the
+/// driver resolved once and then holds for the connection's life. `true` selects the
+/// gathered drain, `false` the coalesced one. No drain re-asks the writer, and none
+/// re-derives the answer.
+///
+/// The flag is a `bool` and not a richer type on purpose. A named enum here would have to be
+/// public, because this method is — and this crate has no honest public constructor to offer
+/// for one, since the value is produced inside the driver from the transport's own answer
+/// and never by a caller. The result would be a public enum that exists only to be a
+/// parameter nobody outside can supply: nameable, unconstructable, and load-bearing for
+/// nothing. A `bool` says exactly as much as there is to say — the writer answered a yes/no
+/// question — and leaves no vestigial type in the public surface. The parameter is named
+/// `vectored` rather than typed so that the name carries the meaning the type would have.
 ///
 /// Sealed, and not something to implement or call. It appears in the public API only because
 /// it is named in a public bound.
 pub trait Drains<W: ?Sized>: sealed::Sealed {
-    /// Drains one pass under the given policy.
+    /// Drains one pass, gathering if `vectored` and coalescing otherwise.
     #[doc(hidden)]
     fn drain<'a>(
         writer: &'a mut W,
-        policy: crate::http::WritePolicy,
+        vectored: bool,
         pass: Pass<'a>,
     ) -> impl Future<Output = super::error::Result<()>> + 'a;
 }

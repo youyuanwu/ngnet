@@ -304,8 +304,8 @@ mod asynchronous {
     };
     use ngnet_h2::http::{
         Config, Error, ErrorKind, IncomingBody, ResponseFuture, SendRequest, Transport,
-        TransportRead, TransportWrite, WritePolicy, handshake, handshake_shared,
-        handshake_shared_with, handshake_with,
+        TransportRead, TransportWrite, handshake, handshake_shared, handshake_shared_with,
+        handshake_with,
     };
 
     /// The connection configuration, pinned as a `Copy` builder with conservative
@@ -667,9 +667,13 @@ mod asynchronous {
     /// required write operation.
     ///
     /// This is the successor to the deleted `vectored_write_surface`, which pinned a
-    /// `gathers()` boolean and a separate `VectoredWrite` trait. Both are gone. What replaces
-    /// them is this: gathering is not something a transport opts into, so the surface to pin
-    /// is that it can be reached *without* being mentioned.
+    /// `gathers()` boolean and a separate `VectoredWrite` trait. The separate trait is gone
+    /// for good; the boolean came back, on `TransportWrite`, under tokio's name and with
+    /// tokio's `false` default. What this pins is the split between the two: the gathering
+    /// *operation* is still reachable without being mentioned, because it is a provided
+    /// default over the required primitive. Declaring the capability is a separate, optional
+    /// act — pinned by `gathering_capability_surface` — and a transport that declines it, as
+    /// `Minimal` does here, still gathers correctly when its `write_vectored` is called.
     pub(super) fn minimal_readiness_surface() {
         struct Minimal;
 
@@ -683,7 +687,11 @@ mod asynchronous {
             }
         }
 
-        // It gathers, without having said so — the point of the whole inversion.
+        // Its gathering operation exists without having been asked for. What it does *not*
+        // get for free is the driver routing a pass through that operation: `Minimal` says
+        // nothing, so it inherits `is_write_vectored`'s `false` and a driven connection would
+        // coalesce it. Reachability of the operation and selection of the drain are two
+        // different things, and this pins only the first.
         borrowed_write_surface::<Minimal>();
     }
 
@@ -774,10 +782,10 @@ mod asynchronous {
     ///
     /// There used to be four markers, and they named a *drain*: `Coalesced`, `PerRegion`,
     /// `Gathering`, `OwnedRegions`. All four are gone. A writer no longer declares a drain at
-    /// all — it declares only whether its I/O is readiness- or completion-based, and the h2
-    /// layer picks the drain from [`WritePolicy`]. So the classification pinned here is
-    /// narrower than it was, and deliberately so: there is nothing left for a transport to get
-    /// wrong.
+    /// all — it declares whether its I/O is readiness- or completion-based, which settles who
+    /// owns the buffer, and separately whether its gathering is efficient, which the h2 layer
+    /// turns into a drain. So the classification pinned here is narrower than it was, and
+    /// deliberately so: a transport states two facts about itself and chooses nothing.
     ///
     /// [`Drains`] and [`Pass`] are named in the write-half bounds and here as a type. Note
     /// that [`Drains::drain`] cannot be exercised from an integration test: a [`Pass`] is
@@ -808,36 +816,80 @@ mod asynchronous {
         let _: Option<fn(Pass<'_>)> = None;
     }
 
-    /// The write policy: the public API that replaces the backend's say in how a pass drains.
+    /// The gathering capability: the public API that decides how a pass drains.
     ///
-    /// This is the new surface the whole change exists to add. It is a plain two-variant enum
-    /// on [`Config`], not a boolean, because "gathering" already names something specific in
-    /// this crate — accumulating small blocks while lending large ones uncopied — and a
-    /// `gather_writes(false)` would have *copied more*, not gathered less.
-    pub(super) fn write_policy_surface() {
-        // Both variants, named.
-        let gathered: WritePolicy = WritePolicy::Gathered;
-        let coalesced: WritePolicy = WritePolicy::Coalesced;
+    /// **This replaced `write_policy_surface`, which pinned a `WritePolicy` enum and a
+    /// `Config::write_policy` setter.** Both are gone, and the surface that replaces them is
+    /// on the transport rather than on the configuration: a writer reports whether its
+    /// gathering operation is efficient, and the h2 layer picks the drain from that. The
+    /// removal is pinned negatively by `compile_fail` doctests on `Config`, which assert the
+    /// old names no longer resolve; this function pins what took their place.
+    ///
+    /// The shape is deliberately tokio's `AsyncWrite::is_write_vectored`: a provided `&self`
+    /// method returning `bool`, defaulting to `false`. Each of those three properties is
+    /// pinned below, because each is load-bearing. It is *provided*, so adding it did not
+    /// break a single downstream transport. It takes `&self` and returns a plain `bool` rather
+    /// than a future or an `Option`, so it is answerable without I/O — which is what makes it
+    /// safe to ask once and cache. And it defaults to `false`, so a transport that says
+    /// nothing gets the conservative drain rather than the optimistic one.
+    pub(super) fn gathering_capability_surface() {
+        // The method exists, on `TransportWrite`, with exactly this signature. Named as a
+        // function pointer so a change of receiver, of return type, or of the trait it sits
+        // on fails here.
+        fn capability_of<W: TransportWrite>() -> fn(&W) -> bool {
+            W::is_write_vectored
+        }
 
-        // `Copy`, `Clone`, `Debug`, `PartialEq`, `Eq` — the derives a config knob needs to be
-        // usable in an `assert_eq!` and storable in a `Copy` `Config`. `Copy` is pinned by
-        // using `gathered` twice by value; `Clone` is pinned through the fully-qualified call
-        // rather than `.clone()`, which would resolve to the `Copy` and draw
-        // `clippy::clone_on_copy`.
-        let _: WritePolicy = gathered;
-        let _: WritePolicy = gathered;
-        let _: WritePolicy = Clone::clone(&coalesced);
-        let _: String = format!("{gathered:?}");
-        let _: bool = gathered == coalesced;
+        // It is **provided**, not required: this type implements `TransportWrite` by
+        // declaring a model and nothing else, and still has the method. A downstream
+        // transport written before the capability existed keeps compiling.
+        struct Silent;
+        impl TransportWrite for Silent {
+            type Model = Readiness;
+        }
+        impl BorrowedWrite for Silent {
+            async fn write_borrowed<'w>(&'w mut self, data: &'w [u8]) -> std::io::Result<usize> {
+                Ok(data.len())
+            }
+        }
 
-        // `Default` is `Gathered`: gathering is on unless a caller turns it off.
-        assert_eq!(WritePolicy::default(), WritePolicy::Gathered);
+        // And the provided answer is `false`. This is the one assertion in this file that
+        // pins a *value* rather than a shape, and it is here because the value is the
+        // compatibility promise: a transport that never heard of this method must be routed
+        // to the drain that is correct for a transport that never heard of this method.
+        assert!(
+            !Silent.is_write_vectored(),
+            "the provided default must be `false`; a `true` default would tell the h2 layer \
+             that a transport which has said nothing about gathering gathers efficiently",
+        );
 
-        // The setter, on the `Copy` builder, reachable wherever a connection is configured —
-        // which is both `handshake_with`/`handshake_shared_with` on the client and
-        // `server::serve_with` on the server, since both take a `Config`.
-        let _: Config = Config::default().write_policy(WritePolicy::Coalesced);
-        let _: fn(Config, WritePolicy) -> Config = Config::write_policy;
+        // An overriding transport, pinned as such, so that overriding remains possible with
+        // the obvious syntax.
+        struct Loud;
+        impl TransportWrite for Loud {
+            type Model = Readiness;
+
+            fn is_write_vectored(&self) -> bool {
+                true
+            }
+        }
+        impl BorrowedWrite for Loud {
+            async fn write_borrowed<'w>(&'w mut self, data: &'w [u8]) -> std::io::Result<usize> {
+                Ok(data.len())
+            }
+        }
+        assert!(Loud.is_write_vectored());
+
+        let _: fn(&Silent) -> bool = capability_of::<Silent>();
+        let _: fn(&Loud) -> bool = capability_of::<Loud>();
+
+        // `Config` keeps only the two advertised limits. Pinned positively here; the absence
+        // of the third is pinned by the `compile_fail` doctests on `Config` itself, since a
+        // `let _ = Config::default().write_policy(..)` in this file would not compile and so
+        // could not be checked in.
+        let _: Config = Config::default()
+            .max_concurrent_streams(1)
+            .max_header_list_size(1);
     }
 }
 
@@ -845,7 +897,8 @@ mod asynchronous {
 #[test]
 fn the_asynchronous_surface_is_unchanged() {
     use ngnet_h2::http::testing::{
-        Duplex, DuplexReader, DuplexWriter, Empty, Emulating, RegionEmulating, Regions, Vectored,
+        Duplex, DuplexReader, DuplexWriter, Empty, Emulating, RegionEmulating, Regions, Unvectored,
+        UnvectoredRegions, Vectored,
     };
 
     let _: fn(&ngnet_h2::http::Error) = asynchronous::error_surface;
@@ -866,7 +919,9 @@ fn the_asynchronous_surface_is_unchanged() {
     // readiness transport gathers".
     asynchronous::borrowed_write_surface::<DuplexWriter<Vectored>>();
     asynchronous::borrowed_write_surface::<DuplexWriter<Emulating>>();
+    asynchronous::borrowed_write_surface::<DuplexWriter<Unvectored>>();
     asynchronous::region_write_surface::<DuplexWriter<Regions>>();
+    asynchronous::region_write_surface::<DuplexWriter<UnvectoredRegions>>();
     // And that each is reachable with nothing beyond the one required method.
     asynchronous::minimal_readiness_surface();
     asynchronous::minimal_completion_surface();
@@ -875,8 +930,8 @@ fn the_asynchronous_surface_is_unchanged() {
     // The I/O-model markers, their model-trait memberships, and `Pass`/`Drains` as named
     // types (with the note on why `Drains::drain` is pinned by an in-crate doctest instead).
     asynchronous::model_marker_surface();
-    // The write policy — the public API this change adds.
-    asynchronous::write_policy_surface();
+    // The gathering capability — the public API that decides how a pass drains.
+    asynchronous::gathering_capability_surface();
     // The vectored testing transport and its observation handle. Hidden from the docs but
     // still public, and integration tests are separate crates that can reach nothing else.
     let _: fn() -> (Duplex<Vectored>, Duplex<Vectored>) = ngnet_h2::http::testing::duplex_vectored;
@@ -896,15 +951,30 @@ fn the_asynchronous_surface_is_unchanged() {
     // or test-only, overrides it — so without this the completion emulation is untested.
     let _: fn() -> (Duplex<RegionEmulating>, Duplex<RegionEmulating>) =
         ngnet_h2::http::testing::duplex_region_emulating;
+    // The two honestly-declaring transports. Structurally these are the emulating pair above
+    // — same operations, same absent overrides — differing only in answering
+    // `is_write_vectored` with `false`. They are how a test reaches the *coalescing* drains,
+    // which used to be reached by setting `WritePolicy::Coalesced` on a `Config`; that route
+    // is gone, so these constructors are load-bearing rather than convenient.
+    let _: fn() -> (Duplex<Unvectored>, Duplex<Unvectored>) =
+        ngnet_h2::http::testing::duplex_unvectored;
+    let _: fn() -> (Duplex<UnvectoredRegions>, Duplex<UnvectoredRegions>) =
+        ngnet_h2::http::testing::duplex_unvectored_regions;
     // The election-log handle a region-write assertion reads.
     let _: fn(&Duplex<Vectored>) -> ngnet_h2::http::testing::ElectionLog = Duplex::election_log;
-    // `region_writes` counts owned-region writes, and is now the only counter left on this
-    // handle. `gathers_consultations` is **deleted**: it counted how often the driver read
-    // `VectoredWrite::gathers()`, and there is nothing to read any more — no run-time
-    // capability is consulted on any path, which is a stronger statement than the
-    // once-per-connection guarantee it used to pin.
+    // `region_writes` counts owned-region writes. `capability_reads` counts how often the h2
+    // layer asked the writer whether its gathering is efficient, and is the only observation
+    // that can tell "asked once per connection" from "asked once per pass" — the two are
+    // identical in every octet and every write count.
+    //
+    // A predecessor counter, `gathers_consultations`, was deleted when the crate briefly had
+    // no run-time capability at all. `capability_reads` is not that counter restored: the
+    // question it counts is a different one, asked of a different party, with the opposite
+    // default.
     let _: fn(&ngnet_h2::http::testing::ElectionLog) -> usize =
         ngnet_h2::http::testing::ElectionLog::region_writes;
+    let _: fn(&ngnet_h2::http::testing::ElectionLog) -> usize =
+        ngnet_h2::http::testing::ElectionLog::capability_reads;
     let _: fn(&Duplex<Vectored>) -> ngnet_h2::http::testing::VectoredLog = Duplex::vectored_log;
     let _: fn(&ngnet_h2::http::testing::VectoredLog) -> Vec<Vec<usize>> =
         ngnet_h2::http::testing::VectoredLog::calls;

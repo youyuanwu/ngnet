@@ -71,11 +71,12 @@ where
 
 /// Starts a client connection over `transport` with an explicit [`Config`].
 ///
-/// Identical to [`handshake`] but for the limits advertised to the peer and for the local
-/// [`WritePolicy`](crate::http::WritePolicy), which decides how this connection drains a pass
-/// to the transport. This is the entry point through which a client turns gathering off; see
-/// [`Config`] for what the limits bound, why the defaults are conservative, and when the
-/// non-default policy is worth choosing.
+/// Identical to [`handshake`] but for the limits advertised to the peer. See [`Config`] for
+/// what those limits bound and why the defaults are conservative.
+///
+/// How this connection drains a pass to the transport is *not* configured here. It is asked
+/// of the transport itself, once, through
+/// [`TransportWrite::is_write_vectored`](crate::http::transport::TransportWrite::is_write_vectored).
 ///
 /// # Errors
 ///
@@ -184,7 +185,6 @@ where
         Arc::clone(&shared),
         registry,
         guard,
-        config.policy(),
     ));
 
     Ok((

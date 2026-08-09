@@ -47,7 +47,7 @@ use crate::{
 
 use super::body::outgoing::Outgoing;
 use super::body::shared::SharedOutgoing;
-use super::config::{Config, WritePolicy};
+use super::config::Config;
 use super::error::{Error, ErrorKind, Result};
 use super::head;
 use super::shared;
@@ -587,7 +587,6 @@ pub(crate) async fn run<T, R>(
     shared: Arc<Shared>,
     registry: Arc<Registry>,
     mut guard: DriverGuard<R>,
-    policy: WritePolicy,
 ) -> Result<()>
 where
     T: Transport,
@@ -595,10 +594,26 @@ where
 {
     let (mut reader, mut writer) = transport.split();
 
-    // No transport capability is consulted here, or anywhere. Earlier revisions resolved a
-    // `gathers()` answer once at this point and threaded it through every drain; the writer no
-    // longer has an opinion to resolve. The only input to a drain's shape is `policy`, which
-    // came from this endpoint's own `Config`.
+    // The one capability this layer reads, read once, here, before a single octet is
+    // written. `is_write_vectored` answers whether the writer's gathering operation reaches
+    // a real scatter-gather call or the provided emulation's loop; `true` routes every pass
+    // of this connection's life through the gathered drain, `false` through the coalesced
+    // one. It is asked once rather than per pass because it is a property of the underlying
+    // I/O and cannot change while the connection is up — the same reason tokio's
+    // `AsyncWrite::is_write_vectored` is a plain `&self -> bool`, answerable without I/O.
+    //
+    // Two earlier revisions each got half of this. The first asked the writer a `gathers()`
+    // question here and threaded the answer through every drain — right about *where* to ask,
+    // wrong in that the question defaulted to `true`, so a transport that had never thought
+    // about gathering was reported as gathering well. The second removed the question
+    // entirely and took the answer from the caller's `Config` instead, on the reasoning that
+    // how many writes a pass becomes is a tuning decision belonging to the layer that owns
+    // the accumulation buffer. That reasoning does not survive: the decision does not turn on
+    // what this layer owns, it turns on whether the *transport's* `write_vectored` is real,
+    // which this layer cannot see and the caller generally does not know. Asking the
+    // transport puts the question to the only party that can answer it, and the `false`
+    // default makes silence mean the conservative answer instead of the optimistic one.
+    let vectored = writer.is_write_vectored();
 
     // Locals of this future, borrowed by both halves. Mutexes rather than a `RefCell`
     // because `&RefCell<T>` is never `Sync`, which would make the whole driver non-`Send`
@@ -749,11 +764,11 @@ where
                 &shared,
                 &mut guard.role,
             )?;
-            flush(&mut session, &mut writer, &mut events, &mut write, policy).await?;
+            flush(&mut session, &mut writer, &mut events, &mut write, vectored).await?;
             // A body announces its trailers while it is being serialised, so they can only
             // be submitted once that pass is over — and then written by a second one.
             if submit_trailers(&mut session, &shared, &registry)? {
-                flush(&mut session, &mut writer, &mut events, &mut write, policy).await?;
+                flush(&mut session, &mut writer, &mut events, &mut write, vectored).await?;
             }
             // Serialising fires the stream-close handler, so what it observed is
             // dispatched too rather than waiting for the next pass.
@@ -1304,9 +1319,11 @@ struct Gather<'a> {
 ///
 /// A thin dispatcher over two independent choices. The writer's
 /// [`Model`](TransportWrite::Model) resolves, through [`Drains`], to *which family* of drain
-/// runs — borrowed regions or owned ones — and that is settled at compile time. `policy`
-/// chooses *within* the family, and comes from this endpoint's configuration rather than from
-/// the transport. There is no run-time probe of the writer and no precedence to arbitrate.
+/// runs — borrowed regions or owned ones — and that is settled at compile time. `vectored`
+/// chooses *within* the family, and is the writer's own answer to
+/// [`TransportWrite::is_write_vectored`], resolved once when the driver split the transport
+/// and unchanged for the connection's life. The writer is not re-probed here, and there is no
+/// precedence to arbitrate: the two choices are orthogonal.
 ///
 /// This does not commit the octets to the peer; [`TransportWrite::commit`] does, and the
 /// caller runs it once the pass is fully drained.
@@ -1315,11 +1332,11 @@ async fn flush<W: TransportWrite>(
     writer: &mut W,
     events: &mut Events,
     buffers: &mut WriteBuffers,
-    policy: WritePolicy,
+    vectored: bool,
 ) -> Result<()> {
     <W::Model as Drains<W>>::drain(
         writer,
-        policy,
+        vectored,
         Pass {
             inner: PassInner {
                 session,
@@ -1353,7 +1370,7 @@ where
 {
     fn drain<'a>(
         writer: &'a mut W,
-        policy: WritePolicy,
+        vectored: bool,
         pass: Pass<'a>,
     ) -> impl Future<Output = Result<()>> + 'a {
         let PassInner {
@@ -1362,15 +1379,16 @@ where
             buffers,
         } = pass.inner;
         async move {
-            match policy {
-                // Gathering is unconditional here. Whether it reaches a real `writev` or the
-                // provided default's loop is the transport's business and never this layer's:
-                // both deliver the same octets in the same order, and the accumulation that
-                // collapses small blocks into one region happens before either.
-                WritePolicy::Gathered => flush_readiness(session, writer, events, buffers).await,
-                WritePolicy::Coalesced => {
-                    flush_coalesced_borrowed(session, writer, events, buffers).await
-                }
+            if vectored {
+                // The writer declared its `write_vectored` reaches a real scatter-gather
+                // call, so hand it the region list: small blocks already collapsed into one
+                // accumulation run, large blocks and handed-over payloads riding uncopied.
+                flush_readiness(session, writer, events, buffers).await
+            } else {
+                // It declared otherwise, so its `write_vectored` is the provided emulation —
+                // a loop of one borrowed write per region. Coalescing pays a copy of every
+                // octet to make the pass one region, and one write, instead.
+                flush_coalesced_borrowed(session, writer, events, buffers).await
             }
         }
     }
@@ -1382,7 +1400,7 @@ where
 {
     fn drain<'a>(
         writer: &'a mut W,
-        policy: WritePolicy,
+        vectored: bool,
         pass: Pass<'a>,
     ) -> impl Future<Output = Result<()>> + 'a {
         let PassInner {
@@ -1391,21 +1409,21 @@ where
             buffers,
         } = pass.inner;
         async move {
-            match policy {
-                WritePolicy::Gathered => {
-                    flush_owned(
-                        session,
-                        writer,
-                        events,
-                        &mut buffers.minted,
-                        &mut buffers.owned,
-                        &mut buffers.send_records,
-                    )
-                    .await
-                }
-                WritePolicy::Coalesced => {
-                    flush_coalesced_owned(session, writer, events, buffers).await
-                }
+            if vectored {
+                // A native region submission: one owned vectored write for the whole pass.
+                flush_owned(
+                    session,
+                    writer,
+                    events,
+                    &mut buffers.minted,
+                    &mut buffers.owned,
+                    &mut buffers.send_records,
+                )
+                .await
+            } else {
+                // `write_regions` is the provided emulation, one owned write per region.
+                // Coalescing mints a single owned buffer for the pass instead.
+                flush_coalesced_owned(session, writer, events, buffers).await
             }
         }
     }
@@ -1549,7 +1567,7 @@ where
     Ok(())
 }
 
-/// Drains a pass on the readiness model under [`WritePolicy::Gathered`].
+/// Drains a pass on the readiness model when the writer declared efficient gathering.
 ///
 /// There is one loop and one shape. Earlier revisions had two, because a transport could
 /// decline to gather; it cannot any more — [`BorrowedWrite::write_vectored`] is always

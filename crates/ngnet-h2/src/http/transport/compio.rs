@@ -48,14 +48,17 @@
 //! with the write implementing it. Both are gone: the model declaration says the same thing,
 //! once, and the compiler checks it.
 //!
-//! # Gathering is not optional here, and never was
+//! # This transport declares that its gathering is real
 //!
-//! A completion transport gathers on every pass under
-//! [`WritePolicy::Gathered`](crate::http::WritePolicy::Gathered). There is no capability to
-//! decline and there never was one on this side — the whole owned list goes to
-//! [`RegionWrite::write_regions`] in one call.
+//! [`is_write_vectored`](TransportWrite::is_write_vectored) returns `true` here, and that is
+//! a statement of fact rather than optimism: [`RegionWrite::write_regions`] below is overridden with
+//! compio's own vectored submission, which reaches `IORING_OP_SENDMSG` with the whole region
+//! list in one operation. The h2 layer therefore hands this transport the gathered drain and
+//! the whole owned list goes out in one call.
 //!
-//! That method is *provided* rather than required: a completion transport with no vectored
+//! A completion transport that did *not* override it would have to answer `false`, and would
+//! be routed to the coalescing drain instead. That method is *provided* rather than required:
+//! a completion transport with no vectored
 //! submission of its own inherits a default that hands each region to
 //! [`RegionWrite::write_owned`] in turn, so supplying that one owned primitive is a complete
 //! implementation. This transport overrides it, because compio has a real one.
@@ -188,14 +191,27 @@ impl<R: AsyncRead> TransportRead for CompioReader<R> {
 
 impl<W: AsyncWrite> TransportWrite for CompioWriter<W> {
     /// A completion runtime owns its buffers, which is what lets this transport issue a
-    /// genuine gathering write for a no-copy body. Declaring the model settles *ownership*;
-    /// how many writes a pass becomes is [`WritePolicy`](crate::http::WritePolicy)'s to
-    /// choose. There is no flag to set and nothing for the driver to ask. See the module
+    /// genuine gathering write for a no-copy body. Declaring the model settles *ownership*
+    /// and nothing else; how many writes a pass becomes follows from
+    /// [`is_write_vectored`](TransportWrite::is_write_vectored) below. See the module
     /// documentation for why the borrowed path is unavailable here.
     type Model = Completion;
 
     // `commit` is deliberately left at its default; see the module documentation for why a
     // completion runtime has nothing to flush.
+
+    /// `true`, because [`write_regions`](RegionWrite::write_regions) below is a real vectored
+    /// submission and not the provided default's loop.
+    ///
+    /// This is the one case in the crate where the answer needs no qualification. The
+    /// override reaches compio's `write_vectored`, which passes `Vec<Bytes>` as an
+    /// `IoVectoredBuf` to `IORING_OP_SENDMSG`: one operation for the whole list, with the
+    /// allocation handed back for reuse. Declaring `false` here would send a transport whose
+    /// entire reason for existing is no-copy region submission to the drain that copies every
+    /// octet.
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
 }
 
 impl<W: AsyncWrite> RegionWrite for CompioWriter<W> {
@@ -208,7 +224,8 @@ impl<W: AsyncWrite> RegionWrite for CompioWriter<W> {
     }
 
     /// Overrides the provided default, which would write each region separately, with
-    /// compio's real vectored submission.
+    /// compio's real vectored submission. This override is what
+    /// [`TransportWrite::is_write_vectored`] reports `true` about.
     async fn write_regions(&mut self, regions: Vec<Bytes>) -> (std::io::Result<usize>, Vec<Bytes>) {
         // `Vec<Bytes>` is a compio `IoVectoredBuf` (`Vec<T: IoBuf>`, `Bytes: IoBuf`), so this
         // is a real `writev` reaching `IORING_OP_SENDMSG`, not an emulation. compio takes the

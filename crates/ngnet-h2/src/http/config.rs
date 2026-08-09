@@ -9,14 +9,35 @@
 //! `SETTINGS_MAX_HEADER_LIST_SIZE` default is `UINT32_MAX` — so this crate advertises its
 //! own, and a caller that knows its peer can widen them.
 //!
-//! Not everything here is advertised. [`WritePolicy`] is a purely local choice about the
-//! shape of this endpoint's writes — how a pass of session output becomes syscalls. It is
-//! carried on the same type because it is settled at the same moment, per connection, by the
-//! same caller, and threading a second configuration value through the same four entry points
-//! would buy nothing.
+//! Everything here is advertised, and that is the type's whole remit. An earlier revision
+//! also carried a local write-shaping knob here — how a pass of session output became
+//! syscalls — on the reasoning that it was settled at the same moment, per connection, by
+//! the same caller. The reasoning was sound about *when*; it was wrong about *who*. The
+//! answer depends on whether the transport's gathering write reaches a real scatter-gather
+//! call, which the caller generally does not know and the transport always does. It is now
+//! asked of the transport, once per connection, through
+//! [`TransportWrite::is_write_vectored`](super::transport::TransportWrite::is_write_vectored),
+//! and there is nothing to configure.
 
-/// How an asynchronous connection is configured: limits it advertises to its peer and
-/// enforces locally, plus the local shape of its writes.
+/// How an asynchronous connection is configured: the limits it advertises to its peer and
+/// enforces locally.
+///
+/// # Examples
+///
+/// The write-shaping knob this type used to carry is gone. It is not deprecated and not
+/// hidden; the name does not resolve, because the decision it named is no longer the
+/// caller's to make:
+///
+/// ```compile_fail,E0599
+/// // `write_policy` is not a method on `Config`; how a pass becomes writes is now the
+/// // transport's declaration, via `TransportWrite::is_write_vectored`.
+/// let _ = ngnet_h2::http::Config::default().write_policy(todo!());
+/// ```
+///
+/// ```compile_fail,E0433
+/// // Nor is there a type to pass it. `WritePolicy` does not exist.
+/// fn takes(_: ngnet_h2::http::WritePolicy) {}
+/// ```
 ///
 /// The defaults are deliberately conservative; the setters exist for a caller that wants
 /// to trade that headroom away. This is an additive surface: [`handshake`] and [`serve`]
@@ -30,7 +51,6 @@
 pub struct Config {
     max_concurrent_streams: u32,
     max_header_list_size: u32,
-    write_policy: WritePolicy,
 }
 
 impl Default for Config {
@@ -48,7 +68,6 @@ impl Default for Config {
             // chosen because h2c here is often an internal hop where headers stay small and
             // the copy, not interoperability, is the thing worth bounding.
             max_header_list_size: 64 * 1024,
-            write_policy: WritePolicy::Gathered,
         }
     }
 }
@@ -73,16 +92,6 @@ impl Config {
         self
     }
 
-    /// Chooses how a pass of session output becomes writes on the transport.
-    ///
-    /// Defaults to [`WritePolicy::Gathered`]. See that type for what each policy costs and
-    /// when turning gathering off is worth it.
-    #[must_use]
-    pub fn write_policy(mut self, policy: WritePolicy) -> Self {
-        self.write_policy = policy;
-        self
-    }
-
     pub(crate) fn concurrency(&self) -> u32 {
         self.max_concurrent_streams
     }
@@ -90,61 +99,4 @@ impl Config {
     pub(crate) fn header_list_size(&self) -> u32 {
         self.max_header_list_size
     }
-
-    pub(crate) fn policy(&self) -> WritePolicy {
-        self.write_policy
-    }
-}
-
-/// How a pass of session output becomes writes on the transport.
-///
-/// This is a decision for the layer that owns the accumulation buffer and knows the region
-/// count — not for the transport, which knows only how to write. A transport declares its I/O
-/// model ([`Readiness`] or [`Completion`]) and always supplies a gathering operation; this
-/// chooses whether to use it.
-///
-/// [`Readiness`]: super::transport::Readiness
-/// [`Completion`]: super::transport::Completion
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum WritePolicy {
-    /// Gather each pass into as few writes as possible. **The default.**
-    ///
-    /// Small session blocks accumulate into a driver-owned run; large ones and handed-over
-    /// payloads ride uncopied as their own regions; the whole list goes out as one gathering
-    /// write. A multiplexed pass of hundreds of small blocks becomes one region and one
-    /// write.
-    ///
-    /// Whether that write reaches a real `writev` depends on the transport: one that
-    /// overrides its model's gathering operation reaches one syscall, and one that does not
-    /// gets the provided default, which writes each region in turn. Both deliver the same
-    /// octets in the same order — the difference is syscall count, and it is bounded, because
-    /// the accumulation that collapses small blocks into one region happens either way.
-    #[default]
-    Gathered,
-    /// Copy each pass into one contiguous driver-owned buffer and write that.
-    ///
-    /// One write offer per pass, at the cost of copying **every** outgoing octet, including
-    /// payloads that would otherwise have been handed to the transport untouched. The buffer
-    /// is reused across passes, so this costs no allocation in steady state. A short write is
-    /// re-offered from the remainder, so "one write per pass" is the shape, not a promise
-    /// about syscall count.
-    ///
-    /// This is worth choosing when a write costs more than a copy: a transport with real
-    /// per-write overhead — a TLS record layer, a userspace stack, an encrypted tunnel — that
-    /// does not implement a native gathering write. Under [`Gathered`](WritePolicy::Gathered)
-    /// such a transport pays one write per region, and on a pass carrying many handed-over
-    /// payloads that can be dozens.
-    ///
-    /// On a completion transport that submits regions natively — as the shipped `CompioWriter`
-    /// does — this is close to pure loss: it replaces one owned vectored submission with one
-    /// owned contiguous write plus a copy of every octet, and there is no per-write overhead
-    /// being saved. Its use there is diagnostic — bisecting whether a fault lies in the region
-    /// path — rather than performance.
-    ///
-    /// A completion transport that leaves [`RegionWrite::write_regions`] at its default is the
-    /// exception, and the same case as the readiness one above: the default submits one owned
-    /// write per region, so coalescing genuinely trades a copy for a syscall there too.
-    ///
-    /// [`RegionWrite::write_regions`]: crate::http::transport::RegionWrite::write_regions
-    Coalesced,
 }

@@ -109,11 +109,14 @@
 //! error.
 //!
 //! The writer additionally names its *I/O model* as an associated type — readiness or
-//! completion — and that is the **only** thing it declares about how its writes are shaped.
-//! It does not say how a pass should be drained: that is the h2 layer's decision, taken from
-//! [`Config::write_policy`] and settled at handshake. Naming a model obliges the writer to
-//! implement that model's write trait, by compiler error, and the two models are disjoint, so
-//! no transport can carry both. The models, the traits they oblige, and how each policy drains
+//! completion — which settles who owns the buffer a write is given, and answers one yes/no
+//! question, [`TransportWrite::is_write_vectored`],
+//! which settles whether its gathering operation is efficient enough to be worth calling.
+//! The h2 layer asks that question once, when it splits the transport, and drains every pass
+//! of the connection accordingly: gathering if the answer was `true`, coalescing into one
+//! buffer and one write if it was `false`. Naming a model obliges the writer to implement
+//! that model's write trait, by compiler error, and the two models are disjoint, so no
+//! transport can carry both. The models, the traits they oblige, and how each answer drains
 //! are tabulated in
 //! [the transport module's documentation](transport#how-a-pass-gets-drained).
 //!
@@ -154,9 +157,10 @@
 //! already owned, at the cost of a pair of atomic refcount operations. Both are gone; the
 //! readiness coalescing drain now lends the buffer and clears it.
 //!
-//! Nothing else about a transport changes. In particular the write *policy* is still the
-//! caller's alone, through [`Config::write_policy`]: this change moves where the write
-//! primitive lives, not who chooses how many writes a pass costs.
+//! Nothing else about a transport changes. In particular that change moved where the write
+//! primitive lives, not who decides how many writes a pass costs — that decision moved
+//! separately, and later, when it became
+//! [`TransportWrite::is_write_vectored`].
 //!
 //! # Migrating a transport written against the strategy traits
 //!
@@ -164,22 +168,34 @@
 //! strategies the driver should use: `Coalesced`, `PerRegion`, `Gathering`, `OwnedRegions`,
 //! named through `TransportWrite::Strategy`. All four markers are gone, along with the
 //! `VectoredWrite` trait and its `gathers()` predicate. What replaces them is two markers
-//! naming only the I/O model, and a policy the *caller* sets.
+//! naming only the I/O model, plus one `bool` — [`is_write_vectored`][iwv] — saying whether
+//! the transport's gathering is real.
+//!
+//! [iwv]: transport::TransportWrite::is_write_vectored
 //!
 //! | old declaration | new declaration | operations move to |
 //! | --- | --- | --- |
 //! | `type Strategy = Coalesced;` (readiness) | `type Model = Readiness;` | [`BorrowedWrite`](transport::BorrowedWrite), whose `write_borrowed` is now **required** |
 //! | `type Strategy = Coalesced;` (completion) | `type Model = Completion;` | [`RegionWrite`](transport::RegionWrite), whose `write_owned` is now **required** — move the old `write` body there verbatim |
 //! | `type Strategy = PerRegion;` | `type Model = Readiness;` | unchanged: keep `write_borrowed`, drop the marker |
-//! | `type Strategy = Gathering;` | `type Model = Readiness;` | `write_vectored` moves from `VectoredWrite` onto [`BorrowedWrite`](transport::BorrowedWrite); delete `gathers()` |
-//! | `type Strategy = OwnedRegions;` | `type Model = Completion;` | unchanged: keep `write_regions`, drop the marker |
+//! | `type Strategy = Gathering;` | `type Model = Readiness;` + `fn is_write_vectored(&self) -> bool { true }` | `write_vectored` moves from `VectoredWrite` onto [`BorrowedWrite`](transport::BorrowedWrite); `gathers()` becomes [`is_write_vectored`][iwv] on [`TransportWrite`] |
+//! | `type Strategy = OwnedRegions;` | `type Model = Completion;` + `fn is_write_vectored(&self) -> bool { true }` | unchanged: keep `write_regions`, drop the marker |
 //!
 //! Note the first two rows: `Coalesced` used to mean "I have nothing to offer", and it was
-//! one line either way. It is no longer a thing a transport can say, because whether a pass
-//! coalesces is not the transport's business. What a minimal transport says instead is which
-//! model it belongs to, and the minimum work is one write method either way —
-//! `write_owned` on the completion side, `write_borrowed` on the readiness side, each of
-//! which that model's API already provides, because that is what the model *is*.
+//! one line either way. It is no longer a thing a transport can *name*, but it is still a
+//! thing a transport can *say*: leaving [`is_write_vectored`][iwv] at its `false` default is
+//! exactly that statement, and it is what puts the transport on the coalesced drain. What a
+//! minimal transport says beyond that is which model it belongs to, and the minimum work is
+//! one write method either way — `write_owned` on the completion side, `write_borrowed` on
+//! the readiness side, each of which that model's API already provides, because that is what
+//! the model *is*.
+//!
+//! Note also the last two rows' second half. `gathers()` used to be answered by the
+//! transport and then thrown away: the driver never saw it, because the drain came from the
+//! caller's `Config`. It is answered by the transport again now, and this time the driver
+//! reads it. A transport that overrides `write_vectored` or `write_regions` with a real
+//! scatter-gather call and *forgets* the declaration is not broken — it is merely coalesced,
+//! and its override goes unused.
 //!
 //! ```
 //! use std::io;
@@ -192,8 +208,10 @@
 //! # impl Sink {
 //! #     fn put(&mut self, _: &[u8]) {}
 //! # }
-//! // 1. Was `Coalesced`, readiness-based. Name the model and supply the one primitive; the
-//! //    gathering default loops over it, so this transport gathers without saying so.
+//! // 1. Was `Coalesced`, readiness-based. Name the model and supply the one primitive.
+//! //    `is_write_vectored` is left at its `false` default, which is the honest answer for a
+//! //    transport with no scatter-gather call, and puts it on the coalesced drain — which is
+//! //    what `Coalesced` used to mean, now said by the transport rather than the caller.
 //! struct Simple(Sink);
 //! impl TransportWrite for Simple {
 //!     type Model = Readiness;
@@ -206,8 +224,9 @@
 //! }
 //!
 //! // 2. Was `PerRegion`. Identical body; only the declaration changed. There is no
-//! //    per-region *drain* any more — this transport now gathers, by emulation, and the
-//! //    driver accumulates before offering, so it pays fewer writes than it used to.
+//! //    per-region *drain* any more, and this transport declares `false` by omission, so the
+//! //    driver coalesces each pass into one write — strictly fewer writes than `PerRegion`
+//! //    ever cost it, at the price of a copy.
 //! struct PerBlock(Sink);
 //! impl TransportWrite for PerBlock {
 //!     type Model = Readiness;
@@ -220,11 +239,15 @@
 //! }
 //!
 //! // 3. Was `Gathering`. `write_vectored` moves onto `BorrowedWrite` as an override of the
-//! //    default, and `gathers()` is deleted outright — see the note below on why its
-//! //    disappearance is a simplification rather than a loss.
+//! //    default, and `gathers()` becomes `is_write_vectored` on `TransportWrite` — see the
+//! //    note below on what moved and what did not.
 //! struct Vectoring(Sink);
 //! impl TransportWrite for Vectoring {
 //!     type Model = Readiness;
+//!     // Without this line the override below is dead code: the driver would coalesce.
+//!     fn is_write_vectored(&self) -> bool {
+//!         true
+//!     }
 //! }
 //! impl BorrowedWrite for Vectoring {
 //!     async fn write_borrowed<'w>(&'w mut self, data: &'w [u8]) -> io::Result<usize> {
@@ -241,10 +264,14 @@
 //!     }
 //! }
 //!
-//! // 4. Was `OwnedRegions`. Identical body; only the declaration changed.
+//! // 4. Was `OwnedRegions`. The body is identical; the declaration gained the same line
+//! //    case 3 did, and for the same reason.
 //! struct Owned(Sink);
 //! impl TransportWrite for Owned {
 //!     type Model = Completion;
+//!     fn is_write_vectored(&self) -> bool {
+//!         true
+//!     }
 //! }
 //! impl RegionWrite for Owned {
 //!     async fn write_owned(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
@@ -276,37 +303,63 @@
 //!     }
 //! }
 //! // That one method is the whole completion-side obligation: `write_regions` is provided,
-//! // and loops one `write_owned` per region. Override it only if the runtime has a real
-//! // vectored write, as `CompioWriter` does.
+//! // and loops one `write_owned` per region. Override it — and declare
+//! // `is_write_vectored` alongside it — only if the runtime has a real vectored write, as
+//! // `CompioWriter` does.
 //! ```
 //!
-//! ## `gathers()` is gone, and the hazard it created with it
+//! ## `gathers()` came back, under tokio's name and with tokio's default
 //!
 //! `VectoredWrite::gathers()` existed because a stream may inherit tokio's default
 //! `poll_write_vectored`, which writes the first region and ignores the rest. It answered
-//! whether that was the case, and the driver routed around it.
+//! whether that was the case, and the driver routed around it. It was deleted when the drain
+//! moved to `Config`, on the grounds that the transport should not vote on a decision that
+//! was the caller's. It is back, as
+//! [`TransportWrite::is_write_vectored`], because the decision was never the caller's
+//! either: no caller can know whether the socket it is handing over has a real `writev`
+//! behind it, and the transport always could.
 //!
-//! It was never a correctness mechanism. Such a stream reports the count it actually wrote,
-//! which the driver treats as an ordinary short write and re-offers the remainder from — no
-//! octet was ever at risk. What `gathers()` avoided was the *cost*: one syscall per region
-//! with none of the gathering benefit. Removing it is affordable because the driver
-//! accumulates sub-threshold blocks into a single region before any write happens, so the
-//! emulating loop typically runs once, not once per block.
+//! Three things are different this time, and all three matter.
 //!
-//! Its removal also closes a documented footgun. `gathers()` defaulted to `true` while
-//! tokio's `is_write_vectored()` defaults to `false` — opposite conservatism — so a
-//! third-party wrapper that forgot to forward the question silently inherited the optimistic
-//! answer and quietly wrote one region per pass. There is now no question to forget: a
-//! wrapper that forwards nothing inherits the emulating default, which is correct and
-//! bounded, and one that forwards `write_vectored` gets the native path.
+//! **The default inverted, from `true` to `false`.** `gathers()` was optimistic; a wrapper
+//! that forgot to forward the question inherited "yes, I gather" and then quietly wrote one
+//! region per pass. `is_write_vectored` is conservative, exactly as
+//! `tokio::io::AsyncWrite::is_write_vectored` is: a wrapper that forgets inherits "no", and
+//! the driver coalesces. Forgetting now costs a copy instead of a syscall storm, and the copy
+//! is bounded by the pass while the syscalls were not.
+//!
+//! **It is asked once, not per write.** The driver reads it immediately after
+//! [`Transport::split`] and keeps the answer for the
+//! connection's life. It must therefore be answerable without I/O and must not change its
+//! mind, which is why it is a plain `&self -> bool` and not a future.
+//!
+//! **It selects a drain rather than routing around one.** `gathers()` chose between the
+//! gathered drain's two implementations; `is_write_vectored` chooses between the gathered
+//! drain and the coalesced one. A transport that answers `false` no longer reaches
+//! `write_vectored` from the driver at all — the emulating default is still there, still
+//! correct, and still reached by a transport that answers `true` without overriding, but it
+//! is no longer the fallback for a transport that cannot gather. That transport gets one
+//! write and one copy instead.
+//!
+//! This is not free in every direction, and the crate does not claim it is. A readiness
+//! transport that cannot gather used to take the gathered drain and reach the emulating
+//! default, which — because the driver accumulates sub-threshold blocks into a single region
+//! before writing — usually issued *one* write and copied only the accumulated blocks,
+//! leaving handed-over payloads uncopied. It now issues one write and copies every outgoing
+//! octet, payloads included. For a pass that was already one region that is a regression, and
+//! a real one. It is accepted because it is the shape hyper has, because it is bounded and
+//! predictable where the emulating loop's cost is not, and because the transport that pays it
+//! is the one that declined to say it could gather.
 //!
 //! ## Behaviours that are no longer expressible
 //!
-//! **Declining to gather.** There is no `gathers()` and no strategy to name, so a transport
-//! cannot route the driver away from gathering. A caller who wants that reaches for
-//! [`Config::write_policy`] with [`WritePolicy::Coalesced`], which is a per-connection
-//! decision made where connections are configured rather than a per-transport one baked into
-//! a type.
+//! **Naming a drain strategy.** There is no strategy type to name, so a transport cannot
+//! select a drain *by name*. What it can do is answer [`is_write_vectored`][iwv], and the h2
+//! layer routes a `false` to the coalescing drain and a `true` to the gathered one — which is
+//! most of what the four strategies were used to express. The difference is that the
+//! transport declares a *property of itself*, in one bit, and the h2 layer decides what that
+//! is worth; it does not name the decision. `PerRegion` in particular is gone and stays gone:
+//! no answer to a yes/no question can ask for one write per region.
 //!
 //! **Offering more than one fast path.** A transport still belongs to exactly one I/O model
 //! and gets exactly one fast path with it. The old precedence advice — prefer gathering over
@@ -335,7 +388,7 @@ pub use body::IncomingBody;
 pub use client::{
     ResponseFuture, SendRequest, handshake, handshake_shared, handshake_shared_with, handshake_with,
 };
-pub use config::{Config, WritePolicy};
+pub use config::Config;
 pub use connection::Connection;
 pub use error::{Error, ErrorKind, Result};
 pub use server::{Cancelled, serve, serve_shared, serve_shared_with, serve_with};

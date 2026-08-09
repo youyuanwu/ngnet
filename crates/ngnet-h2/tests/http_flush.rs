@@ -160,6 +160,14 @@ impl Transport for GatheringBuffer {
 impl TransportWrite for GatheringBufferWriter {
     type Model = Readiness;
 
+    /// `true`, and honestly so: `write_vectored` below is overridden with a real gather into
+    /// this writer's buffer, not the provided default's loop. The declaration is what routes
+    /// this transport to the gathered drain — which is the whole point of the test, since a
+    /// `false` answer would coalesce and the gathering path would never run.
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
     async fn commit(&mut self) -> io::Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
@@ -312,6 +320,13 @@ impl Transport for GatheringRegionBuffer {
 
 impl TransportWrite for GatheringRegionBufferWriter {
     type Model = Completion;
+
+    /// `true`, and honestly so: `write_regions` below is overridden with a real gather over
+    /// the owned list. Without it this transport would take the completion coalescing drain
+    /// and the owned-region commit obligation this test exists to pin would go unexercised.
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
 
     async fn commit(&mut self) -> io::Result<()> {
         if self.buffer.is_empty() {
