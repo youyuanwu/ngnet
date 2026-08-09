@@ -47,7 +47,7 @@ use bytes::Bytes;
 use compio::net::{TcpListener, TcpStream};
 use core::future::Future;
 use http_body::{Body, Frame};
-use ngnet_h2::http::transport::{CompioIo, CompioWriter, OwnedRegions, TransportWrite};
+use ngnet_h2::http::transport::{CompioIo, CompioWriter, Completion, TransportWrite};
 use ngnet_h2::http::{IncomingBody, server};
 
 /// A body already held in memory.
@@ -190,7 +190,7 @@ fn an_exchange_completes_over_the_shipped_compio_transport() {
 ///
 /// 1. **The shipped transport declares the strategy** —
 ///    `the_shipped_compio_transport_elects_the_owned_region_path` below, now a compile-time
-///    assertion on the writer's associated `Strategy` type.
+///    assertion on the writer's associated `Model` type.
 /// 2. **The driver honours the declaration** — pinned by
 ///    `http_transport.rs::a_transport_can_elect_the_owned_region_path`, which counts the
 ///    region writes the driver actually performs.
@@ -261,23 +261,23 @@ fn a_shared_body_exchange_gathers_over_the_shipped_compio_transport() {
 /// completion fast path could have regressed to copying every octet without a single failure.
 ///
 /// The election is now the writer's declared
-/// [`Strategy`](ngnet_h2::http::transport::TransportWrite::Strategy), so this assertion is
+/// [`Model`](ngnet_h2::http::transport::TransportWrite::Model), so this assertion is
 /// made **at compile time** rather than by calling a predicate. That is strictly stronger
 /// than what stood here before: the old flag could be read `true` by this test while some
 /// other part of the contract went unimplemented, whereas declaring
-/// [`OwnedRegions`](ngnet_h2::http::transport::OwnedRegions) is inseparable from supplying
+/// [`Completion`](ngnet_h2::http::transport::Completion) is inseparable from supplying
 /// [`RegionWrite`](ngnet_h2::http::transport::RegionWrite) — the compiler will not accept one
 /// without the other.
 ///
-/// Mutation-verified: changing `CompioWriter`'s `type Strategy` to `Coalesced` fails this
-/// file to compile, with `expected `OwnedRegions`, found `Coalesced``.
+/// Mutation-verified: changing `CompioWriter`'s `type Model` to `Readiness` fails this file to
+/// compile, with `expected `Completion`, found `Readiness``.
 #[test]
 fn the_shipped_compio_transport_elects_the_owned_region_path() {
-    /// Compiles only if `W` declares exactly `OwnedRegions`. A different strategy is a type
+    /// Compiles only if `W` declares exactly `Completion`. A different model is a type
     /// error, not a failed assertion, so this cannot go vacuously green.
     fn elects_owned_regions<W>()
     where
-        W: TransportWrite<Strategy = OwnedRegions>,
+        W: TransportWrite<Model = Completion>,
     {
     }
 

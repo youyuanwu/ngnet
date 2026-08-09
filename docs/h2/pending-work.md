@@ -128,7 +128,7 @@ test, and no more.
   the new plumbing seam. (6) The API did change, additively — the opt-in is a parallel set of
   entry points, and the no-copy source trait stayed crate-private.
 
-  **The completion transport now gathers.** `CompioIo` declares the owned-region strategy,
+  **The completion transport now gathers.** `CompioIo` declares the completion model,
   whose regions are owned `Bytes`, which satisfies compio's `IoVectoredBuf: 'static` bound and
   reaches a real `IORING_OP_SENDMSG`. The structural reason it could not gather — that borrowed
   `IoSlice`s can never be `'static` — was correctly diagnosed here, and handing bodies over is
@@ -222,13 +222,15 @@ These are not gaps. They are decisions, recorded so they are not mistaken for ov
   not physics. h2c on a trusted network may well want them looser, and a public-facing server
   may want them tighter.
 
-- **Which write strategy a transport should elect.** Settled for the two that ship: the tokio
-  adapter declares `Gathering`, and the completion adapter declares `OwnedRegions` because a
-  completion API needs the kernel to own the buffer. Since the strategy split this is no longer
-  even a choice a shipped adapter re-litigates per call — it is one line of type declaration,
-  checked by the compiler. Gathering was measured to dominate rather than trade — zero
-  steady-state allocation *and* one write per pass — so there is no longer a knob-shaped
-  question here for a readiness transport. What remains open is narrower: `VECTORED_THRESHOLD`
+- **Which drain a connection should use.** No longer a transport question at all: a transport
+  declares only its I/O model, and the drain comes from `Config::write_policy`. The default,
+  `WritePolicy::Gathered`, was measured to dominate on realistic traffic — zero steady-state
+  allocation *and* one write per pass — and `WritePolicy::Coalesced` exists for the case where
+  it does not: at high region counts `writev` loses to a single copied `write` outright
+  (roughly 68 Kelem/s against 152 at N=64). Whether that crossover deserves an automatic
+  policy rather than a manual one is genuinely open, and deliberately not attempted: it would
+  need a region-count predictor in the driver, and the honest per-connection knob is available
+  now. What else remains open is narrower: `VECTORED_THRESHOLD`
   is 256 bytes, untuned, and deliberately so. Dumping real block sizes shows the distribution
   is sharply bimodal with nothing in between — control and `HEADERS` blocks at 9–73 bytes,
   DATA blocks at 16392–16393 (a 16 KiB payload with its 9-byte header already joined) — so any
@@ -242,24 +244,40 @@ These are not gaps. They are decisions, recorded so they are not mistaken for ov
   sit in a user-space buffer while the driver parks awaiting a response that never comes.
   The module doc's claim that "a completion write is committed when it completes" is true of
   a raw socket and false of a buffered wrapper. The tokio adapter already flushes in `commit`
-  for exactly this reason. Pre-existing — it predates the strategy split and is unchanged by
-  it — and deliberately not fixed there, because adding a flush per pass to the completion
+  for exactly this reason. Pre-existing — it predates both the strategy split and the write
+  policy, and is unchanged by either — and deliberately not fixed there, because adding a flush
+  per pass to the completion
   path is a behaviour change that would perturb the owned-region measurements that refactor
   had to hold constant. Fix wants its own change and its own before/after numbers, plus a
   bounded-budget regression test of the kind `http_flush.rs` already uses for tokio.
 
-- **Whether `ngnet-h3` and `ngnet-quic` should adopt the strategy split.** Transport traits
-  exist only in `ngnet-h2`; neither of the other crates has an equivalent, so the split was
-  deliberately scoped to h2. If either grows an I/O abstraction, the shape is worth copying
-  rather than reinventing: an associated `type Strategy` naming one of a sealed set, with the
-  operations on separate traits bounded by the strategy's I/O model, so a backend implements
-  exactly one model and the compiler enforces it. The two things that were not obvious and
-  would have to be rediscovered otherwise are that the `ReadinessStrategy`/`CompletionStrategy`
-  marker traits are load-bearing — without them one type can implement both models and it
-  compiles — and that resolving a capability once per connection needs an explicit `prepare`
-  step, because a driver generic over the base trait has no capability method in scope and
-  will otherwise re-read it per pass. Not worth doing speculatively; recorded so it is not
-  re-derived.
+- **Whether `ngnet-h3` and `ngnet-quic` should adopt the transport-trait shape.** Transport
+  traits exist only in `ngnet-h2`; neither of the other crates has an equivalent, so the shape
+  was deliberately scoped to h2. **The answer to what is worth copying changed** when the write
+  policy moved to the h2 layer, and the change is a simplification, so the advice is shorter
+  than it was:
+
+  Copy the *model* split, not a strategy split. An associated `type Model` naming one of a
+  sealed pair — readiness or completion — with the operations on separate traits bounded by
+  that model, so a backend implements exactly one and the compiler enforces it. Do **not**
+  give the backend a say in how the layer drains a pass; that is the layer's business, and a
+  backend that is asked will answer about itself rather than about the traffic.
+
+  Three things were not obvious and would have to be rediscovered otherwise:
+
+  1. The `ReadinessModel`/`CompletionModel` marker traits are load-bearing — without them one
+     type can implement both models and it compiles, which was verified by building exactly
+     that.
+  2. Make the gathering operation a *provided* default that loops over the model's required
+     primitive. Every backend then gathers by construction, one that can do better overrides,
+     and there is no capability to consult, no `prepare` step, and no once-per-connection
+     machinery — all of which the previous design needed and none of which survived.
+  3. A defaulted operation cannot be detected by the compiler when it is deleted, so a test
+     that means to pin a native override has to find a workload where native and emulated
+     genuinely differ. Most workloads do not, because accumulation collapses the region list
+     before the write; the handed-over no-copy path is the one that does.
+
+  Not worth doing speculatively; recorded so it is not re-derived.
 
 ## Testing gaps worth closing eventually
 

@@ -32,11 +32,12 @@ use std::sync::{Arc, Mutex};
 use core::future::Future;
 
 use ngnet_h2::http::testing::{
-    Duplex, DuplexReader, DuplexWriter, Empty, Failing, Full, Scripted, VectoredLog, alongside,
-    block_on, bytes_crate as bytes, duplex, duplex_borrowed, duplex_owned_regions, duplex_vectored,
-    failing, failing_borrowed, failing_vectored, http_crate as http, scripted, serve,
+    Duplex, DuplexReader, DuplexWriter, Empty, Failing, Full, Scripted, Vectored, VectoredLog,
+    alongside, block_on, bytes_crate as bytes, duplex, duplex_emulating, duplex_owned_regions,
+    duplex_vectored, failing, failing_borrowed, failing_vectored, http_crate as http, scripted,
+    serve,
 };
-use ngnet_h2::http::transport::{Coalesced, Transport, TransportWrite};
+use ngnet_h2::http::transport::{BorrowedWrite, Readiness, Transport, TransportWrite};
 use ngnet_h2::http::{
     Error as HttpError, IncomingBody, ResponseFuture, SendRequest, handshake, handshake_shared,
 };
@@ -670,9 +671,10 @@ fn the_readiness_paths_hand_over_the_whole_payload_from_caller_memory() {
         );
     }
 
-    // Borrowed: each payload is its own single-region uncopied write, logged the same way.
+    // Emulating: gathering runs through the trait default, so each region becomes its own
+    // single-region uncopied write, logged the same way.
     {
-        let (client_side, server_side) = duplex_borrowed();
+        let (client_side, server_side) = duplex_emulating();
         let log = client_side.vectored_log();
         let (body, ranges, expected) = make_body();
         let peer = upload_tracked(client_side, server_side, body);
@@ -738,24 +740,26 @@ fn the_readiness_paths_hand_over_the_whole_payload_from_caller_memory() {
 /// A transport that keeps the octets of every owned write, grouped by the write that
 /// produced them.
 ///
-/// It wraps an ordinary owned [`Duplex`] — the coalescing shape, which offers neither fast
-/// path — and forwards every write on unchanged, so the connection it drives is a real one
-/// talking to a real peer. All it adds is a tap: each owned write's octets are cloned into
-/// `passes` before being handed on. On the owned shape the driver gathers a whole pass into
-/// a single `write`, so one entry in `passes` is exactly one driver pass, in order. That is
-/// what lets the ordering test speak about *passes* rather than only about the flat wire —
-/// which frames the driver chose to emit together, and in what order within the pass.
+/// It wraps an ordinary [`Duplex`] and forwards every write on unchanged, so the connection it
+/// drives is a real one talking to a real peer. All it adds is a tap: each write's octets are
+/// cloned into `passes` before being handed on. The driver emits one write per pass on both
+/// readiness policies — one owned `write` under [`WritePolicy::Coalesced`], one gathered
+/// `write_vectored` under [`WritePolicy::Gathered`] — so both are tapped and exactly one of
+/// them runs for a given connection. Either way one entry in `passes` is one driver pass, in
+/// order. That is what lets the ordering test speak about *passes* rather than only about the
+/// flat wire — which frames the driver chose to emit together, and in what order within the
+/// pass.
 ///
 /// Defined here rather than in `testing.rs` for the same reason `http_flush.rs` keeps its
 /// `GatheringBuffer` local: it exists to make one point in one file, and the crate's public
 /// testing surface is pinned by `compat_surface.rs`, not a place to add things casually.
 struct Recording {
-    inner: Duplex<Coalesced>,
+    inner: Duplex<Vectored>,
     passes: Rc<RefCell<Vec<Vec<u8>>>>,
 }
 
 struct RecordingWriter {
-    inner: DuplexWriter<Coalesced>,
+    inner: DuplexWriter<Vectored>,
     passes: Rc<RefCell<Vec<Vec<u8>>>>,
 }
 
@@ -765,7 +769,7 @@ impl Recording {
     /// The handle is shared rather than reachable through the transport because
     /// [`Transport::split`] consumes the transport and moves the writer out of reach, and
     /// the recorded passes are exactly what the test must read afterwards.
-    fn over(inner: Duplex<Coalesced>) -> (Self, Rc<RefCell<Vec<Vec<u8>>>>) {
+    fn over(inner: Duplex<Vectored>) -> (Self, Rc<RefCell<Vec<Vec<u8>>>>) {
         let passes = Rc::new(RefCell::new(Vec::new()));
         (
             Self {
@@ -794,15 +798,39 @@ impl Transport for Recording {
 }
 
 impl TransportWrite for RecordingWriter {
-    type Strategy = Coalesced;
+    type Model = Readiness;
 
     fn write(&mut self, buf: Bytes) -> impl Future<Output = (io::Result<usize>, Bytes)> {
-        // Recorded before the write is forwarded, so the group order is the pass order.
-        // Overriding neither `write_borrowed` nor `write_vectored` keeps the driver on the
-        // owned strategy, where one call here is one whole pass — the property this tap
-        // relies on to attribute frames to passes.
+        // Recorded before the write is forwarded, so the group order is the pass order. This
+        // is the tap for `WritePolicy::Coalesced`, where one call is one whole pass.
         self.passes.borrow_mut().push(buf.to_vec());
         self.inner.write(buf)
+    }
+}
+
+impl BorrowedWrite for RecordingWriter {
+    fn write_borrowed<'w>(
+        &'w mut self,
+        data: &'w [u8],
+    ) -> impl Future<Output = io::Result<usize>> + 'w {
+        // Untapped on purpose: `write_vectored` below is overridden, so the gathering default
+        // never loops through here and a recorded entry could not be a whole pass anyway.
+        self.inner.write_borrowed(data)
+    }
+
+    fn write_vectored<'w>(
+        &'w mut self,
+        regions: &'w [io::IoSlice<'w>],
+    ) -> impl Future<Output = io::Result<usize>> + 'w {
+        // The tap for `WritePolicy::Gathered` — the default on this transport. The regions of
+        // one gathered write are one driver pass, so they are flattened into one entry, which
+        // keeps `passes` the same shape it has on the coalesced path.
+        let mut pass = Vec::new();
+        for region in regions {
+            pass.extend_from_slice(region);
+        }
+        self.passes.borrow_mut().push(pass);
+        self.inner.write_vectored(regions)
     }
 }
 

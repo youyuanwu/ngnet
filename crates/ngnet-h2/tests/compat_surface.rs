@@ -299,13 +299,13 @@ mod asynchronous {
         bytes_crate as bytes, http_body_crate as http_body, http_crate as http,
     };
     use ngnet_h2::http::transport::{
-        BorrowedWrite, Coalesced, CompletionStrategy, Elects, Gathering, OwnedRegions, Pass,
-        PerRegion, ReadinessStrategy, RegionWrite, VectoredWrite, WriteStrategy,
+        BorrowedWrite, Completion, CompletionModel, Drains, Pass, Readiness, ReadinessModel,
+        RegionWrite, WriteModel,
     };
     use ngnet_h2::http::{
         Config, Error, ErrorKind, IncomingBody, ResponseFuture, SendRequest, Transport,
-        TransportRead, TransportWrite, handshake, handshake_shared, handshake_shared_with,
-        handshake_with,
+        TransportRead, TransportWrite, WritePolicy, handshake, handshake_shared,
+        handshake_shared_with, handshake_with,
     };
 
     /// The connection configuration, pinned as a `Copy` builder with conservative
@@ -567,8 +567,11 @@ mod asynchronous {
 
         let carried: TokioIo<T> = TokioIo::new(stream);
         let (reader, writer): (TokioReader<T>, TokioWriter<T>) = Transport::split(carried);
-        // `TokioWriter` elects `Gathering`, so it is named through the vectored model surface.
-        vectored_write_surface::<TokioWriter<T>>();
+        // `TokioWriter` is a readiness transport, so it is named through the borrowed model
+        // surface — which now carries `write_vectored` too. It overrides that default when
+        // the stream reports `is_write_vectored`, and inherits the loop when it does not, but
+        // neither fact is visible in the surface: gathering is present either way.
+        borrowed_write_surface::<TokioWriter<T>>();
         drop((reader, writer));
     }
 
@@ -616,89 +619,125 @@ mod asynchronous {
             fn assert_future<F: core::future::Future<Output = std::io::Result<()>>>(_: F) {}
             assert_future(writer.commit());
         }
-        // The strategy is an associated type on the writer, bounded to a `WriteStrategy` that
-        // also `Elects<W>`. Naming both bounds keeps the pair from being loosened silently.
-        fn strategy_is_a_write_strategy<W: TransportWrite>()
+        // The I/O model is an associated type on the writer, bounded to a `WriteModel` that
+        // also `Drains<W>`. Naming both bounds keeps the pair from being loosened silently.
+        // This replaces the former `Strategy`/`WriteStrategy`/`Elects` triple: a writer now
+        // declares only *how* it does I/O, never *which drain shape* the h2 layer should use.
+        fn model_is_a_write_model<W: TransportWrite>()
         where
-            W::Strategy: WriteStrategy + Elects<W>,
+            W::Model: WriteModel + Drains<W>,
         {
         }
         let _ = write_takes_and_returns_owned::<W>;
         let _ = commit_returns_a_result_future::<W>;
-        let _ = strategy_is_a_write_strategy::<W>;
+        let _ = model_is_a_write_model::<W>;
     }
 
     /// The borrowed (per-region) fast path, pinned as a **method that is always present**,
     /// not an `Option` to inspect.
     ///
     /// The refactor moved the decision out of the return type and into the type system: a
-    /// writer offers this path by carrying a [`ReadinessStrategy`] and implementing
+    /// writer offers this path by carrying a [`ReadinessModel`] and implementing
     /// [`BorrowedWrite`], so `write_borrowed` is an ordinary future of the octet count. The
-    /// `where` clause is the strategy bound the trait itself imposes, named here so it cannot
+    /// `where` clause is the model bound the trait itself imposes, named here so it cannot
     /// be dropped.
+    ///
+    /// `write_vectored` now lives on this trait too, with a provided default that loops over
+    /// `write_borrowed`. The former `VectoredWrite` trait is gone: there is no longer a
+    /// separate opt-in to gathering, because every readiness transport gathers.
     pub(super) fn borrowed_write_surface<W: BorrowedWrite>()
     where
-        W::Strategy: ReadinessStrategy,
+        W::Model: ReadinessModel,
     {
         fn borrowed_is_one_future<W: BorrowedWrite>(writer: &mut W, data: &[u8])
         where
-            W::Strategy: ReadinessStrategy,
+            W::Model: ReadinessModel,
         {
             fn assert_future<F: core::future::Future<Output = std::io::Result<usize>>>(_: F) {}
             assert_future(writer.write_borrowed(data));
         }
-        let _ = borrowed_is_one_future::<W>;
-    }
-
-    /// The vectored (gathering) fast path, pinned as a `gathers()` boolean and an always-present
-    /// `write_vectored` method.
-    ///
-    /// [`VectoredWrite`] requires [`BorrowedWrite`], so this model also has the borrowed path;
-    /// `gathers` is the once-per-connection property the driver reads to decide whether the
-    /// gathering write really writes every region or must fall back to the borrowed one. The
-    /// write itself is now a plain future of the octet count, not an `Option`.
-    pub(super) fn vectored_write_surface<W: VectoredWrite>()
-    where
-        W::Strategy: ReadinessStrategy,
-    {
-        fn gathers_is_a_bool<W: VectoredWrite>(writer: &W)
-        where
-            W::Strategy: ReadinessStrategy,
-        {
-            let _: bool = writer.gathers();
-        }
-        fn vectored_is_one_future<W: VectoredWrite>(
+        fn vectored_is_one_future<W: BorrowedWrite>(
             writer: &mut W,
             regions: &[std::io::IoSlice<'_>],
         ) where
-            W::Strategy: ReadinessStrategy,
+            W::Model: ReadinessModel,
         {
             fn assert_future<F: core::future::Future<Output = std::io::Result<usize>>>(_: F) {}
             assert_future(writer.write_vectored(regions));
         }
-        // A vectored writer is a borrowed writer too — the fallback when `gathers()` is false.
-        borrowed_write_surface::<W>();
-        let _ = gathers_is_a_bool::<W>;
+        let _ = borrowed_is_one_future::<W>;
         let _ = vectored_is_one_future::<W>;
+    }
+
+    /// The minimal readiness transport, pinned by *compiling*: `write_borrowed` is the only
+    /// required write operation.
+    ///
+    /// This is the successor to the deleted `vectored_write_surface`, which pinned a
+    /// `gathers()` boolean and a separate `VectoredWrite` trait. Both are gone. What replaces
+    /// them is this: gathering is not something a transport opts into, so the surface to pin
+    /// is that it can be reached *without* being mentioned.
+    pub(super) fn minimal_readiness_surface() {
+        struct Minimal;
+
+        impl TransportWrite for Minimal {
+            type Model = Readiness;
+
+            async fn write(&mut self, buf: bytes::Bytes) -> (std::io::Result<usize>, bytes::Bytes) {
+                let written = buf.len();
+                (Ok(written), buf)
+            }
+        }
+
+        impl BorrowedWrite for Minimal {
+            async fn write_borrowed<'w>(&'w mut self, data: &'w [u8]) -> std::io::Result<usize> {
+                Ok(data.len())
+            }
+        }
+
+        // It gathers, without having said so — the point of the whole inversion.
+        borrowed_write_surface::<Minimal>();
+    }
+
+    /// The minimal completion transport, pinned by *compiling*: `write` is the only required
+    /// write operation, because `RegionWrite` has no required methods at all.
+    ///
+    /// `impl RegionWrite for X {}` is the successor to the deleted `type Strategy = Coalesced;`
+    /// — the way a transport says "I have nothing special to offer" — and the default loops
+    /// the owned regions through `write`.
+    pub(super) fn minimal_completion_surface() {
+        struct Minimal;
+
+        impl TransportWrite for Minimal {
+            type Model = Completion;
+
+            async fn write(&mut self, buf: bytes::Bytes) -> (std::io::Result<usize>, bytes::Bytes) {
+                let written = buf.len();
+                (Ok(written), buf)
+            }
+        }
+
+        impl RegionWrite for Minimal {}
+
+        region_write_surface::<Minimal>();
     }
 
     /// The owned-region (completion) fast path, pinned as `write_regions`, which takes an owned
     /// `Vec<Bytes>` and hands it back.
     ///
     /// This model is the completion transport's zero-copy write, gated on a
-    /// [`CompletionStrategy`] rather than a readiness one — the two are disjoint, so a writer
-    /// carries exactly one of the fast paths, never this alongside the borrowed or vectored
-    /// ones. The `Vec` returns so the driver can reuse its allocation and never loses owned
-    /// buffers to an error.
+    /// [`CompletionModel`] rather than a readiness one — the two are disjoint, so a writer
+    /// carries exactly one of the fast paths, never this alongside the borrowed one. The
+    /// `Vec` returns so the driver can reuse its allocation and never loses owned buffers to
+    /// an error. `write_regions` is now **provided**, so this trait has no required methods.
     pub(super) fn region_write_surface<W: RegionWrite>()
     where
-        W::Strategy: CompletionStrategy,
+        W::Model: CompletionModel,
     {
         fn write_regions_takes_and_returns_owned_regions<W: RegionWrite>(
             writer: &mut W,
             regions: Vec<bytes::Bytes>,
         ) where
-            W::Strategy: CompletionStrategy,
+            W::Model: CompletionModel,
         {
             fn assert_future<
                 F: core::future::Future<Output = (std::io::Result<usize>, Vec<bytes::Bytes>)>,
@@ -736,100 +775,142 @@ mod asynchronous {
         unreachable!("the client surface fixture is never executed")
     }
 
-    /// The four strategy markers and their strategy-trait memberships, pinned as types.
+    /// The **two** I/O-model markers and their model-trait memberships, pinned as types.
     ///
-    /// The markers are the whole basis of the refactor: a writer carries exactly one, and it
-    /// decides which fast-path trait the writer may implement. Naming each as a value and
-    /// asserting the strategy traits it belongs to (or, for [`Coalesced`], the ones it must
-    /// *not*) keeps that classification from drifting.
+    /// There used to be four markers, and they named a *drain*: `Coalesced`, `PerRegion`,
+    /// `Gathering`, `OwnedRegions`. All four are gone. A writer no longer declares a drain at
+    /// all — it declares only whether its I/O is readiness- or completion-based, and the h2
+    /// layer picks the drain from [`WritePolicy`]. So the classification pinned here is
+    /// narrower than it was, and deliberately so: there is nothing left for a transport to get
+    /// wrong.
     ///
-    /// [`Elects`] and [`Pass`] are named in the write-half bounds and here as a type. Note
-    /// that [`Elects::drain`] cannot be exercised from an integration test: a [`Pass`] is
+    /// [`Drains`] and [`Pass`] are named in the write-half bounds and here as a type. Note
+    /// that [`Drains::drain`] cannot be exercised from an integration test: a [`Pass`] is
     /// unconstructible outside the crate — its only field is `pub(crate)` — so a downstream
     /// caller can name the type but never build one. `drain`'s behaviour is therefore pinned
     /// by an in-crate doctest rather than here; this comment records that split so the gap is
     /// deliberate rather than silent.
-    pub(super) fn strategy_marker_surface() {
-        fn is_write_strategy<S: WriteStrategy>() {}
-        fn is_readiness_strategy<S: ReadinessStrategy>() {}
-        fn is_completion_strategy<S: CompletionStrategy>() {}
+    pub(super) fn model_marker_surface() {
+        fn is_write_model<M: WriteModel>() {}
+        fn is_readiness_model<M: ReadinessModel>() {}
+        fn is_completion_model<M: CompletionModel>() {}
 
-        // Every marker is a `WriteStrategy`.
-        is_write_strategy::<Coalesced>();
-        is_write_strategy::<PerRegion>();
-        is_write_strategy::<Gathering>();
-        is_write_strategy::<OwnedRegions>();
+        // Both markers are a `WriteModel`.
+        is_write_model::<Readiness>();
+        is_write_model::<Completion>();
 
-        // The two readiness markers, and the one completion marker. `Coalesced` is neither,
-        // which is what keeps it from admitting any fast-path trait.
-        is_readiness_strategy::<PerRegion>();
-        is_readiness_strategy::<Gathering>();
-        is_completion_strategy::<OwnedRegions>();
+        // And each belongs to exactly one side. The disjointness is what keeps a writer from
+        // carrying both fast paths; that it cannot is pinned by the compile-fail doctests.
+        is_readiness_model::<Readiness>();
+        is_completion_model::<Completion>();
 
         // The markers named as values, so a rename or removal fails here too.
-        let _: Coalesced = Coalesced;
-        let _: PerRegion = PerRegion;
-        let _: Gathering = Gathering;
-        let _: OwnedRegions = OwnedRegions;
+        let _: Readiness = Readiness;
+        let _: Completion = Completion;
 
         // `Pass<'_>` named as a type. It is unconstructible from here (see the note above),
         // so only its name and lifetime are pinned.
         let _: Option<fn(Pass<'_>)> = None;
+    }
+
+    /// The write policy: the public API that replaces the backend's say in how a pass drains.
+    ///
+    /// This is the new surface the whole change exists to add. It is a plain two-variant enum
+    /// on [`Config`], not a boolean, because "gathering" already names something specific in
+    /// this crate — accumulating small blocks while lending large ones uncopied — and a
+    /// `gather_writes(false)` would have *copied more*, not gathered less.
+    pub(super) fn write_policy_surface() {
+        // Both variants, named.
+        let gathered: WritePolicy = WritePolicy::Gathered;
+        let coalesced: WritePolicy = WritePolicy::Coalesced;
+
+        // `Copy`, `Clone`, `Debug`, `PartialEq`, `Eq` — the derives a config knob needs to be
+        // usable in an `assert_eq!` and storable in a `Copy` `Config`. `Copy` is pinned by
+        // using `gathered` twice by value; `Clone` is pinned through the fully-qualified call
+        // rather than `.clone()`, which would resolve to the `Copy` and draw
+        // `clippy::clone_on_copy`.
+        let _: WritePolicy = gathered;
+        let _: WritePolicy = gathered;
+        let _: WritePolicy = Clone::clone(&coalesced);
+        let _: String = format!("{gathered:?}");
+        let _: bool = gathered == coalesced;
+
+        // `Default` is `Gathered`: gathering is on unless a caller turns it off.
+        assert_eq!(WritePolicy::default(), WritePolicy::Gathered);
+
+        // The setter, on the `Copy` builder, reachable wherever a connection is configured —
+        // which is both `handshake_with`/`handshake_shared_with` on the client and
+        // `server::serve_with` on the server, since both take a `Config`.
+        let _: Config = Config::default().write_policy(WritePolicy::Coalesced);
+        let _: fn(Config, WritePolicy) -> Config = Config::write_policy;
     }
 }
 
 #[cfg(feature = "http")]
 #[test]
 fn the_asynchronous_surface_is_unchanged() {
-    use ngnet_h2::http::testing::{Duplex, DuplexReader, DuplexWriter, Empty};
-    use ngnet_h2::http::transport::{Coalesced, Gathering, OwnedRegions, PerRegion};
+    use ngnet_h2::http::testing::{
+        Duplex, DuplexReader, DuplexWriter, Empty, Emulating, RegionEmulating, Regions, Vectored,
+    };
 
     let _: fn(&ngnet_h2::http::Error) = asynchronous::error_surface;
-    let _: fn(Duplex<Coalesced>) -> core::result::Result<(), ngnet_h2::http::Error> =
-        asynchronous::client_surface::<Duplex<Coalesced>, Empty>;
+    let _: fn(Duplex<Vectored>) -> core::result::Result<(), ngnet_h2::http::Error> =
+        asynchronous::client_surface::<Duplex<Vectored>, Empty>;
     let _: fn(&ngnet_h2::http::IncomingBody) = asynchronous::incoming_body_surface;
     let _: fn(&ngnet_h2::http::Cancelled) = asynchronous::cancelled_surface;
     // The writing half's base contract — `write` and `commit` — pinned generically so the
     // shape holds for every transport, not only the ready-made tokio one.
-    asynchronous::write_half_surface::<DuplexWriter<Coalesced>>();
-    // Each fast path is now its own model trait, pinned through the concrete `DuplexWriter`
-    // that carries the matching strategy: borrowed on `PerRegion`, vectored on `Gathering`,
-    // owned regions on `OwnedRegions`. A plain `TransportWrite` bound admits none of them.
-    asynchronous::borrowed_write_surface::<DuplexWriter<PerRegion>>();
-    asynchronous::vectored_write_surface::<DuplexWriter<Gathering>>();
-    asynchronous::region_write_surface::<DuplexWriter<OwnedRegions>>();
+    asynchronous::write_half_surface::<DuplexWriter<Vectored>>();
+    // Each fast path is its own model trait, pinned through the concrete `DuplexWriter` that
+    // carries the matching I/O model: `BorrowedWrite` on the readiness halves, `RegionWrite`
+    // on the completion one. A plain `TransportWrite` bound admits neither.
+    //
+    // `borrowed_write_surface` is pinned against *both* readiness halves on purpose: the
+    // natively-gathering one, which overrides `write_vectored`, and the emulating one, which
+    // does not. That both satisfy the same bound is the surface-level statement of "every
+    // readiness transport gathers".
+    asynchronous::borrowed_write_surface::<DuplexWriter<Vectored>>();
+    asynchronous::borrowed_write_surface::<DuplexWriter<Emulating>>();
+    asynchronous::region_write_surface::<DuplexWriter<Regions>>();
+    // And that each is reachable with nothing beyond the one required method.
+    asynchronous::minimal_readiness_surface();
+    asynchronous::minimal_completion_surface();
     // The read side was deliberately *not* split; this pins that non-change as evidence.
     asynchronous::read_half_surface::<DuplexReader>();
-    // The strategy markers, their strategy-trait memberships, and `Pass`/`Elects` as named
-    // types (with the note on why `Elects::drain` is pinned by an in-crate doctest instead).
-    asynchronous::strategy_marker_surface();
+    // The I/O-model markers, their model-trait memberships, and `Pass`/`Drains` as named
+    // types (with the note on why `Drains::drain` is pinned by an in-crate doctest instead).
+    asynchronous::model_marker_surface();
+    // The write policy — the public API this change adds.
+    asynchronous::write_policy_surface();
     // The vectored testing transport and its observation handle. Hidden from the docs but
     // still public, and integration tests are separate crates that can reach nothing else.
-    let _: fn() -> (Duplex<Gathering>, Duplex<Gathering>) =
-        ngnet_h2::http::testing::duplex_vectored;
-    // The non-gathering vectored transport, whose `gathers()` returns false so the driver
-    // falls back to the borrowed path. Same shape as `duplex_vectored`.
-    let _: fn() -> (Duplex<Gathering>, Duplex<Gathering>) =
-        ngnet_h2::http::testing::duplex_vectored_non_gathering;
-    // The borrowed (per-region) testing transport, mirroring the vectored one.
-    let _: fn() -> (Duplex<PerRegion>, Duplex<PerRegion>) =
-        ngnet_h2::http::testing::duplex_borrowed;
-    // The completion-shaped transport: it elects the owned-region path, taking ownership of a
-    // list of `Bytes` rather than borrowing slices.
-    let _: fn() -> (Duplex<OwnedRegions>, Duplex<OwnedRegions>) =
+    let _: fn() -> (Duplex<Vectored>, Duplex<Vectored>) = ngnet_h2::http::testing::duplex_vectored;
+    // The emulating transport, which reaches gathering only through `write_vectored`'s
+    // provided default. It replaces both `duplex_borrowed` and
+    // `duplex_vectored_non_gathering`, which named the two halves of a distinction that no
+    // longer exists: there is no per-region *drain* to fall back to, and no way to decline.
+    let _: fn() -> (Duplex<Emulating>, Duplex<Emulating>) =
+        ngnet_h2::http::testing::duplex_emulating;
+    // The completion-shaped transport: it takes ownership of a list of `Bytes` rather than
+    // borrowing slices.
+    let _: fn() -> (Duplex<Regions>, Duplex<Regions>) =
         ngnet_h2::http::testing::duplex_owned_regions;
-    // The election-log handle a once-per-connection or region-write assertion reads. The
-    // strategy is settled at construction now, so `election_log` is generic over the marker.
-    let _: fn(&Duplex<Gathering>) -> ngnet_h2::http::testing::ElectionLog = Duplex::election_log;
-    // `gathers_consultations` counts how often the driver read `gathers()` — the headline
-    // once-per-connection guarantee — and `region_writes` counts owned-region writes. The
-    // deleted `vectored_probes` and `owned_region_elections` had no meaning once a writer can
-    // no longer be probed for or decline a path it did not declare.
-    let _: fn(&ngnet_h2::http::testing::ElectionLog) -> usize =
-        ngnet_h2::http::testing::ElectionLog::gathers_consultations;
+    // The completion-side emulating transport: `impl RegionWrite for X {}` with no override,
+    // so its gathering writes go through `write_regions`' provided default. It is the only
+    // shape in the workspace that runs that default — every other completion writer, shipped
+    // or test-only, overrides it — so without this the completion emulation is untested.
+    let _: fn() -> (Duplex<RegionEmulating>, Duplex<RegionEmulating>) =
+        ngnet_h2::http::testing::duplex_region_emulating;
+    // The election-log handle a region-write assertion reads.
+    let _: fn(&Duplex<Vectored>) -> ngnet_h2::http::testing::ElectionLog = Duplex::election_log;
+    // `region_writes` counts owned-region writes, and is now the only counter left on this
+    // handle. `gathers_consultations` is **deleted**: it counted how often the driver read
+    // `VectoredWrite::gathers()`, and there is nothing to read any more — no run-time
+    // capability is consulted on any path, which is a stronger statement than the
+    // once-per-connection guarantee it used to pin.
     let _: fn(&ngnet_h2::http::testing::ElectionLog) -> usize =
         ngnet_h2::http::testing::ElectionLog::region_writes;
-    let _: fn(&Duplex<Gathering>) -> ngnet_h2::http::testing::VectoredLog = Duplex::vectored_log;
+    let _: fn(&Duplex<Vectored>) -> ngnet_h2::http::testing::VectoredLog = Duplex::vectored_log;
     let _: fn(&ngnet_h2::http::testing::VectoredLog) -> Vec<Vec<usize>> =
         ngnet_h2::http::testing::VectoredLog::calls;
     let _: fn(&ngnet_h2::http::testing::VectoredLog) -> Vec<u8> =
@@ -839,43 +920,39 @@ fn the_asynchronous_surface_is_unchanged() {
     let _: fn(&ngnet_h2::http::testing::VectoredLog) = ngnet_h2::http::testing::VectoredLog::reset;
     let _: fn(&ngnet_h2::http::testing::VectoredLog) -> Vec<Vec<usize>> =
         ngnet_h2::http::testing::VectoredLog::bases;
-    let _: fn(&Duplex<Gathering>, Vec<usize>) = |duplex, caps| duplex.accept_at_most(caps);
-    // The failing transport's two readiness-strategy constructors and its log handle, added
-    // so a transport error can be driven through the vectored and borrowed fast paths. Hidden
+    let _: fn(&Duplex<Vectored>, Vec<usize>) = |duplex, caps| duplex.accept_at_most(caps);
+    // The failing transport's two readiness constructors and its log handle, so a transport
+    // error can be driven through both the native and the emulated gathering path. Hidden
     // from the docs like the rest of `testing`, but public, so pinned here beside the duplex
-    // constructors they mirror.
+    // constructors they mirror. The two now differ in *where* the failure can land — one
+    // gathered call, or part-way through the default's loop — rather than in which drain the
+    // transport elected.
+    let _: fn(usize, bool) -> (ngnet_h2::http::testing::Failing<Vectored>, Duplex<Vectored>) =
+        ngnet_h2::http::testing::failing_vectored;
     let _: fn(
         usize,
         bool,
     ) -> (
-        ngnet_h2::http::testing::Failing<Gathering>,
-        Duplex<Gathering>,
-    ) = ngnet_h2::http::testing::failing_vectored;
-    let _: fn(
-        usize,
-        bool,
-    ) -> (
-        ngnet_h2::http::testing::Failing<PerRegion>,
-        Duplex<PerRegion>,
+        ngnet_h2::http::testing::Failing<Emulating>,
+        Duplex<Emulating>,
     ) = ngnet_h2::http::testing::failing_borrowed;
-    let _: fn(
-        &ngnet_h2::http::testing::Failing<Gathering>,
-    ) -> ngnet_h2::http::testing::VectoredLog = ngnet_h2::http::testing::Failing::vectored_log;
+    let _: fn(&ngnet_h2::http::testing::Failing<Vectored>) -> ngnet_h2::http::testing::VectoredLog =
+        ngnet_h2::http::testing::Failing::vectored_log;
     let _: fn() = asynchronous::config_surface;
     let _: fn(
-        Duplex<Coalesced>,
+        Duplex<Vectored>,
         ngnet_h2::http::Config,
     ) -> core::result::Result<(), ngnet_h2::http::Error> =
-        asynchronous::client_with_config_surface::<Duplex<Coalesced>, Empty>;
+        asynchronous::client_with_config_surface::<Duplex<Vectored>, Empty>;
     // The four no-copy entry points, pinned exactly as their copying counterparts are. They
     // return the same pair and take the same arguments; only the body bound differs.
-    let _: fn(Duplex<Coalesced>) -> core::result::Result<(), ngnet_h2::http::Error> =
-        asynchronous::client_shared_surface::<Duplex<Coalesced>, Empty>;
+    let _: fn(Duplex<Vectored>) -> core::result::Result<(), ngnet_h2::http::Error> =
+        asynchronous::client_shared_surface::<Duplex<Vectored>, Empty>;
     let _: fn(
-        Duplex<Coalesced>,
+        Duplex<Vectored>,
         ngnet_h2::http::Config,
     ) -> core::result::Result<(), ngnet_h2::http::Error> =
-        asynchronous::client_shared_with_config_surface::<Duplex<Coalesced>, Empty>;
+        asynchronous::client_shared_with_config_surface::<Duplex<Vectored>, Empty>;
     #[cfg(feature = "tokio")]
     {
         let _: fn(tokio::net::TcpStream) = asynchronous::tokio_transport_surface::<_>;
@@ -953,7 +1030,7 @@ fn the_asynchronous_surface_is_unchanged() {
     // `http::Request` and gets back an `http::Response`, not a bespoke type.
     let (client_side, _peer) = ngnet_h2::http::testing::duplex();
     let (requests, connection) =
-        ngnet_h2::http::handshake::<Duplex<Coalesced>, Empty>(client_side).expect("handshake");
+        ngnet_h2::http::handshake::<Duplex<Vectored>, Empty>(client_side).expect("handshake");
     let response: ngnet_h2::http::ResponseFuture = requests.send_request(
         ngnet_h2::http::testing::http_crate::Request::builder()
             .uri("http://example.test/")

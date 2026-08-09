@@ -25,12 +25,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Wake;
 
 use ngnet_h2::http::testing::{
-    Duplex, DuplexReader, Full, block_on, duplex, duplex_borrowed, duplex_owned_regions,
+    Duplex, DuplexReader, Full, block_on, duplex, duplex_emulating, duplex_owned_regions,
     duplex_vectored, http_crate as http,
 };
-use ngnet_h2::http::transport::{
-    BorrowedWrite, Coalesced, Gathering, OwnedRegions, PerRegion, RegionWrite, VectoredWrite,
-};
+use ngnet_h2::http::transport::{BorrowedWrite, Completion, Readiness, RegionWrite};
 use ngnet_h2::http::{Transport, TransportRead, TransportWrite};
 
 use bytes::{Bytes, BytesMut};
@@ -42,7 +40,7 @@ use core::task::{Context, Poll, Waker};
 ///
 /// This is the shape `io_uring`-backed runtimes need, and it compiles without naming
 /// `write_borrowed` — the default carries it.
-struct Completion {
+struct CompletionOnly {
     written: Vec<u8>,
     to_read: Vec<u8>,
 }
@@ -55,7 +53,7 @@ struct CompletionWriter {
     written: Vec<u8>,
 }
 
-impl Transport for Completion {
+impl Transport for CompletionOnly {
     type Reader = CompletionReader;
     type Writer = CompletionWriter;
 
@@ -81,7 +79,7 @@ impl TransportRead for CompletionReader {
 }
 
 impl TransportWrite for CompletionWriter {
-    type Strategy = Coalesced;
+    type Model = Completion;
 
     async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
         self.written.extend_from_slice(&buf);
@@ -91,13 +89,13 @@ impl TransportWrite for CompletionWriter {
 }
 
 /// A readiness-based transport: overrides the borrowed path and advertises it.
-struct Readiness;
+struct ReadinessOnly;
 
 struct ReadinessHalf {
     borrowed: Rc<RefCell<usize>>,
 }
 
-impl Transport for Readiness {
+impl Transport for ReadinessOnly {
     type Reader = ReadinessHalf;
     type Writer = ReadinessHalf;
 
@@ -119,7 +117,7 @@ impl TransportRead for ReadinessHalf {
 }
 
 impl TransportWrite for ReadinessHalf {
-    type Strategy = PerRegion;
+    type Model = Readiness;
 
     async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
         let written = buf.len();
@@ -182,7 +180,7 @@ impl TransportRead for VectoredOnly {
 }
 
 impl TransportWrite for VectoredOnly {
-    type Strategy = Gathering;
+    type Model = Readiness;
 
     async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
         let written = buf.len();
@@ -202,9 +200,7 @@ impl BorrowedWrite for VectoredOnly {
         self.regions_seen.borrow_mut().push(1);
         core::future::ready(Ok(data.len()))
     }
-}
 
-impl VectoredWrite for VectoredOnly {
     fn write_vectored<'w>(
         &'w mut self,
         regions: &'w [io::IoSlice<'w>],
@@ -230,13 +226,18 @@ struct OwnedRegionsOnly {
 }
 
 impl TransportWrite for OwnedRegionsOnly {
-    type Strategy = OwnedRegions;
+    type Model = Completion;
 
     async fn write(&mut self, buf: Bytes) -> (io::Result<usize>, Bytes) {
         let written = buf.len();
         (Ok(written), buf)
     }
 }
+
+/// The minimal completion transport: `RegionWrite` has no required methods, so an empty impl
+/// is the whole obligation. The default loops the owned regions through `write` above, which
+/// is what makes "every transport gathers" true without asking this one to do any work.
+impl RegionWrite for CompletionWriter {}
 
 impl RegionWrite for OwnedRegionsOnly {
     fn write_regions(
@@ -397,7 +398,7 @@ fn a_completion_transport_needs_no_borrowed_write_path() {
     // *cannot* demand a specialised capability of it. That is the guarantee: adding
     // strategies to the abstraction leaves a completion transport that wants none of them
     // compiling untouched.
-    let (mut reader, mut writer) = Completion {
+    let (mut reader, mut writer) = CompletionOnly {
         written: Vec::new(),
         to_read: b"from the peer".to_vec(),
     }
@@ -649,7 +650,7 @@ fn a_duplex_can_elect_the_owned_region_path() {
 
 #[test]
 fn a_readiness_transport_can_take_the_zero_copy_path() {
-    let (_reader, mut writer) = Readiness.split();
+    let (_reader, mut writer) = ReadinessOnly.split();
 
     // The borrowed path is now a method the `PerRegion` strategy obliges, not an `Option` to
     // inspect: declaring the strategy elected it, and calling it writes.
@@ -669,14 +670,14 @@ fn a_transport_need_not_be_send() {
     // it still satisfies the traits. Thread-per-core completion runtimes look exactly
     // like this.
     fn accepts_any_transport<T: Transport>(_transport: T) {}
-    accepts_any_transport(Readiness);
+    accepts_any_transport(ReadinessOnly);
 
     fn is_send<T: Send>() {}
-    is_send::<Completion>();
+    is_send::<CompletionOnly>();
 
-    // Deliberately *not* `is_send::<Readiness>()`: it need not be, and requiring it is the
+    // Deliberately *not* `is_send::<ReadinessOnly>()`: it need not be, and requiring it is the
     // mistake this test exists to prevent.
-    let (reader, _writer) = Readiness.split();
+    let (reader, _writer) = ReadinessOnly.split();
     let not_send: Rc<()> = Rc::new(());
     drop((reader, not_send));
 }
@@ -759,7 +760,7 @@ fn a_borrowed_write_duplex_takes_the_zero_copy_path_and_still_counts() {
     // The other of the two shapes the in-memory transport can take. Both are used by the
     // later drain-strategy assertions, so both need coverage here rather than one being
     // assumed to work because the other does.
-    let (client, server) = duplex_borrowed();
+    let (client, server) = duplex_emulating();
     let counter = client.write_counter();
     let (_reader, mut writer) = client.split();
     let (mut server_reader, _server_writer) = server.split();

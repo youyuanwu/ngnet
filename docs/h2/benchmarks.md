@@ -152,8 +152,9 @@ I/O. `hyper-tokio` falsifies that. hyper reaches 143–159 Kelem/s at N=64 on *e
 noise of compio's 160 — so almost none of the gap can be the I/O model, because hyper closes
 almost all of it without changing the I/O model at all.
 
-What the gap actually is: **the number of write syscalls per pass.** The tokio transport
-elected the borrowed path and issued a `write(2)` per session block; the completion transport
+What the gap actually is: **the number of write syscalls per pass.** The tokio transport, at
+the time, elected the borrowed path and issued a `write(2)` per session block; the completion
+transport
 structurally cannot borrow and so coalesced; hyper buffers outbound bytes and flushes in large
 writes, which is the same strategy by another name. So the two fast arms were the two
 coalescing arms, and the slow arm was the one writing per block — a cost invisible over a
@@ -161,7 +162,7 @@ duplex, dominant over a socket, and growing with the number of multiplexed strea
 each stream adds blocks to the pass.
 
 This was confirmed directly rather than inferred. Flipping *only* `TokioWriter`'s borrowed write off — at the time, by returning `None`;
-since the strategy split, by declaring `Coalesced` instead of `Gathering` — changing nothing else, moved `ngnet-h2-tokio` by **+95% at N=8 and +128% at
+since the write policy moved to the h2 layer, by setting `WritePolicy::Coalesced` instead of the default `WritePolicy::Gathered` — changing nothing else, moved `ngnet-h2-tokio` by **+95% at N=8 and +128% at
 N=64** (to ~152 Kelem/s), putting it level with compio and ahead of hyper.
 
 #### What that framing got wrong, and the gathering path
@@ -174,7 +175,7 @@ frame-item boundaries, and `Session::send` hands back a slice borrowing the sess
 most one block is live at a time. That forecloses gathering blocks **with each other** —
 nothing more. A live block gathers perfectly well with memory the driver already owns.
 
-`VectoredWrite::write_vectored` does exactly that: small blocks accumulate into a
+`BorrowedWrite::write_vectored` does exactly that: small blocks accumulate into a
 driver-owned buffer reused across passes, and a block at or above `VECTORED_THRESHOLD` goes
 out as the second region of a two-region `writev`, never copied.
 
@@ -214,7 +215,7 @@ so what gathering saves on a body upload is the *`HEADERS` block*, folded into t
 frame's `writev`, and nothing else — every DATA block already exceeds the threshold and goes
 out as its own single-region call either way:
 
-| Body | Borrowed writes | Gathering writes | Reduction |
+| Body | Writes without accumulation | Gathering writes | Reduction |
 | --- | --- | --- | --- |
 | 1 KiB | 2 | **1** | 50% |
 | 64 KiB | 5 | **4** | 20% |
@@ -289,11 +290,19 @@ rather than treated as a proxy for time.
 
 From `crates/ngnet-h2/tests/http_zero_alloc.rs`, exact counts per driver pass in steady state:
 
-| Strategy | Single upload | 8 multiplexed streams |
+| Shape (transport × policy) | Single upload | 8 multiplexed streams |
 | --- | --- | --- |
-| Owned (coalescing) | 0 allocs / 1 write | 0 allocs / 1 write |
-| Borrowed | 0 allocs / 4 writes | 0 allocs / **513 writes** |
-| **Gathering** | **0 allocs / 4 writes** | **0 allocs / 1 write** |
+| `WritePolicy::Coalesced`, either model | 0 allocs / 1 write | 0 allocs / 1 write |
+| `WritePolicy::Gathered`, natively gathering | **0 allocs / 4 writes** | **0 allocs / 1 write** |
+| `WritePolicy::Gathered`, emulating | **0 allocs / 4 writes** | **0 allocs / 1 write** |
+| *(removed)* `PerRegion` — per-block, no accumulation | 0 allocs / 4 writes | 0 allocs / **513 writes** |
+
+The last row is history, kept because the 513 is the number the whole gathering argument turns
+on. That drain no longer exists. A transport that cannot gather natively now emulates instead,
+and emulation is **not** the 513-write cliff: accumulation happens in the driver *before* any
+write, so the 512 small blocks collapse into one region and the emulating loop runs once. That
+is why the emulating row is identical to the native one on both workloads, and it is the
+structural reason mandatory gathering was affordable.
 
 The owned row read `4 allocs` and `12 allocs` when gathering was introduced, and that
 recurring cost was part of the argument for it. It has since been removed independently: the
@@ -303,8 +312,8 @@ owned path still pays, inherently, is a **copy** of every outgoing octet, becaus
 transport takes ownership.
 
 So the separating column is the write count, and it is a syscall count. Gathering reaches the
-borrowed path's zero allocation and zero copy of large blocks at the coalescing path's write
-count; the 513-to-1 collapse is the mechanism behind the −58.9% at N=64. This is also why the
+old borrowed path's zero allocation and zero copy of large blocks at the coalescing path's
+write count; the 513-to-1 collapse is the mechanism behind the −58.9% at N=64. This is also why the
 trade the previous section framed turned out not to exist — no values judgement about the
 library was needed, because nothing had to be given up.
 
@@ -414,7 +423,7 @@ Each is named with its direction, because a number without its bias is not evide
   the other two do not, which biases against compio on large bodies. That copy is no longer
   structural: `NGHTTP2_DATA_FLAG_NO_COPY` is implemented, and a connection that hands its
   bodies over makes the payload the caller's own `Bytes`, which even the completion transport
-  gathers as an owned region without copying (the owned-region strategy). What that buys,
+  gathers as an owned region without copying (the completion model's drain). What that buys,
   measured, is in *Handing bodies over, measured* below — large on the readiness transport,
   and honestly below this file's drift bar on the completion transport, because the completion
   push path already coalesced a pass into one write, so there was never a syscall to save
@@ -449,7 +458,7 @@ Read them as a measure of **protocol, wrapper and syscall CPU work**, and nothin
 
 - **The duplex removes the kernel.** No syscalls, no sockets, no network. Real-world
   performance is dominated by the things that family deletes — as the write-path finding
-  above demonstrates concretely: a strategy that is free over a duplex costs a factor of two
+  above demonstrates concretely: a drain that is free over a duplex costs a factor of two
   over a socket, and the duplex benches cannot see it. A change that helps there may be
   invisible on a real socket, and a change that hurts there may not matter.
 - **Criterion reports wall-clock time.** A stack that burns more CPU to fill the same wall

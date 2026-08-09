@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ngnet_h2::http::testing::{
-    self, Empty, Full, alongside, block_on, duplex, duplex_borrowed, http_crate as http, serve,
+    self, Empty, Full, alongside, block_on, duplex, duplex_emulating, http_crate as http, serve,
 };
 use ngnet_h2::{
     BodyOutcome, BodySource, ErrorCode, FrameType, Header, HeaderAction, HeaderCategory, Session,
@@ -493,11 +493,11 @@ fn a_connection_specific_field_is_rejected() {
 }
 
 #[test]
-fn the_borrowed_write_path_carries_an_exchange_too() {
-    // Which write strategy runs is the transport's choice and the two are mutually
-    // exclusive, so both have to be exercised. This is the same exchange as the first
-    // test over a transport that takes its octets borrowed.
-    let (client_side, server_side) = duplex_borrowed();
+fn the_emulated_gathering_path_carries_an_exchange_too() {
+    // Gathering is mandatory, but a transport reaches it either natively or through the
+    // trait's looping default, and the two put a different number of writes on the wire.
+    // This is the same exchange as the first test over a transport that only emulates.
+    let (client_side, server_side) = duplex_emulating();
     let (requests, connection) =
         ngnet_h2::http::handshake::<_, Full>(client_side).expect("handshake");
 
