@@ -32,6 +32,12 @@ tower-service.workspace = true
 # matters; nothing here contradicts it.
 [dev-dependencies]
 bytes.workspace = true
+# The acceptance suite needs a response body that yields chunks when the *test* decides to,
+# so that "the client saw the first chunk before the handler produced the second" can be
+# asserted causally rather than by sleeping. axum's `Body::from_stream` would want a
+# `futures_core::Stream` and therefore a further dependency; implementing `http_body::Body`
+# over a channel directly is smaller and says exactly what it does.
+http-body.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
