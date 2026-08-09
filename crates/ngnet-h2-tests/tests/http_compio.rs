@@ -47,7 +47,7 @@ use bytes::Bytes;
 use compio::net::{TcpListener, TcpStream};
 use core::future::Future;
 use http_body::{Body, Frame};
-use ngnet_h2::http::transport::{CompioIo, CompioWriter, Completion, TransportWrite};
+use ngnet_h2::http::transport::{CompioIo, CompioWriter, Completion, Transport, TransportWrite};
 use ngnet_h2::http::{IncomingBody, server};
 
 /// A body already held in memory.
@@ -186,14 +186,23 @@ fn an_exchange_completes_over_the_shipped_compio_transport() {
 /// `false` sent every octet down the coalescing fallback and the echo was still correct —
 /// verified by mutation, which passed this test *and the entire workspace suite* unchanged.
 ///
-/// The path is pinned in two independent halves, neither sufficient alone:
+/// The path is pinned in three independent parts, none sufficient alone:
 ///
-/// 1. **The shipped transport declares the strategy** —
-///    `the_shipped_compio_transport_elects_the_owned_region_path` below, now a compile-time
-///    assertion on the writer's associated `Model` type.
-/// 2. **The driver honours the declaration** — pinned by
+/// 1. **The shipped transport declares the model** —
+///    `the_shipped_compio_transport_elects_the_owned_region_path` below, a compile-time
+///    assertion on the writer's associated `Model` type. This says which *trait* carries the
+///    write; on its own it no longer says which drain runs.
+/// 2. **The shipped transport declares its gathering real** —
+///    `the_shipped_compio_transport_declares_its_gathering_real` below. Since the drain
+///    follows `TransportWrite::is_write_vectored` rather than the model, a `false` here would
+///    send this exchange down the completion coalescing drain and `write_regions` would never
+///    be reached — reproducing exactly the vacuity described above, under a new mechanism.
+///    The `Model` assertion cannot catch that, which is why part 2 is separate from part 1.
+/// 3. **The driver honours the declaration** — pinned by
 ///    `http_transport.rs::a_transport_can_elect_the_owned_region_path`, which counts the
-///    region writes the driver actually performs.
+///    region writes the driver actually performs, and by
+///    `http_vectored.rs::the_completion_side_selects_its_drain_from_the_declaration_too`,
+///    which pins that a `false` declaration on the completion side really does coalesce.
 ///
 /// Together those give what the echo cannot: this exchange really did leave through
 /// `write_regions`. The echo remains worth asserting for a different reason — it is what
@@ -271,6 +280,12 @@ fn a_shared_body_exchange_gathers_over_the_shipped_compio_transport() {
 ///
 /// Mutation-verified: changing `CompioWriter`'s `type Model` to `Readiness` fails this file to
 /// compile, with `expected `Completion`, found `Readiness``.
+///
+/// Note what this test stopped covering when the drain moved onto the capability. Declaring
+/// `Completion` obliges the writer to supply `RegionWrite`, and that much is still enforced
+/// here by the compiler — but it no longer implies the driver will *use* the gathering half of
+/// `RegionWrite`. That implication now belongs to
+/// `the_shipped_compio_transport_declares_its_gathering_real`.
 #[test]
 fn the_shipped_compio_transport_elects_the_owned_region_path() {
     /// Compiles only if `W` declares exactly `Completion`. A different model is a type
@@ -282,6 +297,42 @@ fn the_shipped_compio_transport_elects_the_owned_region_path() {
     }
 
     elects_owned_regions::<CompioWriter<compio::net::TcpStream>>();
+}
+
+/// The shipped compio transport reports that its gathering is a real scatter-gather write.
+///
+/// Confirmed rather than assumed. `CompioWriter` overrides `RegionWrite::write_regions` with a
+/// call to compio's `AsyncWriteExt::write_vectored` on a `TcpStream`, which submits an
+/// `IORING_OP_SENDMSG` — one submission carrying every region, not a loop. So `true` is the
+/// honest answer, and it is the answer that keeps
+/// `a_shared_body_exchange_gathers_over_the_shipped_compio_transport` above meaningful: with
+/// `false` the driver would coalesce and that test's `write_regions` would never run.
+///
+/// This is asserted on a live writer rather than as a trait-level constant because
+/// `is_write_vectored` takes `&self` — it is allowed to vary per instance, as tokio's does,
+/// and pinning it for the type would assert something the trait does not promise.
+#[test]
+fn the_shipped_compio_transport_declares_its_gathering_real() {
+    let runtime = compio::runtime::Runtime::new().expect("compio needs io_uring to start");
+
+    runtime.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binding");
+        let addr = listener.local_addr().expect("an address");
+        let accepting = compio::runtime::spawn(async move {
+            let _ = listener.accept().await.expect("accepting");
+        });
+
+        let stream = TcpStream::connect(addr).await.expect("connecting");
+        let (_reader, writer) = Transport::split(CompioIo::new(stream));
+        assert!(
+            writer.is_write_vectored(),
+            "the shipped compio transport overrides `write_regions` with a real \
+             `IORING_OP_SENDMSG` and must declare it, or the driver coalesces and the \
+             override is dead code",
+        );
+
+        accepting.await.expect("the acceptor");
+    });
 }
 
 ///
