@@ -10,7 +10,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod connection;
+mod error;
 mod peer;
+mod server;
 
 pub use connection::serve_connection;
+pub use error::{Error, ErrorKind};
 pub use peer::PeerAddr;
+pub use server::{Serve, serve};
