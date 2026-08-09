@@ -3,14 +3,14 @@ resolver = "3"
 members = [
     "crates/ngnet-h2",
     "crates/ngnet-h2-sys",
-    "crates/ngnet-h2-tests",
-    "crates/ngnet-h2-bench",
     "crates/ngnet-h3-sys",
     "crates/ngnet-h3",
-    "crates/ngnet-h3-tests",
     "crates/ngnet-quic-sys",
     "crates/ngnet-quic",
-    "crates/ngnet-quic-tests",
+    "tests/ngnet-h2-tests",
+    "tests/ngnet-h2-bench",
+    "tests/ngnet-h3-tests",
+    "tests/ngnet-quic-tests",
 ]
 
 [workspace.package]

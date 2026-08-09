@@ -2,6 +2,11 @@
 name = "ngnet-quic"
 version = "0.1.0"
 description = "Safe, sans-I/O Rust bindings to libngtcp2 for QUIC transport"
+# The QUIC stack is not ready to be released: see `docs/quic/pending-work.md`. Publishing
+# would fix a public API that is still expected to change, so the crate is withheld until it
+# is. Remove this line, and the same line in `ngnet-quic-sys`, to release the pair together --
+# a published crate cannot depend on an unpublished one.
+publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

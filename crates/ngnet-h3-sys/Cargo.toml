@@ -2,6 +2,8 @@
 name = "ngnet-h3-sys"
 version = "0.1.0"
 description = "Low level FFI bindings to libnghttp3, built from the vendored nghttp3 submodule"
+# Withheld from release alongside `ngnet-h3`, whose API is still expected to change.
+publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

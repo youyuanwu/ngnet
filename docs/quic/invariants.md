@@ -71,7 +71,7 @@ It also reads `NGTCP2_DCIDTR_MAX_UNUSED_DCID_SIZE` back out of the vendored C he
 absent from the bindings; if ngtcp2 ever changes it, this test fails rather than the range
 check silently becoming wrong.
 
-## Behavioural — `crates/ngnet-quic-tests/`
+## Behavioural — `tests/ngnet-quic-tests/`
 
 Not invariants in the same sense, but two are worth naming here because they guard against
 tests that pass for the wrong reason:

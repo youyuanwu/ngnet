@@ -11,7 +11,7 @@
 //! them to: the double declares `RETAINS_BUFFERS = true` and must report release explicitly,
 //! quinn declares `false` because it copies. Both arms are exercised.
 //!
-//! `crates/ngnet-h3-tests/tests/quic.rs` remains alongside this, driving the *sans-I/O core*
+//! `tests/ngnet-h3-tests/tests/quic.rs` remains alongside this, driving the *sans-I/O core*
 //! over quinn. Neither replaces the other.
 
 use std::sync::Arc;
