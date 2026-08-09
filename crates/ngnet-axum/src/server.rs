@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use axum::Router;
 use ngnet_h2::http::Config;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{Id, JoinSet};
 
 use crate::connection::serve_connection;
@@ -157,6 +157,30 @@ fn report(observer: &mut Option<Observer>, error: Error) {
     }
 }
 
+/// Accepts one connection, after waiting out any backoff still owed.
+///
+/// The wait belongs *inside* this future rather than in the caller's `select!` arm, which
+/// is not a stylistic preference. An `.await` in an arm body runs to completion before the
+/// loop arbitrates again, so a backoff placed there would stop the stop signal from being
+/// observed and stop finished connections from being reported for its whole duration —
+/// reintroducing, in precisely the situation the loop is under stress, the delayed
+/// reporting the arbitrated loop exists to prevent. `axum::serve` puts its sleep in the
+/// same place for the same reason.
+///
+/// One consequence of living in a `select!` branch: if another arm wins, this future is
+/// dropped and the wait restarts on the next pass. That is harmless here — a backoff is a
+/// floor on retry frequency, not a deadline — but it does mean the wait is at least
+/// `backoff`, not exactly it.
+async fn accept(
+    listener: &TcpListener,
+    backoff: Option<Duration>,
+) -> io::Result<(TcpStream, SocketAddr)> {
+    if let Some(backoff) = backoff {
+        tokio::time::sleep(backoff).await;
+    }
+    listener.accept().await
+}
+
 /// Whether an accept failure is about one client rather than about the listener.
 ///
 /// A client that vanishes between the kernel queueing its connection and the loop reaching
@@ -189,11 +213,16 @@ async fn run(server: Serve) {
     // harvest removes its entry.
     let mut peers: HashMap<Id, SocketAddr> = HashMap::new();
     let mut stop = stop.unwrap_or_else(|| Box::pin(pending()));
+    // Owed to the *listener*, not to any connection: set after a failure that will recur,
+    // and waited out at the start of the next accept rather than here. See `accept`.
+    let mut backoff: Option<Duration> = None;
 
     loop {
         tokio::select! {
-            accepted = listener.accept() => match accepted {
+            accepted = accept(&listener, backoff) => match accepted {
                 Ok((stream, peer)) => {
+                    backoff = None;
+
                     // Nagle would otherwise hold back the small writes that HTTP/2 control
                     // frames are made of, waiting for data that is not coming.
                     let _ = stream.set_nodelay(true);
@@ -211,11 +240,8 @@ async fn run(server: Serve) {
                     }
                 }
                 Err(error) => {
-                    let transient = is_transient(&error);
+                    backoff = (!is_transient(&error)).then_some(ACCEPT_BACKOFF);
                     report(&mut observer, Error::accept(error));
-                    if !transient {
-                        tokio::time::sleep(ACCEPT_BACKOFF).await;
-                    }
                 }
             },
 
