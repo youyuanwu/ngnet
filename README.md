@@ -21,6 +21,7 @@ Design notes, the invariants the test suite pins, and the tracked backlog live i
 | [`ngnet-quic-sys`](crates/ngnet-quic-sys) | Not published yet, alongside `ngnet-quic`. Raw FFI bindings to [ngtcp2](https://github.com/ngtcp2/ngtcp2), the QUIC transport. Builds libngtcp2 from source with `bindgen`, plus its OpenSSL crypto helper behind a default-on `crypto-ossl` feature. |
 | [`ngnet-quic-tests`](tests/ngnet-quic-tests) | Not published. Drives `ngnet-quic` through real TLS handshakes, in process and over loopback UDP, so the wrapper needs no certificate or runtime dependency of its own. |
 | [`ngnet-axum`](crates/ngnet-axum) | Not published yet — the API is new and expected to change; see [`docs/axum/design.md`](docs/axum/design.md). Serves an [axum](https://github.com/tokio-rs/axum) `Router` over `ngnet-h2` instead of hyper. Server-side, h2c and tokio only. |
+| [`ngnet-util`](crates/ngnet-util) | Not published yet — the API is new and expected to change; see [`docs/util/design.md`](docs/util/design.md). A pooling HTTP/2 client over `ngnet-h2`: send a request at a URI and the connection is opened, reused, retired and replaced for you. Client-side, h2c and tokio only. |
 
 ### HTTP/3, and what it deliberately is not
 
@@ -38,6 +39,18 @@ negotiating `h3` remain yours. `ngnet-h3-tests` has a working implementation of
 that trait over quinn to copy.
 
 Server push is absent because nghttp3 does not implement it.
+
+### A client you do not have to hold open
+
+`ngnet-util` is to `ngnet-h2`'s client what `ngnet-axum` is to its server: the
+policy layer above a single connection. `ngnet-h2` hands back a `SendRequest`
+and a driver future and leaves the rest to you — resolving the address, opening
+the socket, spawning the driver, holding the handle, and noticing when the
+connection goes closed or starts refusing. `ngnet-util` does all of that, keeps
+one connection per origin because HTTP/2 multiplexes, retires it when the peer
+says goodbye, and dials a replacement when the next request needs one. It also
+implements `tower_service::Service`, which is the same seam `ngnet-axum` uses on
+the server side.
 
 ### axum without hyper
 

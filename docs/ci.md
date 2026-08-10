@@ -44,6 +44,7 @@ cargo clippy -p ngnet-quic --no-default-features --all-targets -- -D warnings
 # One invocation, not a matrix: `ngnet-axum` has no features. axum, tokio and the h2
 # transport are all unconditional, so there is no second configuration to get wrong.
 cargo clippy -p ngnet-axum --all-targets -- -D warnings
+cargo clippy -p ngnet-util --all-targets -- -D warnings
 
 for f in "" "--no-default-features" "--all-features" "--features tokio" "--features completion"; do
   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-h2 $f
@@ -64,6 +65,7 @@ for f in "" "--no-default-features" "--all-features"; do
 done
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-quic-tests
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-axum
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-util
 
 # Two claims, two commands, and the flags are the whole point.
 #
@@ -100,6 +102,14 @@ cargo test -p ngnet-quic --no-default-features --no-run # expect none
 # the test binaries link. The usual way to lose it is an axum feature that depends on
 # `hyper-util` -- `ConnectInfo` is one -- arriving transitively where no manifest shows it.
 cargo tree -p ngnet-axum -e normal | grep -qiE '\bhyper' && exit 1
+
+# And the same claim for `ngnet-util`, checked separately rather than assumed to follow.
+# It is in the same position for the same reason -- hyper is a dev-dependency there because
+# the acceptance suite drives the pool against hyper's HTTP/2 *server*, a client-side crate
+# needing a server this workspace did not write. That is precisely the arrangement in which
+# a hyper crate reaches the normal graph unnoticed: everything builds, every test passes,
+# and only the graph shows it.
+cargo tree -p ngnet-util -e normal | grep -qiE '\bhyper' && exit 1
 
 # Runs each benchmark once without timing it. Benchmarks are not part of `cargo test`, so
 # without this they rot silently as the API moves.
