@@ -54,6 +54,13 @@ pub fn cargo_tree(args: &[&str]) -> String {
         .arg("tree")
         .args(args)
         .arg("--locked")
+        // Force plain output rather than inheriting the ambient setting. CI sets
+        // `CARGO_TERM_COLOR: always`, which makes `cargo tree` wrap its box-drawing prefix in
+        // ANSI escapes -- `\x1b[2m\u{2514}\u{2500}\u{2500}\x1b[0m` instead of `\u{2514}\u{2500}\u{2500}`. Since `2` and `m` are
+        // alphanumeric, the escape survives the prefix trim in `dependency_name` and gets
+        // read as the package name. This is not hypothetical: it went green locally and red
+        // on CI, which is the whole reason to pin the format instead of parsing around it.
+        .arg("--color=never")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .unwrap_or_else(|e| panic!("could not run `cargo tree {}`: {e}", args.join(" ")));
@@ -224,11 +231,44 @@ pub fn needed_libraries(binary: &std::path::Path) -> Vec<String> {
 /// dependency called `foo-ngnet-h3-sys` would have satisfied. Nothing is named that today,
 /// and the point of moving these checks into tests is that they can be made exact rather
 /// than merely as good as the grep they came from.
-pub fn dependency_name(line: &str) -> &str {
-    line.trim_start_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+pub fn dependency_name(line: &str) -> String {
+    strip_ansi(line)
+        .trim_start_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .split_whitespace()
         .next()
         .unwrap_or("")
+        .to_string()
+}
+
+/// Removes ANSI escape sequences from a string.
+///
+/// `cargo_tree` already asks for `--color=never`, so this should never have anything to do.
+/// It is here because the alternative failed in the worst way available: colour made
+/// `dependency_name` read the escape as a package name, and it did so only under
+/// `CARGO_TERM_COLOR=always` -- so it passed locally and failed on CI. Belt and braces is
+/// cheap; a parser that quietly reads terminal formatting as data is not.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // A CSI sequence is ESC '[', then parameter and intermediate bytes, then a final
+        // byte in 0x40..=0x7E. The '[' is itself in that range, so it has to be consumed
+        // before the search for the terminator starts -- otherwise the sequence "ends"
+        // immediately and its parameters leak into the output as text.
+        if chars.peek() == Some(&'[') {
+            chars.next();
+        }
+        for c in chars.by_ref() {
+            if ('@'..='~').contains(&c) {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Whether a library name is OpenSSL -- either half of it.
@@ -288,6 +328,11 @@ mod tests {
         // And the dependency line names a package exactly, rather than containing it.
         assert_eq!(
             dependency_name("\u{2514}\u{2500}\u{2500} ngnet-h3-sys v0.1.0 (/x)"),
+            "ngnet-h3-sys"
+        );
+        // The colourised form, which is what CI produces and what broke once.
+        assert_eq!(
+            dependency_name("\u{1b}[2m\u{2514}\u{2500}\u{2500}\u{1b}[0m ngnet-h3-sys v0.1.0 (/x)"),
             "ngnet-h3-sys"
         );
         assert_eq!(dependency_name("    ngnet-h3-sys v0.1.0"), "ngnet-h3-sys");
