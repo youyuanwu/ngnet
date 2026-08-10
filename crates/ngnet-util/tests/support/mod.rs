@@ -29,6 +29,8 @@
 
 #![allow(dead_code)] // Each integration test file uses a different part of this.
 
+pub mod raw;
+
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

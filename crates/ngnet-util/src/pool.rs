@@ -180,12 +180,6 @@ pub(crate) struct Pool<B> {
     /// request served by a pooled connection resolves nothing — a lookup that did not happen
     /// leaves no trace at a peer, which saw no connection either way.
     resolutions: AtomicUsize,
-    /// A barrier used only by this crate's own tests, to park a dial at a chosen instant.
-    ///
-    /// A field rather than a `static` because Rust runs a crate's unit tests as threads in
-    /// one process: a global would let one test's barrier stall another's pool.
-    #[cfg(test)]
-    pub(crate) dial_barrier: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl<B> Pool<B>
@@ -206,8 +200,6 @@ where
             closed: AtomicBool::new(false),
             config,
             resolutions: AtomicUsize::new(0),
-            #[cfg(test)]
-            dial_barrier: Mutex::new(None),
         }
     }
 
@@ -356,19 +348,6 @@ where
         origin: &Origin,
     ) -> Result<SendRequest<B>, Error> {
         let guard = DialGuard::new(slot);
-
-        #[cfg(test)]
-        {
-            // Test-only park, after the slot is `Dialing` and before anything is registered.
-            let barrier = self
-                .dial_barrier
-                .lock()
-                .expect("barrier lock poisoned")
-                .clone();
-            if let Some(barrier) = barrier {
-                barrier.notified().await;
-            }
-        }
 
         self.resolutions.fetch_add(1, Ordering::Relaxed);
         let outcome = dial::<B>(origin, self.config).await;
@@ -544,5 +523,96 @@ impl<B> Drop for DialGuard<'_, B> {
             // caller should dial rather than inherit an error that was never observed.
             self.slot.settle(Dial::Idle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The two guards, tested directly.
+    //!
+    //! Everything else this crate claims is asserted end to end at a peer, because a pool
+    //! that is wrong in an interesting way still answers requests correctly. These two are
+    //! the exception, and the reason is that their failure mode is not a wrong answer but a
+    //! *hang*: a dialer dropped mid-flight leaves its slot in `Dialing` for ever and every
+    //! later caller for that origin parks behind a dial that is not happening; an acquire
+    //! that does not release its count leaves shutdown waiting on somebody who has gone.
+    //!
+    //! An end-to-end test of either would be a test that hangs when it fails, in a suite
+    //! whose whole discipline is that a stall must name itself. Asserted here instead, where
+    //! the state is directly readable and the failure is an assertion rather than a timeout.
+
+    use super::*;
+
+    /// A body type good enough to name; none of these tests send anything.
+    type TestBody = http_body_util::Full<Bytes>;
+
+    #[test]
+    fn a_dialer_dropped_mid_flight_leaves_the_slot_dialable() {
+        let slot: Arc<Slot<TestBody>> = Arc::new(Slot::new());
+        slot.settle(Dial::Dialing);
+
+        // Built and dropped without settling, which is exactly what a cancelled request's
+        // future does on its way out.
+        drop(DialGuard::new(&slot));
+
+        let state = slot.state.lock().expect("slot lock");
+        assert!(
+            matches!(&*state, Dial::Idle),
+            "a dropped dialer must leave the slot dialable, not `Dialing`"
+        );
+    }
+
+    #[test]
+    fn a_dropped_dialer_leaves_idle_rather_than_failed() {
+        // `Idle` and not `Failed`, because nothing was learned about the origin. Settling to
+        // `Failed` would hand a caller that waited an error nobody ever observed, for a dial
+        // that was abandoned rather than attempted.
+        let slot: Arc<Slot<TestBody>> = Arc::new(Slot::new());
+        drop(DialGuard::new(&slot));
+
+        let state = slot.state.lock().expect("slot lock");
+        assert!(!matches!(&*state, Dial::Failed(_)));
+    }
+
+    #[test]
+    fn settling_a_dial_moves_the_generation() {
+        // What every waiter depends on. A waiter captures this number under the slot lock
+        // and parks until it differs, so a transition that failed to move it would park
+        // every caller for that origin permanently.
+        let slot: Arc<Slot<TestBody>> = Arc::new(Slot::new());
+        let before = *slot.settled.borrow();
+        slot.settle(Dial::Dialing);
+        assert_ne!(*slot.settled.borrow(), before);
+    }
+
+    #[test]
+    fn an_acquire_releases_its_count_however_it_ends() {
+        let pool: Arc<Pool<TestBody>> = Arc::new(Pool::new(Config::default()));
+
+        let guard = AcquireGuard::register(&pool).expect("an open pool accepts an acquire");
+        assert_eq!(*pool.acquires.borrow(), 1);
+
+        drop(guard);
+        assert_eq!(
+            *pool.acquires.borrow(),
+            0,
+            "an acquire that ends must release its count, or shutdown waits for ever"
+        );
+    }
+
+    #[test]
+    fn a_closed_pool_refuses_a_new_acquire() {
+        let pool: Arc<Pool<TestBody>> = Arc::new(Pool::new(Config::default()));
+        pool.state.lock().expect("pool lock").closed = true;
+
+        let Err(error) = AcquireGuard::register(&pool) else {
+            panic!("a closed pool takes no acquires");
+        };
+        assert_eq!(error.kind(), crate::ErrorKind::Closed);
+        assert_eq!(
+            *pool.acquires.borrow(),
+            0,
+            "a refused acquire must not have counted itself in on the way to being refused"
+        );
     }
 }
