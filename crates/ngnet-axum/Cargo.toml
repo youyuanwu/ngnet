@@ -1,0 +1,49 @@
+[package]
+name = "ngnet-axum"
+version = "0.1.0"
+description = "Run an axum Router over ngnet-h2 instead of hyper, serving cleartext HTTP/2"
+# Not released yet. The crate is pinned to a single axum minor version by the `Service` impl
+# it calls, so publishing would commit this workspace to tracking axum's release cadence on
+# top of its own, and the server surface has not been used by anyone but its own tests. It
+# is withheld until both settle. `ngnet-h3` and `ngnet-quic` carry the same line for their
+# own reasons.
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The dependency-free discipline of `ngnet-h2` -- one non-optional dependency, no
+# dev-dependencies, both pinned by a test -- deliberately does not apply here. This crate
+# exists *to* depend on axum, and keeping that dependency out of `ngnet-h2` is precisely why
+# the integration is a separate crate rather than a feature of it.
+[dependencies]
+# The `tokio` feature supplies the `TokioIo` transport adapter this crate wraps every
+# accepted socket in. No other transport is enabled: `completion` would need a second
+# integration whose only difference is the runtime, which would test nothing new about axum.
+ngnet-h2 = { workspace = true, features = ["tokio"] }
+axum.workspace = true
+http.workspace = true
+tokio.workspace = true
+tower-service.workspace = true
+
+# hyper as a *dev*-dependency, on purpose. The end-to-end tests need an HTTP/2 client that
+# this workspace did not write, or they would prove only that `ngnet-h2` agrees with itself.
+# A test asserts hyper is absent from the normal dependency graph, which is the claim that
+# matters; nothing here contradicts it.
+[dev-dependencies]
+bytes.workspace = true
+# The acceptance suite needs a response body that yields chunks when the *test* decides to,
+# so that "the client saw the first chunk before the handler produced the second" can be
+# asserted causally rather than by sleeping. axum's `Body::from_stream` would want a
+# `futures_core::Stream` and therefore a further dependency; implementing `http_body::Body`
+# over a channel directly is smaller and says exactly what it does.
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+# `signal`, for the worked example's Ctrl-C stop signal, and only for that. Declared here
+# rather than added to the workspace's own tokio feature list because the library needs
+# nothing from it: putting it in `[dependencies]` would enable a feature for every
+# downstream user in order to serve one example. Cargo merges the two sets when building
+# examples and tests, which is exactly the scope wanted.
+tokio = { workspace = true, features = ["signal"] }

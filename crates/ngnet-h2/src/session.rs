@@ -961,6 +961,24 @@ impl<C> Session<C> {
         Ok(())
     }
 
+    /// The highest peer-initiated stream this endpoint has processed.
+    ///
+    /// The number a graceful [`shutdown`](Self::shutdown) has to name: streams up to and
+    /// including it were accepted and will be answered, and the peer is free to retry
+    /// anything above it on a new connection. A server cannot know it from outside the
+    /// session, which is why it is exposed rather than inferred — counting the streams a
+    /// caller has seen would double-count retries and miss streams libnghttp2 rejected on
+    /// the caller's behalf.
+    ///
+    /// Zero before anything has been processed, and zero for the whole life of a client
+    /// that accepts no pushed streams — which is every client this crate builds.
+    #[must_use]
+    pub fn last_processed_stream(&self) -> StreamId {
+        // SAFETY: `self.raw` is live. The call only reads session state.
+        let id = unsafe { sys::nghttp2_session_get_last_proc_stream_id(self.raw) };
+        StreamId::new(id)
+    }
+
     /// Resumes a stream whose body previously returned [`BodyOutcome::Defer`](crate::BodyOutcome::Defer).
     ///
     /// Puts the deferred `DATA` frame back on the outbound queue, after which the next

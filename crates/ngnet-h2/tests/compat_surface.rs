@@ -257,6 +257,11 @@ fn session_surface() -> Result<()> {
     let _: bool = session.mid_frame();
     let _: Result<()> = session.resume_body(StreamId::new(1));
 
+    // Added for the server-side drain. A server sending GOAWAY has to name the last stream
+    // it will actually answer, and only nghttp2 knows which that is -- picking the highest
+    // stream it had seen would promise to serve a request it may have already refused.
+    let _: StreamId = session.last_processed_stream();
+
     Ok(())
 }
 
@@ -485,6 +490,17 @@ mod asynchronous {
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
         let connection = ngnet_h2::http::server::serve(transport, handler)?;
+
+        // Added for the server-side drain, and pinned from the moment it exists. The handle
+        // is deliberately separable from the connection: the connection is about to be
+        // moved into a task, so anything a caller needs in order to steer it later has to
+        // be taken *before* that happens. A method that could only be called on a
+        // connection you still own would be unusable for its only purpose.
+        let drain: ngnet_h2::http::Drain = connection.drain_handle();
+        let _: ngnet_h2::http::Drain = drain.clone();
+        let _: String = format!("{drain:?}");
+        drain.drain();
+
         drop(connection);
         Ok(())
     }

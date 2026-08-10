@@ -3,8 +3,11 @@
 Notes that outlive any one change. API documentation lives with the code (`cargo doc`);
 what is here is the reasoning a reader cannot recover from the source.
 
-There are three crate families, built the same way and largely independent of each other, so
-each keeps its own notes. Anything genuinely shared sits at this level.
+There are three crate families — HTTP/2, HTTP/3 and QUIC — built the same way and largely
+independent of each other, so each keeps its own notes. Alongside them sits one
+*integration*: `ngnet-axum`, which is not a family but a piece of wiring between the HTTP/2
+family and a third-party framework, and which keeps its notes here for the same reason.
+Anything genuinely shared sits at this level.
 
 ## HTTP/2 — [`h2/`](h2/)
 
@@ -36,11 +39,20 @@ There are no HTTP/3 benchmarks yet.
 There are no QUIC benchmarks, and the crate has not been tested against another QUIC
 implementation.
 
+## axum integration — [`axum/`](axum/)
+
+| Document | What it covers |
+| --- | --- |
+| [`axum/design.md`](axum/design.md) | Why an axum `Router` can run without hyper at all, the two designs that were assumed and turned out wrong — body adapters, and a graceful shutdown that cannot be built — and what the acceptance suite found that nobody predicted. |
+
+There are no axum invariants or benchmarks: the crate pins its claims in its own acceptance
+suite and in a CI dependency-graph check, rather than in a document of its own.
+
 ## Shared
 
 | Document | What it covers |
 | --- | --- |
-| [`ci.md`](ci.md) | Every check CI runs, for both families, and the ones it deliberately does not. |
+| [`ci.md`](ci.md) | Every check CI runs, across all three families and the axum integration, and the ones it deliberately does not. |
 
 ## Orientation
 
@@ -77,8 +89,17 @@ UDP.
 Client and server are both supported. 0-RTT, unreliable datagrams, connection migration and
 key update are not implemented, and that is a scope decision rather than a to-do.
 
+**axum.** `ngnet-axum` serves an axum `Router` over `ngnet-h2` instead of hyper. It is an
+integration rather than a family: no `-sys` crate, no state machine, no layering of its own —
+it wires two existing things together. That is possible because a `Router` is a
+`tower::Service` over `http` types and the HTTP engine beneath it is separable; hyper's only
+contribution to axum is turning bytes into requests, and this crate gives that job to
+`ngnet-h2`. Server-side, h2c and tokio only, and unpublished for now.
+
 Within a family's own documents, "the crate" means that family's wrapper: `ngnet-h2` under
-[`h2/`](h2/), `ngnet-h3` under [`h3/`](h3/), `ngnet-quic` under [`quic/`](quic/).
+[`h2/`](h2/), `ngnet-h3` under [`h3/`](h3/), `ngnet-quic` under [`quic/`](quic/). The same
+convention holds for the integration: "the crate" means `ngnet-axum` under
+[`axum/`](axum/).
 
 ## Toolchain
 

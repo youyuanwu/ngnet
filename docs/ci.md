@@ -41,6 +41,10 @@ cargo clippy -p ngnet-quic-sys --no-default-features --all-targets -- -D warning
 cargo clippy -p ngnet-quic --all-targets -- -D warnings
 cargo clippy -p ngnet-quic --no-default-features --all-targets -- -D warnings
 
+# One invocation, not a matrix: `ngnet-axum` has no features. axum, tokio and the h2
+# transport are all unconditional, so there is no second configuration to get wrong.
+cargo clippy -p ngnet-axum --all-targets -- -D warnings
+
 for f in "" "--no-default-features" "--all-features" "--features tokio" "--features completion"; do
   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-h2 $f
 done
@@ -59,6 +63,7 @@ for f in "" "--no-default-features" "--all-features"; do
   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-quic $f
 done
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-quic-tests
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p ngnet-axum
 
 # Two claims, two commands, and the flags are the whole point.
 #
@@ -87,6 +92,14 @@ readelf -d target/debug/deps/smoke-*  | grep -i 'NEEDED.*libssl'   # expect noth
 # -- which was true of the bindings check above until the wrapper gave it something to see.
 cargo test -p ngnet-quic --no-run                      # expect libssl
 cargo test -p ngnet-quic --no-default-features --no-run # expect none
+
+# That no hyper crate reaches `ngnet-axum`. This is the claim that crate exists to make,
+# and `-e normal` is what makes the check honest rather than merely strict: hyper *is* a
+# dev-dependency there, deliberately, because the acceptance tests drive the server with an
+# independent HTTP/2 client. The claim is about what a downstream user links, not about what
+# the test binaries link. The usual way to lose it is an axum feature that depends on
+# `hyper-util` -- `ConnectInfo` is one -- arriving transitively where no manifest shows it.
+cargo tree -p ngnet-axum -e normal | grep -qiE '\bhyper' && exit 1
 
 # Runs each benchmark once without timing it. Benchmarks are not part of `cargo test`, so
 # without this they rot silently as the API moves.

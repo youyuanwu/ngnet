@@ -140,6 +140,12 @@ jobs:
       - name: Clippy (QUIC wrapper without a TLS backend)
         run: cargo clippy -p ngnet-quic --no-default-features --all-targets -- -D warnings
 
+      # `ngnet-axum` has no feature matrix -- axum, tokio and the h2 transport are all
+      # unconditional -- so unlike the crates above it needs exactly one invocation rather
+      # than one per configuration.
+      - name: Clippy (axum integration)
+        run: cargo clippy -p ngnet-axum --all-targets -- -D warnings
+
       # Four configurations rather than one, because of a bug this repository actually
       # shipped: a doc link to an item behind the `tokio` feature passed `--all-features`
       # and broke every build without it. `--all-features` alone is not a documentation check.
@@ -179,6 +185,12 @@ jobs:
             echo "::endgroup::"
           done
           cargo doc --no-deps -p ngnet-quic-tests
+
+      # One invocation for the same reason as its clippy step: no features to vary.
+      - name: Rustdoc for the axum integration
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps -p ngnet-axum
 
       # Two separate claims, and they need two separate commands.
       #
@@ -295,6 +307,32 @@ jobs:
             exit 1
           fi
           echo "no readiness backend in the completion build"
+
+      # The claim `ngnet-axum` exists to make is that an axum `Router` runs without hyper
+      # underneath it. That is easy to state and easy to lose: axum has optional features
+      # that pull `hyper-util` in, `ConnectInfo` among them, and enabling one in a moment of
+      # convenience would quietly reinstate the dependency the crate was written to remove.
+      # A reader cannot see that in a manifest, because it would arrive transitively.
+      #
+      # `-e normal` is the whole point of the check. hyper *is* a dev-dependency here, on
+      # purpose: the acceptance tests drive the server with an independent HTTP/2 client,
+      # and a client from this workspace could only show ngnet-h2 agreeing with itself. So
+      # the claim is about what a downstream user links, not about what the test binaries
+      # link, and only the normal graph expresses that.
+      - name: No hyper crate reaches the axum integration
+        run: |
+          tree=$(cargo tree -p ngnet-axum -e normal)
+          echo "$tree"
+          if echo "$tree" | grep -qiE '\bhyper'; then
+            echo "::error::a hyper crate reached ngnet-axum's normal dependency graph,"
+            echo "::error::which is the one thing this crate exists to avoid. Find it with:"
+            echo "::error::  cargo tree -p ngnet-axum -e normal -i hyper"
+            echo "::error::The usual cause is an axum feature that depends on hyper-util."
+            echo "::error::Test-only clients belong in [dev-dependencies], which this"
+            echo "::error::check deliberately ignores."
+            exit 1
+          fi
+          echo "no hyper in the axum integration's normal graph"
 
       # Benchmarks are not run here for their numbers. A shared runner has noisy
       # neighbours, no frequency control and no guaranteed CPU model, so a timing threshold

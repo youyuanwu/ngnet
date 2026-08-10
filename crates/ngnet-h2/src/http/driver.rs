@@ -51,7 +51,7 @@ use super::config::Config;
 use super::error::{Error, ErrorKind, Result};
 use super::head;
 use super::shared;
-use super::shared::{Incoming, Registry, Shared};
+use super::shared::{GoawayTarget, Incoming, Registry, Shared};
 use super::transport::{
     BorrowedWrite, Completion, CompletionModel, Drains, Pass, Readiness, ReadinessModel,
     RegionWrite, Transport, TransportRead, TransportWrite,
@@ -713,8 +713,16 @@ where
                 }
             }
 
-            if let Some((last_stream, code)) = shared.take_shutdown() {
-                session.shutdown(StreamId::new(last_stream), code)?;
+            if let Some((target, code)) = shared.take_shutdown() {
+                // Resolved here rather than where the drain was asked for: the number is a
+                // property of the session, and the session is reachable only from this
+                // side. A handle that guessed would have to guess low, abandoning requests
+                // it is in the middle of answering.
+                let last_stream = match target {
+                    GoawayTarget::Stream(stream) => StreamId::new(stream),
+                    GoawayTarget::LastProcessed => session.last_processed_stream(),
+                };
+                session.shutdown(last_stream, code)?;
             }
 
             shared.take_ready_into(&mut to_resume);

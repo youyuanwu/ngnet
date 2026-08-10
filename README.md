@@ -20,6 +20,7 @@ Design notes, the invariants the test suite pins, and the tracked backlog live i
 | [`ngnet-quic`](crates/ngnet-quic) | Not published yet — the API is still expected to change; see [`docs/quic/pending-work.md`](docs/quic/pending-work.md). Safe, sans-I/O API driving a QUIC client or server connection, the caller owning the socket and the clock. TLS is a backend seam with a default-on OpenSSL implementation. No async layer. |
 | [`ngnet-quic-sys`](crates/ngnet-quic-sys) | Not published yet, alongside `ngnet-quic`. Raw FFI bindings to [ngtcp2](https://github.com/ngtcp2/ngtcp2), the QUIC transport. Builds libngtcp2 from source with `bindgen`, plus its OpenSSL crypto helper behind a default-on `crypto-ossl` feature. |
 | [`ngnet-quic-tests`](tests/ngnet-quic-tests) | Not published. Drives `ngnet-quic` through real TLS handshakes, in process and over loopback UDP, so the wrapper needs no certificate or runtime dependency of its own. |
+| [`ngnet-axum`](crates/ngnet-axum) | Not published yet — the API is new and expected to change; see [`docs/axum/design.md`](docs/axum/design.md). Serves an [axum](https://github.com/tokio-rs/axum) `Router` over `ngnet-h2` instead of hyper. Server-side, h2c and tokio only. |
 
 ### HTTP/3, and what it deliberately is not
 
@@ -37,6 +38,33 @@ negotiating `h3` remain yours. `ngnet-h3-tests` has a working implementation of
 that trait over quinn to copy.
 
 Server push is absent because nghttp3 does not implement it.
+
+### axum without hyper
+
+`ngnet-axum` runs an unmodified axum `Router` — its routing, extractors,
+middleware and state — with this workspace's HTTP/2 stack underneath instead of
+hyper. CI checks that no hyper crate appears in its *normal* dependency graph —
+dev-dependencies are excluded on purpose, because the acceptance tests drive the
+server with hyper's client to prove it interoperates with something other than
+itself.
+
+That is possible because axum barely touches hyper. A `Router` is a
+`tower::Service` from `http::Request` to `http::Response`; hyper's job is only to
+turn socket bytes into the one and the response back into the other, and that job
+is separable. There are no body adapters in the crate, because none is needed:
+the body types on both sides already agree.
+
+It differs from `axum::serve` in ways worth knowing before deploying it —
+handlers must not block, a panicking handler costs its whole connection, and
+graceful shutdown drains without a deadline, so a handler that never returns
+holds the server open. All of them are on the crate's front page, with the
+reasons.
+
+```rust,no_run
+let router = axum::Router::new().route("/hello", axum::routing::get(|| async { "world" }));
+let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
+ngnet_axum::serve(listener, router).await;
+```
 
 ## Building
 

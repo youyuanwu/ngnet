@@ -94,12 +94,39 @@ struct Inner {
     resets: Vec<(i32, crate::ErrorCode)>,
     /// A graceful shutdown the caller asked for and the driver has not yet sent, as the
     /// last stream to honour and the code to give.
-    shutdown: Option<(i32, crate::ErrorCode)>,
+    shutdown: Option<(GoawayTarget, crate::ErrorCode)>,
     /// Set once nothing new may be started: the caller asked to shut down, or the peer
     /// said it was going away.
     refusing: bool,
+    /// Set once *this end* has asked to wind the connection down, and never cleared.
+    ///
+    /// Distinct from `refusing`, which a peer's `GOAWAY` also sets. The difference decides
+    /// whether a server's driver may finish: a server that was *told* its client is going
+    /// away still waits for the socket to end, as it always has, while a server that was
+    /// *asked* to drain finishes as soon as it has nothing left to serve. Folding the two
+    /// together would change the first behaviour while implementing the second.
+    ///
+    /// Distinct from `shutdown` too, which is taken by the driver when the frame is sent.
+    /// A flag that disappears once acted on cannot answer "may this connection finish?",
+    /// which is a question asked on every later pass.
+    draining: bool,
     /// Set once the driver is gone, so nothing waits for an answer that cannot come.
     gone: bool,
+}
+
+/// Which stream a queued `GOAWAY` should name.
+///
+/// Not an `i32` with a sentinel, because the two cases are answered by different parts of
+/// the crate: a caller supplies the number in one and only the driver can supply it in the
+/// other. Spelling that out here means the driver's `match` is exhaustive rather than a
+/// comparison against a magic value that a later reader has to look up.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GoawayTarget {
+    /// Honour streams up to and including this one. What a client sends.
+    Stream(i32),
+    /// Honour whatever the session has processed so far, resolved when the frame is sent.
+    /// What a draining server sends.
+    LastProcessed,
 }
 
 impl Shared {
@@ -244,11 +271,30 @@ impl Shared {
     pub(crate) fn request_shutdown(&self, last_stream: i32, code: crate::ErrorCode) {
         let mut inner = self.lock();
         inner.refusing = true;
-        inner.shutdown = Some((last_stream, code));
+        inner.shutdown = Some((GoawayTarget::Stream(last_stream), code));
+    }
+
+    /// Asks for a graceful drain: a `GOAWAY` naming whatever the session last processed.
+    ///
+    /// A client knows the number to send — zero, since it has honoured no pushed streams —
+    /// so [`request_shutdown`](Self::request_shutdown) lets it say so. A server does not:
+    /// the last stream it processed is a property of the session, which lives on the
+    /// driver's side of this type and cannot be reached from a handle. So the request
+    /// records the *intent* and the driver fills in the number when it sends the frame.
+    pub(crate) fn request_drain(&self, code: crate::ErrorCode) {
+        let mut inner = self.lock();
+        inner.refusing = true;
+        inner.draining = true;
+        inner.shutdown = Some((GoawayTarget::LastProcessed, code));
+    }
+
+    /// Whether this end has asked to wind the connection down.
+    pub(crate) fn is_draining(&self) -> bool {
+        self.lock().draining
     }
 
     /// Takes the shutdown to send, if one was asked for and not yet sent.
-    pub(crate) fn take_shutdown(&self) -> Option<(i32, crate::ErrorCode)> {
+    pub(crate) fn take_shutdown(&self) -> Option<(GoawayTarget, crate::ErrorCode)> {
         self.lock().shutdown.take()
     }
 

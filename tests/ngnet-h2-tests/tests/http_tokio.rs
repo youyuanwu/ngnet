@@ -953,3 +953,71 @@ async fn one_client_handle_serves_many_tasks() {
     .await
     .expect("the exchanges stalled");
 }
+
+/// A drained server hangs up on a peer that will not hang up on it.
+///
+/// The `ngnet-axum` suite covers the drain end to end, but it does so with hyper as the
+/// client, and hyper is well behaved: it reads the GOAWAY, has nothing outstanding, and
+/// closes the socket. A server that merely waited to be disconnected from would look
+/// identical against such a peer. That is not a hypothetical worry — reverting the driver's
+/// completion signal left every one of those tests green, which is why this one exists here,
+/// against the layer that actually owns the behaviour.
+///
+/// The peer is therefore a bare socket: it completes the handshake and then does nothing
+/// forever. It sends no further frames and, above all, never closes. The assertion is that
+/// the server's own future resolves, and that the socket sees a clean end of stream that it
+/// did not ask for.
+#[tokio::test]
+async fn a_drained_server_closes_a_connection_whose_peer_never_does() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(PATIENCE, async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binding");
+        let addr = listener.local_addr().expect("an address");
+
+        let (ready, drained) = tokio::sync::oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accepting");
+            let connection = server::serve(TokioIo::new(stream), echo).expect("serving");
+
+            // Taken before the connection is awaited, which is the only order available: the
+            // future is consumed by the `await` below and there is nothing to ask afterwards.
+            ready.send(connection.drain_handle()).expect("a listener");
+            let _ = connection.await;
+        });
+
+        let mut socket = TcpStream::connect(addr).await.expect("connecting");
+
+        // The client preface and an empty SETTINGS frame — length 0, type 0x04, no flags, on
+        // the connection stream. A real HTTP/2 peer, and nothing beyond that.
+        socket
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .expect("the preface");
+        socket
+            .write_all(&[0, 0, 0, 0x04, 0, 0, 0, 0, 0])
+            .await
+            .expect("settings");
+        socket.flush().await.expect("a flush");
+
+        let handle = drained.await.expect("a drain handle");
+        handle.drain();
+
+        // Read to the end. What the server sends on the way out is its own business; the
+        // claim is that the stream ends cleanly, and that we are not the ones ending it.
+        let mut sink = Vec::new();
+        socket
+            .read_to_end(&mut sink)
+            .await
+            .expect("a clean end of stream");
+
+        server.await.expect("the server task");
+
+        // Still open here, deliberately. Had it been dropped earlier the wait above would
+        // have proved nothing, since a vanished peer ends a connection all by itself.
+        drop(socket);
+    })
+    .await
+    .expect("the drain stalled");
+}
