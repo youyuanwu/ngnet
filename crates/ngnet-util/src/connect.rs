@@ -59,9 +59,7 @@ where
     // origin failing as though the host were unreachable.
     let stream = TcpStream::connect((origin.host(), origin.port()))
         .await
-        .map_err(|source| {
-            Error::connect(format!("connecting to {origin} failed: {source}"))
-        })?;
+        .map_err(|source| Error::connect(format!("connecting to {origin} failed: {source}")))?;
 
     // Nagle off. Every write this stack makes is a deliberately framed HTTP/2 frame, so
     // coalescing them adds latency to a request that is already complete in order to wait for
@@ -71,8 +69,10 @@ where
     // it as a connect failure would refuse a usable connection over a performance hint.
     let _ = stream.set_nodelay(true);
 
-    let (handle, connection) = handshake_shared_with(TokioIo::new(stream), config)
-        .map_err(|source| Error::connect(format!("starting HTTP/2 to {origin} failed: {source}")))?;
+    let (handle, connection) =
+        handshake_shared_with(TokioIo::new(stream), config).map_err(|source| {
+            Error::connect(format!("starting HTTP/2 to {origin} failed: {source}"))
+        })?;
 
     // The driver's outcome is deliberately discarded. A connection failing is not news the
     // pool can deliver to anyone: it reaches the callers who had exchanges on it, through

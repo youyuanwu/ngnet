@@ -82,9 +82,9 @@ impl Origin {
     ///
     /// [`ErrorKind::Uri`]: crate::ErrorKind::Uri
     pub fn from_uri(uri: &Uri) -> Result<Self, Error> {
-        let scheme = uri
-            .scheme()
-            .ok_or_else(|| Error::uri("request URI has no scheme; an absolute `http://` URI is required"))?;
+        let scheme = uri.scheme().ok_or_else(|| {
+            Error::uri("request URI has no scheme; an absolute `http://` URI is required")
+        })?;
 
         if scheme != &Scheme::HTTP {
             return Err(Error::uri(format!(
@@ -97,12 +97,9 @@ impl Origin {
         // `Some("")` for it rather than `None`. Without the emptiness check that becomes an
         // origin with no host, which resolves to nothing and fails as a connect error —
         // reporting a malformed URI as a network problem.
-        let host = uri
-            .host()
-            .filter(|host| !host.is_empty())
-            .ok_or_else(|| {
-                Error::uri("request URI has no host; an absolute `http://` URI is required")
-            })?;
+        let host = uri.host().filter(|host| !host.is_empty()).ok_or_else(|| {
+            Error::uri("request URI has no host; an absolute `http://` URI is required")
+        })?;
 
         let port = uri.port_u16().unwrap_or(HTTP_DEFAULT_PORT);
 

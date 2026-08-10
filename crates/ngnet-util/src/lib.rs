@@ -122,7 +122,7 @@ mod error;
 mod origin;
 mod pool;
 
-pub use client::{Client, ResponseFuture};
+pub use client::{Builder, Client, ResponseFuture};
 pub use error::{Error, ErrorKind};
 pub use origin::Origin;
 

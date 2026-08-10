@@ -81,10 +81,15 @@ where
     }
 
     /// Starts building a client with a non-default configuration.
+    ///
+    /// Note the inference wart, which is real and is not hidden: this sits on `Client<B>`,
+    /// so writing `Client::builder()` where `B` cannot be worked out from context does not
+    /// compile — and it usually cannot, because [`Builder::build`] chooses its own `B`
+    /// independently. Either name it, `Client::<Full<Bytes>>::builder()`, or start from
+    /// [`Builder::new`], which has no type parameter to infer. The method is kept because it
+    /// is where a reader looks first.
     pub fn builder() -> Builder {
-        Builder {
-            config: Config::default(),
-        }
+        Builder::new()
     }
 
     /// Sends a request, opening or reusing a connection to the URI's origin.
@@ -127,16 +132,10 @@ where
                 // retry would need a copy made before every request on the chance that one
                 // was needed. That impossibility *is* the safety property — no request can be
                 // silently replayed, because none can be held.
-                handle.send_request(request).await.map_err(|source| {
-                    // A refusal observed while this client is shutting down is this end's
-                    // doing, not the peer's, even though `ngnet-h2` reports one category for
-                    // both. It is not retriable: repeating it against a closing client would
-                    // fail identically for ever.
-                    if source.is_retriable() && pool.is_closed() {
-                        return Error::closed(source);
-                    }
-                    Error::exchange(source.is_retriable(), source)
-                })
+                handle
+                    .send_request(request)
+                    .await
+                    .map_err(|source| classify(source, pool.is_closed()))
             }),
         }
     }
@@ -179,6 +178,33 @@ where
     }
 }
 
+/// Decides which of this crate's categories a failed exchange belongs to.
+///
+/// A free function, and not inlined at the one call site, for a reason worth stating: the
+/// branch below is all but unreachable on purpose. `Client::request` checks for a closed
+/// client before it does anything else, so reaching `send_request` at all means the client
+/// was open at that moment, and `closed` can only be true if a shutdown started in the
+/// window between the two. A test cannot reliably win that race — one that tried would pass
+/// most of the time without ever entering the branch, which is worse than no test.
+///
+/// So the classification is separated from the timing, and the timing is left untested while
+/// the classification is tested directly.
+///
+/// # What it decides
+///
+/// `ngnet-h2` reports one category for both "the peer refused this stream" and "this end is
+/// shutting down", because from a connection's point of view they are the same event: a
+/// stream that will not be begun. They are not the same for a caller. A peer's refusal names
+/// a stream that was provably never acted on, so replaying it elsewhere is safe. Our own
+/// shutdown will refuse the next attempt identically, for ever, so calling that retriable
+/// invites a caller into a loop.
+fn classify(source: ngnet_h2::http::Error, closed: bool) -> Error {
+    if source.is_retriable() && closed {
+        return Error::closed(source);
+    }
+    Error::exchange(source.is_retriable(), source)
+}
+
 /// Builds a [`Client`] with a non-default connection configuration.
 #[derive(Debug, Clone)]
 pub struct Builder {
@@ -186,6 +212,16 @@ pub struct Builder {
 }
 
 impl Builder {
+    /// A builder with the default connection configuration.
+    ///
+    /// The entry point that always works. [`Client::builder`] is the same thing behind a
+    /// type parameter that has to be inferred first.
+    pub fn new() -> Self {
+        Self {
+            config: Config::default(),
+        }
+    }
+
     /// Sets the configuration every connection this client dials is created with.
     ///
     /// One configuration for the whole pool rather than one per origin. Per-origin settings
@@ -205,6 +241,12 @@ impl Builder {
         Client {
             pool: Arc::new(Pool::new(self.config)),
         }
+    }
+}
+
+impl Default for Builder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -271,5 +313,61 @@ where
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
         Client::request(self, request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The one classification a socket cannot be made to produce on demand.
+
+    use super::*;
+    use crate::ErrorKind;
+
+    /// A refusal, as `ngnet-h2` reports one.
+    ///
+    /// Obtained by asking a client that has been shut down to send a request, which is the
+    /// only way to get one without a peer: the error type has no public constructor, and
+    /// rightly so.
+    async fn a_refusal() -> ngnet_h2::http::Error {
+        let (transport, _peer) = tokio::io::duplex(1024);
+        let (handle, _driver) = ngnet_h2::http::client::handshake_shared::<
+            _,
+            http_body_util::Full<Bytes>,
+        >(ngnet_h2::http::transport::TokioIo::new(transport))
+        .expect("a session can be created over a duplex pipe");
+
+        handle.shutdown();
+        handle
+            .send_request(
+                http::Request::get("http://example.com/")
+                    .body(http_body_util::Full::new(Bytes::new()))
+                    .expect("a valid request"),
+            )
+            .await
+            .expect_err("a shut-down connection refuses new requests")
+    }
+
+    #[tokio::test]
+    async fn a_refusal_from_an_open_client_is_a_retriable_exchange_failure() {
+        let error = classify(a_refusal().await, false);
+        assert_eq!(error.kind(), ErrorKind::Exchange);
+        assert!(
+            error.is_retriable(),
+            "a stream the peer never began is safe to replay elsewhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_while_this_end_is_closing_is_reported_as_closed() {
+        let error = classify(a_refusal().await, true);
+        assert_eq!(
+            error.kind(),
+            ErrorKind::Closed,
+            "our own shutdown is not the peer refusing us"
+        );
+        assert!(
+            !error.is_retriable(),
+            "retrying against a closing client fails identically for ever"
+        );
     }
 }
