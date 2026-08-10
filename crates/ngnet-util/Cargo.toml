@@ -1,0 +1,59 @@
+[package]
+name = "ngnet-util"
+version = "0.1.0"
+description = "A pooling, connecting HTTP/2 client over ngnet-h2, for cleartext HTTP/2 on tokio"
+# Not released yet, for the same reason `ngnet-axum`, `ngnet-h3` and `ngnet-quic` carry this
+# line: the surface has not been used by anyone but its own tests. A connection pool's API is
+# also the hardest kind to take back -- `Client`, `Config` and `Error` would all become
+# compatibility obligations the moment someone depends on them, and the open questions
+# recorded in `docs/util/design.md` (a second connection per origin, a bound on the wait, a
+# request that can be recovered after a refusal) would each want to change one of them.
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# `ngnet-h2`'s dependency-free discipline -- one non-optional dependency, no dev-dependencies,
+# both pinned by tests -- deliberately does not apply here, exactly as it does not apply to
+# `ngnet-axum`. Keeping pooling out of `ngnet-h2` is the entire reason this is a separate
+# crate rather than a feature of it: the boundary recorded in `docs/h2/pending-work.md` says
+# a policy layer belongs above, and this is that layer.
+[dependencies]
+# The `tokio` feature supplies `TokioIo`, the transport adapter every dialled socket is
+# wrapped in, and it is the only transport enabled. `completion` would need a second
+# connector whose only difference is which runtime spawns the driver, which would test
+# nothing new about pooling.
+ngnet-h2 = { workspace = true, features = ["tokio"] }
+# `Bytes` appears in the body bound this crate requires (`Body<Data = Bytes>`), which it
+# requires because `ngnet-h2` does; it is named rather than inferred so the bound can be
+# written in signatures.
+bytes.workspace = true
+http.workspace = true
+# For the `Body` bound on outbound request bodies. No adapter type is built on top of it:
+# `ngnet-h2` already accepts any `http_body::Body<Data = Bytes>` outbound and already returns
+# one inbound, so a conversion layer here would solve a problem that does not exist.
+http-body.workspace = true
+# TCP, name resolution, the task that drives each connection, and the `watch` channels the
+# pool uses to fan a settled dial out to everyone waiting on it. Every one of those is
+# covered by the feature list already declared in the workspace table.
+tokio.workspace = true
+# The same trait, taken directly for the same reason, as `ngnet-axum` takes it: `tower` would
+# add the combinator layer when what is wanted is the one trait definition. Here it is
+# implemented rather than consumed, which makes this client usable underneath any tower
+# middleware without this crate knowing that middleware exists.
+tower-service.workspace = true
+
+# hyper as a *dev*-dependency, on purpose, and the mirror image of `ngnet-axum`'s reason for
+# doing the same: there, an independent *client* was needed because the server was under
+# test. Here the client is under test, so the server must be one this workspace did not
+# write -- otherwise the suite would prove only that `ngnet-h2` agrees with itself. CI
+# asserts hyper is absent from the *normal* dependency graph, which is the claim that
+# matters; a dev-dependency does not contradict it and the check deliberately ignores them.
+[dev-dependencies]
+# The tests build request bodies and collect response bodies; `Full` and `BodyExt::collect`
+# are all that is wanted from it.
+http-body-util.workspace = true
+hyper.workspace = true
+# `TokioExecutor` for hyper's HTTP/2 server spawns, and hyper's own `TokioIo`. Distinct from
+# `ngnet-h2`'s adapter of the same name; the tests alias whichever they need.
+hyper-util.workspace = true
