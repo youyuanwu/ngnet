@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use axum::Router;
-use ngnet_h2::http::Config;
+use ngnet_h2::http::{Config, Drain};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{Id, JoinSet};
 
@@ -101,23 +101,33 @@ impl Serve {
         self
     }
 
-    /// Stops accepting when `signal` resolves, and finishes once existing connections end.
+    /// Drains when `signal` resolves: stops accepting, tells every connected peer to wind
+    /// up, lets what is in flight finish, and then resolves.
     ///
-    /// **This is quiescence, not a drain, and the difference matters.** A draining shutdown
-    /// tells connected peers to stop sending — over HTTP/2 that is a `GOAWAY` — and then
-    /// waits for what is already in flight. This cannot do that: `ngnet-h2` exposes no
-    /// server-side `GOAWAY`, so there is no way to tell a peer anything. What happens
-    /// instead is that the listener is dropped, so nothing new is accepted, and established
-    /// connections continue for as long as their peers keep them open.
+    /// Precisely, on the signal: the listener is dropped, so the port is released and
+    /// nothing new is accepted; every live connection is sent a `GOAWAY` naming the last
+    /// request it had begun, so the peer learns which of its requests will be answered and
+    /// may retry the rest elsewhere; requests already being served run to completion and
+    /// their responses are delivered normally; each connection closes as its last stream
+    /// finishes; and this future resolves when the last connection has closed.
     ///
-    /// The practical consequence is that a peer holding an idle connection open holds the
-    /// server open with it, and this future will not resolve. If shutdown must complete
-    /// within a bounded time, impose that bound outside — race this future against a
-    /// timeout, or drop it, which ends every connection at once.
+    /// Handlers are *not* cancelled and their futures are not dropped. A request that was
+    /// in flight when the signal arrived gets the same response it would have got had the
+    /// signal never come.
     ///
-    /// See `docs/h2/pending-work.md` for what would be needed to make a real drain
-    /// possible.
-    pub fn with_stop_signal(mut self, signal: impl Future<Output = ()> + Send + 'static) -> Self {
+    /// # There is no deadline, deliberately
+    ///
+    /// A drain waits for the requests in flight, and a handler that never finishes will
+    /// hold its connection — and therefore this future — open indefinitely. Nothing here
+    /// can tell such a handler apart from a slow one, and inventing a timeout would mean
+    /// choosing, on the caller's behalf, a duration after which their users' requests get
+    /// truncated. Bound it outside if it needs bounding: race this future against a timer,
+    /// or drop it, which ends every connection at once. `axum::serve` leaves the same
+    /// choice to its caller for the same reason.
+    pub fn with_graceful_shutdown(
+        mut self,
+        signal: impl Future<Output = ()> + Send + 'static,
+    ) -> Self {
         self.stop = Some(Box::pin(signal));
         self
     }
@@ -218,7 +228,7 @@ async fn run(server: Serve) {
     // the peer address cannot ride along with the task's own output — it has to be kept
     // here and looked up by task id. Bounded by the number of live connections: every
     // harvest removes its entry.
-    let mut peers: HashMap<Id, SocketAddr> = HashMap::new();
+    let mut peers: HashMap<Id, Live> = HashMap::new();
     let mut stop = stop.unwrap_or_else(|| Box::pin(pending()));
     // Owed to the *listener*, not to any connection: set after a failure that will recur,
     // and waited out at the start of the next accept rather than here. Held as the instant
@@ -230,8 +240,8 @@ async fn run(server: Serve) {
         // Two levels, and the nesting is the point. The stop signal is given strict
         // priority via `biased`, because a flat `select!` chooses *at random* among ready
         // branches: with a stop signal already fired and a client already queued, half the
-        // time the loop would admit that connection and then, since stopping only quiesces,
-        // wait for it to finish. Serving a connection accepted after the stop signal is the
+        // time the loop would admit that connection and then immediately drain it, having
+        // served nothing. Serving a connection accepted after the stop signal is the
         // one thing FR-011 forbids.
         //
         // Below that, accepting and harvesting arbitrate *unbiased* against each other. A
@@ -260,8 +270,12 @@ async fn run(server: Serve) {
                     // easy path to miss, since it looks like the infallible half of setup.
                     match serve_connection(stream, router.clone(), peer, config) {
                         Ok(connection) => {
+                            // Taken before the connection is spawned, because afterwards
+                            // the connection has been moved into the task and there is
+                            // nothing left here to ask.
+                            let drain = connection.drain_handle();
                             let handle = connections.spawn(connection);
-                            peers.insert(handle.id(), peer);
+                            peers.insert(handle.id(), Live { peer, drain });
                         }
                         Err(error) => report(&mut observer, Error::connection(peer, error)),
                     }
@@ -284,14 +298,37 @@ async fn run(server: Serve) {
         }
     }
 
-    // Dropping the listener is the whole of "stop accepting": the port is released and
-    // nothing further is queued. Established connections are untouched, because there is
-    // no way to tell their peers anything — see `with_stop_signal`.
+    // Dropping the listener releases the port and stops anything further being queued.
+    // Done first, so that the window between deciding to stop and having stopped is as
+    // short as it can be.
     drop(listener);
+
+    // Then tell every live connection to wind up. This is the half that makes it a drain
+    // rather than a quiesce: each peer gets a `GOAWAY` naming the last request that
+    // connection had begun, so it learns which of its requests will still be answered and
+    // may take the rest elsewhere. Requests already in flight are untouched and their
+    // handlers keep running; the connection ends when the last of them has been answered.
+    //
+    // Every live connection, not just the idle ones. A connection in the middle of serving
+    // a request is exactly the one whose peer most needs to be told, and telling it does
+    // not disturb the request in flight.
+    for live in peers.values() {
+        live.drain.drain();
+    }
 
     while let Some(joined) = connections.join_next_with_id().await {
         harvest(&mut observer, &mut peers, joined);
     }
+}
+
+/// What the accept loop keeps for a connection it has spawned.
+///
+/// The address is here because a panicked task carries no payload of ours and the peer has
+/// to be recoverable by task id. The drain handle is here because by the time the loop
+/// wants it, the connection itself has been moved into its task.
+struct Live {
+    peer: SocketAddr,
+    drain: Drain,
 }
 
 /// Reports one finished connection, and forgets its peer.
@@ -302,18 +339,18 @@ async fn run(server: Serve) {
 /// on exactly the path that most needs the address.
 fn harvest(
     observer: &mut Option<Observer>,
-    peers: &mut HashMap<Id, SocketAddr>,
+    peers: &mut HashMap<Id, Live>,
     joined: Result<(Id, ngnet_h2::http::Result<()>), tokio::task::JoinError>,
 ) {
     match joined {
         Ok((id, outcome)) => {
-            let peer = peers.remove(&id);
+            let peer = peers.remove(&id).map(|live| live.peer);
             if let (Err(error), Some(peer)) = (outcome, peer) {
                 report(observer, Error::connection(peer, error));
             }
         }
         Err(join_error) => {
-            let peer = peers.remove(&join_error.id());
+            let peer = peers.remove(&join_error.id()).map(|live| live.peer);
             // A handler panic unwinds out of the connection future and so out of its task,
             // which is what makes it observable here at all. A panic in a *response body*
             // never reaches this point: it is pulled from inside an `extern "C"` callback

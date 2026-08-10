@@ -68,12 +68,17 @@
 //! `unwrap`. The asymmetry with the handler case is not a design choice made here but a
 //! consequence of where each one runs.
 //!
-//! **The stop signal quiesces; it does not drain.** [`Serve::with_stop_signal`] is
-//! deliberately not called `with_graceful_shutdown`. It stops the server accepting new
-//! connections and then waits for the established ones to end *of their peers' own accord*.
-//! Nothing tells a connected peer to wind up, because `ngnet-h2` exposes no server-side way
-//! to send `GOAWAY`; a peer holding an idle connection open holds the server open with it.
-//! Pair it with a timeout if you need a bound. See `docs/h2/pending-work.md`.
+//! **Graceful shutdown drains; it does not cancel.** [`Serve::with_graceful_shutdown`]
+//! stops the server accepting new connections and tells every established peer to wind up:
+//! each gets a `GOAWAY` naming the last request that connection will answer. Requests
+//! already in flight are answered in full, requests begun after it are refused, and each
+//! connection closes once its last stream finishes. The server future resolves when they
+//! all have.
+//!
+//! There is deliberately **no deadline**. A handler that never returns holds its connection
+//! open, and therefore holds the server open, forever. Bounding that is the caller's job,
+//! because only the caller knows what its own handlers are allowed to take and what should
+//! happen to a request that overruns -- wrap the server future in a timeout if you need one.
 //!
 //! **Peer addresses arrive as an extension, not `ConnectInfo`.** Handlers read
 //! [`PeerAddr`] from the request extensions. axum's `ConnectInfo` extractor is gated behind
@@ -98,12 +103,12 @@
 //!
 //! # A trap worth knowing about
 //!
-//! Because quiescence waits for peers, a client that holds a response body open holds the
-//! connection open, and therefore holds the server open. This is most often met in tests: a
-//! test that checks a status code and lets the response value live until the end of the
-//! function still has an open stream when it asks the server to stop, and then waits. The
-//! server is behaving correctly; the client has not finished. Read response bodies to
-//! completion, or drop them.
+//! A drain waits for streams, and a response body that is never read is a stream that never
+//! finishes. This is most often met in tests: a test that checks a status code and lets the
+//! response value live until the end of the function still has an open stream when it asks
+//! the server to stop, and then waits out its timeout. The server is behaving correctly --
+//! it owes that peer the rest of a body -- and the client is the one that has not finished.
+//! Read response bodies to completion, or drop them.
 //!
 //! [`Router`]: axum::Router
 //! [`IncomingBody`]: ngnet_h2::http::IncomingBody

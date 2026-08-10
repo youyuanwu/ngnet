@@ -59,19 +59,38 @@ trait definition those are written against. It is the same trait either way:
   verified by building the thing before writing the specification, not by reading the trait
   bounds and hoping.
 
-- **The stop signal quiesces; it does not drain — and the name says so.** The plan was
-  `with_graceful_shutdown`, mirroring `axum::serve`. It is not implementable on the public
-  API. `ngnet-h2` has no server-side way to send `GOAWAY`: `shutdown()` exists only on the
-  client handle, and the server's completion signal is hard-wired never to fire, on the
-  reasoning that a server does not decide when it is finished. So there is no way to tell a
-  peer to wind up, and therefore no drain.
+- **Graceful shutdown drains, and making it do so meant changing `ngnet-h2`.** The plan was
+  `with_graceful_shutdown`, mirroring `axum::serve`. It was not implementable on the public
+  API as it stood: `ngnet-h2` had no server-side way to send `GOAWAY` — `shutdown()` existed
+  only on the client handle — and the server's completion signal was hard-wired never to
+  fire, on the reasoning that a server does not decide when it is finished.
 
-  What is offered instead is honest about itself: `with_stop_signal` stops the accept loop
-  and waits for established connections to end of their peers' own accord. An idle peer
-  holds the server open. Calling it `with_graceful_shutdown` would have been the more
-  familiar name for behaviour that does not match it, and someone would eventually have
-  deployed a release believing connections were being drained. The gap and what would close
-  it are recorded in [`../h2/pending-work.md`](../h2/pending-work.md).
+  The first version of this crate therefore shipped mere quiescence under the deliberately
+  unfamiliar name `with_stop_signal`, so that the name would not promise a drain. That was
+  the right call for an unmodified `ngnet-h2` and the wrong one to leave standing, so the
+  gap was closed at the source: `Connection::drain_handle` and a completion signal that can
+  actually fire. What that cost, and why the two changes could not be made separately, is in
+  [`../h2/pending-work.md`](../h2/pending-work.md).
+
+  **What "drained" means here, precisely.** On the stop signal the listener is dropped, then
+  every live connection is sent a `GOAWAY` naming the last request it will answer — the last
+  stream nghttp2 actually *processed*, not the highest it has seen, because the highest may
+  include one already refused. Requests in flight are answered in full. Requests begun after
+  that mark are refused. Each connection closes when its last stream finishes, and the
+  server future resolves when the last connection has closed.
+
+  **There is no deadline, and that is a decision rather than an omission.** A handler that
+  never returns holds its connection open and holds the server open with it. Imposing a
+  bound here would mean guessing what a caller's handlers are allowed to take and what
+  should happen to one that overruns — questions only the caller can answer. A caller that
+  wants a bound wraps the server future in a timeout, which composes exactly as well and
+  says what it means.
+
+  **The order matters and is easy to get wrong.** The listener is dropped *before* the
+  connections are drained, so nothing can be accepted into a server that has already
+  started saying goodbye. The drain handles are taken *before* each connection is spawned,
+  because afterwards the connection has been moved into its task and there is nothing left
+  to ask.
 
 ## Errors go to a callback, not into the return type
 
@@ -107,8 +126,8 @@ instant, inheriting the progress already made.
 The other thing the loop does deliberately is rank its branches. The stop signal is
 `biased` ahead of everything else, because `select!` chooses at *random* among ready
 branches: with a stop signal already fired and a client already queued, an unranked loop
-would admit that client about half the time, and then wait for it, since stopping only
-quiesces. Accepting and harvesting, by contrast, arbitrate unbiased against each other on
+would admit that client about half the time, and then immediately drain it, having
+served it nothing. Accepting and harvesting, by contrast, arbitrate unbiased against each other on
 purpose — ranking those two would starve whichever came second under sustained load.
 
 ## Peer addresses, and the feature that would undo the crate
@@ -179,5 +198,5 @@ it.
   cleanup belongs in `Drop`, not after the `await`.
 - **An outstanding response body holds a connection open.** hyper's `Incoming` keeps its
   connection alive while it exists, so a client that has not finished reading has not gone
-  away, and quiescence correctly waits for it. This cost an afternoon of debugging a
+  away, and the drain correctly waits for it — the stream is still open. This cost an afternoon of debugging a
   "hanging shutdown" that was the server being right.

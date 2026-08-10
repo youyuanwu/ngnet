@@ -188,37 +188,36 @@ test, and no more.
   sees when io_uring is unavailable, because this machine cannot make it unavailable to order
   and a mocked one would test the mock.
 
-## A server cannot initiate shutdown
+## A server can initiate shutdown
 
-**Found while building `ngnet-axum`.** The async server has no way to tell a connected peer
-that it is winding up, so "stop accepting, let outstanding exchanges finish, then close" —
-the shutdown every HTTP server library offers, and what `axum::serve`'s
-`with_graceful_shutdown` does — cannot be built on top of this crate. `ngnet-axum` therefore
-offers quiescence instead: it stops accepting and waits for peers to leave of their own
-accord, and its method is called `with_stop_signal` rather than `with_graceful_shutdown` so
-that the name does not promise a drain. A peer that holds an idle connection open holds the
-server open with it.
+**Found while building `ngnet-axum`, and settled in the same change.** The async server had
+no way to tell a connected peer that it was winding up, so "stop accepting, let outstanding
+exchanges finish, then close" — the shutdown every HTTP server library offers, and what
+`axum::serve`'s `with_graceful_shutdown` does — could not be built on top of this crate.
 
-The machinery is nearly all present, which is what makes this worth recording rather than
-merely noting. `GOAWAY` handling in the driver is role-agnostic. Two things are missing, and
-they have to arrive together:
+The machinery was nearly all there: `GOAWAY` handling in the driver is role-agnostic, and
+`Session::shutdown` never cared which role called it. Two things were missing, and the
+important part of this entry is *why they had to arrive together*:
 
-- **A server-side shutdown handle.** `shutdown()` exists on the client handle
-  (`src/http/client.rs`) and has no server counterpart. Sending `GOAWAY` is the easy half.
-- **A completion signal that can fire.** The server's is currently hard-wired to never
-  complete (`src/http/server.rs`, `|| false`), with the comment "A server does not decide
-  when it is finished; the peer does." That is right for a server that has not announced a
-  shutdown, and wrong for one that has. It would need to become: finished once a `GOAWAY`
-  has been sent and no stream remains open.
+- **A server-side shutdown handle.** `Connection::drain_handle` now returns a `Drain`, the
+  server counterpart to the client's `SendRequest::shutdown`. It is taken from the
+  connection *before* the connection is spawned, because afterwards the connection has been
+  moved into a task and there is nothing left to ask.
+- **A completion signal that can fire.** The server's was hard-wired to `|| false`, with the
+  comment "A server does not decide when it is finished; the peer does." That is right for a
+  server that has not announced a shutdown and wrong for one that has, so it is now
+  `|| shared.is_draining()`: finished once a `GOAWAY` has been sent and no stream remains.
 
-Adding only the first gives a server that says goodbye and then waits forever, which is
-worse than the present behaviour because it looks like it works.
+Adding only the first would have given a server that says goodbye and then waits forever,
+which is worse than the old behaviour because it looks like it works. That is not a
+hypothetical: reverting just the completion signal left the entire `ngnet-axum` acceptance
+suite green, because hyper closes the socket itself on `GOAWAY` and the server ended by
+reading EOF exactly as it always had. The test that catches it — in
+`tests/ngnet-h2-tests/tests/http_tokio.rs` — uses a bare socket that completes the handshake
+and then never closes, which is the only peer that can tell the two behaviours apart.
 
-**Settle it** by adding both, additively — no existing caller's behaviour changes, since a
-server that never calls the new handle keeps the never-done signal it has today. The
-acceptance test to write with it is the one `ngnet-axum` cannot write now: a client with an
-exchange in flight sees that exchange complete, sees its next request refused, and the
-server future resolves without the client having closed anything.
+Both are additive. A server that never calls `drain_handle` keeps the never-done signal it
+has always had, and no existing caller changed.
 
 ## Toolchain upgrades cost lint fixes
 
@@ -240,9 +239,10 @@ These are not gaps. They are decisions, recorded so they are not mistaken for ov
   `ngnet-h3` wraps nghttp3 as a sans-I/O core. What that core deliberately lacks — an
   asynchronous layer, a bundled QUIC or TLS implementation, and server push, which nghttp3
   does not implement — is recorded in `docs/README.md`.
-- **No server-initiated shutdown**, which is a gap rather than a boundary — see "A server
-  cannot initiate shutdown" above. Listed here too because it is the kind of absence a
-  reader is most likely to mistake for a deliberate omission.
+- **No deadline on a drain.** Once drained, a connection closes when its last stream ends,
+  and a stream that never ends never closes it. That is the caller's bound to impose, not
+  this crate's: only the caller knows what its handlers may legitimately take and what
+  should happen to one that overruns. A crate-level timeout would have to guess.
 - **One connection, no policy layer.** No pooling, retries, redirects, or `Service`
   abstraction — those belong in a layer above this crate.
 - **No boxed transports.** The transport traits return `impl Future`, so they are

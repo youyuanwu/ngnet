@@ -179,13 +179,10 @@ where
         },
     );
 
-    let connection = Connection::new(driver::run(
-        transport,
-        session,
+    let connection = Connection::new(
+        driver::run(transport, session, Arc::clone(&shared), registry, guard),
         Arc::clone(&shared),
-        registry,
-        guard,
-    ));
+    );
 
     Ok((
         SendRequest {

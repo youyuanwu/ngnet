@@ -47,13 +47,13 @@ async fn main() -> Fallible {
     println!("listening on http://{}", listener.local_addr()?);
     println!("this is h2c: use --http2-prior-knowledge, not --http2");
 
-    // Ctrl-C stops the server accepting. Established connections are *not* torn down: they
-    // end when their peers end them, which is quiescence rather than a drain. A connection
-    // an idle peer holds open holds the server open with it, so a real deployment wants a
-    // timeout around this rather than an unbounded wait.
+    // Ctrl-C stops the server accepting and drains what is already established: every peer
+    // is told the last request its connection will answer, in-flight requests are finished,
+    // and each connection closes after its last stream. There is no deadline on that, so a
+    // deployment whose handlers can take arbitrarily long wants a timeout around this.
     ngnet_axum::serve(listener, router)
         .on_error(|error| eprintln!("connection failed: {error}"))
-        .with_stop_signal(async {
+        .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
             println!("stopping: no new connections will be accepted");
         })

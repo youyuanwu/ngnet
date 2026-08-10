@@ -55,9 +55,10 @@ is separable. There are no body adapters in the crate, because none is needed:
 the body types on both sides already agree.
 
 It differs from `axum::serve` in ways worth knowing before deploying it —
-handlers must not block, a panicking handler costs its whole connection, and the
-stop signal quiesces rather than drains, because `ngnet-h2` has no server-side
-`GOAWAY`. All of them are on the crate's front page, with the reasons.
+handlers must not block, a panicking handler costs its whole connection, and
+graceful shutdown drains without a deadline, so a handler that never returns
+holds the server open. All of them are on the crate's front page, with the
+reasons.
 
 ```rust,no_run
 let router = axum::Router::new().route("/hello", axum::routing::get(|| async { "world" }));

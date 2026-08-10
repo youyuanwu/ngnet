@@ -212,9 +212,10 @@ where
     };
 
     let guard = DriverGuard::new(Arc::clone(&shared), Arc::clone(&registry), role);
-    Ok(Connection::new(driver::run(
-        transport, session, shared, registry, guard,
-    )))
+    Ok(Connection::new(
+        driver::run(transport, session, Arc::clone(&shared), registry, guard),
+        shared,
+    ))
 }
 
 /// Tells a handler that its stream is gone.
@@ -496,12 +497,24 @@ where
 
     fn signals(&self) -> Signals {
         let ready = self.tasks.ready();
+        let shared = Arc::clone(&self.shared);
         Signals::new(
             move || ready.any(),
-            // A server does not decide when it is finished; the peer does, by going away.
-            // Ending because no stream happens to be open would close a connection between
-            // two requests.
-            || false,
+            // A server does not decide when it is finished; the peer does, by going away —
+            // *unless* this end has asked to drain. Ending because no stream happens to be
+            // open would close a connection between two requests, which is why this cannot
+            // simply be "no streams".
+            //
+            // This is the half of a graceful shutdown that is easy to leave out, and
+            // leaving it out is not a partial success but a hang: a drain handle on its own
+            // sends the `GOAWAY`, refuses new streams, lets the in-flight ones finish, and
+            // then waits here forever, because nothing ever told the driver it was allowed
+            // to stop. The caller sees a connection that has done everything except end.
+            //
+            // Deliberately keyed on `is_draining` rather than `is_refusing`: a peer's
+            // `GOAWAY` sets the latter, and a server that is *told* its client is going away
+            // still owes it the socket until the client closes it.
+            move || shared.is_draining(),
         )
     }
 }

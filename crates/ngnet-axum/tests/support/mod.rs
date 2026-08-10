@@ -70,7 +70,7 @@ impl TestServer {
             serve(listener, router)
                 .config(config)
                 .on_error(move |error| sink.lock().expect("a lock").push(error))
-                .with_stop_signal(async {
+                .with_graceful_shutdown(async {
                     let _ = stopped.await;
                 })
                 .into_future(),
