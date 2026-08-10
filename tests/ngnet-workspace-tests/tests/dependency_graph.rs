@@ -13,7 +13,7 @@
 //! cargo test -p ngnet-workspace-tests --test dependency_graph
 //! ```
 
-use ngnet_workspace_tests::{cargo_tree, contains_at_word_boundary};
+use ngnet_workspace_tests::{cargo_tree, contains_at_word_boundary, dependency_name};
 
 /// The HTTP/3 sans-I/O core depends on nothing but its bindings.
 ///
@@ -51,11 +51,12 @@ fn http3_core_depends_only_on_its_bindings() {
     );
 
     assert!(
-        dependencies[0].contains("ngnet-h3-sys"),
-        "the HTTP/3 core has exactly one dependency, but it is not its bindings.\n\
+        dependency_name(dependencies[0]) == "ngnet-h3-sys",
+        "the HTTP/3 core has exactly one dependency, but it is not its bindings: it is `{}`.\n\
          Counting alone would have passed here, which is why the name is checked.\n\
          Inspect it with:\n  \
          cargo tree -p ngnet-h3 --no-default-features -e normal\n\n{tree}",
+        dependency_name(dependencies[0]),
     );
 }
 

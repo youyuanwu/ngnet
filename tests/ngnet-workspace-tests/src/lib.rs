@@ -216,6 +216,21 @@ pub fn needed_libraries(binary: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// The package name on a `cargo tree` dependency line.
+///
+/// A line looks like `└── ngnet-h3-sys v0.1.0 (/path)`, so the name is the token after
+/// the box-drawing prefix. Returning it lets a caller compare names for equality rather than
+/// by substring: the shell this replaces asked `grep -q 'ngnet-h3-sys'`, which a sole
+/// dependency called `foo-ngnet-h3-sys` would have satisfied. Nothing is named that today,
+/// and the point of moving these checks into tests is that they can be made exact rather
+/// than merely as good as the grep they came from.
+pub fn dependency_name(line: &str) -> &str {
+    line.trim_start_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+}
+
 /// Whether a library name is OpenSSL -- either half of it.
 ///
 /// `libssl` and `libcrypto` are checked together wherever the claim is "no TLS at all", and
@@ -223,18 +238,64 @@ pub fn needed_libraries(binary: &std::path::Path) -> Vec<String> {
 /// replace. Matching on the `lib` prefix rather than the bare word keeps a crate or file
 /// merely called `crypto-something` from being mistaken for the C library.
 pub fn is_openssl(library: &str) -> bool {
-    let library = library.to_ascii_lowercase();
-    library.starts_with("libssl") || library.starts_with("libcrypto")
+    names_library(library, "libssl") || names_library(library, "libcrypto")
 }
 
 /// Whether a library name is specifically `libssl`.
 pub fn is_libssl(library: &str) -> bool {
-    library.to_ascii_lowercase().starts_with("libssl")
+    names_library(library, "libssl")
+}
+
+/// Whether a `DT_NEEDED` entry names the given library.
+///
+/// The entry is usually a bare soname, but it is permitted to be a path, and a build using
+/// a non-default OpenSSL is exactly the case that produces one -- `/opt/openssl/lib/libssl.so.3`
+/// rather than `libssl.so.3`. The shell this replaces matched `NEEDED.*lib(ssl|crypto)`,
+/// anywhere in the line, so it caught those; anchoring at the start of the string would
+/// have quietly narrowed the check while moving it, which is the specific failure this
+/// migration is trying not to commit. So the file name is taken first, and the prefix
+/// matched against that -- still refusing to mistake `crypto-something` for the C library,
+/// but no longer blind to a path.
+fn names_library(entry: &str, library: &str) -> bool {
+    let entry = entry.to_ascii_lowercase();
+    let file_name = entry.rsplit('/').next().unwrap_or(&entry);
+    file_name.starts_with(library)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::contains_at_word_boundary;
+    use super::{contains_at_word_boundary, dependency_name, is_openssl};
+
+    /// Pins the two matchers that the implementation review found narrower than the shell
+    /// they replaced.
+    #[test]
+    fn matchers_are_no_narrower_than_the_shell_they_replace() {
+        // A `DT_NEEDED` entry may be a path, which `NEEDED.*lib(ssl|crypto)` matched and an
+        // anchored prefix comparison did not.
+        assert!(is_openssl("libssl.so.3"));
+        assert!(is_openssl("/opt/openssl/lib/libssl.so.3"));
+        assert!(is_openssl("/usr/lib/x86_64-linux-gnu/libcrypto.so.3"));
+        // Not fooled by something merely named after the concept, as long as it does not
+        // start with the library name. `libcryptoki.so` (PKCS#11) does start with it and so
+        // matches -- which is what `NEEDED.*lib(ssl|crypto)` did too. Being broader than the
+        // property here is safe in a way that being narrower is not: a false positive fails
+        // loudly and has never fired, whereas a false negative is a check that has stopped
+        // working without saying so.
+        assert!(!is_openssl("crypto-helper.so"));
+        assert!(!is_openssl("libssh.so.4"));
+        assert!(is_openssl("libcryptoki.so"));
+
+        // And the dependency line names a package exactly, rather than containing it.
+        assert_eq!(
+            dependency_name("\u{2514}\u{2500}\u{2500} ngnet-h3-sys v0.1.0 (/x)"),
+            "ngnet-h3-sys"
+        );
+        assert_eq!(dependency_name("    ngnet-h3-sys v0.1.0"), "ngnet-h3-sys");
+        assert_ne!(
+            dependency_name("\u{2514}\u{2500}\u{2500} foo-ngnet-h3-sys v0.1.0"),
+            "ngnet-h3-sys"
+        );
+    }
 
     /// Pins the boundary rule against the shell it replaces.
     ///
