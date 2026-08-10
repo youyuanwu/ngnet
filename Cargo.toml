@@ -13,6 +13,7 @@ members = [
     "tests/ngnet-h2-bench",
     "tests/ngnet-h3-tests",
     "tests/ngnet-quic-tests",
+    "tests/ngnet-workspace-tests",
 ]
 
 [workspace.package]

@@ -1,0 +1,23 @@
+[package]
+name = "ngnet-workspace-tests"
+version = "0.1.0"
+description = "Checks on the workspace itself: what the resolved dependency graph contains, and what the linked binaries pull in"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# This crate exists because its checks belong to no single crate. Each one spans the
+# workspace -- the HTTP/3 core's dependency graph, the completion transport's feature
+# resolution, the axum integration's and the client policy layer's freedom from hyper, the
+# QUIC bindings' and wrapper's linkage -- so putting any of them in a per-crate test suite
+# would file it under one of the several crates it is actually about.
+#
+# They also used to be shell scripts in .github/workflows/ci.yml, which meant a contributor
+# could not run them without opening a pull request. They are ordinary tests now.
+#
+# There are deliberately no dependencies here, normal or dev, and the empty tables are the
+# point rather than an omission. Every check drives `cargo` or `readelf` as a subprocess and
+# reads the output, so nothing needs to be linked in; parsing the little that is needed by
+# hand is a smaller cost than adding a JSON or ELF crate to a workspace whose dependency
+# register is short and individually justified on purpose.
