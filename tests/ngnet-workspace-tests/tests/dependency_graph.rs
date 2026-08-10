@@ -115,6 +115,26 @@ fn completion_transport_compiles_no_readiness_backend() {
         "features",
     ]);
 
+    // Anchor the negative before asserting it. This check is unusual among the five in that
+    // the string it looks for only exists while `compio-driver` is in the graph at all: if the
+    // completion transport were rewritten onto a different driver, or compio's crate split
+    // renamed this one, the search target would simply vanish and the assertion below would
+    // pass while asking nothing. The shell this replaces had the same hole. It is worth
+    // closing here rather than merely reproducing, because a check that has quietly stopped
+    // asking its question is the exact failure this repository has been bitten by before --
+    // and unlike the hyper and transport checks, whose targets are crates that *should* be
+    // absent, this one names a feature of a crate that must be present for the question to
+    // mean anything.
+    assert!(
+        tree.contains("compio-driver"),
+        "`compio-driver` is not in the completion transport's feature graph at all, so the \
+         `polling` check below is asking nothing.\n\
+         Either the transport no longer uses compio's driver, in which case this test needs \
+         rewriting against whatever replaced it, or the graph broke.\n\
+         Inspect it with:\n  \
+         cargo tree -p ngnet-h2 --features completion -e features\n\n{tree}",
+    );
+
     assert!(
         !tree.contains(r#"compio-driver feature "polling""#),
         "compio's `polling` feature reached the build, which restores the fusion driver and \
