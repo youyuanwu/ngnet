@@ -123,12 +123,27 @@ impl<B> Slot<B> {
 
     /// Publishes a new state and rings the bell.
     ///
-    /// `send_replace` rather than `send`: `send` fails when there are no receivers, and a
+    /// `send_modify` rather than `send`: `send` fails when there are no receivers, and a
     /// transition with nobody currently waiting still has to be *retained* so that the next
     /// subscriber sees the new generation rather than a stale zero.
+    ///
+    /// It is also `send_modify` rather than `send_replace(self.settled.borrow() + 1)`, and
+    /// that is not a style preference. `borrow()` returns a guard over the channel's own
+    /// lock which lives to the end of the *statement* it appears in, so folding it into the
+    /// argument leaves it held while `send_replace` asks for the same lock to write. That
+    /// deadlocks — and because the lock is a blocking one, it deadlocks the executor thread
+    /// rather than the task, so even a `tokio::time::timeout` wrapped around the request
+    /// never fires. `send_modify` takes the lock once and increments in place.
+    ///
+    /// The slot lock is deliberately held across the bump, so that the state and the
+    /// generation move together as far as any waiter is concerned. A waiter captures the
+    /// generation under this same lock, so a split here would let one capture the new state's
+    /// old generation and park for a transition that had already happened.
     fn settle(&self, state: Dial<B>) {
-        *self.state.lock().expect("slot lock poisoned") = state;
-        self.settled.send_replace(self.settled.borrow().wrapping_add(1));
+        let mut current = self.state.lock().expect("slot lock poisoned");
+        *current = state;
+        self.settled
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 }
 
@@ -239,7 +254,10 @@ where
     /// woken into a state that is neither an answer nor a wait — a newcomer may have started
     /// a fresh dial in the meantime — and each pass takes the slot lock exactly once,
     /// deciding and transitioning under it so that two callers cannot both become the dialer.
-    pub(crate) async fn acquire(self: &Arc<Self>, origin: &Origin) -> Result<SendRequest<B>, Error> {
+    pub(crate) async fn acquire(
+        self: &Arc<Self>,
+        origin: &Origin,
+    ) -> Result<SendRequest<B>, Error> {
         // Registered before anything else, and released by the guard's `Drop`, so that a
         // shutdown starting now waits for this acquire to finish rather than draining around
         // it. The guard is synchronous precisely because `Drop` cannot await.
@@ -342,7 +360,11 @@ where
         #[cfg(test)]
         {
             // Test-only park, after the slot is `Dialing` and before anything is registered.
-            let barrier = self.dial_barrier.lock().expect("barrier lock poisoned").clone();
+            let barrier = self
+                .dial_barrier
+                .lock()
+                .expect("barrier lock poisoned")
+                .clone();
             if let Some(barrier) = barrier {
                 barrier.notified().await;
             }
@@ -365,7 +387,9 @@ where
                         // the one place already holding the lock for a reason, and a pool
                         // with no traffic needs no sweeping.
                         state.drivers.retain(|driver| !driver.is_finished());
-                        state.drivers.push(driver_slot.take().expect("driver taken twice"));
+                        state
+                            .drivers
+                            .push(driver_slot.take().expect("driver taken twice"));
                     }
                     state.closed
                 };
