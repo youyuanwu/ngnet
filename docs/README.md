@@ -4,10 +4,11 @@ Notes that outlive any one change. API documentation lives with the code (`cargo
 what is here is the reasoning a reader cannot recover from the source.
 
 There are three crate families — HTTP/2, HTTP/3 and QUIC — built the same way and largely
-independent of each other, so each keeps its own notes. Alongside them sits one
-*integration*: `ngnet-axum`, which is not a family but a piece of wiring between the HTTP/2
-family and a third-party framework, and which keeps its notes here for the same reason.
-Anything genuinely shared sits at this level.
+independent of each other, so each keeps its own notes. Alongside them sit two crates that
+are not families but *layers above* one: `ngnet-axum`, which wires the HTTP/2 family to a
+third-party framework on the server side, and `ngnet-util`, which is the client-side policy
+layer over `ngnet-h2`'s single-connection client. Both keep their notes here for the same
+reason. Anything genuinely shared sits at this level.
 
 ## HTTP/2 — [`h2/`](h2/)
 
@@ -47,6 +48,16 @@ implementation.
 
 There are no axum invariants or benchmarks: the crate pins its claims in its own acceptance
 suite and in a CI dependency-graph check, rather than in a document of its own.
+
+## Client policy layer — [`util/`](util/)
+
+| Document | What it covers |
+| --- | --- |
+| [`util/design.md`](util/design.md) | Why HTTP/2 multiplexing makes a pool something other than a queue of idle sockets, what the dial state machine is for and why a `OnceCell` will not do, when a connection is evicted and why replacement is lazy, and why the crate reports a retriable failure without ever retrying. |
+
+There are no `ngnet-util` invariants or benchmarks: like the axum integration, the crate
+pins its claims in its own acceptance suite and in a CI dependency-graph check rather than
+in a document of its own.
 
 ## Shared
 

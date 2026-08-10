@@ -110,7 +110,7 @@
 //!
 //! [`handshake`]: ngnet_h2::http::client::handshake
 //! [`SendRequest`]: ngnet_h2::http::client::SendRequest
-//! [`TokioIo`]: ngnet_h2::http::transport::tokio::TokioIo
+//! [`TokioIo`]: ngnet_h2::http::transport::TokioIo
 
 #![deny(missing_docs)]
 #![deny(unsafe_code)]

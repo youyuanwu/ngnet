@@ -244,7 +244,12 @@ These are not gaps. They are decisions, recorded so they are not mistaken for ov
   this crate's: only the caller knows what its handlers may legitimately take and what
   should happen to one that overruns. A crate-level timeout would have to guess.
 - **One connection, no policy layer.** No pooling, retries, redirects, or `Service`
-  abstraction — those belong in a layer above this crate.
+  abstraction — those belong in a layer above this crate, and `ngnet-util` is now that
+  layer. The boundary has not moved: `ngnet-h2`'s client is still one connection, and the
+  pool lives entirely outside it. Nothing in `ngnet-util` required a change here, which is
+  the evidence that the seam was drawn in the right place — `SendRequest::is_closed`,
+  `is_refusing` and `shutdown` turned out to be exactly the vocabulary a pool needs, and no
+  new one was added for it. See [`../util/design.md`](../util/design.md).
 - **No boxed transports.** The transport traits return `impl Future`, so they are
   generic-only and not object-safe, by design.
 - **Outgoing bodies must be `Send + 'static`**, because the session holds them. Received

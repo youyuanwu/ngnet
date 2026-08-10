@@ -146,6 +146,11 @@ jobs:
       - name: Clippy (axum integration)
         run: cargo clippy -p ngnet-axum --all-targets -- -D warnings
 
+      # Same reasoning: `ngnet-util` has no features either -- tokio, the h2 transport and
+      # the tower `Service` impl are all unconditional.
+      - name: Clippy (client policy layer)
+        run: cargo clippy -p ngnet-util --all-targets -- -D warnings
+
       # Four configurations rather than one, because of a bug this repository actually
       # shipped: a doc link to an item behind the `tokio` feature passed `--all-features`
       # and broke every build without it. `--all-features` alone is not a documentation check.
@@ -191,6 +196,11 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps -p ngnet-axum
+
+      - name: Rustdoc for the client policy layer
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps -p ngnet-util
 
       # Two separate claims, and they need two separate commands.
       #
@@ -333,6 +343,26 @@ jobs:
             exit 1
           fi
           echo "no hyper in the axum integration's normal graph"
+
+      # The same claim for the client side, and it is worth making separately rather than
+      # trusting the one above. `ngnet-util` reaches hyper in its *dev*-dependencies on
+      # purpose: the acceptance suite drives the pool against hyper's HTTP/2 server, because
+      # a server from this workspace could only show ngnet-h2 agreeing with itself. That is
+      # exactly the arrangement in which a hyper crate slips into the normal graph unnoticed,
+      # since everything still builds and every test still passes.
+      - name: No hyper crate reaches the client policy layer
+        run: |
+          tree=$(cargo tree -p ngnet-util -e normal)
+          echo "$tree"
+          if echo "$tree" | grep -qiE '\bhyper'; then
+            echo "::error::a hyper crate reached ngnet-util's normal dependency graph."
+            echo "::error::Find it with:"
+            echo "::error::  cargo tree -p ngnet-util -e normal -i hyper"
+            echo "::error::The acceptance suite's hyper server belongs in [dev-dependencies],"
+            echo "::error::which this check deliberately ignores."
+            exit 1
+          fi
+          echo "no hyper in the client policy layer's normal graph"
 
       # Benchmarks are not run here for their numbers. A shared runner has noisy
       # neighbours, no frequency control and no guaranteed CPU model, so a timing threshold
