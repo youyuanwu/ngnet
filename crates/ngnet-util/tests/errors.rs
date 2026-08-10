@@ -30,7 +30,8 @@ async fn the_four_kinds_are_each_reachable_and_distinct() {
     }
 
     // Connect: this end could not reach the peer. Nothing was sent, so nothing was acted on,
-    // but the request is not retriable *on this client* — the origin is what failed.
+    // and the delivery claim `is_retriable` makes is therefore true — repeating this request
+    // cannot duplicate an effect, because it had none.
     {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -43,6 +44,7 @@ async fn the_four_kinds_are_each_reachable_and_distinct() {
         let error = within("the connect failure", client.request(get(uri)))
             .await
             .expect_err("nothing is listening");
+        assert!(error.is_retriable());
         produced.push(error.kind());
     }
 
@@ -84,9 +86,16 @@ async fn the_four_kinds_are_each_reachable_and_distinct() {
 }
 
 #[tokio::test]
-async fn only_an_exchange_failure_is_ever_retriable() {
-    // The conservative half of the retry rule. Everything except a refused stream either was
-    // or might have been acted on, or will fail identically next time.
+async fn a_refused_stream_is_retriable_and_a_bad_uri_is_not() {
+    // The conservative half of the retry rule, and the name matters: an earlier draft called
+    // this `only_an_exchange_failure_is_ever_retriable`, which is false. `Connect` is
+    // retriable too, and unconditionally so — nothing reached a peer, so nothing was acted
+    // on. The name asserted a contract the crate does not implement and the test did not
+    // check, which is the quiet kind of wrong: it would have been read as authority for the
+    // opposite rule. The connect case is asserted in the matrix test above.
+    //
+    // What this pins is the *conditional* half. `Exchange` is retriable only when `ngnet-h2`
+    // was willing to say the stream was never begun, and `Uri` never is.
     let peer = RawPeer::start(Behaviour::RefuseEverything).await;
     let client: Client<Full<Bytes>> = Client::new();
 
@@ -121,4 +130,58 @@ async fn an_exchange_failure_keeps_the_protocol_error_as_its_source() {
         source.downcast_ref::<ngnet_h2::http::Error>().is_some(),
         "the cause should be the protocol error itself, got: {source}"
     );
+}
+
+#[tokio::test]
+async fn a_connect_failure_keeps_the_io_error_as_its_source() {
+    // The same claim as above, made separately because it is the one that was false. The
+    // connect path formatted its cause into the message — `"connecting to {origin} failed:
+    // {source}"` — which reads perfectly and leaves nothing to downcast to. A caller wanting
+    // to distinguish `ConnectionRefused` from `HostUnreachable`, to decide whether another
+    // address is worth trying, could only have got there by parsing English.
+    //
+    // The chain is two links: this crate's context, then the `io::Error` under it.
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("a bound listener");
+    let address = listener.local_addr().expect("a bound address");
+    drop(listener);
+
+    let client: Client<Full<Bytes>> = Client::new();
+    let uri: http::Uri = format!("http://{address}/x").parse().expect("a valid URI");
+    let error = within("the connect failure", client.request(get(uri)))
+        .await
+        .expect_err("nothing is listening");
+
+    assert_eq!(error.kind(), ErrorKind::Connect);
+
+    // Walked rather than indexed. The chain has an intermediate link — a dial failure is
+    // shared between everyone who waited on it, so it arrives wrapped — and a caller has no
+    // business knowing that. Walking to the end is what `anyhow`, `eyre` and hand-written
+    // matches all do, and it keeps this test pinning the property (the `io::Error` is
+    // reachable) rather than the pool's current internal shape.
+    let io = sources(&error)
+        .find_map(|link| link.downcast_ref::<std::io::Error>())
+        .unwrap_or_else(|| {
+            let chain: Vec<String> = sources(&error).map(|link| link.to_string()).collect();
+            panic!("no io::Error anywhere in the chain: {chain:#?}")
+        });
+    assert_eq!(io.kind(), std::io::ErrorKind::ConnectionRefused);
+
+    // And the message is unchanged by keeping the cause typed: the whole chain still renders.
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("connecting to") && rendered.contains(&address.to_string()),
+        "the message should still name the origin, got: {rendered}"
+    );
+}
+
+/// Every link below an error, in order.
+///
+/// `std::error::Error::sources` is still unstable, so this is the two lines it will one day
+/// replace.
+fn sources<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(error.source(), |link| link.source())
 }

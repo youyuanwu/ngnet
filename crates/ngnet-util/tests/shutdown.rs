@@ -242,3 +242,54 @@ async fn dropping_the_client_does_not_cancel_an_exchange_in_flight() {
         .to_bytes();
     assert_eq!(body, Bytes::from_static(b"late"));
 }
+
+#[tokio::test]
+async fn a_shutdown_abandoned_by_its_caller_still_completes() {
+    // The defect this pins is the documentation's own advice turning into a wedge.
+    //
+    // `shutdown` has no deadline, deliberately — the bound belongs to the caller, and the way
+    // a caller applies one is `tokio::time::timeout` around the future. `timeout` on expiry
+    // *drops* that future. When the drain ran inline in the first caller's future, that drop
+    // cancelled the only drain there would ever be: `closed` stayed set so nobody else could
+    // elect themselves leader, and `finished` was never published so every later call waited
+    // for a completion nothing was left to produce. Shutting down became impossible after
+    // exactly the timeout the docs recommend.
+    //
+    // A slow exchange holds the drain open long enough for the first caller to give up on it.
+    let peer = RawPeer::start(Behaviour::AnswerInTwoParts { delay_ms: 300 }).await;
+    let client: Client<Full<Bytes>> = Client::new();
+
+    let response = within("the response head", client.request(get(peer.uri("/slow"))))
+        .await
+        .expect("the head arrives");
+
+    let reader = tokio::spawn(async move {
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("the body completes")
+            .to_bytes()
+    });
+
+    // Abandoned well before the exchange can finish, so the drain is certainly mid-flight
+    // when the future is dropped.
+    let abandoned = tokio::time::timeout(std::time::Duration::from_millis(20), client.shutdown());
+    assert!(
+        abandoned.await.is_err(),
+        "this test needs the first shutdown to be abandoned mid-drain; it completed instead, \
+         so it proves nothing"
+    );
+
+    // The drain must have survived its caller. This is the assertion: a second shutdown
+    // returns, rather than waiting for ever on a signal nobody will send.
+    within("the second shutdown", client.shutdown()).await;
+
+    assert_eq!(
+        within("the reader", reader)
+            .await
+            .expect("the task completes"),
+        Bytes::from_static(b"late"),
+        "the abandoned drain should still have let the exchange finish"
+    );
+}

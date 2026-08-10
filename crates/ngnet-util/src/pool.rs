@@ -354,34 +354,38 @@ where
 
         match outcome {
             Ok((handle, driver)) => {
-                let mut driver_slot = Some(driver);
                 // Registered *before* this acquire's count is released, which is the ordering
                 // that makes shutdown correct: a drain that started while this dial was in
                 // flight waits for the count, and by the time the count drops the driver is
                 // already in the vector for it to find.
+                //
+                // Registered unconditionally, including when the pool closed underneath us,
+                // and that case is the subtle one. The obvious reading — we are closing, so
+                // do not file it, just wind it down here — hands the driver to *this* future
+                // to await. This future belongs to a request, and a request future may be
+                // dropped at any await by a caller who lost interest or timed out. Dropping
+                // it there detaches the driver, while `AcquireGuard` still dutifully releases
+                // the count, so the drain proceeds and publishes a completion with a live
+                // connection still running behind it. Filing it is safe precisely because we
+                // hold an acquire count: the drain cannot have taken the vector yet, because
+                // it is still waiting for this count to reach zero.
                 let closed = {
                     let mut state = self.state.lock().expect("pool lock poisoned");
-                    if !state.closed {
-                        // Reap finished drivers here rather than in a sweeper task: this is
-                        // the one place already holding the lock for a reason, and a pool
-                        // with no traffic needs no sweeping.
-                        state.drivers.retain(|driver| !driver.is_finished());
-                        state
-                            .drivers
-                            .push(driver_slot.take().expect("driver taken twice"));
-                    }
+                    // Reap finished drivers here rather than in a sweeper task: this is
+                    // the one place already holding the lock for a reason, and a pool
+                    // with no traffic needs no sweeping.
+                    state.drivers.retain(|driver| !driver.is_finished());
+                    state.drivers.push(driver);
                     state.closed
                 };
 
                 if closed {
                     // Shut down underneath us. Wind the fresh connection down rather than
                     // leaking it, and do not publish it — a caller must not be handed a
-                    // connection by a pool that has closed.
+                    // connection by a pool that has closed. No await separates this from the
+                    // registration above, so no cancellation can land between them.
                     handle.shutdown();
                     drop(handle);
-                    if let Some(driver) = driver_slot {
-                        let _ = driver.await;
-                    }
                     guard.settle(Dial::Idle);
                     return Err(Error::closed(Reason("the client has been shut down")));
                 }
@@ -412,6 +416,16 @@ where
     /// Dropping the handles is what lets each driver finish: `ngnet-h2`'s driver completes
     /// when its handle count reaches zero *and* its stream registry is empty, so a retained
     /// handle would hold the connection open for ever.
+    ///
+    /// The drain itself runs in a task of its own, and that is not an optimisation. This
+    /// function has no deadline by design — the bound belongs to the caller — and the way a
+    /// caller applies one is [`tokio::time::timeout`] around this future, which on expiry
+    /// *drops* it. If the drain ran inline, that drop would cancel the only drain there will
+    /// ever be: `closed` would stay set, so no later call could elect itself leader, and
+    /// `finished` would never be published, so every later call would wait for a completion
+    /// that nothing was left to produce. Shutdown would be unretryable after precisely the
+    /// timeout its own documentation recommends. Spawning severs the drain from the future
+    /// that started it, so a caller may give up on waiting without giving up the drain.
     pub(crate) async fn shutdown(self: &Arc<Self>) {
         let leader = {
             let mut state = self.state.lock().expect("pool lock poisoned");
@@ -424,43 +438,49 @@ where
         };
 
         if leader {
-            // No lock held across this await; the count is mirrored into a `watch` for
-            // exactly that reason.
-            let mut acquires = self.acquires.subscribe();
-            let _ = acquires.wait_for(|count| *count == 0).await;
-
-            let (connections, drivers) = {
-                let mut state = self.state.lock().expect("pool lock poisoned");
-                (
-                    std::mem::take(&mut state.connections),
-                    std::mem::take(&mut state.drivers),
-                )
-            };
-
-            for slot in connections.into_values() {
-                // `take` rather than read: the handle must be *dropped*, and dropping it
-                // while the slot still held a clone would keep the connection alive.
-                let state = std::mem::replace(
-                    &mut *slot.state.lock().expect("slot lock poisoned"),
-                    Dial::Idle,
-                );
-                if let Dial::Ready(handle) = state {
-                    handle.shutdown();
-                    drop(handle);
-                }
-            }
-
-            for driver in drivers {
-                let _ = driver.await;
-            }
-
-            self.finished.send_replace(true);
+            let pool = Arc::clone(self);
+            tokio::spawn(async move { pool.drain().await });
         }
 
         // Every caller awaits the same completion, the leader included. A second caller
         // returning early would be reporting a drain it did not observe.
         let mut finished = self.finished.subscribe();
         let _ = finished.wait_for(|done| *done).await;
+    }
+
+    /// The drain proper, run once, in its own task. See [`Pool::shutdown`].
+    async fn drain(self: Arc<Self>) {
+        // No lock held across this await; the count is mirrored into a `watch` for
+        // exactly that reason.
+        let mut acquires = self.acquires.subscribe();
+        let _ = acquires.wait_for(|count| *count == 0).await;
+
+        let (connections, drivers) = {
+            let mut state = self.state.lock().expect("pool lock poisoned");
+            (
+                std::mem::take(&mut state.connections),
+                std::mem::take(&mut state.drivers),
+            )
+        };
+
+        for slot in connections.into_values() {
+            // `take` rather than read: the handle must be *dropped*, and dropping it
+            // while the slot still held a clone would keep the connection alive.
+            let state = std::mem::replace(
+                &mut *slot.state.lock().expect("slot lock poisoned"),
+                Dial::Idle,
+            );
+            if let Dial::Ready(handle) = state {
+                handle.shutdown();
+                drop(handle);
+            }
+        }
+
+        for driver in drivers {
+            let _ = driver.await;
+        }
+
+        self.finished.send_replace(true);
     }
 }
 
@@ -583,6 +603,65 @@ mod tests {
         let before = *slot.settled.borrow();
         slot.settle(Dial::Dialing);
         assert_ne!(*slot.settled.borrow(), before);
+    }
+
+    #[tokio::test]
+    async fn a_dial_landing_into_a_closed_pool_still_files_its_driver() {
+        // The third liveness trap, and the least obvious of them, because the wrong code
+        // reads better than the right code. A dial that succeeds just as the pool closes
+        // obviously should not publish its connection — but the tempting next step, "so wind
+        // it down here and await it ourselves", hands the driver to a *request's* future.
+        // A request's future may be dropped at any await by a caller who timed out or lost
+        // interest, and dropping it there detaches the driver while `AcquireGuard` still
+        // dutifully releases the count. The drain then proceeds, finds nothing to wait for,
+        // and publishes a completion with a live connection running behind it — the exact
+        // lie `shutdown` exists to not tell.
+        //
+        // Filing it is safe because this path holds an acquire count, so the drain cannot yet
+        // have taken the vector. Asserted here rather than end to end because provoking it
+        // outside needs a cancellation to land inside a window a few microseconds wide; the
+        // property itself — the driver is in the pool's vector, not in a caller's future —
+        // is directly readable.
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("a bound listener");
+        let address = listener.local_addr().expect("a bound address");
+        tokio::spawn(async move {
+            // Accept and hold, so the dial genuinely succeeds.
+            let _held = listener.accept().await;
+            std::future::pending::<()>().await;
+        });
+
+        let pool: Arc<Pool<TestBody>> = Arc::new(Pool::new(Config::default()));
+        let origin = Origin::from_uri(
+            &format!("http://{address}/")
+                .parse::<http::Uri>()
+                .expect("a valid URI"),
+        )
+        .expect("an absolute URI has an origin");
+
+        // Closed before the dial lands, which is the race, without having to race.
+        {
+            let mut state = pool.state.lock().expect("pool lock");
+            state.closed = true;
+        }
+        pool.closed.store(true, Ordering::Release);
+
+        let slot: Arc<Slot<TestBody>> = Arc::new(Slot::new());
+        slot.settle(Dial::Dialing);
+        let error = pool
+            .dial_into(&slot, &origin)
+            .await
+            .expect_err("a closed pool must not hand out a connection");
+        assert_eq!(error.kind(), crate::ErrorKind::Closed);
+
+        let state = pool.state.lock().expect("pool lock");
+        assert_eq!(
+            state.drivers.len(),
+            1,
+            "the driver must be filed with the pool for the drain to await, not owned by \
+             the request future that happened to create it"
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ use ngnet_h2::http::transport::TokioIo;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
-use crate::error::Error;
+use crate::error::{Context, Error};
 use crate::origin::Origin;
 
 /// Opens a connection to `origin` and puts its driver on a task.
@@ -59,7 +59,9 @@ where
     // origin failing as though the host were unreachable.
     let stream = TcpStream::connect((origin.host(), origin.port()))
         .await
-        .map_err(|source| Error::connect(format!("connecting to {origin} failed: {source}")))?;
+        .map_err(|source| {
+            Error::connect(Context::new(format!("connecting to {origin} failed"), source))
+        })?;
 
     // Nagle off. Every write this stack makes is a deliberately framed HTTP/2 frame, so
     // coalescing them adds latency to a request that is already complete in order to wait for
@@ -71,7 +73,10 @@ where
 
     let (handle, connection) =
         handshake_shared_with(TokioIo::new(stream), config).map_err(|source| {
-            Error::connect(format!("starting HTTP/2 to {origin} failed: {source}"))
+            Error::connect(Context::new(
+                format!("starting HTTP/2 to {origin} failed"),
+                source,
+            ))
         })?;
 
     // The driver's outcome is deliberately discarded. A connection failing is not news the

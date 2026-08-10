@@ -192,6 +192,45 @@ impl fmt::Display for Reason {
 
 impl StdError for Reason {}
 
+/// Adds context to a cause without consuming it.
+///
+/// The obvious way to say where a failure happened is to format it into the message —
+/// `format!("connecting to {origin} failed: {source}")` — and it reads correctly, which is
+/// what makes it a trap. It turns the cause into text. [`Error::source`] promises a caller
+/// can downcast to find *which* [`std::io::Error`] refused a connection, and a stringified
+/// cause has no type left to downcast to; the promise silently becomes false while every
+/// log message continues to look exactly right.
+///
+/// So the context goes in front of the cause rather than around it, and `Display` renders
+/// both. The message a caller logs is unchanged, and the `io::Error` is still there to be
+/// found.
+#[derive(Debug)]
+pub(crate) struct Context<E> {
+    context: String,
+    source: E,
+}
+
+impl<E> Context<E>
+where
+    E: StdError + Send + Sync + 'static,
+{
+    pub(crate) fn new(context: String, source: E) -> Self {
+        Self { context, source }
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for Context<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.context, self.source)
+    }
+}
+
+impl<E: StdError + 'static> StdError for Context<E> {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Wraps a shared failure so it can be the `source` of several errors at once.
 #[derive(Debug)]
 struct SharedCause(std::sync::Arc<Error>);

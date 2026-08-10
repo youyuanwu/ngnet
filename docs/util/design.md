@@ -319,6 +319,42 @@ Every caller awaits the same completion, including the one that performed the dr
 second caller returning early on the strength of the flag already being set would be
 reporting a drain it had not observed.
 
+### The drain runs in a task of its own
+
+Not an optimisation, and the reason is a defect this crate had until review found it.
+
+`shutdown` has no deadline by design — the bound belongs to the caller, for the same reason
+recorded in `pending-work.md` — and the way a caller applies one is `tokio::time::timeout`
+around the future. On expiry `timeout` *drops* that future. With the drain running inline in
+the first caller's future, that drop cancelled the only drain there would ever be: `closed`
+stayed set, so no later call could elect itself leader, and `finished` was never published,
+so every later call waited for a completion nothing was left to produce. Shutting down
+became impossible after precisely the timeout the documentation recommends.
+
+Spawning severs the drain from the future that started it. A caller may give up on *waiting*
+without giving up the drain, and a second `shutdown` after an abandoned one returns
+normally. This is also the second place the crate spawns, and both are on this side of the
+same line: `ngnet-h2` never spawns because it cannot know the caller's runtime; this layer
+already requires tokio, so it can.
+
+### A dial that lands into a closing pool
+
+The narrowest of the three windows, and the one where the wrong code reads better than the
+right code. A dial that succeeds just as the pool closes must not publish its connection —
+that much is obvious. The tempting next step is "so wind it down here and await it
+ourselves", which hands the driver task to a *request's* future.
+
+A request's future may be dropped at any await, by a caller who timed out or lost interest.
+Dropping it there detaches the driver, while the acquire guard still dutifully releases its
+count — so the drain proceeds, finds nothing left to wait for, and publishes a completion
+with a live connection running behind it. That is exactly the lie the ordering above exists
+to prevent, reintroduced by the code that handles the edge case.
+
+So the driver is filed with the pool unconditionally, closed or not, and the connection is
+wound down without awaiting it. Filing is safe precisely because this path still holds an
+acquire count: the drain cannot yet have taken the vector, because it is still waiting for
+that count to reach zero.
+
 **There is no deadline**, consistently with the decision recorded for the server side in
 [`../h2/pending-work.md`](../h2/pending-work.md). A response body the caller never reads
 holds its exchange open, which holds this pending. That is a real trap, and it is the
@@ -404,7 +440,7 @@ property that a much worse implementation also has.
 
 ### What being suspicious of green tests found
 
-Three things, and none of them would have been found by reading the code.
+Six things, and none of them would have been found by reading the code.
 
 **A deadlock that no timeout caught**, described above. Found by writing the first test that
 actually opened a connection.
@@ -432,10 +468,27 @@ that asserted the peer had *recorded* the `GOAWAY` the instant `shutdown` return
 what `shutdown` guarantees is that the bytes were written — reading them is the peer task's
 own work, and asserting on when it was scheduled is asserting on the scheduler.
 
+**A promise the error type made and the connect path broke.** `Error::source` documents that
+a caller can downcast to find *which* `io::Error` refused a connection. The connect path
+built its errors with `format!("connecting to {origin} failed: {source}")`, which reads
+correctly and turns the cause into text — there is no type left to downcast to. The promise
+was false, silently, while every log line continued to look exactly right. The fix puts the
+context in front of the cause rather than around it, so `Display` is unchanged and the
+`io::Error` is still there to be found. There is now a test for the connect chain as well as
+the exchange chain, and it fails without the fix.
+
+**A test whose name asserted the opposite of the contract.** `only_an_exchange_failure_is_
+ever_retriable` was false: `Connect` is retriable too, and unconditionally so, because
+nothing reached a peer and so nothing was acted on. The test never checked a connect
+failure's predicate, so it passed while its name stood as authority for a rule the crate
+does not implement — the quiet kind of wrong, since the name is what a reader takes away.
+The connect case is now asserted in the error-matrix test, and the name says what the test
+actually pins.
+
 ### Inversion
 
 Every behavioural claim was checked by reverting the code that makes it true and confirming
-the test fails: twenty-one mutations, twenty-one failures, each one the test that names the
+the test fails: twenty-three mutations, twenty-three failures, each one the test that names the
 behaviour and not some other test noticing. A green test that has not been seen fail is an
 unverified test, and a pool — dense with races, futures rebuilt on a lost `select!` branch,
 and detached `JoinHandle`s that make an assertion wait for nothing — is exactly where that
