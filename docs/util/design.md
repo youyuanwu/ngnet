@@ -435,10 +435,20 @@ own work, and asserting on when it was scheduled is asserting on the scheduler.
 ### Inversion
 
 Every behavioural claim was checked by reverting the code that makes it true and confirming
-the test fails. The results are in the pull request. A green test that has not been seen
-fail is an unverified test, and a pool — dense with races, futures rebuilt on a lost
-`select!` branch, and detached `JoinHandle`s that make an assertion wait for nothing — is
-exactly where that matters.
+the test fails: twenty-one mutations, twenty-one failures, each one the test that names the
+behaviour and not some other test noticing. A green test that has not been seen fail is an
+unverified test, and a pool — dense with races, futures rebuilt on a lost `select!` branch,
+and detached `JoinHandle`s that make an assertion wait for nothing — is exactly where that
+matters. The full matrix is in the pull request.
+
+One mutation survived on the first attempt, and it is the reason the exercise is worth its
+cost. Deleting the `is_closed` check at the top of `Client::request` changed no test's
+result, because `Pool::acquire` checks the same flag moments later and caught everything.
+The branch was covered by no test at all, and its comment justified it with a benefit it did
+not deliver. What it actually decides is precedence — whether a closed client with a
+malformed URI is told about the closure or about the URI — and only a request that would
+fail on both can tell those apart. That test now exists, and the comment now claims only
+what is true.
 
 ## Dependencies
 

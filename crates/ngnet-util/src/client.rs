@@ -117,8 +117,13 @@ where
 
         ResponseFuture {
             inner: Box::pin(async move {
-                // Checked before the URI is even parsed, so a request offered to a closed
-                // client cannot resolve a name or open a socket on its way to being refused.
+                // The pool refuses a new acquire once it is closed, so this is not the only
+                // guard and removing it would not let a request through — inversion proved
+                // exactly that, by deleting it and watching every shutdown test stay green.
+                // What it decides is *precedence*: checked ahead of the URI, a request
+                // offered to a closed client is reported as closed even when its URI is also
+                // malformed. That is the more useful of the two answers, since the URI is not
+                // why the request will never be sent and correcting it would change nothing.
                 if pool.is_closed() {
                     return Err(Error::closed(Reason("the client has been shut down")));
                 }

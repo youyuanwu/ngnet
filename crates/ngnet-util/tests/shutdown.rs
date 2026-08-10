@@ -131,6 +131,26 @@ async fn a_request_to_a_cold_origin_after_shutdown_dials_nothing() {
 }
 
 #[tokio::test]
+async fn a_closed_client_reports_closure_ahead_of_a_bad_uri() {
+    // This exists because inversion caught the branch it pins having no test at all. The
+    // client checks `is_closed` before parsing the URI, but the pool checks it again on
+    // acquire, so deleting the first check left every shutdown test still green — the second
+    // one caught everything. The check is not redundant, though: it decides which of two
+    // true things a caller is told when both are true. Only a request that would fail on its
+    // URI anyway can tell the two orderings apart, so only this test can fail for it.
+    let client: Client<Full<Bytes>> = Client::new();
+    within("shutdown", client.shutdown()).await;
+
+    let error = within("the request", client.request(get(http::Uri::from_static("/relative"))))
+        .await
+        .expect_err("the client is closed and the URI has no host");
+
+    // Not `Uri`. The URI is not why this request will never be sent, and correcting it would
+    // change nothing about the outcome.
+    assert_eq!(error.kind(), ErrorKind::Closed);
+}
+
+#[tokio::test]
 async fn shutdown_on_one_clone_closes_every_clone() {
     // Clones share a pool, which means they share a shutdown. This is a property worth
     // pinning rather than an implementation detail: a caller who clones a client into ten
