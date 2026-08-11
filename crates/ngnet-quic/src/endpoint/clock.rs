@@ -45,7 +45,11 @@ use crate::time::Timestamp;
 /// the path that is already late.
 pub trait Clock {
     /// The future [`Clock::sleep_until`] returns.
-    type Sleep: Future<Output = ()>;
+    ///
+    /// [`Unpin`] because the driver stores one and polls it in place. Every implementation
+    /// satisfies it by boxing, which costs one allocation per rearm and buys the driver
+    /// freedom from `unsafe` — a trade worth making in a subtree that contains none at all.
+    type Sleep: Future<Output = ()> + Unpin;
 
     /// The current time, in the caller's own monotonic timescale.
     fn now(&self) -> Timestamp;

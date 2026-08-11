@@ -15,5 +15,15 @@ repository.workspace = true
 # These are `[dependencies]` rather than `[dev-dependencies]` because the harness lives in
 # `src/lib.rs`, and a library target cannot see dev-dependencies.
 [dependencies]
-ngnet-quic.workspace = true
+# `endpoint` comes with the default features; `tokio` is asked for explicitly, because the
+# asynchronous tests drive the endpoint over a real socket on a real runtime.
+ngnet-quic = { workspace = true, features = ["tokio"] }
 rcgen.workspace = true
+
+# The runtime the asynchronous tests run on. A dependency of this crate rather than of
+# `ngnet-quic`, which keeps its own runtime integration optional.
+#
+# Note that the in-process endpoint tests deliberately do *not* use it: they drive the
+# layer with a hand-rolled poll loop, which is how the claim that the crate needs no
+# executor is tested rather than asserted.
+tokio = { workspace = true }

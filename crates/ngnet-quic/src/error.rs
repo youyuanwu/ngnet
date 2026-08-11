@@ -241,6 +241,16 @@ impl CloseError {
     pub fn phrase(&self) -> &[u8] {
         &self.phrase
     }
+
+    /// An idle-timeout close, for tests that need one without waiting for a timeout.
+    #[cfg(test)]
+    pub(crate) fn idle_for_test() -> Self {
+        Self {
+            reason: CloseReason::IdleTimeout,
+            frame_type: 0,
+            phrase: Vec::new(),
+        }
+    }
 }
 
 impl fmt::Display for CloseError {

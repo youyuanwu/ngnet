@@ -83,6 +83,18 @@ pub enum ErrorKind {
 
     /// The caller's configuration is inconsistent.
     InvalidInput,
+
+    /// The peer reset the stream being read.
+    ///
+    /// Distinct from an ordinary end-of-stream: bytes already delivered are still valid,
+    /// but no more are coming and the peer chose a code to say why.
+    StreamReset,
+
+    /// The peer asked this endpoint to stop sending on the stream being written.
+    ///
+    /// Writing more would spend the connection's flow-control window on bytes nothing will
+    /// read, so a write is refused rather than silently accepted.
+    StreamStopped,
 }
 
 impl ErrorKind {
@@ -102,6 +114,7 @@ pub struct Error {
     kind: ErrorKind,
     context: &'static str,
     close: Option<CloseError>,
+    stream_code: Option<crate::error::ApplicationErrorCode>,
     source: Option<Box<dyn core::error::Error + Send + Sync>>,
 }
 
@@ -112,6 +125,7 @@ impl Error {
             kind,
             context,
             close: None,
+            stream_code: None,
             source: None,
         }
     }
@@ -139,6 +153,20 @@ impl Error {
     ) -> Self {
         self.source = Some(source);
         self
+    }
+
+    /// Attaches the application error code a stream carried.
+    pub(crate) fn with_stream_code(mut self, code: crate::error::ApplicationErrorCode) -> Self {
+        self.stream_code = Some(code);
+        self
+    }
+
+    /// The application error code the peer sent, for a stream reset or stop-sending.
+    ///
+    /// This is the number the protocol above QUIC chose, so it means whatever that protocol
+    /// says it means.
+    pub fn stream_code(&self) -> Option<crate::error::ApplicationErrorCode> {
+        self.stream_code
     }
 
     /// What kind of failure this is.
@@ -172,6 +200,7 @@ impl fmt::Debug for Error {
             .field("kind", &self.kind)
             .field("context", &self.context)
             .field("close", &self.close)
+            .field("stream_code", &self.stream_code)
             .field("source", &self.source.as_ref().map(|s| s.to_string()))
             .finish()
     }

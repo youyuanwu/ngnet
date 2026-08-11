@@ -32,7 +32,11 @@
 
 mod clock;
 mod config;
+mod connection;
+mod driver;
+mod handle;
 mod error;
+mod shared;
 mod socket;
 
 #[cfg(feature = "tokio")]
@@ -43,6 +47,8 @@ pub mod testing;
 
 pub use clock::Clock;
 pub use config::{Config, DEFAULT_DATAGRAMS_PER_PASS};
+pub use connection::{AcceptStream, Chunk, Connection, OpenStream, ReadStream};
+pub use handle::{Accepting, Built, Connecting, Endpoint, EndpointBuilder, EndpointDriver};
 pub use error::{Error, ErrorKind, Result};
 pub use socket::{AsyncUdpSocket, Received, Sent};
 

@@ -258,7 +258,7 @@ impl TestClock {
 }
 
 impl Clock for TestClock {
-    type Sleep = TestSleep;
+    type Sleep = Pin<Box<TestSleep>>;
 
     fn now(&self) -> Timestamp {
         Timestamp::from_nanos(self.now.get()).expect("the test clock stays in range")
@@ -266,12 +266,12 @@ impl Clock for TestClock {
 
     fn sleep_until(&self, deadline: Timestamp) -> Self::Sleep {
         self.armed.set(self.armed.get() + 1);
-        TestSleep {
+        Box::pin(TestSleep {
             deadline: deadline.as_nanos(),
             now: Rc::clone(&self.now),
             sleepers: Rc::clone(&self.sleepers),
             registered: false,
-        }
+        })
     }
 }
 
