@@ -38,6 +38,8 @@ mod handle;
 mod error;
 mod shared;
 mod socket;
+#[cfg(feature = "tls-ossl")]
+mod validate;
 
 #[cfg(feature = "tokio")]
 mod tokio;
@@ -51,6 +53,9 @@ pub use connection::{AcceptStream, Chunk, Connection, OpenStream, ReadStream};
 pub use handle::{Accepting, Built, Connecting, Endpoint, EndpointBuilder, EndpointDriver};
 pub use error::{Error, ErrorKind, Result};
 pub use socket::{AsyncUdpSocket, Received, Sent};
+
+#[cfg(feature = "tls-ossl")]
+pub use validate::{DEFAULT_RESET_BURST, DEFAULT_TOKEN_LIFETIME};
 
 #[cfg(feature = "tokio")]
 pub use tokio::{TokioClock, TokioSocket};

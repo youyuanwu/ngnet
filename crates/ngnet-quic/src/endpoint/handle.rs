@@ -44,6 +44,12 @@ pub struct EndpointBuilder<Sock, Clk, B> {
     config: Config,
     entropy: Option<EntropyFactory>,
     accepts: bool,
+    #[cfg(feature = "tls-ossl")]
+    validation: Option<crate::token::TokenSecret>,
+    #[cfg(feature = "tls-ossl")]
+    token_lifetime: Option<crate::time::Duration>,
+    #[cfg(feature = "tls-ossl")]
+    reset_burst: Option<u32>,
 }
 
 impl<Sock, Clk, B> EndpointBuilder<Sock, Clk, B>
@@ -61,6 +67,12 @@ where
             config: Config::new(),
             entropy: None,
             accepts: false,
+            #[cfg(feature = "tls-ossl")]
+            validation: None,
+            #[cfg(feature = "tls-ossl")]
+            token_lifetime: None,
+            #[cfg(feature = "tls-ossl")]
+            reset_burst: None,
         }
     }
 
@@ -95,6 +107,55 @@ where
         self
     }
 
+    /// Validates client addresses before committing any connection state.
+    ///
+    /// A server without this completes a handshake in response to a first packet, and the
+    /// handshake is several times larger than that packet — so a spoofed source address
+    /// turns the server into an amplifier aimed at whoever the attacker names. With it, an
+    /// unvalidated first packet draws a small Retry carrying a token instead, and only a
+    /// client that genuinely holds the address it claimed can come back with that token.
+    ///
+    /// The same secret also derives the stateless reset tokens this endpoint sends to peers
+    /// whose connections it no longer has.
+    ///
+    /// **Strongly recommended for anything reachable from a network.** It is not the
+    /// default only because it requires a secret this crate cannot invent for you.
+    ///
+    /// Available only with the bundled TLS backend: writing a Retry packet needs the packet
+    /// protection that backend supplies, so without it there is nothing to turn on.
+    #[cfg(feature = "tls-ossl")]
+    #[must_use]
+    pub fn validate_addresses(mut self, secret: crate::token::TokenSecret) -> Self {
+        self.validation = Some(secret);
+        self
+    }
+
+    /// How long a Retry token stays valid.
+    ///
+    /// Shorter is safer and costs a dawdling client one extra round trip; longer widens the
+    /// window in which a captured token is useful. Defaults to
+    /// [`DEFAULT_TOKEN_LIFETIME`](super::DEFAULT_TOKEN_LIFETIME). Ignored unless
+    /// [`EndpointBuilder::validate_addresses`] was called.
+    #[cfg(feature = "tls-ossl")]
+    #[must_use]
+    pub fn token_lifetime(mut self, lifetime: crate::time::Duration) -> Self {
+        self.token_lifetime = Some(lifetime);
+        self
+    }
+
+    /// How many stateless resets this endpoint may send in a burst.
+    ///
+    /// Answering unmatched datagrams tells a peer that has lost state to stop
+    /// retransmitting, but doing it without limit turns a flood of spoofed datagrams into a
+    /// flood aimed at whoever they name. The budget refills once a second. Defaults to
+    /// [`DEFAULT_RESET_BURST`](super::DEFAULT_RESET_BURST).
+    #[cfg(feature = "tls-ossl")]
+    #[must_use]
+    pub fn stateless_reset_burst(mut self, burst: u32) -> Self {
+        self.reset_burst = Some(burst);
+        self
+    }
+
     /// Builds the handle and the driver.
     ///
     /// # Errors
@@ -120,6 +181,18 @@ where
             next_index: 0,
             buffer: vec![0u8; MAX_DATAGRAM],
             accepts: self.accepts,
+            outbox: std::collections::VecDeque::new(),
+            #[cfg(feature = "tls-ossl")]
+            validation: self.validation.map(|secret| {
+                let mut policy = super::validate::Validation::new(secret);
+                if let Some(lifetime) = self.token_lifetime {
+                    policy.lifetime(lifetime);
+                }
+                if let Some(burst) = self.reset_burst {
+                    policy.reset_burst(burst);
+                }
+                policy
+            }),
             sleeping: None,
             sleeping_until: None,
         };
@@ -363,11 +436,67 @@ where
             // A client endpoint answers strangers with silence.
             return;
         }
-        let Ok(Some(packet)) = crate::accept::inspect_initial(datagram) else {
+
+        // Too short to be a QUIC packet at all. Answering would mean answering noise, and
+        // any answer would be larger than what provoked it.
+        if datagram.len() < 21 {
             return;
+        }
+
+        match crate::accept::inspect_initial(datagram) {
+            Ok(Some(packet)) => self.begin(datagram, &packet, source),
+            // Not an acceptable Initial. Either it names a version this build cannot speak,
+            // or it belongs to a connection this endpoint no longer has.
+            Ok(None) | Err(_) => self.answer_unmatched(datagram, source),
+        }
+    }
+
+    /// Decides what a first packet has earned, and acts on it.
+    fn begin(&mut self, datagram: &[u8], packet: &crate::accept::InitialPacket, source: SocketAddr) {
+        #[cfg(feature = "tls-ossl")]
+        let (original, retried) = {
+            use super::validate::Decision;
+
+            if let Some(policy) = self.inner.validation.take() {
+                let now = self.inner.clock.now();
+                let mut entropy = (self.inner.entropy)();
+                let decision = policy.decide(packet, source, entropy.as_mut(), now);
+                self.inner.validation = Some(policy);
+
+                match decision {
+                    Decision::Accept(original) => (original, true),
+                    Decision::Retry { scid, token } => {
+                        // No per-connection state is created here, which is the whole point:
+                        // a Retry is computed from the packet and the secret and then
+                        // forgotten, so answering a flood costs nothing to remember.
+                        let mut buffer = vec![0u8; MAX_DATAGRAM];
+                        if let Ok(len) = crate::token::write_retry(
+                            &mut buffer,
+                            packet.version,
+                            &packet.scid,
+                            &scid,
+                            &packet.dcid,
+                            &token,
+                        ) {
+                            buffer.truncate(len);
+                            self.inner.outbox.push_back((source, buffer));
+                        }
+                        return;
+                    }
+                    Decision::Ignore => return,
+                }
+            } else {
+                (packet.dcid, false)
+            }
         };
+        #[cfg(not(feature = "tls-ossl"))]
+        let (original, retried) = (packet.dcid, false);
+
         let shared = ConnectionShared::new();
-        match self.inner.accept(source, &packet, Arc::clone(&shared)) {
+        match self
+            .inner
+            .accept(source, packet, &original, retried, Arc::clone(&shared))
+        {
             Ok(index) => {
                 self.inner.deliver(index, datagram);
                 self.shared.lock().accepted.push_back(shared);
@@ -377,6 +506,68 @@ where
                 // Refusing to build a connection for a first packet is not something the
                 // peer needs to be told about; it will retransmit and give up.
             }
+        }
+    }
+
+    /// Answers a datagram that belongs to no connection here.
+    ///
+    /// A peer that has lost this endpoint's state -- or whose connection this endpoint has
+    /// evicted -- would otherwise retransmit until its idle timeout. A stateless reset tells
+    /// it to stop.
+    fn answer_unmatched(&mut self, datagram: &[u8], source: SocketAddr) {
+        #[cfg(feature = "tls-ossl")]
+        {
+            let now = self.inner.clock.now();
+            let Some(mut policy) = self.inner.validation.take() else {
+                return;
+            };
+            let permitted = policy.take_reset_budget(now);
+            let secret = policy.secret().clone();
+            self.inner.validation = Some(policy);
+            if !permitted {
+                return;
+            }
+
+            // The identifier the datagram was addressed to is what the reset must be
+            // derived from: the peer recognises the token only for the connection it thought
+            // it was talking to.
+            let Ok(inspection) = crate::accept::inspect(datagram, crate::cid::DEFAULT_LEN) else {
+                return;
+            };
+            let dcid = match inspection {
+                crate::accept::Inspection::Supported { dcid, .. }
+                | crate::accept::Inspection::UnsupportedVersion { dcid, .. }
+                | crate::accept::Inspection::ShortHeader { dcid } => dcid,
+            };
+
+            let Ok(token) = crate::token::reset_token(&secret, &dcid) else {
+                return;
+            };
+
+            let mut random = vec![0u8; datagram.len()];
+            let mut entropy = (self.inner.entropy)();
+            if entropy.fill(&mut random).is_err() {
+                return;
+            }
+
+            let mut buffer = vec![0u8; MAX_DATAGRAM];
+            // Strictly smaller than what provoked it, or not sent at all -- otherwise the
+            // way this endpoint says "I have lost your connection" becomes an amplifier.
+            if let Ok(Some(len)) = crate::token::write_stateless_reset_smaller_than(
+                &mut buffer,
+                &token,
+                &random,
+                datagram.len(),
+            ) {
+                buffer.truncate(len);
+                self.inner.outbox.push_back((source, buffer));
+            }
+        }
+        #[cfg(not(feature = "tls-ossl"))]
+        {
+            // Deriving a reset token needs the crypto helpers, which are absent without a
+            // TLS backend. Silence is the only honest answer.
+            let _ = (datagram, source);
         }
     }
 

@@ -133,6 +133,25 @@ impl TransportParams {
     /// ngtcp2 asserts its presence (`ngtcp2_conn.c:1264-1265`), and since that assertion is
     /// compiled out of release builds, omitting it there is undefined behaviour rather than
     /// a crash. The value comes from decoding the client's first packet.
+    /// The source identifier this server used in a Retry packet.
+    ///
+    /// Servers only, and **required** after a Retry: the client checks that the identifier
+    /// it was told to address really did come from a Retry this server sent, and rejects
+    /// the handshake if the parameter is missing. ngtcp2 states the obligation directly --
+    /// "server application must set Destination Connection ID field from the Initial packet
+    /// to this field" once it has verified a token (`ngtcp2.h:832`).
+    ///
+    /// Omitting it produces a handshake that simply never completes, which looks like an
+    /// unreachable server rather than a protocol error.
+    pub fn retry_scid(mut self, scid: &ConnectionId) -> Self {
+        self.raw.retry_scid = *scid.as_raw();
+        self.raw.retry_scid_present = 1;
+        self
+    }
+
+    /// The identifier the client first addressed, before any Retry.
+    ///
+    /// Servers only, and required for them.
     pub fn original_dcid(mut self, dcid: &ConnectionId) -> Self {
         self.raw.original_dcid = *dcid.as_raw();
         self.raw.original_dcid_present = 1;

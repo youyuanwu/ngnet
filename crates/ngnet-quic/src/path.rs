@@ -101,6 +101,20 @@ impl PathStorage {
     pub(crate) fn remote(&self) -> SocketAddr {
         self.remote.to_socket_addr()
     }
+
+    /// The remote address as a raw `sockaddr`, for the calls that take one directly.
+    ///
+    /// Address validation works on an address rather than on a path: a Retry token is
+    /// bound to where the client claimed to be, and no connection exists yet to own a path.
+    pub(crate) fn remote_sockaddr(&self) -> *const sys::ngtcp2_sockaddr {
+        let ptr: *const SockaddrStorage = &self.remote;
+        ptr.cast::<sys::ngtcp2_sockaddr>()
+    }
+
+    /// The length that goes with [`PathStorage::remote_sockaddr`].
+    pub(crate) fn remote_socklen(&self) -> sys::ngtcp2_socklen {
+        self.remote.len()
+    }
 }
 
 /// A `sockaddr_in` or `sockaddr_in6`, whichever the address needs.

@@ -220,6 +220,11 @@ fn the_allowance_list_is_the_ffi_boundary_and_nothing_else() {
         "stream_io",
         "tls",
         "tls_ossl",
+        // Address validation. Retry tokens and stateless reset tokens are derived by
+        // ngtcp2's crypto helpers, and writing a Retry packet needs packet protection --
+        // so this cannot live in the asynchronous subtree, which contains no `unsafe` at
+        // all. It is a core module for that reason rather than by preference.
+        "token",
     ]
     .into_iter()
     .map(str::to_string)

@@ -149,6 +149,13 @@ where
     pub(crate) buffer: Vec<u8>,
     /// Whether this endpoint accepts connections it did not initiate.
     pub(crate) accepts: bool,
+    /// Datagrams that belong to no connection -- Retry, Version Negotiation, stateless
+    /// reset. They cannot be queued on a connection because the whole point of each is that
+    /// there is not one.
+    pub(crate) outbox: std::collections::VecDeque<(SocketAddr, Vec<u8>)>,
+    /// How address validation is configured, if at all.
+    #[cfg(feature = "tls-ossl")]
+    pub(crate) validation: Option<super::validate::Validation>,
     /// The armed sleep, if any.
     pub(crate) sleeping: Option<Clk::Sleep>,
     /// The deadline the armed sleep is for.
@@ -585,6 +592,8 @@ where
         &mut self,
         remote: SocketAddr,
         packet: &crate::accept::InitialPacket,
+        original_dcid: &crate::cid::ConnectionId,
+        retried: bool,
         shared: Arc<ConnectionShared>,
     ) -> Result<u64, Error> {
         let local = self
@@ -598,12 +607,24 @@ where
             .map_err(Error::from)?;
 
         let now = self.clock.now();
+
         // A server cannot be built without the identifier the client first addressed:
         // ngtcp2 asserts on it, and the assertion is compiled out of release builds.
+        let mut params = self.config.transport_params().original_dcid(original_dcid);
+        let mut settings = self.config.settings(now);
+        if retried {
+            // Both halves are required after a Retry and neither errors when omitted. The
+            // client verifies that the identifier it was told to address really came from a
+            // Retry this server sent, so without `retry_scid` the handshake never
+            // completes -- indistinguishable from an unreachable server.
+            params = params.retry_scid(&packet.dcid);
+            settings = settings.validated_token(packet.token.bytes(), crate::TokenKind::Retry);
+        }
+
         let conn = crate::conn::ConnBuilder::new(
             Role::Server,
-            self.config.settings(now),
-            self.config.transport_params().original_dcid(&packet.dcid),
+            settings,
+            params,
             (self.entropy)(),
             session,
             local,
@@ -669,6 +690,23 @@ where
 
     /// Sends whatever every connection has to send.
     pub(crate) fn flush(&mut self, cx: &mut Context<'_>) -> Result<(), Error> {
+        // Connectionless answers first. They are small, they are replies to something that
+        // already arrived, and holding them behind a bulk transfer would make a Retry
+        // arrive after the client had given up.
+        while let Some((destination, datagram)) = self.outbox.pop_front() {
+            match self.socket.poll_send(cx, destination, &datagram) {
+                Poll::Ready(Ok(Sent::Complete)) => {}
+                Poll::Ready(Ok(Sent::WouldBlock)) | Poll::Pending => {
+                    self.outbox.push_front((destination, datagram));
+                    break;
+                }
+                Poll::Ready(Err(err)) => {
+                    return Err(Error::new(ErrorKind::Socket, "the socket failed")
+                        .with_source(SocketError(err.to_string())));
+                }
+            }
+        }
+
         let indices: Vec<u64> = self.connections.keys().copied().collect();
         for index in indices {
             while let Some(datagram) = self.next_datagram(index) {
@@ -711,9 +749,9 @@ where
         }
     }
 
-    /// Whether any connection has something to send.
+    /// Whether anything is waiting to be sent.
     pub(crate) fn has_pending(&self) -> bool {
-        self.connections.values().any(|t| t.pending.is_some())
+        !self.outbox.is_empty() || self.connections.values().any(|t| t.pending.is_some())
     }
 
 

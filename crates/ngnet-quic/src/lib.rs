@@ -87,6 +87,9 @@ mod stream_io;
 mod tls;
 #[cfg(feature = "tls-ossl")]
 #[allow(unsafe_code)]
+mod token;
+#[cfg(feature = "tls-ossl")]
+#[allow(unsafe_code)]
 mod tls_ossl;
 
 mod handlers;
@@ -125,6 +128,13 @@ pub use tls::{NativeTlsHandle, Role, TlsBackend, TlsSession};
 
 #[cfg(feature = "tls-ossl")]
 pub use tls_ossl::{OsslBackend, OsslBackendBuilder, OsslSession, Verify};
+
+#[cfg(feature = "tls-ossl")]
+pub use token::{
+    MIN_RESET_RANDOM, RESET_TOKEN_LEN, TokenSecret, issue_retry_token, reset_token,
+    verify_retry_token, write_retry, write_stateless_reset,
+    write_stateless_reset_smaller_than,
+};
 
 /// The raw bindings, for capabilities the safe API does not cover yet.
 ///
