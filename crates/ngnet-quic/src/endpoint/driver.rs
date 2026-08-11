@@ -184,7 +184,7 @@ where
     /// address change, and a table keyed on the address would lose a connection the moment
     /// a NAT rebound. ngtcp2's own server routes the same way.
     pub(crate) fn route(&self, datagram: &[u8]) -> Option<u64> {
-        let inspection = crate::accept::inspect(datagram, crate::cid::MIN_LEN).ok()?;
+        let inspection = crate::accept::inspect(datagram, crate::cid::DEFAULT_LEN).ok()?;
         let dcid = match inspection {
             crate::accept::Inspection::Supported { dcid, .. }
             | crate::accept::Inspection::UnsupportedVersion { dcid, .. }
@@ -306,7 +306,18 @@ where
                         tracked.conn.open_uni_stream()
                     };
                     match opened {
-                        Ok(id) => shared.observe(Observed::Opened(id)),
+                        Ok(id) => {
+                            shared.observe(Observed::Opened(id));
+                            shared.wake_all();
+                        }
+                        // Running out of stream credit is an ordinary condition in a
+                        // working connection, not a failure of it: the peer advertised a
+                        // limit and this endpoint has reached it. The request waits for the
+                        // peer to raise it rather than tearing the connection down, which
+                        // is what a caller means by "open a stream".
+                        Err(err) if err.kind() == crate::ErrorKind::Blocked => {
+                            shared.push(Command::OpenStream { bidi });
+                        }
                         Err(err) => shared.fail(Error::from(err)),
                     }
                 }

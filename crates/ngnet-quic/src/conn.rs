@@ -79,7 +79,7 @@ impl<S: TlsSession> ConnBuilder<S> {
             dcid: None,
             scid: None,
             version: accept::VERSION_V1,
-            cid_len: 8,
+            cid_len: crate::cid::DEFAULT_LEN,
         }
     }
 

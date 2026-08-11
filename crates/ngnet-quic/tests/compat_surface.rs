@@ -76,6 +76,7 @@ fn the_public_surface_still_has_the_shape_it_promised() {
     let _: &[u8] = cid.as_bytes();
     let _: usize = ngnet_quic::MAX_CID_LEN;
     let _: usize = ngnet_quic::MIN_CID_LEN;
+    let _: usize = ngnet_quic::DEFAULT_CID_LEN;
 
     // --- Streams --------------------------------------------------------------------
     let stream: Result<StreamId> = StreamId::new(0);

@@ -102,7 +102,9 @@ pub use accept::{
     InitialPacket, InitialToken, Inspection, VERSION_V1, inspect, inspect_initial,
     is_acceptable_initial, supported_versions, write_version_negotiation,
 };
-pub use cid::{ConnectionId, MAX_LEN as MAX_CID_LEN, MIN_LEN as MIN_CID_LEN};
+pub use cid::{
+    ConnectionId, DEFAULT_LEN as DEFAULT_CID_LEN, MAX_LEN as MAX_CID_LEN, MIN_LEN as MIN_CID_LEN,
+};
 pub use conn::{Conn, ConnBuilder};
 pub use error::{
     ApplicationErrorCode, CloseError, CloseReason, Error, ErrorKind, NativeCode, Result,

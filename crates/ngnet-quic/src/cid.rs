@@ -14,6 +14,20 @@ pub const MAX_LEN: usize = sys::NGTCP2_MAX_CIDLEN as usize;
 /// The shortest non-empty connection ID ngtcp2 will accept.
 pub const MIN_LEN: usize = sys::NGTCP2_MIN_CIDLEN as usize;
 
+/// The identifier length this crate issues unless told otherwise.
+///
+/// Eight bytes, which is what most QUIC implementations use. The value matters beyond
+/// taste: a **short-header** packet does not carry the length of its destination
+/// identifier, because an endpoint is expected to know how long its own are. Anything
+/// routing datagrams must therefore decode short headers with exactly this length, and
+/// using a different one reads the wrong bytes as the identifier — so the handshake, whose
+/// long headers carry explicit lengths, succeeds and every packet after it fails to route.
+/// That failure looks like a connection which establishes and then goes silent.
+///
+/// It is one constant so that the connection builder and anything demultiplexing for it
+/// cannot disagree.
+pub const DEFAULT_LEN: usize = 8;
+
 /// A QUIC connection identifier.
 ///
 /// Wraps `ngtcp2_cid`, which stores its bytes inline rather than by pointer — so a
