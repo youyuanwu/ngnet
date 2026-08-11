@@ -22,6 +22,7 @@ Design notes, the invariants the test suite pins, and the tracked backlog live i
 | [`ngnet-quic-tests`](tests/ngnet-quic-tests) | Not published. Drives `ngnet-quic` through real TLS handshakes, in process and over loopback UDP, so the wrapper needs no certificate or runtime dependency of its own. |
 | [`ngnet-axum`](crates/ngnet-axum) | Not published yet — the API is new and expected to change; see [`docs/axum/design.md`](docs/axum/design.md). Serves an [axum](https://github.com/tokio-rs/axum) `Router` over `ngnet-h2` instead of hyper. Server-side, h2c and tokio only. |
 | [`ngnet-util`](crates/ngnet-util) | Not published yet — the API is new and expected to change; see [`docs/util/design.md`](docs/util/design.md). A pooling HTTP/2 client over `ngnet-h2`: send a request at a URI and the connection is opened, reused, retired and replaced for you. Client-side, h2c and tokio only. |
+| [`ngnet-workspace-tests`](tests/ngnet-workspace-tests) | Not published. Checks that belong to the workspace rather than to any crate in it: what the resolved dependency graph contains, and what the linked binaries pull in. Takes no dependencies of its own — it drives `cargo` and `readelf` and reads the output. |
 
 ### HTTP/3, and what it deliberately is not
 
