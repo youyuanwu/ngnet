@@ -3,6 +3,20 @@
 Known gaps and deferred decisions, each with the evidence that produced it and what would
 settle it.
 
+## Things the endpoint layer does not do
+
+Deliberate omissions in the asynchronous layer, each excluded to keep the work finishable
+rather than because it is unwanted.
+
+| Gap | What it would need |
+| --- | --- |
+| **Explicit congestion notification** | `ngtcp2_pkt_info` carries an ECN byte and this layer always passes zero. Reading it back needs socket ancillary data, which the `AsyncUdpSocket` seam would have to expose — a real widening of the trait for a signal nothing here acts on yet. |
+| **Datagram batching** | `sendmmsg`, `recvmmsg` and segmentation offload. Throughput work, optional even in ngtcp2's own examples, and invisible until an endpoint is carrying enough traffic for syscall overhead to matter. |
+| **More than one socket per endpoint** | A scaling concern rather than a capability one: nothing in the API would change, and a caller who needs it today can run several endpoints. |
+| **An ownership-taking write** | `Connection::write` copies, because the transport holds what it is given until acknowledgement. A `write_owned(Bytes)` alongside it would let a caller hand over instead — see [Sent stream data is copied](#sent-stream-data-is-copied). |
+| **Backpressure on the write queue** | A caller may queue writes faster than the connection drains them, and nothing bounds that queue. The transport's own flow control bounds what is *in flight*, not what is waiting. |
+| **NEW_TOKEN for returning clients** | The endpoint validates Retry tokens but never issues the regular tokens that would let a client skip validation on its next connection. `accept.rs` classifies them already. |
+
 ## The `QuicConnection` adapter
 
 `ngnet-h3` defines a `QuicConnection` trait (`crates/ngnet-h3/src/http/quic.rs`) that its
@@ -14,8 +28,9 @@ It was deliberately excluded from this work. The wrapper is large enough on its 
 building the adapter at the same time would have meant designing the wrapper's API around a
 consumer that did not exist yet — which tends to produce an API that fits exactly one caller.
 
-**What would settle it:** writing the adapter. Two things to expect. The trait is `poll`-based
-and `ngnet-quic` is not, so the adapter owns the event loop and the timer; and the trait was
+**What would settle it:** writing the adapter. One of the two things previously expected has
+since arrived: `ngnet-quic` now has an event loop and a timer of its own, in its `endpoint`
+layer, so an adapter would sit alongside that rather than having to invent one. The trait was
 shaped against a survey of four QUIC libraries including ngtcp2, so the shapes should meet,
 but "should" is doing real work in that sentence until someone tries.
 
@@ -34,7 +49,6 @@ because it is unwanted.
 | **Connection migration and path validation** | `path.user_data` can never be reclaimed mid-connection (`ngtcp2.h:2158-2168`), so a migrating connection needs a different ownership story for path data than the static one used now. |
 | **Explicit key update** | `ngtcp2_conn_initiate_key_update`, plus deciding when a safe API should trigger one. |
 | **The `MORE` coalescing write path** | `NGTCP2_WRITE_STREAM_FLAG_MORE` lets several stream writes share one packet, but requires that `conn`, `path`, `pi`, `dest`, `destlen` and `ts` be **byte-identical** across every call in a run, and forbids almost the whole API in between (`ngtcp2.h:5288-5312`). That is expressible safely only behind a guard type holding all of them, in the shape of `ngnet-h3`'s `SendGuard`. Nothing needs it yet. |
-| **Retry and address validation tokens** | `accept.rs` exposes the primitives; no token issuance or validation policy is built on top. |
 
 ## Inherited behaviours worth knowing about
 

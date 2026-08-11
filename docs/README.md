@@ -33,7 +33,7 @@ There are no HTTP/3 benchmarks yet.
 
 | Document | What it covers |
 | --- | --- |
-| [`quic/design.md`](quic/design.md) | Why the QUIC crates are shaped the way they are: the API ngtcp2 documents but does not export, why validation is duplicated in Rust, the three-object TLS teardown order, and why entropy cannot travel through the callback bridge. |
+| [`quic/design.md`](quic/design.md) | Why the QUIC crates are shaped the way they are: the API ngtcp2 documents but does not export, why validation is duplicated in Rust, the three-object TLS teardown order, why entropy cannot travel through the callback bridge, why one driver owns a whole socket, and the two lengths and two flow-control windows that make a working connection go silent when either is got wrong. |
 | [`quic/pending-work.md`](quic/pending-work.md) | Known gaps and deferred decisions, with what would settle each. |
 | [`quic/invariants.md`](quic/invariants.md) | The properties the `ngnet-quic` suite pins, and where each is enforced. |
 
@@ -91,14 +91,22 @@ HTTP/3 family depends on it and no adapter between the two exists yet — see
 [`quic/pending-work.md`](quic/pending-work.md).
 
 **QUIC.** `ngnet-quic-sys` builds ngtcp2 from the vendored submodule and generates raw
-bindings; `ngnet-quic` wraps it **once**, as a sans-I/O state machine with no async layer —
-the one structural difference from the other two families. TLS is a backend seam with a
+bindings; `ngnet-quic` wraps it twice, in the same shape as the other two families — a
+sans-I/O state machine, and behind the default-on `endpoint` feature an asynchronous layer
+that owns a UDP socket and the connections reachable through it. TLS is a backend seam with a
 default-on OpenSSL implementation, which needs system OpenSSL 3.5 or newer.
 `ngnet-quic-tests` is unpublished and drives real handshakes, in process and over loopback
 UDP.
 
-Client and server are both supported. 0-RTT, unreliable datagrams, connection migration and
-key update are not implemented, and that is a scope decision rather than a to-do.
+Where the HTTP families take a byte transport or an established connection, this layer owns
+the socket: one driver serves every connection on it, because several drivers cannot each own
+one UDP socket. The socket and the clock are seams a caller implements, with a ready-made
+pair for tokio behind an off-by-default feature. A server can validate client addresses
+before committing any connection state, which is what makes it safe to expose.
+
+Client and server are both supported. 0-RTT, unreliable datagrams, connection migration, key
+update, ECN marking and datagram batching are not implemented, and that is a scope decision
+rather than a to-do.
 
 **axum.** `ngnet-axum` serves an axum `Router` over `ngnet-h2` instead of hyper. It is an
 integration rather than a family: no `-sys` crate, no state machine, no layering of its own —
