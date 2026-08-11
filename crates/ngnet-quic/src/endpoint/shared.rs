@@ -46,6 +46,14 @@ pub(crate) enum Observed {
     Data(StreamId, Vec<u8>, bool),
     /// The peer opened a stream.
     Opened(StreamId),
+    /// This endpoint opened a stream, in response to a request from a handle.
+    ///
+    /// Distinct from [`Observed::Opened`] because the two go to different places: a peer's
+    /// stream belongs to whoever is awaiting `accept_stream`, and this one belongs to the
+    /// `open_*` future that asked for it. Sharing a variant let an `open_bidi()` resolve
+    /// with a stream the peer had opened, and sent the caller's next write to the wrong
+    /// stream.
+    LocallyOpened(StreamId),
     /// A stream finished.
     Closed(StreamId, StreamCloseReason),
     /// The peer reset a stream it was sending on.
@@ -67,8 +75,14 @@ pub(crate) enum Observed {
 /// One mutex rather than several. The critical sections are short — pushing an observation,
 /// taking a queue — and one lock held briefly is both faster and easier to reason about
 /// than four that must be taken in a fixed order.
-#[derive(Default)]
 pub(crate) struct ConnectionShared {
+    /// The endpoint this connection belongs to, so queued work can wake its driver.
+    ///
+    /// Without this a handle can queue a write and then wait for a driver that is asleep on
+    /// the socket and the timer -- neither of which a command touches. The connection would
+    /// make no progress until something unrelated woke the driver, and on a quiescent
+    /// connection the next such thing is the idle timeout, which closes it.
+    endpoint: Arc<EndpointShared>,
     inner: Mutex<ConnectionInner>,
     /// Whether the connection is finished, readable without taking the lock.
     ///
@@ -116,12 +130,25 @@ pub(crate) enum Command {
     StopSending(StreamId, ApplicationErrorCode),
     /// Close the connection.
     Close(ApplicationErrorCode, Vec<u8>),
+    /// Give the peer back credit for bytes the application has now consumed.
+    ExtendCredit {
+        /// The stream the bytes came from.
+        stream: StreamId,
+        /// How many bytes were consumed.
+        bytes: u64,
+    },
 }
 
 impl ConnectionShared {
-    /// A fresh shared state.
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+    /// A fresh shared state belonging to `endpoint`.
+    pub(crate) fn new(endpoint: Arc<EndpointShared>) -> Arc<Self> {
+        Arc::new(Self {
+            endpoint,
+            inner: Mutex::default(),
+            closed: AtomicBool::new(false),
+            established: AtomicBool::new(false),
+            retained: AtomicU64::new(0),
+        })
     }
 
     /// Takes the lock, recovering from a poisoned one.
@@ -219,9 +246,14 @@ impl ConnectionShared {
         }
     }
 
-    /// Queues work for the driver.
+    /// Queues work for the driver, and wakes it.
+    ///
+    /// The wake is not optional. A driver with nothing to read and no timer due is parked,
+    /// and a command reaches neither of those -- so queuing without waking means the work
+    /// waits for an unrelated event, which on a quiescent connection is the idle timeout.
     pub(crate) fn push(&self, command: Command) {
         self.lock().commands.push_back(command);
+        self.endpoint.wake_driver();
     }
 
     /// Takes everything queued.
@@ -341,7 +373,7 @@ mod tests {
     fn the_first_failure_is_the_one_reported() {
         // A connection that fails and is then torn down should report what actually went
         // wrong, not the teardown that followed from it.
-        let shared = ConnectionShared::new();
+        let shared = ConnectionShared::new(EndpointShared::new());
         shared.fail(Error::new(ErrorKind::HandshakeRejected, "first"));
         shared.fail(Error::new(ErrorKind::DriverGone, "second"));
         assert_eq!(shared.failure().kind(), ErrorKind::HandshakeRejected);
@@ -351,7 +383,7 @@ mod tests {
     fn an_idle_close_is_reported_as_a_timeout_rather_than_a_peer_close() {
         // The distinction a caller acts on: nothing refused anything, and the peer may not
         // know the connection is over.
-        let shared = ConnectionShared::new();
+        let shared = ConnectionShared::new(EndpointShared::new());
         let close = crate::error::CloseError::idle_for_test();
         shared.fail_with_close(close);
         assert_eq!(shared.failure().kind(), ErrorKind::IdleTimeout);
@@ -359,7 +391,7 @@ mod tests {
 
     #[test]
     fn commands_are_taken_in_order() {
-        let shared = ConnectionShared::new();
+        let shared = ConnectionShared::new(EndpointShared::new());
         shared.push(Command::Reset(
             StreamId::new(0).expect("valid"),
             ApplicationErrorCode::new(1),
@@ -387,7 +419,7 @@ mod tests {
             }
         }
 
-        let shared = ConnectionShared::new();
+        let shared = ConnectionShared::new(EndpointShared::new());
         let first = Arc::new(Counting(AtomicBool::new(false)));
         let waker = Waker::from(Arc::clone(&first));
         shared.register(&waker);

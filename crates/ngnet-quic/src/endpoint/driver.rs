@@ -218,6 +218,10 @@ where
                 shared.fail_with_close(close);
             }
             Err(err) => {
+                // A connection the transport has given up on has nothing more to send and
+                // nothing more to read, so it is evictable rather than lingering until some
+                // other condition happens to catch it.
+                tracked.finished = true;
                 shared.fail(Error::from(err));
             }
         }
@@ -238,14 +242,12 @@ where
         let mut new_routes = Vec::new();
         let mut dead_routes = Vec::new();
         let mut established = false;
-        let mut credit = 0u64;
 
         for event in &observed {
             match event {
                 Observed::IdMinted(cid) => new_routes.push(cid.as_bytes().to_vec()),
                 Observed::IdRetired(cid) => dead_routes.push(cid.as_bytes().to_vec()),
                 Observed::HandshakeCompleted => established = true,
-                Observed::Data(_, bytes, _) => credit += bytes.len() as u64,
                 _ => {}
             }
         }
@@ -258,20 +260,6 @@ where
         }
 
         if let Some(tracked) = self.connections.get_mut(&index) {
-            // Flow control. Reading is what earns credit back, and both levels must be
-            // extended: the connection window is shared across every stream, so extending
-            // only the stream level stalls the connection once enough total bytes have
-            // flowed -- late, and with no error to explain it.
-            if credit > 0 {
-                for event in &observed {
-                    if let Observed::Data(stream, bytes, _) = event {
-                        let _ = tracked
-                            .conn
-                            .extend_max_stream_offset(*stream, bytes.len() as u64);
-                    }
-                }
-                tracked.conn.extend_max_offset(credit);
-            }
             tracked
                 .shared
                 .set_retained(tracked.conn.retained_bytes() as u64);
@@ -314,7 +302,7 @@ where
                     };
                     match opened {
                         Ok(id) => {
-                            shared.observe(Observed::Opened(id));
+                            shared.observe(Observed::LocallyOpened(id));
                             shared.wake_all();
                         }
                         // Running out of stream credit is an ordinary condition in a
@@ -339,6 +327,20 @@ where
                 }
                 Command::Close(code, reason) => {
                     self.close_connection(index, code, &reason);
+                }
+                Command::ExtendCredit { stream, bytes } => {
+                    // Credit is returned when the *application* consumes bytes, not when
+                    // they are delivered. Returning it on delivery would make the
+                    // flow-control window advisory: a peer could stream indefinitely past a
+                    // reader that never reads, and the bytes would pile up in this process
+                    // until it ran out of memory. Tying it to consumption is what makes the
+                    // window an actual bound.
+                    //
+                    // Both levels, because the connection window is shared across every
+                    // stream: extending only the stream level stalls the connection once
+                    // enough total bytes have flowed, late and with nothing to explain it.
+                    let _ = tracked.conn.extend_max_stream_offset(stream, bytes);
+                    tracked.conn.extend_max_offset(bytes);
                 }
             }
         }
@@ -438,9 +440,27 @@ where
             && len > 0
         {
             datagram.truncate(len);
+            // Kept for the closing period: `write_connection_close` returns nothing once
+            // the connection is closing, so a close that has to be answered again cannot be
+            // regenerated -- it has to have been kept.
             tracked.close_datagram = Some(datagram.clone());
-            tracked.pending = Some(datagram);
+
+            // The pending slot may already hold a datagram -- one produced earlier in this
+            // same command batch, or one the socket refused. Overwriting it would silently
+            // drop a packet, which is the exact thing that slot exists to prevent, so the
+            // close queues behind it instead.
+            match tracked.pending.take() {
+                Some(waiting) => {
+                    tracked.pending = Some(waiting);
+                    self.outbox.push_back((tracked.remote, datagram));
+                }
+                None => tracked.pending = Some(datagram),
+            }
         }
+
+        // Closing locally ends the connection, and nothing more will be read from it -- so
+        // it becomes evictable once its close datagram has gone.
+        tracked.finished = true;
         tracked
             .shared
             .fail(Error::new(ErrorKind::LocallyClosed, "closed by this endpoint"));
@@ -483,10 +503,14 @@ where
         match tracked.conn.handle_expiry(now) {
             Ok(ExpiryOutcome::Handled) => {}
             Ok(ExpiryOutcome::IdleClose) => {
+                // ngtcp2 says to drop the connection without writing a close, so there is
+                // nothing left to send and it is evictable immediately.
                 let close = tracked.conn.close_error();
+                tracked.finished = true;
                 shared.fail_with_close(close);
             }
             Ok(ExpiryOutcome::Terminal) => {
+                tracked.finished = true;
                 shared.fail(Error::new(
                     ErrorKind::Transport,
                     "the connection reached a terminal state",
@@ -517,11 +541,24 @@ where
     pub(crate) fn earliest_expiry(&self) -> Option<Timestamp> {
         self.connections
             .values()
+            // A finished connection's deadline is in the past and will never move, so
+            // including it would pin the timer there and starve every other connection's.
+            .filter(|t| !t.finished)
             .filter_map(|t| t.conn.expiry())
             .min()
     }
 
     /// Removes connections that have finished and released their identifiers.
+    ///
+    /// A connection is finished when it has closed *and* has nothing left to send. The
+    /// second half matters: evicting one with a close datagram still queued would drop the
+    /// packet that tells the peer why, and the peer would wait out its idle timeout instead.
+    ///
+    /// `finished` is set on every path that ends a connection without the peer closing it —
+    /// a local close, an idle timeout, a terminal transport failure — because
+    /// `in_draining_period` covers only the peer-initiated case. Relying on that alone left
+    /// every other kind of dead connection in the table for good, which is a leak an
+    /// endpoint accumulates for as long as it runs.
     pub(crate) fn evict(&mut self) {
         let mut dead = Vec::new();
         for (index, tracked) in &self.connections {

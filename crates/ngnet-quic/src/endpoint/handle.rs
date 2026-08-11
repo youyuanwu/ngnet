@@ -237,7 +237,7 @@ impl Endpoint {
     /// if it never answered, [`ErrorKind::Socket`] if the socket failed, and
     /// [`ErrorKind::DriverGone`] if the driver is not running.
     pub fn connect(&self, remote: SocketAddr, server_name: Option<&str>) -> Connecting {
-        let shared = ConnectionShared::new();
+        let shared = ConnectionShared::new(Arc::clone(&self.shared));
         if self.shared.is_gone() {
             shared.fail(Error::new(
                 ErrorKind::DriverGone,
@@ -492,7 +492,7 @@ where
         #[cfg(not(feature = "tls-ossl"))]
         let (original, retried) = (packet.dcid, false);
 
-        let shared = ConnectionShared::new();
+        let shared = ConnectionShared::new(Arc::clone(&self.shared));
         match self
             .inner
             .accept(source, packet, &original, retried, Arc::clone(&shared))

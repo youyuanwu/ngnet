@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use crate::error::ApplicationErrorCode;
 use crate::handlers::StreamCloseReason;
-use crate::stream::StreamId;
+use crate::stream::{Directionality, StreamId};
 
 use super::error::{Error, ErrorKind, Result};
 use super::shared::{Command, ConnectionShared, Observed};
@@ -90,6 +90,22 @@ impl Connection {
         self.shared.retained_bytes()
     }
 
+    /// Tells the driver the application has consumed bytes, so credit can be returned.
+    ///
+    /// Deliberately *not* done when the bytes arrive. Returning credit on delivery makes the
+    /// flow-control window advisory rather than real: a peer could keep sending past a
+    /// reader that never reads, and the bytes would accumulate in this process until it ran
+    /// out of memory. Tied to consumption, the window is what bounds the buffer.
+    fn consumed(&self, stream: StreamId, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        self.shared.push(Command::ExtendCredit {
+            stream,
+            bytes: bytes as u64,
+        });
+    }
+
     /// Moves everything the driver has recorded into this handle.
     fn absorb(&mut self) {
         let observed = self.shared.take_observed();
@@ -113,6 +129,7 @@ impl Connection {
                     slot.finished = true;
                     slot.reset.get_or_insert(code);
                 }
+                Observed::LocallyOpened(_) => {}
                 Observed::StopSending(stream, code) => {
                     self.stopped.insert(stream.get(), code);
                 }
@@ -145,9 +162,9 @@ impl Connection {
     fn open(&self, bidi: bool) -> OpenStream<'_> {
         self.shared.push(Command::OpenStream { bidi });
         OpenStream {
-            connection: self,
-            requested: false,
+            shared: Arc::clone(&self.shared),
             bidi,
+            _borrow: core::marker::PhantomData,
         }
     }
 
@@ -270,44 +287,55 @@ impl core::fmt::Debug for Connection {
 /// A stream being opened.
 #[must_use = "no stream is opened until this is awaited"]
 pub struct OpenStream<'a> {
-    connection: &'a Connection,
-    requested: bool,
+    shared: Arc<ConnectionShared>,
     bidi: bool,
+    _borrow: core::marker::PhantomData<&'a Connection>,
+}
+
+impl OpenStream<'_> {
+    /// Takes the first stream this endpoint opened with the directionality asked for.
+    ///
+    /// Matching on directionality matters when a bidirectional and a unidirectional open
+    /// are outstanding at once: without it the two futures could resolve with each other's
+    /// stream, and a caller would write to a stream the peer cannot read.
+    fn take(&self) -> Option<StreamId> {
+        let mut inner = self.shared.lock();
+        let wanted = if self.bidi {
+            Directionality::Bidirectional
+        } else {
+            Directionality::Unidirectional
+        };
+        let position = inner.observed.iter().position(|event| {
+            matches!(event, Observed::LocallyOpened(id) if id.directionality() == wanted)
+        });
+        position.and_then(|at| match inner.observed.remove(at) {
+            Observed::LocallyOpened(id) => Some(id),
+            _ => None,
+        })
+    }
 }
 
 impl Future for OpenStream<'_> {
     type Output = Result<StreamId>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let shared = Arc::clone(&self.connection.shared);
-        if shared.is_closed() {
-            return Poll::Ready(Err(shared.failure()));
-        }
-
-        // The driver records the opened stream as an `Opened` observation, which is the
-        // same event a peer-opened stream produces -- so the first one to arrive after this
-        // request is ours.
-        let opened = {
-            let mut inner = shared.lock();
-            let position = inner
-                .observed
-                .iter()
-                .position(|event| matches!(event, Observed::Opened(_)));
-            position.and_then(|at| match inner.observed.remove(at) {
-                Observed::Opened(id) => Some(id),
-                _ => None,
-            })
-        };
-
-        if let Some(stream) = opened {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(stream) = self.take() {
             return Poll::Ready(Ok(stream));
         }
-
-        if !self.requested {
-            self.requested = true;
+        if self.shared.is_closed() {
+            return Poll::Ready(Err(self.shared.failure()));
         }
-        let _ = self.bidi;
-        shared.register(cx.waker());
+
+        self.shared.register(cx.waker());
+        // Re-check after registering. The driver may have opened the stream between the
+        // scan above and the registration, in which case the wake has already happened and
+        // waiting for another would wait forever.
+        if let Some(stream) = self.take() {
+            return Poll::Ready(Ok(stream));
+        }
+        if self.shared.is_closed() {
+            return Poll::Ready(Err(self.shared.failure()));
+        }
         Poll::Pending
     }
 }
@@ -353,10 +381,12 @@ impl Future for ReadStream<'_> {
             // A zero-length chunk with `fin` set is legal and must be delivered: it is how
             // a stream ends without a final byte, and a reader that treated it as "nothing
             // yet" would wait forever for bytes that are not coming.
-            return Poll::Ready(Ok(Chunk {
+            let chunk = Chunk {
                 bytes: core::mem::take(&mut slot.bytes),
                 fin: slot.finished,
-            }));
+            };
+            this.connection.consumed(this.stream, chunk.bytes.len());
+            return Poll::Ready(Ok(chunk));
         }
 
         if this.connection.shared.is_closed() {
@@ -368,10 +398,12 @@ impl Future for ReadStream<'_> {
         if let Some(slot) = this.connection.incoming.get_mut(&this.stream.get())
             && (!slot.bytes.is_empty() || slot.finished)
         {
-            return Poll::Ready(Ok(Chunk {
+            let chunk = Chunk {
                 bytes: core::mem::take(&mut slot.bytes),
                 fin: slot.finished,
-            }));
+            };
+            this.connection.consumed(this.stream, chunk.bytes.len());
+            return Poll::Ready(Ok(chunk));
         }
         Poll::Pending
     }

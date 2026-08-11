@@ -9,13 +9,15 @@
 //! Over real loopback UDP on tokio, because a stall in a bounded in-process loop is
 //! indistinguishable from a bound that was too small.
 
+use core::future::Future;
+use core::task::Poll;
 use std::time::Duration as StdDuration;
 
 use ngnet_quic::endpoint::{
     Config, Connection, Endpoint, EndpointBuilder, EndpointDriver, ErrorKind, TokioClock,
     TokioSocket,
 };
-use ngnet_quic::{ApplicationErrorCode, OsslBackend, Role};
+use ngnet_quic::{ApplicationErrorCode, Directionality, OsslBackend, Role};
 use ngnet_quic_tests::{TEST_ALPN, TEST_SERVER_NAME, TestCredentials, TestEntropy};
 
 /// The endpoint driver these tests run.
@@ -491,11 +493,18 @@ async fn acknowledgement_releases_what_the_transport_was_holding() {
         .expect("the read failed");
     assert_eq!(received.len(), payload.len());
 
-    // Give acknowledgements time to come back.
+    // Both of these are asynchronous signals that arrive as acknowledgements come back, so
+    // both are waited for rather than sampled once.
     let deadline = tokio::time::Instant::now() + PATIENCE;
-    while pair.client.retained_bytes() > 0 && tokio::time::Instant::now() < deadline {
+    while tokio::time::Instant::now() < deadline {
+        let released = pair.client.retained_bytes() == 0;
+        let counted = pair.client.acked_bytes(stream) >= payload.len() as u64;
+        if released && counted {
+            break;
+        }
         tokio::time::sleep(StdDuration::from_millis(10)).await;
     }
+
     assert_eq!(
         pair.client.retained_bytes(),
         0,
@@ -504,7 +513,9 @@ async fn acknowledgement_releases_what_the_transport_was_holding() {
     );
     assert!(
         pair.client.acked_bytes(stream) >= payload.len() as u64,
-        "fewer bytes were acknowledged than were sent"
+        "only {} of {} bytes were reported acknowledged",
+        pair.client.acked_bytes(stream),
+        payload.len()
     );
 }
 
@@ -530,4 +541,183 @@ async fn a_configured_stream_limit_takes_effect() {
         second.is_err(),
         "a second stream was opened despite the peer advertising room for one"
     );
+}
+
+#[tokio::test]
+async fn a_peer_cannot_outrun_a_reader_that_never_reads() {
+    // The flow-control window is only a bound if credit is returned when the application
+    // *consumes* bytes rather than when they arrive. Returning it on delivery makes the
+    // window advisory: a peer streams indefinitely past a reader that never reads, and the
+    // bytes accumulate in this process until it runs out of memory.
+    //
+    // So: write far more than the window, never read, wait, then read once. What comes back
+    // is everything that was allowed to arrive, and it must be bounded by the window rather
+    // than by what was written.
+    let credentials = TestCredentials::generate();
+    let window = 32 * 1024u64;
+    let config = Config::new()
+        .initial_max_stream_data(16 * 1024)
+        .initial_max_data(window);
+    let mut pair = connect_with(&credentials, config).await;
+
+    let stream = tokio::time::timeout(PATIENCE, pair.client.open_bidi())
+        .await
+        .expect("opening stalled")
+        .expect("opening failed");
+
+    // An order of magnitude more than the window allows.
+    let payload = vec![0x5au8; 512 * 1024];
+    pair.client
+        .write(stream, &payload, false)
+        .expect("queueing the write");
+
+    let accepted = tokio::time::timeout(PATIENCE, pair.server.accept_stream())
+        .await
+        .expect("the server never saw the stream")
+        .expect("accepting failed");
+
+    // Long enough that an unbounded sender would have delivered the whole payload.
+    tokio::time::sleep(StdDuration::from_secs(2)).await;
+
+    let first = tokio::time::timeout(PATIENCE, pair.server.read(accepted))
+        .await
+        .expect("the read stalled")
+        .expect("the read failed");
+
+    assert!(
+        !first.bytes.is_empty(),
+        "nothing arrived at all, so this proves nothing about flow control"
+    );
+
+    // A little slack over the window: ngtcp2 may have a packet or two in hand beyond what
+    // the window strictly permits. An order of magnitude of slack would not be a bound.
+    let allowed = (window * 3) as usize;
+    assert!(
+        first.bytes.len() <= allowed,
+        "{} bytes were buffered against a {window}-byte connection window while the \
+         application had read nothing -- credit is being returned on delivery rather than \
+         on consumption, so the window is bounding nothing",
+        first.bytes.len()
+    );
+    assert!(
+        first.bytes.len() < payload.len(),
+        "the entire payload arrived despite the reader never reading"
+    );
+}
+
+#[tokio::test]
+async fn a_write_on_a_quiescent_connection_is_serviced_promptly() {
+    // The lost-wakeup test, and the reason it has to be written this way.
+    //
+    // Queuing a command does not make the driver run. A driver with nothing to read and no
+    // timer due is parked, and a command touches neither -- so unless queuing also *wakes*
+    // it, the write waits for some unrelated event. On a connection that has gone quiet the
+    // next such event is the idle timeout, which closes the connection rather than serving
+    // the write.
+    //
+    // The in-process harness cannot catch this: it re-polls every driver on every pass with
+    // a no-op waker, so it never depends on a wake happening at all. This runs on a real
+    // runtime, where a driver that is not woken simply does not run.
+    let credentials = TestCredentials::generate();
+    let mut pair = connect(&credentials).await;
+
+    let stream = tokio::time::timeout(PATIENCE, pair.client.open_bidi())
+        .await
+        .expect("opening stalled")
+        .expect("opening failed");
+    pair.client.write(stream, b"first", false).expect("queueing");
+
+    let accepted = tokio::time::timeout(PATIENCE, pair.server.accept_stream())
+        .await
+        .expect("the server never saw the stream")
+        .expect("accepting failed");
+    let first = tokio::time::timeout(PATIENCE, pair.server.read(accepted))
+        .await
+        .expect("the first read stalled")
+        .expect("the first read failed");
+    assert_eq!(first.bytes, b"first");
+
+    // Let everything settle: data acknowledged, nothing in flight, no timer due but the
+    // idle timeout. This is the state in which a missing wake is fatal rather than merely
+    // slow.
+    tokio::time::sleep(StdDuration::from_millis(750)).await;
+
+    pair.client
+        .write(stream, b"second", true)
+        .expect("queueing the second write");
+
+    // A tight bound on purpose. Thirty seconds would pass even with the wake missing,
+    // because the idle timer would eventually fire; two seconds only passes if queuing the
+    // write actually woke the driver.
+    let second = tokio::time::timeout(
+        StdDuration::from_secs(2),
+        read_to_end(&mut pair.server, accepted),
+    )
+    .await
+    .expect(
+        "a write on a quiescent connection was not serviced within two seconds, which means \
+         queuing it did not wake the driver",
+    )
+    .expect("the second read failed");
+
+    assert_eq!(second, b"second");
+}
+
+#[tokio::test]
+async fn opening_two_streams_of_different_kinds_at_once_does_not_cross_them() {
+    // Both opens are outstanding together, and each must resolve with a stream of the kind
+    // it asked for. Resolving from a shared queue of "a stream was opened" events let these
+    // swap, and a caller would then write to a unidirectional stream believing it could
+    // read the reply.
+    let credentials = TestCredentials::generate();
+    let pair = connect(&credentials).await;
+
+    let (bidi, uni) = tokio::time::timeout(
+        PATIENCE,
+        futures_join(pair.client.open_bidi(), pair.client.open_uni()),
+    )
+    .await
+    .expect("opening stalled");
+
+    let bidi = bidi.expect("opening a bidirectional stream failed");
+    let uni = uni.expect("opening a unidirectional stream failed");
+
+    assert_eq!(
+        bidi.directionality(),
+        Directionality::Bidirectional,
+        "open_bidi resolved with {bidi:?}, which is not bidirectional"
+    );
+    assert_eq!(
+        uni.directionality(),
+        Directionality::Unidirectional,
+        "open_uni resolved with {uni:?}, which is not unidirectional"
+    );
+    assert_ne!(bidi, uni);
+}
+
+/// Polls two futures to completion together, without pulling in a futures crate.
+async fn futures_join<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
+    let mut a = Box::pin(a);
+    let mut b = Box::pin(b);
+    let mut first = None;
+    let mut second = None;
+    core::future::poll_fn(|cx| {
+        if first.is_none()
+            && let Poll::Ready(value) = a.as_mut().poll(cx)
+        {
+            first = Some(value);
+        }
+        if second.is_none()
+            && let Poll::Ready(value) = b.as_mut().poll(cx)
+        {
+            second = Some(value);
+        }
+        if first.is_some() && second.is_some() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    (first.expect("a"), second.expect("b"))
 }
