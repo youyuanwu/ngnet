@@ -32,7 +32,7 @@ use crate::accept;
 use crate::alloc::Allocator;
 use crate::callbacks::{self, Bridge, BridgeGuard, BridgeSlot, RandCtx, RandGuard};
 use crate::cid::ConnectionId;
-use crate::error::{Error, Result};
+use crate::error::{CloseError, Error, Result};
 use crate::handlers::Handlers;
 use crate::params::TransportParams;
 use crate::path::PathStorage;
@@ -144,7 +144,10 @@ impl<S: TlsSession> ConnBuilder<S> {
             None => ConnectionId::generate(&mut *self.entropy, self.cid_len)?,
         };
 
-        let mut settings = self.settings.build()?;
+        // The token buffer must outlive the constructor call, which is the only place
+        // ngtcp2 copies it from. Binding it here rather than dropping it with the builder
+        // is what keeps `settings.token` from dangling.
+        let (mut settings, _token_storage) = self.settings.build()?;
         let params = self.params.build(server)?;
 
         // Everything ngtcp2 keeps a pointer to is boxed here, before the constructor runs,
@@ -256,6 +259,7 @@ impl<S: TlsSession> ConnBuilder<S> {
         // `ngtcp2_callbacks.c`.
         cbs.rand = Some(callbacks::rand_cb);
         cbs.get_new_connection_id = Some(callbacks::get_new_connection_id_cb);
+        cbs.remove_connection_id = Some(callbacks::remove_connection_id_cb);
 
         // Optional, but these are the events an application acts on.
         cbs.recv_stream_data = Some(callbacks::recv_stream_data_cb);
@@ -348,6 +352,65 @@ impl<'h, S: TlsSession> Conn<'h, S> {
     /// The TLS session driving this connection.
     pub fn tls(&self) -> &S {
         &self.tls
+    }
+
+    /// Every source connection ID this endpoint is currently reachable by.
+    ///
+    /// A connection answers to several identifiers at once, and [`Conn::scid`] reports only
+    /// the one it was built with. Anything routing datagrams to connections needs the whole
+    /// set at creation, and then needs to follow
+    /// [`Handlers::on_new_connection_id`](crate::Handlers::on_new_connection_id) and
+    /// [`Handlers::on_remove_connection_id`](crate::Handlers::on_remove_connection_id) to
+    /// keep it accurate — this is a snapshot, not a subscription.
+    pub fn scids(&self) -> Vec<ConnectionId> {
+        // Asking for the count first is ngtcp2's documented protocol for this call, and is
+        // what its own server does (`examples/server.cc:1856-1865`).
+        // SAFETY: `raw` is live; passing null asks for the count without writing.
+        let count = unsafe { sys::ngtcp2_conn_get_scid2(self.raw, core::ptr::null_mut()) };
+        if count == 0 {
+            return Vec::new();
+        }
+        // SAFETY: a zeroed `ngtcp2_cid` is a valid empty identifier, and the buffer is
+        // exactly the length ngtcp2 just asked for.
+        let mut raw = vec![unsafe { core::mem::zeroed::<sys::ngtcp2_cid>() }; count];
+        // SAFETY: `raw` has room for `count` identifiers, which is what ngtcp2 reported.
+        let written = unsafe { sys::ngtcp2_conn_get_scid2(self.raw, raw.as_mut_ptr()) };
+        raw.truncate(written);
+        raw.iter().map(ConnectionId::from_raw).collect()
+    }
+
+    /// The largest UDP payload this connection may currently put on the wire, in bytes.
+    ///
+    /// Note what this is *not*. It is not the send quantum, which is a pacing burst budget
+    /// spanning several packets and would be far too large to size one datagram with. And
+    /// it is not the size of the buffer to hand a write call: that must be at least the
+    /// configured maximum transmit payload size, because ngtcp2 writes into it before it
+    /// knows how much of it will be used. This value is *permission* — the ceiling on what
+    /// may be emitted — while the buffer is *capacity*.
+    ///
+    /// It tracks path MTU discovery, so it changes over a connection's life.
+    pub fn max_tx_udp_payload_size(&self) -> usize {
+        // SAFETY: `raw` is live; this is a pure query.
+        unsafe { sys::ngtcp2_conn_get_path_max_tx_udp_payload_size2(self.raw) }
+    }
+
+    /// Why the connection closed, once something has closed it.
+    ///
+    /// [`ReadOutcome::Draining`](crate::ReadOutcome) says only *that* the peer closed; this
+    /// says what it said — an application code and a reason phrase the protocol above QUIC
+    /// chose, or an idle timeout, or a transport error. That difference is what turns "the
+    /// connection ended" into something an application can report or act on.
+    ///
+    /// Meaningful only after a close has been observed. Before then it reports the
+    /// connection's initial unset error, which is byte-for-byte a graceful `NO_ERROR`
+    /// close; see [`CloseError`].
+    pub fn close_error(&self) -> CloseError {
+        // SAFETY: `raw` is live; ngtcp2 returns a pointer to storage inside the connection,
+        // which lives at least as long as this borrow.
+        let raw = unsafe { sys::ngtcp2_conn_get_ccerr2(self.raw) };
+        debug_assert!(!raw.is_null(), "ngtcp2 always carries a connection error");
+        // SAFETY: non-null per the above, and ngtcp2 keeps `reason`/`reasonlen` consistent.
+        unsafe { CloseError::from_raw(&*raw) }
     }
 
     /// Runs a closure with the bridge installed, so callbacks can reach the handlers.

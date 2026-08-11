@@ -99,12 +99,15 @@ mod validate;
 pub mod endpoint;
 
 pub use accept::{
-    Inspection, VERSION_V1, inspect, is_acceptable_initial, supported_versions,
-    write_version_negotiation,
+    InitialPacket, InitialToken, Inspection, VERSION_V1, inspect, inspect_initial,
+    is_acceptable_initial, supported_versions, write_version_negotiation,
 };
 pub use cid::{ConnectionId, MAX_LEN as MAX_CID_LEN, MIN_LEN as MIN_CID_LEN};
 pub use conn::{Conn, ConnBuilder};
-pub use error::{ApplicationErrorCode, Error, ErrorKind, NativeCode, Result, TransportErrorCode};
+pub use error::{
+    ApplicationErrorCode, CloseError, CloseReason, Error, ErrorKind, NativeCode, Result,
+    TransportErrorCode,
+};
 pub use handlers::{Handlers, StreamCloseReason};
 pub use packet::{ExpiryOutcome, ReadOutcome, WriteOutcome};
 pub use params::{
@@ -112,7 +115,7 @@ pub use params::{
     TransportParams,
 };
 pub use rand::EntropySource;
-pub use settings::Settings;
+pub use settings::{Settings, TokenKind};
 pub use stream::{Directionality, Initiator, StreamId};
 pub use stream_io::StreamWrite;
 pub use time::{Duration, Timestamp};
