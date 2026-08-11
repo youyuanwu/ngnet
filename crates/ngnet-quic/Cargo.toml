@@ -29,6 +29,11 @@ repository.workspace = true
 default = ["tls-ossl", "endpoint"]
 tls-ossl = ["ngnet-quic-sys/crypto-ossl"]
 endpoint = []
+# A ready-made socket and clock for tokio. Off by default: a caller on another runtime
+# should not pay for this one, and describing a socket to this crate is a small job for
+# anyone who has to. Implies `endpoint`, since there is nothing for it to plug into
+# otherwise.
+tokio = ["endpoint", "dep:tokio"]
 
 # Exactly one *non-optional* dependency, as in `ngnet-h2` and `ngnet-h3`. A test fails the
 # build if that grows, and requires every optional one to be reachable only through a
@@ -43,3 +48,7 @@ endpoint = []
 # table and not on this line.)
 [dependencies]
 ngnet-quic-sys = { workspace = true }
+
+# Optional, and reachable only through the `tokio` feature above -- which is what keeps the
+# non-optional count at one, the claim a structural test enforces.
+tokio = { workspace = true, optional = true }

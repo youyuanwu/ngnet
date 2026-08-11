@@ -1117,6 +1117,7 @@ name = "ngnet-quic"
 version = "0.1.0"
 dependencies = [
  "ngnet-quic-sys",
+ "tokio",
 ]
 
 [[package]]

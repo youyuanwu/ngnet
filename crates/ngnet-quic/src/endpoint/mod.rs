@@ -35,6 +35,9 @@ mod config;
 mod error;
 mod socket;
 
+#[cfg(feature = "tokio")]
+mod tokio;
+
 #[doc(hidden)]
 pub mod testing;
 
@@ -42,4 +45,7 @@ pub use clock::Clock;
 pub use config::{Config, DEFAULT_DATAGRAMS_PER_PASS};
 pub use error::{Error, ErrorKind, Result};
 pub use socket::{AsyncUdpSocket, Received, Sent};
+
+#[cfg(feature = "tokio")]
+pub use tokio::{TokioClock, TokioSocket};
 
