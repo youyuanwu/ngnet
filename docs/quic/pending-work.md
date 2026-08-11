@@ -14,7 +14,8 @@ rather than because it is unwanted.
 | **Datagram batching** | `sendmmsg`, `recvmmsg` and segmentation offload. Throughput work, optional even in ngtcp2's own examples, and invisible until an endpoint is carrying enough traffic for syscall overhead to matter. |
 | **More than one socket per endpoint** | A scaling concern rather than a capability one: nothing in the API would change, and a caller who needs it today can run several endpoints. |
 | **An ownership-taking write** | `Connection::write` copies, because the transport holds what it is given until acknowledgement. A `write_owned(Bytes)` alongside it would let a caller hand over instead — see [Sent stream data is copied](#sent-stream-data-is-copied). |
-| **Backpressure on the write queue** | A caller may queue writes faster than the connection drains them, and nothing bounds that queue. The transport's own flow control bounds what is *in flight*, not what is waiting. |
+| **Backpressure on the write queue** | A caller may queue writes faster than the connection drains them, and nothing bounds that queue. The transport's own flow control bounds what is *in flight*, not what is waiting. Not reachable by a peer — the queue is driven by the local application — but a `write` that resolved only once the transport had accepted the bytes would be the honest shape. |
+| **A bounded accept backlog** | Connections waiting to be accepted accumulate in an unbounded queue. Address validation bounds it in practice on any endpoint that enables it, since an unvalidated peer never reaches the point of creating one; an endpoint without validation has no such bound. |
 | **NEW_TOKEN for returning clients** | The endpoint validates Retry tokens but never issues the regular tokens that would let a client skip validation on its next connection. `accept.rs` classifies them already. |
 
 ## The `QuicConnection` adapter
