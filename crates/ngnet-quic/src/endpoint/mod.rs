@@ -30,6 +30,16 @@
 //! connection on it shares one receive path, so one driver owns them all and the handles a
 //! caller holds speak to it rather than to the connections directly.
 
-// Populated by later phases. The subtree exists from the first commit so that the
-// structural claims made about it are claims about something rather than about nothing.
+mod clock;
+mod config;
+mod error;
+mod socket;
+
+#[doc(hidden)]
+pub mod testing;
+
+pub use clock::Clock;
+pub use config::{Config, DEFAULT_DATAGRAMS_PER_PASS};
+pub use error::{Error, ErrorKind, Result};
+pub use socket::{AsyncUdpSocket, Received, Sent};
 
