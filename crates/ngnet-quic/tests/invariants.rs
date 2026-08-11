@@ -35,6 +35,38 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// The subtree the asynchronous layer lives in, relative to `src`.
+///
+/// The core's structural claims are about the code *outside* this directory. Inside it the
+/// crate is deliberately asynchronous and deliberately reaches for a socket and a clock, so
+/// scanning it for those would flag the feature rather than a defect. The subtree makes its
+/// own claims, pinned separately below, and [`the_async_subtree_exists_and_is_scanned`]
+/// fails if this path ever stops matching anything — a filter that silently matches nothing
+/// turns every test that uses it into a test of nothing.
+const ASYNC_SUBTREE: &str = "endpoint";
+
+/// Whether `path` is inside the asynchronous subtree.
+fn in_async_subtree(path: &Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str() == std::ffi::OsStr::new(ASYNC_SUBTREE))
+}
+
+/// The crate's source outside the asynchronous subtree.
+fn core_files() -> Vec<PathBuf> {
+    rust_files(&crate_root().join("src"))
+        .into_iter()
+        .filter(|path| !in_async_subtree(path))
+        .collect()
+}
+
+/// The crate's source inside the asynchronous subtree.
+fn async_files() -> Vec<PathBuf> {
+    rust_files(&crate_root().join("src"))
+        .into_iter()
+        .filter(|path| in_async_subtree(path))
+        .collect()
+}
+
 /// Removes comments and string literals, so prose about a forbidden construct is not
 /// mistaken for a use of it.
 ///
@@ -131,7 +163,10 @@ fn unsafe_lives_only_in_the_modules_that_declare_they_need_it() {
     let mut offenders = Vec::new();
     let mut carriers = BTreeSet::new();
 
-    for path in rust_files(&crate_root().join("src")) {
+    // Core files only. A subtree file's stem could collide with an allowed core module name
+    // -- `endpoint/error.rs` against `error` -- and would then inherit a grant it was never
+    // given. `the_async_subtree_contains_no_unsafe_at_all` makes the stronger claim there.
+    for path in core_files() {
         let module = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -198,20 +233,24 @@ fn the_allowance_list_is_the_ffi_boundary_and_nothing_else() {
 }
 
 #[test]
-fn all_module_files_are_flat() {
+fn all_core_module_files_are_flat() {
     // Not style. The scan above derives a module's name from its file stem, so a nested
     // `foo/bar.rs` would be scanned as `bar` -- a name `lib.rs` never declares -- and would
     // be reported as using `unsafe` without a grant, or worse, slip through as `mod`.
+    //
+    // The asynchronous subtree is exempt because it is a subtree by construction, and
+    // because `the_async_subtree_contains_no_unsafe_at_all` below makes the stronger claim
+    // that nothing in it uses `unsafe` at all -- which is what the flat rule was protecting.
     let src = crate_root().join("src");
-    let nested: Vec<PathBuf> = rust_files(&src)
+    let nested: Vec<PathBuf> = core_files()
         .into_iter()
         .filter(|p| p.parent() != Some(src.as_path()))
         .collect();
 
     assert!(
         nested.is_empty(),
-        "module files must sit directly in src/, or the unsafe scan misreads their names: \
-         {nested:#?}"
+        "core module files must sit directly in src/, or the unsafe scan misreads their \
+         names: {nested:#?}"
     );
 }
 
@@ -226,7 +265,7 @@ const FORBIDDEN: &[&str] = &[
 ];
 
 #[test]
-fn the_crate_reaches_for_no_io_threading_or_time_facility() {
+fn the_core_reaches_for_no_io_threading_or_time_facility() {
     // The clock is the interesting one. ngtcp2 wants a timestamp on almost every call, and
     // the only way to supply one without reading a clock is to make the caller pass it --
     // which is why `Timestamp` exists at all.
@@ -234,9 +273,12 @@ fn the_crate_reaches_for_no_io_threading_or_time_facility() {
     // `std::net` matters for a subtler reason: socket addresses are unavoidable in a
     // transport library, and the obvious spelling would fail this scan. `core::net` gives
     // the same types with no I/O attached.
+    //
+    // This is a claim about the core alone. The asynchronous subtree exists precisely to
+    // name these things, and has its own, narrower claim below.
     let mut offenders = Vec::new();
 
-    for path in rust_files(&crate_root().join("src")) {
+    for path in core_files() {
         let source = std::fs::read_to_string(&path).expect("reading a source file");
         let code = strip_comments_and_literals(&source);
         for forbidden in FORBIDDEN {
@@ -252,22 +294,88 @@ fn the_crate_reaches_for_no_io_threading_or_time_facility() {
     );
 }
 
+/// Facilities the asynchronous subtree must not reach for either.
+///
+/// It is allowed a socket and a clock — that is what it is for. It is not allowed to make
+/// its own threads or processes, because it takes no executor and spawns nothing: every
+/// future it produces is polled by the caller, and a subtree that could spawn would be able
+/// to hide work from the caller's runtime.
+const FORBIDDEN_IN_SUBTREE: &[&str] = &["std::thread", "std::process", "std::env"];
+
 #[test]
-fn no_asynchrony_escapes_into_the_crate() {
-    // There is no async subtree here, unlike `ngnet-h2` and `ngnet-h3`: this crate is a
-    // state machine and nothing else. Its absence is what lets it be driven from blocking
-    // code, from any runtime, and from a test with no runtime at all.
+fn the_async_subtree_spawns_nothing_and_runs_nothing() {
     let mut offenders = Vec::new();
-    for path in rust_files(&crate_root().join("src")) {
+    for path in async_files() {
         let source = std::fs::read_to_string(&path).expect("reading a source file");
         let code = strip_comments_and_literals(&source);
-        if code.contains("async fn") || code.contains("await") {
+        for forbidden in FORBIDDEN_IN_SUBTREE {
+            if code.contains(forbidden) {
+                offenders.push(format!("{} names {forbidden}", path.display()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "the asynchronous layer acquired a way to run work the caller did not poll: \
+         {offenders:#?}"
+    );
+}
+
+#[test]
+fn the_async_subtree_contains_no_unsafe_at_all() {
+    // A claim the core cannot make, and the reason the subtree needs no entry in the
+    // `unsafe` allowance list in `lib.rs`. Every foreign call lives below this layer; if
+    // one appears here, the safe API it is meant to be built on has a hole.
+    let mut offenders = Vec::new();
+    for path in async_files() {
+        let source = std::fs::read_to_string(&path).expect("reading a source file");
+        if mentions_unsafe(&strip_comments_and_literals(&source)) {
             offenders.push(path);
         }
     }
     assert!(
         offenders.is_empty(),
-        "the crate acquired asynchrony, which it is not supposed to have: {offenders:#?}"
+        "the asynchronous layer must need no `unsafe`: {offenders:#?}"
+    );
+}
+
+#[test]
+fn the_async_subtree_exists_and_is_scanned() {
+    // Without this, deleting or renaming the subtree would turn all three claims above into
+    // claims about the empty set, silently and with every test still green.
+    let found = async_files();
+    assert!(
+        !found.is_empty(),
+        "no files found under src/{ASYNC_SUBTREE}/; the subtree filter has gone stale and \
+         the claims made about the asynchronous layer are now claims about nothing"
+    );
+
+    // And the partition must actually partition: a filter matching everything would make
+    // the core's claims vacuous instead.
+    assert!(
+        !core_files().is_empty(),
+        "the subtree filter swallowed the whole crate; the core's claims now cover nothing"
+    );
+}
+
+#[test]
+fn no_asynchrony_escapes_the_subtree() {
+    // The core is driven, not driving. Its freedom from asynchrony is what lets it be used
+    // from blocking code, from any runtime, and from a test with no runtime at all -- so
+    // the asynchronous layer is allowed to exist only inside `src/endpoint/`, and nowhere
+    // else.
+    let mut offenders = Vec::new();
+    for path in core_files() {
+        let source = std::fs::read_to_string(&path).expect("reading a source file");
+        let code = strip_comments_and_literals(&source);
+        if code.contains("async fn") || code.contains("async move") || code.contains("await") {
+            offenders.push(path);
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "asynchrony must stay inside the `{ASYNC_SUBTREE}` subtree: {offenders:#?}"
     );
 }
 
@@ -277,13 +385,20 @@ fn an_included_file_cannot_smuggle_code_past_the_scans() {
     // what the scans above read. A file included from `src/` could therefore carry `unsafe`,
     // an `async fn`, or a forbidden `std::` path that this suite would report as absent.
     //
-    // `ngnet-h3` closes the same hole by requiring every include to resolve inside its async
-    // subtree. There is no subtree here, so the claim is made directly: every included file
-    // must be inert data, not source. Today that is two PEM certificates.
+    // The core makes the strict claim: every file it includes must be inert data, not
+    // source. Today that is two PEM certificates.
+    //
+    // The subtree makes the weaker claim `ngnet-h3` makes -- an include must at least
+    // resolve inside the subtree -- because a layer that documents itself with prose needs
+    // to include Markdown, and because the subtree's own claims (no `unsafe`, no spawning)
+    // are checked over files the scans can see. An include reaching *out* of the subtree
+    // would evade the core's scans, which is the hole being closed.
     const INERT: &[&str] = &["pem", "md", "txt", "json"];
 
+    let src = crate_root().join("src");
     let mut offenders = Vec::new();
-    for path in rust_files(&crate_root().join("src")) {
+
+    for path in rust_files(&src) {
         let source = std::fs::read_to_string(&path).expect("reading a source file");
         // The included path is a string literal, so it survives only in the raw source --
         // which is exactly why this scan reads the unstripped text.
@@ -306,6 +421,17 @@ fn an_included_file_cannot_smuggle_code_past_the_scans() {
                 "{} includes {literal}, which does not exist",
                 path.display()
             );
+
+            // An include from inside the subtree must resolve inside it too. Reaching out
+            // would let a subtree file pull in text the core's scans never examine.
+            if in_async_subtree(&path) {
+                let resolved = target.canonicalize().expect("an existing include resolves");
+                assert!(
+                    in_async_subtree(&resolved),
+                    "{} includes {literal}, which resolves outside the subtree",
+                    path.display()
+                );
+            }
         }
     }
 
@@ -446,12 +572,26 @@ fn every_version_constant_lives_in_one_module() {
 fn the_scan_actually_sees_files() {
     // A path filter that stopped matching would make every claim above a claim about an
     // empty set, and would do so silently.
-    let files = rust_files(&crate_root().join("src"));
+    let files = core_files();
     assert!(
         files.len() >= 15,
-        "the scan found only {} source files, which suggests it stopped matching",
+        "the scan found only {} core source files, which suggests it stopped matching",
         files.len()
     );
+}
+
+#[test]
+fn the_subtree_filter_discriminates() {
+    // Proves the partition is a partition rather than a predicate that answers the same way
+    // for everything -- the failure mode that would make one side's claims vacuous while
+    // leaving every test green.
+    let src = crate_root().join("src");
+    assert!(in_async_subtree(&src.join(ASYNC_SUBTREE).join("mod.rs")));
+    assert!(in_async_subtree(
+        &src.join(ASYNC_SUBTREE).join("deeper").join("thing.rs")
+    ));
+    assert!(!in_async_subtree(&src.join("conn.rs")));
+    assert!(!in_async_subtree(&src.join("lib.rs")));
 }
 
 #[test]

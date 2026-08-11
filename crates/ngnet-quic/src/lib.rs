@@ -40,9 +40,10 @@
 //!
 //! # Scope
 //!
-//! One connection at a time, client or server. No socket, no runtime, no connection
-//! demultiplexing. 0-RTT, unreliable datagrams, connection migration and key update are
-//! not implemented.
+//! One connection at a time from the state machine, client or server. Above it, behind the
+//! default-on `endpoint` feature, an asynchronous layer that owns a UDP socket and the
+//! connections reachable through it. 0-RTT, unreliable datagrams, connection migration and
+//! key update are not implemented.
 
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
@@ -52,9 +53,11 @@
 // above makes a stray `unsafe` anywhere else a compile error, and a test reads this exact
 // list back out of this file so the two cannot disagree.
 //
-// Module files are deliberately flat -- `tls.rs`, never `tls/mod.rs`. That test derives a
-// module's name from its file stem, so a nested file would produce a name this list never
-// mentions and be reported as using `unsafe` without a grant.
+// Core module files are deliberately flat -- `tls.rs`, never `tls/mod.rs`. That test derives
+// a module's name from its file stem, so a nested file would produce a name this list never
+// mentions and be reported as using `unsafe` without a grant. The `endpoint` subtree below
+// is the one exception, and it earns it by containing no `unsafe` at all, which a separate
+// test pins.
 #[allow(unsafe_code)]
 mod accept;
 #[allow(unsafe_code)]
@@ -91,6 +94,9 @@ mod rand;
 mod stream;
 mod time;
 mod validate;
+
+#[cfg(feature = "endpoint")]
+pub mod endpoint;
 
 pub use accept::{
     Inspection, VERSION_V1, inspect, is_acceptable_initial, supported_versions,
