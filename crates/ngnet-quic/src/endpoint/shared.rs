@@ -41,7 +41,8 @@ use super::error::{Error, ErrorKind};
 /// cannot act — they can only record. The driver drains these after the call returns, which
 /// is the same shape `ngnet-h3` uses and for the same reason.
 #[derive(Debug)]
-pub(crate) enum Observed {
+#[non_exhaustive]
+pub enum Observed {
     /// Bytes arrived on a stream, and whether they end it.
     Data(StreamId, Vec<u8>, bool),
     /// The peer opened a stream.
@@ -64,6 +65,12 @@ pub(crate) enum Observed {
     Acked(StreamId, u64),
     /// The handshake completed.
     HandshakeCompleted,
+    /// The peer raised how many streams this endpoint may open, to the given total.
+    ///
+    /// The only signal that a refused open may now succeed. Without it a caller that waits
+    /// for room waits forever, because opening past the limit is reported as a temporary
+    /// block and nothing else announces that the block has lifted.
+    StreamsExtended(u64),
 }
 
 /// State a connection's handle and the driver share.

@@ -373,6 +373,15 @@ impl<S: TlsSession> DetachedConnection<S> {
         self.shared.take_inbound()
     }
 
+    /// Takes everything this connection's handlers have recorded since the last call.
+    ///
+    /// Handlers may only take notes: ngtcp2 calls them while it holds the connection, so
+    /// nothing they see can be acted on until the call that triggered them has returned.
+    /// This is where those notes come out.
+    pub fn take_observed(&self) -> Vec<super::shared::Observed> {
+        self.shared.take_observed()
+    }
+
     /// Whether there is room to produce another outgoing datagram.
     ///
     /// Checked *before* writing, never after. A datagram that has been produced cannot be

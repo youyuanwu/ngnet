@@ -114,6 +114,8 @@ pub(crate) fn handlers_for(shared: &Arc<ConnectionShared>) -> Handlers<'static> 
     let established = Arc::clone(shared);
     let minted = Arc::clone(shared);
     let retired = Arc::clone(shared);
+    let bidi = Arc::clone(shared);
+    let uni = Arc::clone(shared);
 
     Handlers::new()
         .on_stream_data(move |id, bytes, fin| {
@@ -128,6 +130,14 @@ pub(crate) fn handlers_for(shared: &Arc<ConnectionShared>) -> Handlers<'static> 
         // Identifier changes go to the routing queue rather than the observation queue: the
         // endpoint needs them whoever is driving the connection, and a detached connection's
         // driver would otherwise consume them and leave the endpoint routing to a stale set.
+        .on_extend_max_local_streams_bidi(move |max| {
+            bidi.observe(Observed::StreamsExtended(max));
+            bidi.wake_all();
+        })
+        .on_extend_max_local_streams_uni(move |max| {
+            uni.observe(Observed::StreamsExtended(max));
+            uni.wake_all();
+        })
         .on_new_connection_id(move |cid| minted.observe_route(RouteUpdate::Minted(*cid)))
         .on_remove_connection_id(move |cid| retired.observe_route(RouteUpdate::Retired(*cid)))
 }
