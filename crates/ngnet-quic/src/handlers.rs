@@ -17,13 +17,47 @@ use crate::error::ApplicationErrorCode;
 use crate::stream::StreamId;
 
 /// Why a stream ended.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// QUIC closes the two directions of a stream independently, so there are two error codes
+/// and either may be absent. A direction with no code closed cleanly.
+///
+/// ngtcp2's own example: a client receives a `STOP_SENDING` frame and answers with
+/// `RESET_STREAM` carrying the same code, which is reported as the *sending* side's code;
+/// meanwhile the response body arrived intact, so the *receiving* side has no code at all
+/// (`ngtcp2.h:3683-3712`).
+///
+/// This comes from `stream_close2` rather than the older `stream_close`, which collapses
+/// both directions into one code and cannot express the case above.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[non_exhaustive]
-pub enum StreamCloseReason {
-    /// Both sides finished normally.
-    Finished,
-    /// The peer reset it, or this endpoint did.
-    Reset(ApplicationErrorCode),
+pub struct StreamCloseReason {
+    receiving: Option<ApplicationErrorCode>,
+    sending: Option<ApplicationErrorCode>,
+}
+
+impl StreamCloseReason {
+    /// A reason with the given per-direction codes.
+    pub fn new(
+        receiving: Option<ApplicationErrorCode>,
+        sending: Option<ApplicationErrorCode>,
+    ) -> Self {
+        Self { receiving, sending }
+    }
+
+    /// The code that shut down the receiving side, if it did not end cleanly.
+    pub fn receiving(&self) -> Option<ApplicationErrorCode> {
+        self.receiving
+    }
+
+    /// The code that shut down the sending side, if it did not end cleanly.
+    pub fn sending(&self) -> Option<ApplicationErrorCode> {
+        self.sending
+    }
+
+    /// Whether both directions ended cleanly.
+    pub fn is_clean(&self) -> bool {
+        self.receiving.is_none() && self.sending.is_none()
+    }
 }
 
 /// A handler for stream data: the identifier, the bytes, and whether they end the stream.
@@ -59,6 +93,8 @@ pub struct Handlers<'a> {
     pub(crate) on_handshake_completed: Option<Box<dyn FnMut() + Send + 'a>>,
     pub(crate) on_new_connection_id: Option<ConnectionIdHandler<'a>>,
     pub(crate) on_remove_connection_id: Option<ConnectionIdHandler<'a>>,
+    pub(crate) on_extend_max_local_streams_bidi: Option<Box<dyn FnMut(u64) + Send + 'a>>,
+    pub(crate) on_extend_max_local_streams_uni: Option<Box<dyn FnMut(u64) + Send + 'a>>,
 }
 
 impl<'a> Handlers<'a> {
@@ -147,6 +183,27 @@ impl<'a> Handlers<'a> {
     /// told to stop using.
     pub fn on_remove_connection_id(mut self, f: impl FnMut(&ConnectionId) + Send + 'a) -> Self {
         self.on_remove_connection_id = Some(Box::new(f));
+        self
+    }
+
+    /// Called when the peer raises the number of bidirectional streams this endpoint may
+    /// open, with the new cumulative total.
+    ///
+    /// This is what makes a refused open worth retrying. Opening a stream past the peer's
+    /// limit fails as blocked rather than as an error, because the condition is temporary —
+    /// but nothing else announces that it has lifted, so a caller that waits without
+    /// listening here waits indefinitely.
+    pub fn on_extend_max_local_streams_bidi(mut self, f: impl FnMut(u64) + Send + 'a) -> Self {
+        self.on_extend_max_local_streams_bidi = Some(Box::new(f));
+        self
+    }
+
+    /// Called when the peer raises the number of unidirectional streams this endpoint may
+    /// open, with the new cumulative total.
+    ///
+    /// See [`Handlers::on_extend_max_local_streams_bidi`].
+    pub fn on_extend_max_local_streams_uni(mut self, f: impl FnMut(u64) + Send + 'a) -> Self {
+        self.on_extend_max_local_streams_uni = Some(Box::new(f));
         self
     }
 }

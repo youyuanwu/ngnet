@@ -264,11 +264,17 @@ impl<S: TlsSession> ConnBuilder<S> {
         // Optional, but these are the events an application acts on.
         cbs.recv_stream_data = Some(callbacks::recv_stream_data_cb);
         cbs.stream_open = Some(callbacks::stream_open_cb);
-        cbs.stream_close = Some(callbacks::stream_close_cb);
+        cbs.stream_close2 = Some(callbacks::stream_close2_cb);
         cbs.stream_reset = Some(callbacks::stream_reset_cb);
         cbs.recv_stop_sending = Some(callbacks::recv_stop_sending_cb);
         cbs.acked_stream_data_offset = Some(callbacks::acked_stream_data_offset_cb);
         cbs.handshake_completed = Some(callbacks::handshake_completed_cb);
+        // The peer raising the number of streams this endpoint may open. Without these an
+        // application that has hit the limit has nothing to wait on: opening fails as
+        // blocked, and the event that lifts the block is never delivered, so a caller that
+        // parks waiting for it parks forever.
+        cbs.extend_max_local_streams_bidi = Some(callbacks::extend_max_local_streams_bidi_cb);
+        cbs.extend_max_local_streams_uni = Some(callbacks::extend_max_local_streams_uni_cb);
 
         let _ = role;
         cbs

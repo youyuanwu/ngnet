@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use ngnet_quic::{
-    ApplicationErrorCode, Handlers, Inspection, StreamCloseReason, StreamId, StreamWrite, inspect,
+    ApplicationErrorCode, Handlers, Inspection, StreamId, StreamWrite, inspect,
 };
 use ngnet_quic_tests::{
     TEST_SERVER_NAME, TestClock, TestConn, TestCredentials, client_backend, client_conn, drain,
@@ -44,13 +44,16 @@ fn handlers(sink: &Shared) -> Handlers<'_> {
             b.lock().unwrap().data.push((id.get(), data.to_vec(), fin));
         })
         .on_stream_close(move |id, reason| {
-            // A wildcard is required rather than optional: `StreamCloseReason` is
-            // `#[non_exhaustive]`, which is the crate promising it may add reasons without
-            // that being a breaking change.
-            let text = match reason {
-                StreamCloseReason::Finished => "finished".to_string(),
-                StreamCloseReason::Reset(code) => format!("reset:{}", code.get()),
-                other => format!("{other:?}"),
+            // Both directions, because they are independent: a stream can end with the
+            // receiving side clean and the sending side reset, and collapsing that to one
+            // word loses the distinction the callback exists to report.
+            let text = match (reason.receiving(), reason.sending()) {
+                (None, None) => "finished".to_string(),
+                (rx, tx) => format!(
+                    "rx:{} tx:{}",
+                    rx.map_or_else(|| "clean".to_string(), |c| c.get().to_string()),
+                    tx.map_or_else(|| "clean".to_string(), |c| c.get().to_string()),
+                ),
             };
             c.lock().unwrap().closed.push((id.get(), text));
         })

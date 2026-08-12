@@ -92,17 +92,34 @@ impl Retained {
     ///
     /// Returns `None` for empty input; ngtcp2 treats a zero-length write specially and
     /// there is nothing to retain.
-    pub(crate) fn stage(&mut self, stream: StreamId, data: &[u8]) -> Option<(*const u8, usize)> {
-        if data.is_empty() {
+    /// Copies one or more ranges as a single contiguous chunk, and returns a pointer to it.
+    ///
+    /// The ranges are concatenated rather than handed to ngtcp2 as a vector array. That
+    /// sounds like it gives up something, and it does not: the copy has to happen regardless,
+    /// because ngtcp2 keeps the pointer and the caller's buffers are borrowed only for the
+    /// call. Copying into one chunk costs exactly what copying into several would, and
+    /// leaves a single address and length to account for on acknowledgement instead of a set
+    /// that ngtcp2 may accept a prefix of.
+    pub(crate) fn stage_many(
+        &mut self,
+        stream: StreamId,
+        ranges: &[&[u8]],
+    ) -> Option<(*const u8, usize)> {
+        let total: usize = ranges.iter().map(|r| r.len()).sum();
+        if total == 0 {
             return None;
+        }
+        let mut buffer = Vec::with_capacity(total);
+        for range in ranges {
+            buffer.extend_from_slice(range);
         }
         let entry = self.streams.entry(stream.get()).or_default();
         let chunk = Chunk {
-            data: data.to_vec().into_boxed_slice(),
+            data: buffer.into_boxed_slice(),
             start: entry.next_offset,
             // Provisional: the whole staged buffer is on offer. `commit` records how much
             // ngtcp2 took, and is always called before the write path returns.
-            len: data.len(),
+            len: total,
         };
         let ptr = chunk.data.as_ptr();
         let len = chunk.data.len();
@@ -204,7 +221,7 @@ mod tests {
         let mut retained = Retained::default();
         let (ptr, len) = {
             let caller_buffer = vec![1u8, 2, 3, 4];
-            let staged = retained.stage(sid(0), &caller_buffer).unwrap();
+            let staged = retained.stage_many(sid(0), &[&caller_buffer]).unwrap();
             retained.commit(sid(0), 4);
             staged
             // `caller_buffer` is dropped here.
@@ -218,7 +235,7 @@ mod tests {
     #[test]
     fn an_empty_write_stages_nothing() {
         let mut retained = Retained::default();
-        assert!(retained.stage(sid(0), &[]).is_none());
+        assert!(retained.stage_many(sid(0), &[&[]]).is_none());
         assert_eq!(retained.bytes_held(), 0);
     }
 
@@ -227,7 +244,7 @@ mod tests {
         // Bytes ngtcp2 did not take will be offered again; retaining them here would both
         // waste memory and number the stream wrongly.
         let mut retained = Retained::default();
-        retained.stage(sid(0), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        retained.stage_many(sid(0), &[&[1, 2, 3, 4, 5, 6, 7, 8]]);
         retained.commit(sid(0), 3);
         assert_eq!(retained.bytes_held(), 3);
 
@@ -247,7 +264,7 @@ mod tests {
         // Nothing catches that on a lossless loopback, because nothing retransmits. It
         // needs a test that looks at the address rather than at the bytes.
         let mut retained = Retained::default();
-        let (staged, offered) = retained.stage(sid(0), &[7u8; 1200]).unwrap();
+        let (staged, offered) = retained.stage_many(sid(0), &[&[7u8; 1200]]).unwrap();
         assert_eq!(offered, 1200);
 
         // A packet fills before the offer is exhausted -- the ordinary case, not an edge
@@ -270,9 +287,9 @@ mod tests {
         // stream's offsets: the next chunk has to start where the accepted prefix ended,
         // not where the allocation ended.
         let mut retained = Retained::default();
-        retained.stage(sid(0), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        retained.stage_many(sid(0), &[&[1, 2, 3, 4, 5, 6, 7, 8]]);
         retained.commit(sid(0), 3);
-        retained.stage(sid(0), &[4, 5, 6]);
+        retained.stage_many(sid(0), &[&[4, 5, 6]]);
         retained.commit(sid(0), 3);
         assert_eq!(retained.bytes_held(), 6);
 
@@ -288,7 +305,7 @@ mod tests {
     #[test]
     fn a_rejected_write_retains_nothing() {
         let mut retained = Retained::default();
-        retained.stage(sid(0), &[1, 2, 3]);
+        retained.stage_many(sid(0), &[&[1, 2, 3]]);
         retained.commit(sid(0), 0);
         assert_eq!(retained.bytes_held(), 0);
     }
@@ -296,9 +313,9 @@ mod tests {
     #[test]
     fn offsets_advance_across_writes() {
         let mut retained = Retained::default();
-        retained.stage(sid(0), &[0; 10]);
+        retained.stage_many(sid(0), &[&[0; 10]]);
         retained.commit(sid(0), 10);
-        retained.stage(sid(0), &[0; 5]);
+        retained.stage_many(sid(0), &[&[0; 5]]);
         retained.commit(sid(0), 5);
         assert_eq!(retained.bytes_held(), 15);
 
@@ -312,7 +329,7 @@ mod tests {
         // A chunk is released only when every one of its bytes is acknowledged; releasing
         // early would be the same use-after-free this module exists to prevent.
         let mut retained = Retained::default();
-        retained.stage(sid(0), &[0; 10]);
+        retained.stage_many(sid(0), &[&[0; 10]]);
         retained.commit(sid(0), 10);
         retained.acknowledge(sid(0), 0, 4);
         assert_eq!(retained.bytes_held(), 10);
@@ -323,7 +340,7 @@ mod tests {
     #[test]
     fn forgetting_a_stream_releases_everything_it_held() {
         let mut retained = Retained::default();
-        retained.stage(sid(0), &[0; 32]);
+        retained.stage_many(sid(0), &[&[0; 32]]);
         retained.commit(sid(0), 32);
         retained.forget(sid(0));
         assert_eq!(retained.bytes_held(), 0);
@@ -332,9 +349,9 @@ mod tests {
     #[test]
     fn streams_are_accounted_separately() {
         let mut retained = Retained::default();
-        retained.stage(sid(0), &[0; 4]);
+        retained.stage_many(sid(0), &[&[0; 4]]);
         retained.commit(sid(0), 4);
-        retained.stage(sid(4), &[0; 6]);
+        retained.stage_many(sid(4), &[&[0; 6]]);
         retained.commit(sid(4), 6);
         assert_eq!(retained.bytes_held(), 10);
 
@@ -355,12 +372,12 @@ mod tests {
         // A `Vec` would reallocate and move bytes ngtcp2 still points at. Boxed chunks are
         // what makes that impossible.
         let mut retained = Retained::default();
-        retained.stage(sid(0), &[1, 2, 3]);
+        retained.stage_many(sid(0), &[&[1, 2, 3]]);
         retained.commit(sid(0), 3);
         let (first, _) = retained.last_pointer(sid(0)).unwrap();
 
         for _ in 0..64 {
-            retained.stage(sid(0), &[9; 16]);
+            retained.stage_many(sid(0), &[&[9; 16]]);
             retained.commit(sid(0), 16);
         }
 
