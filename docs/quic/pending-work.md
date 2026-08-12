@@ -18,25 +18,20 @@ rather than because it is unwanted.
 | **A bounded accept backlog** | Connections waiting to be accepted accumulate in an unbounded queue. Address validation bounds it in practice on any endpoint that enables it, since an unvalidated peer never reaches the point of creating one; an endpoint without validation has no such bound. |
 | **NEW_TOKEN for returning clients** | The endpoint validates Retry tokens but never issues the regular tokens that would let a client skip validation on its next connection. `accept.rs` classifies them already. |
 
-## The `QuicConnection` adapter
+## The `QuicConnection` adapter — done
 
 `ngnet-h3` defines a `QuicConnection` trait (`crates/ngnet-h3/src/http/quic.rs`) that its
-async layer drives, with one implementation today over quinn in `ngnet-h3-tests`. An
-`ngnet-quic` implementation of it would make ngtcp2 a second HTTP/3 backend, and is the
-obvious next piece.
+async layer drives. It now has three implementations: an in-memory one for tests, one over
+quinn in `ngnet-h3-tests`, and one over this crate in `ngnet-quic-h3`. HTTP/3 runs on ngtcp2.
 
-It was deliberately excluded from this work. The wrapper is large enough on its own, and
-building the adapter at the same time would have meant designing the wrapper's API around a
-consumer that did not exist yet — which tends to produce an API that fits exactly one caller.
+The shapes did meet, as the trait's design against a survey of four QUIC libraries suggested
+they would, but not without two things that had to be found by running it rather than by
+reading. Both are recorded in `docs/quic-h3/design.md`: the connection has to be *pumped*
+from every entry point rather than only where datagrams seem to belong, and a stream's close
+has to be delivered in a different batch from that stream's last bytes.
 
-**What would settle it:** writing the adapter. One of the two things previously expected has
-since arrived: `ngnet-quic` now has an event loop and a timer of its own, in its `endpoint`
-layer, so an adapter would sit alongside that rather than having to invent one. The trait was
-shaped against a survey of four QUIC libraries including ngtcp2, so the shapes should meet,
-but "should" is doing real work in that sentence until someone tries.
-
-The API was sanity-checked against the trait during this work and no blocking mismatch was
-found. That is a weaker claim than it sounds — nobody has written the adapter.
+Building the adapter also required the endpoint to give up per-connection state to a caller
+who drives it. That is the *detached connection* described in `docs/quic/design.md`.
 
 ## Deliberately unimplemented QUIC features
 
@@ -105,10 +100,20 @@ rather than lowering the requirement — nothing older has 3.5.
 
 ## Things not measured
 
-There are no QUIC benchmarks. The crate has never been run against another QUIC
-implementation, only against itself; interoperability with quinn, quiche, msquic or a browser
-is unverified. Neither is a gap in correctness so much as an absence of evidence, but the
-distinction is worth keeping visible.
+There are no QUIC benchmarks.
+
+Interoperability is no longer wholly unverified, but it is worth being exact about what was
+established. `tests/ngnet-quic-h3-tests/tests/interop.rs` runs this crate against **quinn**,
+in both roles: a bare QUIC handshake with no HTTP/3 involved, HTTP/3 requests in each
+direction, and a 512 KiB payload crossing both ways byte for byte. A negative test confirms
+an untrusted certificate is refused, so the positive results are not an artefact of
+verification being switched off.
+
+That is evidence against one other implementation. It is not evidence about the protocol in
+general: quiche, msquic, picoquic and browsers remain untried, and so do the conditions a
+loopback socket does not produce — real loss, reordering, path changes, and peers that
+negotiate different transport parameters. The QUIC Interop Runner exists for exactly this and
+running against it would be the next real step.
 
 ## Sent stream data is copied
 
