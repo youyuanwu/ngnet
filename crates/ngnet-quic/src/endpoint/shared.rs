@@ -97,6 +97,8 @@ pub(crate) struct ConnectionShared {
     retained: AtomicU64,
     /// Whether this connection is to be handed to its caller once established.
     detach: AtomicBool,
+    /// Whether it is to be handed to whoever is accepting, rather than to one named waiter.
+    detach_to_acceptor: AtomicBool,
 }
 
 /// The part of a connection's shared state that needs the lock.
@@ -197,6 +199,7 @@ impl ConnectionShared {
             established: AtomicBool::new(false),
             retained: AtomicU64::new(0),
             detach: AtomicBool::new(false),
+            detach_to_acceptor: AtomicBool::new(false),
         })
     }
 
@@ -219,9 +222,20 @@ impl ConnectionShared {
         self.detach.store(true, Ordering::Release);
     }
 
+    /// Asks that this connection go to whoever is accepting, rather than to one waiter.
+    pub(crate) fn request_detach_to_acceptor(&self) {
+        self.detach.store(true, Ordering::Release);
+        self.detach_to_acceptor.store(true, Ordering::Release);
+    }
+
     /// Whether this connection is to be handed over rather than driven by the endpoint.
     pub(crate) fn wants_detach(&self) -> bool {
         self.detach.load(Ordering::Acquire)
+    }
+
+    /// Whether it goes to an acceptor rather than to the caller who dialled it.
+    pub(crate) fn detaches_to_acceptor(&self) -> bool {
+        self.detach_to_acceptor.load(Ordering::Acquire)
     }
 
     /// Records an identifier change for the endpoint's routing table.

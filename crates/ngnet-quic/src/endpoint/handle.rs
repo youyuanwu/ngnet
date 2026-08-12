@@ -171,7 +171,7 @@ where
     ///
     /// Fails if no source of randomness was supplied.
     pub fn build(self) -> Result<Built<Sock, Clk, B>> {
-        self.assemble(None)
+        self.assemble(None, None)
     }
 
     /// Builds an endpoint whose connections may be handed to callers who drive them.
@@ -197,17 +197,24 @@ where
     pub fn build_detachable(self) -> Result<Built<Sock, Clk, B>>
     where
         Clk: Clone + Send + Sync + 'static,
+        Clk::Sleep: Send + 'static,
     {
         let timescale = {
             let clock = self.clock.clone();
             Arc::new(move || clock.now()) as Arc<dyn Fn() -> crate::Timestamp + Send + Sync>
         };
-        self.assemble(Some(timescale))
+        let sleeper = {
+            let clock = self.clock.clone();
+            Arc::new(move |deadline| Box::pin(clock.sleep_until(deadline)) as Sleep)
+                as Arc<dyn Fn(crate::Timestamp) -> Sleep + Send + Sync>
+        };
+        self.assemble(Some(timescale), Some(sleeper))
     }
 
     fn assemble(
         self,
         timescale: Option<Arc<dyn Fn() -> crate::Timestamp + Send + Sync>>,
+        sleeper: Option<Arc<dyn Fn(crate::Timestamp) -> Sleep + Send + Sync>>,
     ) -> Result<Built<Sock, Clk, B>> {
         let entropy = self.entropy.ok_or_else(|| {
             Error::new(
@@ -221,6 +228,7 @@ where
         let inner = Inner {
             detached: Arc::clone(&detached),
             timescale,
+            sleeper,
             socket: self.socket,
             clock: self.clock,
             backend: self.backend,
@@ -296,12 +304,26 @@ impl<S: TlsSession> DetachQueue<S> {
         }
     }
 
+    /// Takes the connection a waiter asked for.
+    ///
+    /// Key zero means "one this endpoint accepted", which is what an acceptor wants; any
+    /// other key names one particular outbound attempt. The two must not be confused: an
+    /// acceptor that matched anything could take a connection this endpoint *dialled*, hand
+    /// it to a server, and leave the caller who dialled it waiting forever. Which of the two
+    /// completes first is not this endpoint's decision — the peer influences it.
     fn take(&self, key: usize) -> Option<DetachedConnection<S>> {
         let mut ready = self.ready.lock().unwrap_or_else(|e| e.into_inner());
-        let at = ready
-            .iter()
-            .position(|(k, _)| if key == 0 { true } else { *k == key })?;
+        let at = ready.iter().position(|(k, _)| *k == key)?;
         Some(ready.remove(at).1)
+    }
+
+    /// Gives up a connection nobody collected, so the endpoint can reclaim it.
+    fn abandon(&self, key: usize) {
+        let mut ready = self.ready.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = ready.iter().position(|(k, _)| *k == key) {
+            let (_, connection) = ready.remove(at);
+            connection.release();
+        }
     }
 
     fn register(&self, waker: &core::task::Waker) {
@@ -344,7 +366,17 @@ pub struct DetachedConnection<S: TlsSession> {
     /// Erased into a closure rather than carried as another type parameter, because a caller
     /// has no reason to name the endpoint's clock type in order to hold a connection.
     clock: Arc<dyn Fn() -> crate::Timestamp + Send + Sync>,
+    /// Sleeps until a deadline, on that same clock.
+    ///
+    /// Carried for the same reason and with more force than reading the time: a deadline
+    /// produced by this connection is expressed on the endpoint's timescale, so a sleep
+    /// arranged on any other clock resolves at the wrong moment. Nothing reports that; the
+    /// connection simply retransmits late, or wakes early and spins.
+    sleeper: Arc<dyn Fn(crate::Timestamp) -> Sleep + Send + Sync>,
 }
+
+/// A sleep that finishes at a deadline.
+pub type Sleep = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 impl<S: TlsSession> DetachedConnection<S> {
     pub(crate) fn new(
@@ -352,13 +384,25 @@ impl<S: TlsSession> DetachedConnection<S> {
         shared: Arc<ConnectionShared>,
         remote: SocketAddr,
         clock: Arc<dyn Fn() -> crate::Timestamp + Send + Sync>,
+        sleeper: Arc<dyn Fn(crate::Timestamp) -> Sleep + Send + Sync>,
     ) -> Self {
         Self {
             conn,
             shared,
             remote,
             clock,
+            sleeper,
         }
+    }
+
+    /// Sleeps until a deadline, on the endpoint's clock.
+    ///
+    /// Always this rather than a clock of the caller's own. A deadline this connection
+    /// produced is on the endpoint's timescale, and another clock's origin differs, so the
+    /// sleep would resolve at the wrong time — late, which delays loss recovery, or
+    /// immediately, which spins.
+    pub fn sleep_until(&self, deadline: crate::Timestamp) -> Sleep {
+        (self.sleeper)(deadline)
     }
 
     /// The current time, on the endpoint's clock.
@@ -435,6 +479,25 @@ pub struct Detaching<S: TlsSession> {
     shared: Option<Arc<ConnectionShared>>,
     queue: Arc<DetachQueue<S>>,
     endpoint: Arc<EndpointShared>,
+    /// Whether this wait handed its connection over, or ended without one.
+    settled: bool,
+}
+
+impl<S: TlsSession> Drop for Detaching<S> {
+    fn drop(&mut self) {
+        // A caller that gives up before collecting must not leave a connection stranded in
+        // the queue: the endpoint would keep routing to it, and its entry and identifiers
+        // would live as long as the endpoint does. Only a keyed wait can clean up after
+        // itself; an abandoned accept is covered by the endpoint's own accept bookkeeping.
+        if self.settled {
+            return;
+        }
+        if let Some(shared) = self.shared.as_ref() {
+            let key = Arc::as_ptr(shared) as *const u8 as usize;
+            self.queue.abandon(key);
+            shared.mark_terminal();
+        }
+    }
 }
 
 impl<S: TlsSession> Future for Detaching<S> {
@@ -448,14 +511,17 @@ impl<S: TlsSession> Future for Detaching<S> {
             .map_or(0, |s| Arc::as_ptr(s) as *const u8 as usize);
 
         if let Some(connection) = this.queue.take(key) {
+            this.settled = true;
             return Poll::Ready(Ok(connection));
         }
         if let Some(shared) = this.shared.as_ref()
             && shared.is_closed()
         {
+            this.settled = true;
             return Poll::Ready(Err(shared.failure()));
         }
         if this.endpoint.is_gone() {
+            this.settled = true;
             return Poll::Ready(Err(Error::new(
                 ErrorKind::DriverGone,
                 "the endpoint driver is not running",
@@ -562,6 +628,7 @@ impl<S: TlsSession> Endpoint<S> {
             shared: Some(shared),
             queue: Arc::clone(&self.detached),
             endpoint: Arc::clone(&self.shared),
+            settled: false,
         }
     }
 
@@ -574,6 +641,7 @@ impl<S: TlsSession> Endpoint<S> {
             shared: None,
             queue: Arc::clone(&self.detached),
             endpoint: Arc::clone(&self.shared),
+            settled: false,
         }
     }
 }
@@ -810,7 +878,7 @@ where
         // accepts, once each is established. The request is made on the endpoint rather than
         // per connection because a server does not know what is coming before it arrives.
         if self.shared.detached_accepts() {
-            shared.request_detach();
+            shared.request_detach_to_acceptor();
         }
         match self
             .inner
@@ -818,8 +886,13 @@ where
         {
             Ok(index) => {
                 self.inner.deliver(index, datagram);
-                self.shared.lock().accepted.push_back(shared);
-                self.shared.wake_acceptors();
+                // A connection destined for a detached acceptor does not also belong on the
+                // managed accept queue: nothing would ever take it from there, and every
+                // entry left behind keeps its shared state alive for the endpoint's life.
+                if !shared.detaches_to_acceptor() {
+                    self.shared.lock().accepted.push_back(shared);
+                    self.shared.wake_acceptors();
+                }
             }
             Err(_) => {
                 // Refusing to build a connection for a first packet is not something the

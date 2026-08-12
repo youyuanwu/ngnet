@@ -1,14 +1,12 @@
 //! The transport the HTTP/3 layer runs over.
 
-use core::future::Future;
 use core::net::SocketAddr;
-use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
 use ngnet_h3::http::{QuicConnection, QuicEvent, StreamSource};
 use ngnet_h3::StreamId as H3StreamId;
 use ngnet_h3::{ErrorCode, Timestamp as H3Timestamp};
-use ngnet_quic::endpoint::{Clock, DetachedConnection, Endpoint, Observed};
+use ngnet_quic::endpoint::{DetachedConnection, Endpoint, Observed};
 use ngnet_quic::{
     ApplicationErrorCode, Directionality, ErrorKind as QuicErrorKind, Initiator, Role, StreamId,
     Timestamp, TlsSession,
@@ -67,19 +65,18 @@ impl Shared {
         self.push(Recorded::ConnectionClosed(code));
     }
 
+    /// Records that written bytes are the layer's own again.
+    pub(crate) fn record_released(&self, stream: StreamId, bytes: u64) {
+        self.push(Recorded::Released(stream, bytes));
+    }
+
     pub(crate) fn record_connection_closed_bare(&self) {
         self.push(Recorded::ConnectionClosed(None));
     }
 }
 
 /// A sleep armed for one of the connection's deadlines.
-///
-/// Boxed and erased so a caller's clock type does not have to appear in this crate's public
-/// surface: a connection is a connection whatever produced its timers.
-pub(crate) type Sleep = Pin<Box<dyn Future<Output = ()> + Send>>;
-
-/// Makes a sleep that finishes at a deadline, on the endpoint's clock.
-pub(crate) type Sleeper = Box<dyn Fn(Timestamp) -> Sleep + Send>;
+pub(crate) use ngnet_quic::endpoint::Sleep;
 
 /// What the next record is, without taking it.
 struct PeekedKind {
@@ -111,8 +108,6 @@ pub(crate) struct State {
     pub(crate) sleeping: Option<Sleep>,
     /// The deadline that sleep is for.
     pub(crate) sleeping_until: Option<Timestamp>,
-    /// Makes a sleep for a deadline, on the endpoint's clock.
-    pub(crate) sleep: Sleeper,
     /// Wakers waiting for a stream limit to rise.
     pub(crate) limit_wakers: Vec<Waker>,
     /// Streams this end opened, in the order they were opened, awaiting collection.
@@ -134,11 +129,7 @@ pub struct NgtcpConnection<S: TlsSession> {
 }
 
 impl<S: TlsSession> NgtcpConnection<S> {
-    fn new(
-        detached: DetachedConnection<S>,
-        role: Role,
-        sleep: Sleeper,
-    ) -> Self {
+    fn new(detached: DetachedConnection<S>, role: Role) -> Self {
         Self {
             detached,
             shared: Shared::default(),
@@ -148,7 +139,6 @@ impl<S: TlsSession> NgtcpConnection<S> {
                 emitted_since_pending: false,
                 sleeping: None,
                 sleeping_until: None,
-                sleep,
                 limit_wakers: Vec::new(),
                 opened_bidi: std::collections::VecDeque::new(),
                 opened_uni: std::collections::VecDeque::new(),
@@ -187,7 +177,13 @@ impl<S: TlsSession> NgtcpConnection<S> {
                         self.state.opened_uni.push_back(id);
                     }
                 }
-                Observed::Acked(id, bytes) => self.shared.push(Recorded::Acked(id, bytes)),
+                // Acknowledgement is *not* what releases the layer's buffers. See
+                // `RETAINS_BUFFERS`: this transport copies, so the buffers are the layer's
+                // again as soon as a write is accepted, and release is reported there.
+                // Reporting it here as well would count every byte twice, which the state
+                // machine rejects -- correctly, since that is the shape of an accounting bug
+                // that frees a buffer early.
+                Observed::Acked(..) => {}
                 Observed::Reset(id, code) => self.shared.push(Recorded::Reset(id, code)),
                 Observed::StopSending(id, code) => {
                     self.shared.push(Recorded::StopSending(id, code));
@@ -317,7 +313,7 @@ impl<S: TlsSession> QuicConnection for NgtcpConnection<S> {
         if self.state.closed {
             return Poll::Ready(Err(pump::ended()));
         }
-        transmit::drain(&mut self.detached, &mut self.state, source)?;
+        transmit::drain(&mut self.detached, &self.shared, &mut self.state, source)?;
         let _ = pump::poll_timer(&self.detached, &mut self.state, cx);
         Poll::Ready(Ok(()))
     }
@@ -424,22 +420,16 @@ fn quic_stream(stream: H3StreamId) -> StreamId {
 /// # Errors
 ///
 /// Fails if the handshake does not complete, or if the endpoint driver is not running.
-pub async fn connect<S, C>(
+pub async fn connect<S: TlsSession>(
     endpoint: &Endpoint<S>,
-    clock: C,
     remote: SocketAddr,
     server_name: Option<&str>,
-) -> Result<NgtcpConnection<S>>
-where
-    S: TlsSession,
-    C: Clock + Send + 'static,
-    C::Sleep: Send,
-{
+) -> Result<NgtcpConnection<S>> {
     let detached = endpoint
         .connect_detached(remote, server_name)
         .await
         .map_err(Error::endpoint)?;
-    Ok(NgtcpConnection::new(detached, Role::Client, sleeper(clock)))
+    Ok(NgtcpConnection::new(detached, Role::Client))
 }
 
 /// Waits for a connection a peer opened and drives it to establishment, ready for the
@@ -448,25 +438,9 @@ where
 /// # Errors
 ///
 /// Fails if the endpoint driver is not running.
-pub async fn accept<S, C>(endpoint: &Endpoint<S>, clock: C) -> Result<NgtcpConnection<S>>
-where
-    S: TlsSession,
-    C: Clock + Send + 'static,
-    C::Sleep: Send,
-{
-    let detached = endpoint
-        .accept_detached()
-        .await
-        .map_err(Error::endpoint)?;
-    Ok(NgtcpConnection::new(detached, Role::Server, sleeper(clock)))
-}
-
-fn sleeper<C>(clock: C) -> Sleeper
-where
-    C: Clock + Send + 'static,
-    C::Sleep: Send,
-{
-    Box::new(move |deadline| Box::pin(clock.sleep_until(deadline)))
+pub async fn accept<S: TlsSession>(endpoint: &Endpoint<S>) -> Result<NgtcpConnection<S>> {
+    let detached = endpoint.accept_detached().await.map_err(Error::endpoint)?;
+    Ok(NgtcpConnection::new(detached, Role::Server))
 }
 
 const _: () = {

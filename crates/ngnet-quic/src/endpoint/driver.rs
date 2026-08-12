@@ -189,6 +189,8 @@ where
     /// `None` on an endpoint built with `build` rather than `build_detachable`, where no
     /// connection can be handed over and so no shared timescale is needed.
     pub(crate) timescale: Option<Arc<dyn Fn() -> Timestamp + Send + Sync>>,
+    /// Sleeps on that same clock. See `DetachedConnection::sleep_until`.
+    pub(crate) sleeper: Option<Arc<dyn Fn(Timestamp) -> super::handle::Sleep + Send + Sync>>,
     /// The armed sleep, if any.
     pub(crate) sleeping: Option<Clk::Sleep>,
     /// The deadline the armed sleep is for.
@@ -334,7 +336,14 @@ where
         // written before the hand-over and the peer is owed it either way.
         let shared = Arc::clone(&tracked.shared);
         let remote = tracked.remote;
-        let key = Arc::as_ptr(&shared) as *const u8 as usize;
+        // An accepted connection goes to whoever is accepting, under the reserved key; a
+        // dialled one goes to the caller who asked for it, under its own. Sharing a key
+        // would let an acceptor take a connection this endpoint dialled.
+        let key = if shared.detaches_to_acceptor() {
+            0
+        } else {
+            Arc::as_ptr(&shared) as *const u8 as usize
+        };
         let Some(timescale) = self.timescale.clone() else {
             // Asked to hand over a connection from an endpoint that cannot share its
             // timescale. Failing the connection says so; handing it over anyway would give
@@ -346,10 +355,18 @@ where
             ));
             return;
         };
+        let Some(sleeper) = self.sleeper.clone() else {
+            tracked.conn = Some(conn);
+            shared.fail(Error::new(
+                ErrorKind::InvalidInput,
+                "this endpoint cannot detach connections; build it with build_detachable",
+            ));
+            return;
+        };
         let detached = Arc::clone(&self.detached);
         detached.deliver(
             key,
-            super::handle::DetachedConnection::new(conn, shared, remote, timescale),
+            super::handle::DetachedConnection::new(conn, shared, remote, timescale, sleeper),
         );
     }
 

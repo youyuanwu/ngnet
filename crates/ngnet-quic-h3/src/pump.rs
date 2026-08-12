@@ -50,6 +50,10 @@ pub(crate) fn pump<S: TlsSession>(
             Ok(ngnet_quic::ReadOutcome::Draining | ngnet_quic::ReadOutcome::Closing) => {
                 state.closed = true;
                 shared.record_connection_closed(detached.conn.close_error());
+                // Nothing further is read into a connection that has ended. Continuing
+                // would re-enter the same branch for every datagram still queued and record
+                // the close again for each.
+                break;
             }
             Err(err) => {
                 state.closed = true;
@@ -136,7 +140,7 @@ pub(crate) fn poll_timer<S: TlsSession>(
     // folds its pacing deadline into the same expiry, so a connection that rearmed only
     // after reading would send one datagram and then wait for the peer to speak.
     if state.sleeping_until != Some(deadline) {
-        state.sleeping = Some((state.sleep)(deadline));
+        state.sleeping = Some(detached.sleep_until(deadline));
         state.sleeping_until = Some(deadline);
     }
 

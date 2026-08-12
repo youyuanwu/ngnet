@@ -18,7 +18,7 @@ type Payload = Full<Bytes>;
 fn serve_echo(endpoint: ngnet_quic::endpoint::Endpoint<ngnet_quic::OsslSession>) {
     tokio::spawn(async move {
         loop {
-            let Ok(backend) = accept(&endpoint, ngnet_quic::endpoint::TokioClock::new()).await
+            let Ok(backend) = accept(&endpoint).await
             else {
                 break;
             };
@@ -49,12 +49,7 @@ async fn sender(
     tokio::spawn(client_driver);
     let backend = tokio::time::timeout(
         StdDuration::from_secs(10),
-        connect(
-            &client,
-            ngnet_quic::endpoint::TokioClock::new(),
-            address,
-            Some(TEST_SERVER_NAME),
-        ),
+        connect(&client, address, Some(TEST_SERVER_NAME)),
     )
     .await
     .expect("connecting must not hang")
@@ -193,12 +188,7 @@ async fn an_endpoint_serves_http3_and_raw_quic_at_the_same_time() {
     // And an HTTP/3 one, over the same socket.
     let backend = tokio::time::timeout(
         StdDuration::from_secs(10),
-        connect(
-            &client,
-            ngnet_quic::endpoint::TokioClock::new(),
-            address,
-            Some(TEST_SERVER_NAME),
-        ),
+        connect(&client, address, Some(TEST_SERVER_NAME)),
     )
     .await
     .expect("the HTTP/3 connection must not hang")
@@ -235,12 +225,7 @@ async fn a_connection_to_nothing_fails_rather_than_hanging() {
 
     let outcome = tokio::time::timeout(
         StdDuration::from_secs(20),
-        connect(
-            &client,
-            ngnet_quic::endpoint::TokioClock::new(),
-            dead,
-            Some(TEST_SERVER_NAME),
-        ),
+        connect(&client, dead, Some(TEST_SERVER_NAME)),
     )
     .await
     .expect("the attempt must give up on its own rather than waiting for this timeout");

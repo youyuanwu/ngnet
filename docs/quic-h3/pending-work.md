@@ -33,6 +33,20 @@ know where each copy is rather than assuming there is only one.
 **What would settle it:** measurement. There are no benchmarks, so the cost is currently a
 description rather than a number.
 
+## A detached close is sent once, without retransmission
+
+`NgtcpConnection::close` writes one CONNECTION_CLOSE and queues it. The endpoint's managed
+path keeps its close datagram for the closing period, because `write_connection_close`
+returns nothing once a connection is closing and a close that must be answered again cannot
+be regenerated. The detached path does not do this, so a lost close leaves the peer waiting
+out its idle timeout instead of closing promptly.
+
+Legal, and invisible in ordinary use. Worth fixing when the detached path grows a closing
+period of its own.
+
+**What would settle it:** keeping the close datagram in the connection's outbound queue
+until the endpoint evicts it, rather than releasing immediately.
+
 ## No datagram or WebTransport support
 
 Neither `ngnet-quic` nor `ngnet-h3` exposes unreliable datagrams, so this crate cannot. See
@@ -51,6 +65,20 @@ not carry it, so a caller holding an `NgtcpConnection` cannot reach it either.
 
 **What would settle it:** deciding whether that belongs on this crate's own type, which is
 reachable before the connection is handed to the HTTP/3 layer but not afterwards.
+
+## The detached hand-over queue is unbounded
+
+A connection that completes its handshake is placed in a queue for whoever asked for it. A
+caller who stops accepting leaves connections there, each holding its protocol and TLS state,
+and the endpoint keeps routing to them. A caller who *drops* a pending `connect_detached` is
+handled — the wait releases what it never collected — but a server that simply stops calling
+`accept` is not.
+
+This is the same shape as the bounded-accept-backlog item in `docs/quic/pending-work.md` and
+should be fixed with it: a server under load is exactly where both bite.
+
+**What would settle it:** an accept permit with a bound, releasing connections that overflow
+it rather than holding them.
 
 ## Inbound datagrams are dropped rather than queued without bound
 

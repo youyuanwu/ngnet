@@ -4,7 +4,7 @@ use ngnet_h3::http::{StreamSource, WriteOutcome as H3WriteOutcome};
 use ngnet_quic::endpoint::DetachedConnection;
 use ngnet_quic::{ErrorKind as QuicErrorKind, StreamId, StreamWrite, TlsSession};
 
-use crate::connection::State;
+use crate::connection::{Shared, State};
 use crate::error::{Error, Result};
 use crate::pump::MAX_DATAGRAM;
 
@@ -15,6 +15,7 @@ use crate::pump::MAX_DATAGRAM;
 /// inside the closure and the accepted count is reported back.
 pub(crate) fn drain<S: TlsSession, Src: StreamSource>(
     detached: &mut DetachedConnection<S>,
+    shared: &Shared,
     state: &mut State,
     source: &mut Src,
 ) -> Result<()> {
@@ -34,6 +35,7 @@ pub(crate) fn drain<S: TlsSession, Src: StreamSource>(
         let now = detached.now();
         let conn = &mut detached.conn;
         let mut produced: Option<Vec<u8>> = None;
+        let mut released: Option<(StreamId, usize)> = None;
 
         let offered = source.write_next(&mut |stream, slices, fin| {
             let Ok(id) = StreamId::new(stream.get()) else {
@@ -44,6 +46,9 @@ pub(crate) fn drain<S: TlsSession, Src: StreamSource>(
             match conn.write_stream_vectored(&mut buffer, id, &ranges, fin, now) {
                 Ok(StreamWrite::Datagram { len, accepted }) => {
                     produced = Some(buffer[..len].to_vec());
+                    if accepted > 0 {
+                        released = Some((id, accepted));
+                    }
                     H3WriteOutcome::Accepted(accepted)
                 }
                 // Every blocked condition is the same to the layer: nothing can be taken for
@@ -66,6 +71,12 @@ pub(crate) fn drain<S: TlsSession, Src: StreamSource>(
 
         if let Some(datagram) = produced.take() {
             detached.send(datagram);
+        }
+        // The transport has taken a copy of these bytes, so the layer's own buffer is its
+        // again. Reporting it here rather than on acknowledgement is what keeps a body in
+        // flight from being held twice -- see `RETAINS_BUFFERS`.
+        if let Some((stream, bytes)) = released.take() {
+            shared.record_released(stream, bytes as u64);
         }
         if let Some(err) = failure.take() {
             state.closed = true;

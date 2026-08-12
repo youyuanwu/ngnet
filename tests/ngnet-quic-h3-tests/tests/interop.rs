@@ -141,12 +141,7 @@ async fn an_http3_request_completes_from_this_stack_to_quinn() {
 
     let backend = tokio::time::timeout(
         StdDuration::from_secs(10),
-        connect(
-            &client,
-            ngnet_quic::endpoint::TokioClock::new(),
-            address,
-            Some(TEST_SERVER_NAME),
-        ),
+        connect(&client, address, Some(TEST_SERVER_NAME)),
     )
     .await
     .expect("connecting must not hang")
@@ -192,7 +187,7 @@ async fn an_http3_request_completes_from_quinn_to_this_stack() {
     let expected = body.clone();
 
     tokio::spawn(async move {
-        let backend = ngnet_quic_h3::accept(&server, ngnet_quic::endpoint::TokioClock::new())
+        let backend = ngnet_quic_h3::accept(&server)
             .await
             .expect("accepting");
         let served = ngnet_h3::http::serve(backend, move |request| {
@@ -266,7 +261,7 @@ async fn a_multi_packet_payload_crosses_to_quinn_byte_for_byte() {
     let expected = body.clone();
 
     tokio::spawn(async move {
-        let backend = ngnet_quic_h3::accept(&server, ngnet_quic::endpoint::TokioClock::new())
+        let backend = ngnet_quic_h3::accept(&server)
             .await
             .expect("accepting");
         let served = ngnet_h3::http::serve(backend, move |request| {

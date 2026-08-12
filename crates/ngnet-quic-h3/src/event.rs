@@ -16,8 +16,10 @@ pub(crate) enum Recorded {
     Data(StreamId, Vec<u8>, bool),
     /// The peer opened a stream.
     PeerOpened(StreamId),
-    /// The peer acknowledged stream data. A delta, not a cumulative offset.
-    Acked(StreamId, u64),
+    /// The transport took a copy of written bytes, so the layer's buffer is free.
+    ///
+    /// A delta, not a cumulative offset.
+    Released(StreamId, u64),
     /// The peer reset a stream it was sending on.
     Reset(StreamId, ApplicationErrorCode),
     /// The peer asked this endpoint to stop sending on a stream.
@@ -74,11 +76,11 @@ pub(crate) fn into_event(record: Recorded, local: Initiator) -> Option<QuicEvent
                 stream: stream_id(id),
             }
         }
-        Recorded::Acked(id, bytes) => QuicEvent::Released {
+        Recorded::Released(id, bytes) => QuicEvent::Released {
             stream: stream_id(id),
             bytes,
-            // ngtcp2 reports acknowledgement and nothing else; it has no notion of handing
-            // a buffer back for data that was cancelled, so this is never false.
+            // Never false: this transport copies what it accepts, so bytes it has taken are
+            // its own to deliver. Nothing here cancels a send and hands the buffer back.
             delivered: true,
         },
         Recorded::Reset(id, value) => QuicEvent::Reset {
