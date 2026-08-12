@@ -40,15 +40,32 @@ use crate::stream::StreamId;
 /// One accepted write, held at a fixed address.
 struct Chunk {
     /// The bytes, boxed so the address does not move.
+    ///
+    /// This is the *allocation*, which is what ngtcp2 holds a pointer into. It is never
+    /// reallocated, moved, or shrunk for as long as the chunk lives — see [`Chunk::len`].
     data: Box<[u8]>,
     /// Offset in the stream of this chunk's first byte.
     start: u64,
+    /// How many of `data`'s bytes ngtcp2 actually accepted.
+    ///
+    /// Separate from `data.len()` because ngtcp2 routinely takes less than it was offered —
+    /// a packet fills, and the remainder is offered again as a *new* write. The obvious
+    /// response, shrinking the allocation to the accepted prefix, is a use-after-free: the
+    /// address ngtcp2 was given must stay valid until the acknowledgement arrives
+    /// (`ngtcp2.h:5244-5248`), and reallocating changes it while ngtcp2 still holds the old
+    /// one for retransmission. Nothing detects that on a lossless link, because nothing
+    /// retransmits.
+    ///
+    /// So the tail beyond `len` is left allocated and unused until the chunk is released.
+    /// That waste is bounded by one packet's worth per outstanding chunk, and it is the
+    /// price of the address staying put.
+    len: usize,
 }
 
 impl Chunk {
-    /// Offset one past this chunk's last byte.
+    /// Offset one past this chunk's last accepted byte.
     fn end(&self) -> u64 {
-        self.start + self.data.len() as u64
+        self.start + self.len as u64
     }
 }
 
@@ -83,6 +100,9 @@ impl Retained {
         let chunk = Chunk {
             data: data.to_vec().into_boxed_slice(),
             start: entry.next_offset,
+            // Provisional: the whole staged buffer is on offer. `commit` records how much
+            // ngtcp2 took, and is always called before the write path returns.
+            len: data.len(),
         };
         let ptr = chunk.data.as_ptr();
         let len = chunk.data.len();
@@ -90,11 +110,16 @@ impl Retained {
         Some((ptr, len))
     }
 
-    /// Trims a staged chunk to what ngtcp2 actually accepted.
+    /// Records how much of the staged chunk ngtcp2 accepted.
     ///
     /// Anything beyond `accepted` was never handed over, so it must not count towards the
     /// stream's offset — the caller will submit those bytes again, and they would otherwise
     /// be retained twice and numbered wrongly.
+    ///
+    /// The allocation is deliberately **not** shrunk to fit. ngtcp2 was given its address a
+    /// moment ago and holds it until the accepted prefix is acknowledged, so moving those
+    /// bytes to a smaller box would leave ngtcp2 pointing at freed memory and corrupt any
+    /// retransmission. Only the recorded length changes.
     pub(crate) fn commit(&mut self, stream: StreamId, accepted: usize) {
         let Some(entry) = self.streams.get_mut(&stream.get()) else {
             return;
@@ -104,31 +129,29 @@ impl Retained {
         };
 
         if accepted == 0 {
+            // Nothing was taken, so ngtcp2 kept no pointer into this allocation and it can
+            // go. This is the one case where dropping the chunk is safe.
             entry.chunks.pop_back();
             return;
         }
-        if accepted < chunk.data.len() {
-            // Reallocating here is safe: ngtcp2 was given the pointer moments ago and holds
-            // it only for the accepted prefix, which this preserves bit for bit -- but the
-            // address must not change, so the prefix is copied into a fresh box and the old
-            // one dropped only after ngtcp2 has been told how much it got. That ordering is
-            // the caller's, in `stream_io.rs`, which calls this before returning.
-            let kept = chunk.data[..accepted].to_vec().into_boxed_slice();
-            chunk.data = kept;
-        }
+        debug_assert!(
+            accepted <= chunk.data.len(),
+            "ngtcp2 cannot accept more than it was offered"
+        );
+        chunk.len = accepted.min(chunk.data.len());
         entry.next_offset = chunk.end();
     }
 
-    /// The pointer ngtcp2 was given for the most recent staged write.
+    /// The pointer ngtcp2 was given for the most recent staged write, and how much of it
+    /// was accepted.
     ///
-    /// Read back after [`Retained::commit`] has trimmed it, because trimming may have moved
-    /// the bytes. Used by the tests below to assert what is actually retained; the write
-    /// path stages and commits in one go and does not need to re-read it.
+    /// The pointer is the allocation's, which never moves; the length is the accepted
+    /// prefix. Used by the tests to assert exactly that.
     #[cfg(test)]
     pub(crate) fn last_pointer(&self, stream: StreamId) -> Option<(*const u8, usize)> {
         let entry = self.streams.get(&stream.get())?;
         let chunk = entry.chunks.back()?;
-        Some((chunk.data.as_ptr(), chunk.data.len()))
+        Some((chunk.data.as_ptr(), chunk.len))
     }
 
     /// Releases everything acknowledged up to `offset + len` on a stream.
@@ -162,7 +185,7 @@ impl Retained {
         self.streams
             .values()
             .flat_map(|s| s.chunks.iter())
-            .map(|c| c.data.len())
+            .map(|c| c.len)
             .sum()
     }
 }
@@ -212,6 +235,54 @@ mod tests {
         // SAFETY: the chunk is alive.
         let held = unsafe { core::slice::from_raw_parts(ptr, len) };
         assert_eq!(held, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn a_partial_acceptance_leaves_the_address_ngtcp2_was_given_alone() {
+        // The one ngtcp2 actually cares about. It keeps the pointer it was handed until the
+        // accepted bytes are acknowledged, so shrinking the allocation to fit the accepted
+        // prefix -- which is the obvious tidy-up, and what this code used to do -- leaves
+        // ngtcp2 reading freed memory the moment it retransmits.
+        //
+        // Nothing catches that on a lossless loopback, because nothing retransmits. It
+        // needs a test that looks at the address rather than at the bytes.
+        let mut retained = Retained::default();
+        let (staged, offered) = retained.stage(sid(0), &[7u8; 1200]).unwrap();
+        assert_eq!(offered, 1200);
+
+        // A packet fills before the offer is exhausted -- the ordinary case, not an edge
+        // one, since the endpoint offers up to a full datagram and framing overhead takes
+        // its share.
+        retained.commit(sid(0), 1100);
+
+        let (held, len) = retained.last_pointer(sid(0)).unwrap();
+        assert_eq!(len, 1100, "only the accepted prefix counts as retained");
+        assert_eq!(
+            staged, held,
+            "the allocation ngtcp2 points into must not move"
+        );
+        assert_eq!(retained.bytes_held(), 1100);
+    }
+
+    #[test]
+    fn a_partially_accepted_chunk_still_reads_back_correctly_after_more_writes() {
+        // The tail beyond the accepted prefix stays allocated. That must not leak into the
+        // stream's offsets: the next chunk has to start where the accepted prefix ended,
+        // not where the allocation ended.
+        let mut retained = Retained::default();
+        retained.stage(sid(0), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        retained.commit(sid(0), 3);
+        retained.stage(sid(0), &[4, 5, 6]);
+        retained.commit(sid(0), 3);
+        assert_eq!(retained.bytes_held(), 6);
+
+        // Acknowledging the first three must release exactly the first chunk.
+        retained.acknowledge(sid(0), 0, 3);
+        assert_eq!(retained.bytes_held(), 3);
+        let (ptr, len) = retained.last_pointer(sid(0)).unwrap();
+        // SAFETY: the chunk is alive.
+        let held = unsafe { core::slice::from_raw_parts(ptr, len) };
+        assert_eq!(held, &[4, 5, 6], "offsets must follow the accepted length");
     }
 
     #[test]
