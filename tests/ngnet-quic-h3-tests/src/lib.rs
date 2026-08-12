@@ -57,9 +57,14 @@ pub struct TestEntropy {
 
 impl TestEntropy {
     /// A source seeded from `seed`.
+    ///
+    /// The seed is mixed rather than used directly. A plain `seed | 1` maps 0xC2 and 0xC3
+    /// to the same state, so two endpoints seeded with adjacent numbers would mint identical
+    /// connection identifiers and their datagrams would be routed to each other -- which is
+    /// a confusing way for a test to fail, and did.
     pub fn new(seed: u64) -> Self {
         Self {
-            state: seed | 1,
+            state: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
         }
     }
 }
@@ -94,9 +99,17 @@ pub async fn client_endpoint(
         .use_system_trust_store(false)
         .build()
         .expect("a client backend");
+    // A fresh seed per connection, for the same reason the server needs one: the source is
+    // deterministic, so a factory handing out one seed would mint identical connection
+    // identifiers for every connection this endpoint opens, and they would collide in its
+    // own routing table. An endpoint carrying more than one connection is the ordinary case,
+    // not an exotic one.
+    let seeds = Arc::new(std::sync::atomic::AtomicU64::new(seed));
     EndpointBuilder::new(socket, TokioClock::new(), backend)
         .config(Config::new().handshake_timeout(Duration::from_nanos(5_000_000_000)))
-        .entropy(move || TestEntropy::new(seed))
+        .entropy(move || {
+            TestEntropy::new(seeds.fetch_add(0x9E37_79B9, std::sync::atomic::Ordering::Relaxed))
+        })
         .build_detachable()
         .expect("a client endpoint")
 }
@@ -115,10 +128,19 @@ pub async fn server_endpoint(
         .private_key_pem(credentials.key_pem.as_str())
         .build()
         .expect("a server backend");
+    // A fresh seed per connection. The test entropy source is deterministic, so a factory
+    // that handed out the same seed every time would mint identical connection identifiers
+    // for every connection this server accepts -- and they would collide in its own routing
+    // table, so the second client's datagrams would be delivered to the first. Real
+    // endpoints do not have this problem, which is exactly why the builder makes the caller
+    // supply the randomness rather than choosing it.
+    let seeds = Arc::new(std::sync::atomic::AtomicU64::new(0xC0FFEE));
     let (endpoint, driver) = EndpointBuilder::new(socket, TokioClock::new(), backend)
         .accepts(true)
         .config(Config::new().handshake_timeout(Duration::from_nanos(5_000_000_000)))
-        .entropy(|| TestEntropy::new(0xC0FFEE))
+        .entropy(move || {
+            TestEntropy::new(seeds.fetch_add(0x9E37_79B9, std::sync::atomic::Ordering::Relaxed))
+        })
         .build_detachable()
         .expect("a server endpoint");
     (endpoint, driver, address)

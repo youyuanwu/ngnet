@@ -18,6 +18,10 @@ repository.workspace = true
 ngnet-quic-h3.workspace = true
 ngnet-quic = { workspace = true, features = ["tokio"] }
 ngnet-h3.workspace = true
+# For its quinn-backed transport, which is the foreign implementation these tests
+# interoperate against. Reused rather than written again: a second copy would drift, and the
+# point is to run against the same one the HTTP/3 crate is already tested with.
+ngnet-h3-tests = { path = "../ngnet-h3-tests" }
 
 bytes.workspace = true
 http.workspace = true

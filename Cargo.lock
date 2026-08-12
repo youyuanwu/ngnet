@@ -1138,6 +1138,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "ngnet-h3",
+ "ngnet-h3-tests",
  "ngnet-quic",
  "ngnet-quic-h3",
  "quinn",
