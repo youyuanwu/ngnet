@@ -10,7 +10,7 @@ use std::time::Duration as StdDuration;
 use ngnet_quic::endpoint::{
     Config, Endpoint, EndpointBuilder, EndpointDriver, TokioClock, TokioSocket,
 };
-use ngnet_quic::{OsslBackend, Role, TokenSecret};
+use ngnet_quic::{OsslBackend, OsslSession, Role, TokenSecret};
 use ngnet_quic_tests::{TEST_ALPN, TEST_SERVER_NAME, TestCredentials, TestEntropy};
 
 /// The endpoint driver these tests run.
@@ -19,7 +19,7 @@ type Driver = EndpointDriver<TokioSocket, TokioClock, OsslBackend>;
 /// How long a test waits before declaring a handshake stalled.
 const PATIENCE: StdDuration = StdDuration::from_secs(20);
 
-async fn client(credentials: &TestCredentials, seed: u64) -> (Endpoint, Driver) {
+async fn client(credentials: &TestCredentials, seed: u64) -> (Endpoint<OsslSession>, Driver) {
     let socket = TokioSocket::bind("127.0.0.1:0".parse().expect("valid"))
         .await
         .expect("binding");
@@ -40,7 +40,7 @@ async fn client(credentials: &TestCredentials, seed: u64) -> (Endpoint, Driver) 
 /// A server that validates client addresses before committing any state.
 async fn validating_server(
     credentials: &TestCredentials,
-) -> (Endpoint, Driver, core::net::SocketAddr) {
+) -> (Endpoint<OsslSession>, Driver, core::net::SocketAddr) {
     let socket = TokioSocket::bind("127.0.0.1:0".parse().expect("valid"))
         .await
         .expect("binding");

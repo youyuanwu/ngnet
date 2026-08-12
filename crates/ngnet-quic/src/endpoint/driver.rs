@@ -46,7 +46,7 @@ use crate::tls::{Role, TlsBackend, TlsSession};
 use super::clock::Clock;
 use super::config::Config;
 use super::error::{Error, ErrorKind};
-use super::shared::{Command, ConnectionShared, Observed};
+use super::shared::{Command, ConnectionShared, Observed, RouteUpdate};
 use super::socket::{AsyncUdpSocket, Sent};
 
 /// Makes an entropy source for a new connection.
@@ -69,9 +69,18 @@ pub(crate) const MAX_DATAGRAM: usize = 1500;
 
 /// One connection the driver owns, with the state its handle shares.
 pub(crate) struct Tracked<S: TlsSession> {
-    /// The connection. `'static` because its handlers capture an `Arc` rather than
-    /// borrowing anything the driver owns — see [`super::shared`].
-    pub(crate) conn: Conn<'static, S>,
+    /// The connection, when this endpoint is the one driving it.
+    ///
+    /// `'static` because its handlers capture an `Arc` rather than borrowing anything the
+    /// driver owns — see [`super::shared`].
+    ///
+    /// `None` once the connection has been *detached*: handed to a caller who drives it
+    /// themselves. The endpoint keeps routing datagrams to it and sending what it produces,
+    /// but no longer reads or writes its protocol state, because there is exactly one owner
+    /// of that state and it is no longer this one. A consumer that must reach the connection
+    /// synchronously while composing a packet — which the HTTP/3 layer does — cannot be
+    /// served across a queue, so it takes the connection instead.
+    pub(crate) conn: Option<Conn<'static, S>>,
     /// What the handle reads and writes.
     pub(crate) shared: Arc<ConnectionShared>,
     /// Where its datagrams go.
@@ -116,8 +125,11 @@ pub(crate) fn handlers_for(shared: &Arc<ConnectionShared>) -> Handlers<'static> 
         .on_stop_sending(move |id, code| stop.observe(Observed::StopSending(id, code)))
         .on_acked_stream_data(move |id, len| acked.observe(Observed::Acked(id, len)))
         .on_handshake_completed(move || established.observe(Observed::HandshakeCompleted))
-        .on_new_connection_id(move |cid| minted.observe(Observed::IdMinted(*cid)))
-        .on_remove_connection_id(move |cid| retired.observe(Observed::IdRetired(*cid)))
+        // Identifier changes go to the routing queue rather than the observation queue: the
+        // endpoint needs them whoever is driving the connection, and a detached connection's
+        // driver would otherwise consume them and leave the endpoint routing to a stale set.
+        .on_new_connection_id(move |cid| minted.observe_route(RouteUpdate::Minted(*cid)))
+        .on_remove_connection_id(move |cid| retired.observe_route(RouteUpdate::Retired(*cid)))
 }
 
 /// Everything the driver owns.
@@ -156,6 +168,17 @@ where
     /// How address validation is configured, if at all.
     #[cfg(feature = "tls-ossl")]
     pub(crate) validation: Option<super::validate::Validation>,
+    /// Connections handed to callers who drive them themselves.
+    pub(crate) detached: Arc<super::handle::DetachQueue<B::Session>>,
+    /// The endpoint's clock, erased once at construction.
+    ///
+    /// A detached connection has to read the *same* timescale the endpoint drove its
+    /// handshake against, or every timestamp afterwards is incomparable with the ones
+    /// already recorded. Erased here rather than at each hand-over so the bounds that
+    /// requires sit in one place -- see `EndpointBuilder::build`.
+    /// `None` on an endpoint built with `build` rather than `build_detachable`, where no
+    /// connection can be handed over and so no shared timescale is needed.
+    pub(crate) timescale: Option<Arc<dyn Fn() -> Timestamp + Send + Sync>>,
     /// The armed sleep, if any.
     pub(crate) sleeping: Option<Clk::Sleep>,
     /// The deadline the armed sleep is for.
@@ -173,13 +196,15 @@ where
         let Some(tracked) = self.connections.get(&index) else {
             return;
         };
-        let mut identifiers: Vec<Vec<u8>> = tracked
-            .conn
+        let Some(conn) = tracked.conn.as_ref() else {
+            return;
+        };
+        let mut identifiers: Vec<Vec<u8>> = conn
             .scids()
             .iter()
             .map(|c| c.as_bytes().to_vec())
             .collect();
-        identifiers.push(tracked.conn.scid().as_bytes().to_vec());
+        identifiers.push(conn.scid().as_bytes().to_vec());
         for id in identifiers {
             self.routes.insert(id, index);
         }
@@ -206,7 +231,14 @@ where
         let Some(tracked) = self.connections.get_mut(&index) else {
             return;
         };
-        let outcome = tracked.conn.read_pkt(datagram, now);
+        let Some(conn) = tracked.conn.as_mut() else {
+            // Detached: the datagram belongs to whoever holds the connection, and reading it
+            // here would be a second reader of state that admits only one.
+            let shared = Arc::clone(&tracked.shared);
+            shared.deliver_inbound(datagram.to_vec());
+            return;
+        };
+        let outcome = conn.read_pkt(datagram, now);
         let shared = Arc::clone(&tracked.shared);
 
         match outcome {
@@ -214,8 +246,9 @@ where
             Ok(ReadOutcome::Draining | ReadOutcome::Closing) => {
                 // The peer closed. What it *said* is on the connection, and is the only
                 // application-level explanation available.
-                let close = tracked.conn.close_error();
-                shared.fail_with_close(close);
+                if let Some(conn) = tracked.conn.as_ref() {
+                    shared.fail_with_close(conn.close_error());
+                }
             }
             Err(err) => {
                 // A connection the transport has given up on has nothing more to send and
@@ -239,48 +272,101 @@ where
             return;
         }
 
-        let mut new_routes = Vec::new();
-        let mut dead_routes = Vec::new();
         let mut established = false;
-
         for event in &observed {
-            match event {
-                Observed::IdMinted(cid) => new_routes.push(cid.as_bytes().to_vec()),
-                Observed::IdRetired(cid) => dead_routes.push(cid.as_bytes().to_vec()),
-                Observed::HandshakeCompleted => established = true,
-                _ => {}
+            if matches!(event, Observed::HandshakeCompleted) {
+                established = true;
             }
         }
 
-        for id in new_routes {
-            self.routes.insert(id, index);
-        }
-        for id in dead_routes {
-            self.routes.remove(&id);
-        }
-
-        if let Some(tracked) = self.connections.get_mut(&index) {
-            tracked
-                .shared
-                .set_retained(tracked.conn.retained_bytes() as u64);
+        if let Some(tracked) = self.connections.get_mut(&index)
+            && let Some(conn) = tracked.conn.as_ref()
+        {
+            tracked.shared.set_retained(conn.retained_bytes() as u64);
         }
 
         if established {
             shared.mark_established();
         }
 
-        // Put back what the handle still needs to see. The driver consumes the routing and
-        // flow-control events; everything else belongs to the caller.
+        // A connection asked for by a caller who will drive it is handed over the moment it
+        // can carry anything. Until then the endpoint completes the handshake, which is the
+        // part worth having written once.
+        if shared.wants_detach() && shared.is_established() {
+            self.hand_over(index);
+        }
+
+        // Put back what the handle still needs to see. Identifier changes never reach here:
+        // they go to the routing queue instead, because the endpoint needs them whoever
+        // drives the connection.
         {
             let mut inner = shared.lock();
             for event in observed {
-                match event {
-                    Observed::IdMinted(_) | Observed::IdRetired(_) => {}
-                    other => inner.observed.push(other),
-                }
+                inner.observed.push(event);
             }
         }
         shared.wake_all();
+    }
+
+    /// Gives a connection to the caller that asked for it.
+    ///
+    /// The endpoint keeps the entry, because it still routes datagrams here and still has to
+    /// release the identifiers when the caller is done. What it gives up is the protocol
+    /// state, which admits exactly one owner.
+    pub(crate) fn hand_over(&mut self, index: u64) {
+        let Some(tracked) = self.connections.get_mut(&index) else {
+            return;
+        };
+        let Some(conn) = tracked.conn.take() else {
+            return;
+        };
+        // Anything already produced but not yet sent stays the endpoint's to flush; it was
+        // written before the hand-over and the peer is owed it either way.
+        let shared = Arc::clone(&tracked.shared);
+        let remote = tracked.remote;
+        let key = Arc::as_ptr(&shared) as *const u8 as usize;
+        let Some(timescale) = self.timescale.clone() else {
+            // Asked to hand over a connection from an endpoint that cannot share its
+            // timescale. Failing the connection says so; handing it over anyway would give
+            // the caller one whose timestamps do not line up with its own handshake.
+            tracked.conn = Some(conn);
+            shared.fail(Error::new(
+                ErrorKind::InvalidInput,
+                "this endpoint cannot detach connections; build it with build_detachable",
+            ));
+            return;
+        };
+        let detached = Arc::clone(&self.detached);
+        detached.deliver(
+            key,
+            super::handle::DetachedConnection::new(conn, shared, remote, timescale),
+        );
+    }
+
+    /// Applies a connection's identifier changes to the routing table.
+    ///
+    /// Runs for every connection, detached or not: routing is the endpoint's job in both
+    /// cases, and a connection whose new identifiers were never installed answers on the one
+    /// it started with and on nothing else. Since a peer switches to a new identifier at a
+    /// time of its choosing, that failure appears as a connection that works and then stops.
+    ///
+    /// Applied before anything is sent, so an identifier is routable before the packet
+    /// announcing it leaves.
+    pub(crate) fn apply_routes(&mut self, index: u64) {
+        let Some(tracked) = self.connections.get(&index) else {
+            return;
+        };
+        let updates = tracked.shared.take_routes();
+        for update in updates {
+            match update {
+                RouteUpdate::Minted(cid) => {
+                    self.routes.insert(cid.as_bytes().to_vec(), index);
+                }
+                RouteUpdate::Retired(cid) => {
+                    self.routes.remove(cid.as_bytes());
+                }
+            }
+        }
     }
 
     /// Runs whatever a handle asked for on one connection.
@@ -288,17 +374,24 @@ where
         let Some(tracked) = self.connections.get(&index) else {
             return;
         };
+        if tracked.conn.is_none() {
+            // Detached: its owner drives it directly and issues no commands here.
+            return;
+        }
         let shared = Arc::clone(&tracked.shared);
         for command in shared.take_commands() {
             let Some(tracked) = self.connections.get_mut(&index) else {
                 return;
             };
+            let Some(conn) = tracked.conn.as_mut() else {
+                return;
+            };
             match command {
                 Command::OpenStream { bidi } => {
                     let opened = if bidi {
-                        tracked.conn.open_bidi_stream()
+                        conn.open_bidi_stream()
                     } else {
-                        tracked.conn.open_uni_stream()
+                        conn.open_uni_stream()
                     };
                     match opened {
                         Ok(id) => {
@@ -320,10 +413,10 @@ where
                     self.write_stream(index, stream, &data, fin);
                 }
                 Command::Reset(stream, code) => {
-                    let _ = tracked.conn.reset_stream(stream, code);
+                    let _ = conn.reset_stream(stream, code);
                 }
                 Command::StopSending(stream, code) => {
-                    let _ = tracked.conn.stop_sending(stream, code);
+                    let _ = conn.stop_sending(stream, code);
                 }
                 Command::Close(code, reason) => {
                     self.close_connection(index, code, &reason);
@@ -339,8 +432,8 @@ where
                     // Both levels, because the connection window is shared across every
                     // stream: extending only the stream level stalls the connection once
                     // enough total bytes have flowed, late and with nothing to explain it.
-                    let _ = tracked.conn.extend_max_stream_offset(stream, bytes);
-                    tracked.conn.extend_max_offset(bytes);
+                    let _ = conn.extend_max_stream_offset(stream, bytes);
+                    conn.extend_max_offset(bytes);
                 }
             }
         }
@@ -373,7 +466,10 @@ where
         // Offer at most one packet's worth. The core copies whatever it accepts and holds
         // the copy until the peer acknowledges it, so offering a whole large payload on
         // every attempt would recopy the remainder for every datagram produced.
-        let permitted = tracked.conn.max_tx_udp_payload_size().max(1);
+        let Some(conn) = tracked.conn.as_mut() else {
+            return;
+        };
+        let permitted = conn.max_tx_udp_payload_size().max(1);
         let chunk_len = data.len().min(permitted);
         // The end-of-stream flag belongs on the *last* write, never the first: setting it
         // early closes the write side, and the next attempt is refused with
@@ -381,17 +477,14 @@ where
         let last = fin && chunk_len == data.len();
 
         let mut datagram = vec![0u8; MAX_DATAGRAM];
-        let outcome = tracked
-            .conn
-            .write_stream(&mut datagram, stream, &data[..chunk_len], last, now);
+        let outcome = conn.write_stream(&mut datagram, stream, &data[..chunk_len], last, now);
 
         match outcome {
             Ok(StreamWrite::Datagram { len, accepted }) => {
                 datagram.truncate(len);
                 tracked.pending = Some(datagram);
-                tracked
-                    .shared
-                    .set_retained(tracked.conn.retained_bytes() as u64);
+                let held = conn.retained_bytes() as u64;
+                tracked.shared.set_retained(held);
                 // Whatever was not accepted -- which may be everything, since a packet can
                 // fill with control frames instead -- goes back on the queue.
                 if accepted < data.len() {
@@ -434,9 +527,8 @@ where
             return;
         };
         let mut datagram = vec![0u8; MAX_DATAGRAM];
-        if let Ok(len) = tracked
-            .conn
-            .write_connection_close(&mut datagram, code, reason, now)
+        if let Some(conn) = tracked.conn.as_mut()
+            && let Ok(len) = conn.write_connection_close(&mut datagram, code, reason, now)
             && len > 0
         {
             datagram.truncate(len);
@@ -475,8 +567,15 @@ where
             return Some(pending);
         }
 
+        // A detached connection produces its own datagrams; the endpoint only forwards what
+        // it has queued.
+        if let Some(queued) = tracked.shared.take_outbound() {
+            return Some(queued);
+        }
+
+        let conn = tracked.conn.as_mut()?;
         let mut datagram = vec![0u8; MAX_DATAGRAM];
-        match tracked.conn.write_pkt(&mut datagram, now) {
+        match conn.write_pkt(&mut datagram, now) {
             Ok(WriteOutcome::Datagram { len }) => {
                 datagram.truncate(len);
                 Some(datagram)
@@ -496,16 +595,21 @@ where
         let Some(tracked) = self.connections.get_mut(&index) else {
             return;
         };
-        if tracked.conn.expiry().is_none_or(|at| at > now) {
+        // A detached connection owns its own timer. Firing one here as well would run its
+        // loss detection twice on the endpoint's schedule instead of its own.
+        let Some(conn) = tracked.conn.as_mut() else {
+            return;
+        };
+        if conn.expiry().is_none_or(|at| at > now) {
             return;
         }
         let shared = Arc::clone(&tracked.shared);
-        match tracked.conn.handle_expiry(now) {
+        match conn.handle_expiry(now) {
             Ok(ExpiryOutcome::Handled) => {}
             Ok(ExpiryOutcome::IdleClose) => {
                 // ngtcp2 says to drop the connection without writing a close, so there is
                 // nothing left to send and it is evictable immediately.
-                let close = tracked.conn.close_error();
+                let close = conn.close_error();
                 tracked.finished = true;
                 shared.fail_with_close(close);
             }
@@ -544,7 +648,10 @@ where
             // A finished connection's deadline is in the past and will never move, so
             // including it would pin the timer there and starve every other connection's.
             .filter(|t| !t.finished)
-            .filter_map(|t| t.conn.expiry())
+            // A detached connection's deadline belongs to its owner, who arms a timer of
+            // their own against it. Including it here would wake this driver for work it
+            // cannot do.
+            .filter_map(|t| t.conn.as_ref().and_then(|c| c.expiry()))
             .min()
     }
 
@@ -562,9 +669,18 @@ where
     pub(crate) fn evict(&mut self) {
         let mut dead = Vec::new();
         for (index, tracked) in &self.connections {
-            let done = tracked.shared.is_closed()
-                && tracked.pending.is_none()
-                && (tracked.conn.in_draining_period() || tracked.finished);
+            let done = match tracked.conn.as_ref() {
+                Some(conn) => {
+                    tracked.shared.is_closed()
+                        && tracked.pending.is_none()
+                        && (conn.in_draining_period() || tracked.finished)
+                }
+                // A detached connection cannot be asked whether it is draining, because the
+                // endpoint does not hold it. Its owner says when it is finished instead, and
+                // until it does the entry stays -- an endpoint that guessed would either
+                // leak entries for its whole life or cut a connection off mid-close.
+                None => tracked.shared.is_terminal() && !tracked.shared.has_outbound(),
+            };
             if done {
                 dead.push(*index);
             }
@@ -612,7 +728,7 @@ where
         self.connections.insert(
             index,
             Tracked {
-                conn,
+                conn: Some(conn),
                 shared,
                 remote,
                 pending: None,
@@ -676,7 +792,7 @@ where
         self.connections.insert(
             index,
             Tracked {
-                conn,
+                conn: Some(conn),
                 shared,
                 remote,
                 pending: None,

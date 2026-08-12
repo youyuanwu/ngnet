@@ -17,7 +17,7 @@ use ngnet_quic::endpoint::testing::{TestClock, TestSocket, socket_pair};
 use ngnet_quic::endpoint::{
     Config, Connection, Endpoint, EndpointBuilder, EndpointDriver, ErrorKind,
 };
-use ngnet_quic::{OsslBackend, Role};
+use ngnet_quic::{OsslBackend, OsslSession, Role};
 use ngnet_quic_tests::{TEST_ALPN, TEST_SERVER_NAME, TestCredentials, TestEntropy};
 
 /// The endpoint driver these tests run.
@@ -30,7 +30,7 @@ fn addrs() -> (SocketAddr, SocketAddr) {
     )
 }
 
-fn client(socket: TestSocket, clock: TestClock, credentials: &TestCredentials) -> (Endpoint, Driver) {
+fn client(socket: TestSocket, clock: TestClock, credentials: &TestCredentials) -> (Endpoint<OsslSession>, Driver) {
     let backend = OsslBackend::builder(Role::Client)
         .alpn(TEST_ALPN)
         .trust_anchor_pem(credentials.certificate_pem.as_str())
@@ -45,7 +45,7 @@ fn client(socket: TestSocket, clock: TestClock, credentials: &TestCredentials) -
         .expect("a client endpoint")
 }
 
-fn server(socket: TestSocket, clock: TestClock, credentials: &TestCredentials) -> (Endpoint, Driver) {
+fn server(socket: TestSocket, clock: TestClock, credentials: &TestCredentials) -> (Endpoint<OsslSession>, Driver) {
     let backend = OsslBackend::builder(Role::Server)
         .alpn(TEST_ALPN)
         .certificate_chain_pem(credentials.certificate_pem.as_str())
