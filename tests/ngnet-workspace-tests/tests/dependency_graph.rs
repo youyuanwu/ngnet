@@ -89,6 +89,60 @@ fn no_transport_or_tls_reaches_http3() {
     }
 }
 
+/// No async runtime reaches the QUIC wrapper with its endpoint layer off.
+///
+/// `ngnet-quic` ships a ready-made socket and clock for tokio behind an off-by-default
+/// feature, so the crate's source legitimately contains the word — which is why this claim
+/// is made against the **resolved dependency graph** rather than by scanning the source, as
+/// `ngnet-h3`'s equivalent does. The two ask different questions: `ngnet-quic`'s own
+/// invariants test asserts what the manifest *declares*, and this asserts what a downstream
+/// caller actually builds.
+///
+/// Asked with default features on, because that is the configuration a caller gets by
+/// asking for `ngnet-quic` and is where feature unification could go wrong.
+#[test]
+fn no_async_runtime_reaches_the_quic_wrapper_by_default() {
+    const FORBIDDEN: &[&str] = &["tokio", "quinn", "rustls"];
+
+    let tree = cargo_tree(&["-p", "ngnet-quic", "-e", "normal"]);
+    let lowercase = tree.to_ascii_lowercase();
+
+    for forbidden in FORBIDDEN {
+        assert!(
+            !lowercase.contains(forbidden),
+            "`{forbidden}` reached ngnet-quic's normal dependency graph with default \
+             features, and the crate's claim is that its runtime integration is something a \
+             caller opts into rather than something they are given.\n\
+             Find it with:\n  cargo tree -p ngnet-quic -e normal -i {forbidden}\n\
+             The tokio socket and clock belong behind the `tokio` feature.\n\n{tree}",
+        );
+    }
+}
+
+/// And the endpoint layer alone brings no runtime either.
+///
+/// The layer between the two extremes: asynchronous, but with the caller supplying the
+/// socket and the clock. If a runtime appeared here, the seams would not be seams.
+#[test]
+fn the_quic_endpoint_layer_alone_brings_no_runtime() {
+    let tree = cargo_tree(&[
+        "-p",
+        "ngnet-quic",
+        "--no-default-features",
+        "--features",
+        "endpoint",
+        "-e",
+        "normal",
+    ]);
+    let lowercase = tree.to_ascii_lowercase();
+
+    assert!(
+        !lowercase.contains("tokio"),
+        "tokio reached ngnet-quic's graph with only the `endpoint` feature enabled, which \
+         would mean the socket and clock seams are not seams at all.\n\n{tree}",
+    );
+}
+
 /// The completion transport compiles no readiness backend.
 ///
 /// `ngnet-h2`'s compio dependency takes `io-uring` and deliberately not `polling`: with both,

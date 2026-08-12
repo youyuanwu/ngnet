@@ -26,6 +26,23 @@ use crate::validate;
 /// a clock, only the caller can supply that, so [`Settings::new`] requires it.
 pub struct Settings {
     raw: sys::ngtcp2_settings,
+    /// The address-validation token, kept alive until the constructor copies it.
+    token: Option<Vec<u8>>,
+}
+
+/// Where an address-validation token came from.
+///
+/// A server must tell ngtcp2 which kind it validated, because the two are checked against
+/// different things: a Retry token proves the client echoed back what this server sent it
+/// moments ago, while a NEW_TOKEN token was issued on an earlier connection and only proves
+/// the address was reachable then.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum TokenKind {
+    /// The token was carried in a Retry packet this server sent.
+    Retry,
+    /// The token came from a NEW_TOKEN frame on an earlier connection.
+    NewToken,
 }
 
 impl Settings {
@@ -40,7 +57,7 @@ impl Settings {
         // SAFETY: `raw` is a valid, writable, correctly-sized struct.
         unsafe { crate::ffi::settings_default(&mut raw) };
         raw.initial_ts = initial_ts.as_raw();
-        Self { raw }
+        Self { raw, token: None }
     }
 
     /// Sets the estimate of the round-trip time used before one has been measured.
@@ -89,17 +106,41 @@ impl Settings {
         self
     }
 
+    /// Records an address-validation token that has **already been verified**.
+    ///
+    /// This does not validate anything. Verifying a token needs the secret that minted it,
+    /// which is the server's, so that decision is made before this is called; what this
+    /// does is tell ngtcp2 the decision was made and which kind of token it was. Passing an
+    /// unverified token here is how a server would believe an address it never checked.
+    ///
+    /// A client uses the same setter to present a token it was given earlier, with
+    /// [`TokenKind::NewToken`].
+    pub fn validated_token(mut self, token: &[u8], kind: TokenKind) -> Self {
+        self.raw.token_type = match kind {
+            TokenKind::Retry => sys::NGTCP2_TOKEN_TYPE_RETRY,
+            TokenKind::NewToken => sys::NGTCP2_TOKEN_TYPE_NEW_TOKEN,
+        };
+        self.token = Some(token.to_vec());
+        self
+    }
+
     /// Validates the settings and yields the raw struct.
     ///
     /// The checks mirror the assertions ngtcp2 makes at the top of its constructors, which
     /// are compiled out of release builds. See [`crate::validate`].
+    ///
+    /// Returns the token storage alongside the struct because ngtcp2 copies the token only
+    /// *during* construction and reads it through the pointer until then. The caller must
+    /// therefore keep the returned buffer alive across the constructor call. Returning it
+    /// by value is safe because a `Vec`'s heap allocation does not move when the `Vec` does,
+    /// so the pointer written into the struct stays valid.
     ///
     /// # Errors
     ///
     /// Returns [`ErrorKind::InvalidInput`] naming the offending field.
     ///
     /// [`ErrorKind::InvalidInput`]: crate::ErrorKind::InvalidInput
-    pub(crate) fn build(self) -> Result<sys::ngtcp2_settings> {
+    pub(crate) fn build(mut self) -> Result<(sys::ngtcp2_settings, Option<Vec<u8>>)> {
         validate::settings(
             self.raw.max_window,
             self.raw.max_stream_window,
@@ -107,7 +148,17 @@ impl Settings {
             u64::from(self.raw.initial_pkt_num),
             self.raw.initial_rtt,
         )?;
-        Ok(self.raw)
+        match self.token.as_ref() {
+            Some(token) if !token.is_empty() => {
+                self.raw.token = token.as_ptr();
+                self.raw.tokenlen = token.len();
+            }
+            _ => {
+                self.raw.token = core::ptr::null();
+                self.raw.tokenlen = 0;
+            }
+        }
+        Ok((self.raw, self.token))
     }
 
     /// The raw struct without validating, for tests that want to inspect a default.

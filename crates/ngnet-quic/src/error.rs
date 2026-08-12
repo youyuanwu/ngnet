@@ -147,6 +147,131 @@ impl fmt::Display for ApplicationErrorCode {
     }
 }
 
+/// Who ended a connection, and on what terms.
+///
+/// Reported by [`Conn::close_error`](crate::Conn::close_error). The distinction that
+/// matters most is between an *application* close, whose code means whatever the protocol
+/// running over QUIC says it means, and everything else — because only the application
+/// close carries information the application itself sent.
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum CloseReason {
+    /// A QUIC-level error. `NO_ERROR` here is the ordinary way a connection ends.
+    Transport(TransportErrorCode),
+    /// The protocol running over QUIC closed the connection with its own code.
+    Application(ApplicationErrorCode),
+    /// No version in common.
+    VersionNegotiation,
+    /// Nothing arrived for the idle timeout, so the connection lapsed.
+    ///
+    /// Worth distinguishing from a transport close: no frame was exchanged and the peer may
+    /// not know the connection is over.
+    IdleTimeout,
+    /// ngtcp2 abandoned the connection without sending anything.
+    Dropped,
+    /// A Retry packet ended this connection attempt.
+    Retry,
+}
+
+/// Why a connection closed.
+///
+/// Only meaningful once something *has* closed it — a
+/// [`ReadOutcome::Draining`](crate::ReadOutcome), a
+/// [`ReadOutcome::Closing`](crate::ReadOutcome), an
+/// [`ExpiryOutcome::IdleClose`](crate::ExpiryOutcome), or a local close. Before then it
+/// reports the connection's initial, unset error, which is indistinguishable from a
+/// graceful close with `NO_ERROR` — the two really are the same bytes, so this type does
+/// not pretend to tell them apart.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CloseError {
+    reason: CloseReason,
+    frame_type: u64,
+    phrase: Vec<u8>,
+}
+
+impl CloseError {
+    /// Builds from ngtcp2's own error struct.
+    ///
+    /// # Safety
+    ///
+    /// `raw.reason` must be null or point to `raw.reasonlen` readable bytes.
+    pub(crate) unsafe fn from_raw(raw: &ngnet_quic_sys::ngtcp2_ccerr) -> Self {
+        use ngnet_quic_sys as sys;
+
+        let reason = match raw.type_ {
+            sys::NGTCP2_CCERR_TYPE_APPLICATION => {
+                CloseReason::Application(ApplicationErrorCode::new(raw.error_code))
+            }
+            sys::NGTCP2_CCERR_TYPE_VERSION_NEGOTIATION => CloseReason::VersionNegotiation,
+            sys::NGTCP2_CCERR_TYPE_IDLE_CLOSE => CloseReason::IdleTimeout,
+            sys::NGTCP2_CCERR_TYPE_DROP_CONN => CloseReason::Dropped,
+            sys::NGTCP2_CCERR_TYPE_RETRY => CloseReason::Retry,
+            // Including `NGTCP2_CCERR_TYPE_TRANSPORT`. An unrecognised type is reported as
+            // a transport close rather than dropped, because the code is still meaningful.
+            _ => CloseReason::Transport(TransportErrorCode::new(raw.error_code)),
+        };
+
+        // ngtcp2 truncates a received phrase to 1024 bytes, so this is bounded by the
+        // library rather than by the peer.
+        let phrase = if raw.reason.is_null() || raw.reasonlen == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: the caller guarantees `reasonlen` bytes are readable at `reason`.
+            unsafe { core::slice::from_raw_parts(raw.reason, raw.reasonlen) }.to_vec()
+        };
+
+        Self {
+            reason,
+            frame_type: raw.frame_type,
+            phrase,
+        }
+    }
+
+    /// Who closed the connection, and with what code.
+    pub fn reason(&self) -> &CloseReason {
+        &self.reason
+    }
+
+    /// The frame type that triggered the closure, or zero if it is not known.
+    pub fn frame_type(&self) -> u64 {
+        self.frame_type
+    }
+
+    /// The reason phrase, which may be empty and is not guaranteed to be text.
+    pub fn phrase(&self) -> &[u8] {
+        &self.phrase
+    }
+
+    /// An idle-timeout close, for tests that need one without waiting for a timeout.
+    #[cfg(test)]
+    pub(crate) fn idle_for_test() -> Self {
+        Self {
+            reason: CloseReason::IdleTimeout,
+            frame_type: 0,
+            phrase: Vec::new(),
+        }
+    }
+}
+
+impl fmt::Display for CloseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.reason {
+            CloseReason::Transport(code) => write!(f, "closed by {code}")?,
+            CloseReason::Application(code) => write!(f, "closed by {code}")?,
+            CloseReason::VersionNegotiation => f.write_str("closed: no common QUIC version")?,
+            CloseReason::IdleTimeout => f.write_str("closed: idle timeout")?,
+            CloseReason::Dropped => f.write_str("closed: connection dropped")?,
+            CloseReason::Retry => f.write_str("closed: superseded by a Retry")?,
+        }
+        if !self.phrase.is_empty()
+            && let Ok(text) = core::str::from_utf8(&self.phrase)
+        {
+            write!(f, ": {text}")?;
+        }
+        Ok(())
+    }
+}
+
 /// The broad category of a failure.
 ///
 /// Deliberately coarse. The exact condition is always available through

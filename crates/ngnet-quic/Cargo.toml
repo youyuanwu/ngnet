@@ -20,8 +20,20 @@ repository.workspace = true
 # This maps onto the sys crate's own feature rather than merely gating Rust code: with
 # `crypto-ossl` off, `ngnet-quic-sys` builds no crypto helper archive and its `wrapper.h`
 # does not include the crypto headers, so no `ngtcp2_crypto_*` symbol exists to call.
-default = ["tls-ossl"]
+#
+# The `endpoint` layer is the headline API for a caller who wants to speak QUIC rather than
+# to drive a state machine, so it is on by default, as the `http` layers are in `ngnet-h2`
+# and `ngnet-h3`. Disabling it returns the crate to a sans-I/O state machine with exactly
+# one dependency and no asynchrony of its own -- which is what `--no-default-features`
+# builds, and what a structural test reads the source to confirm.
+default = ["tls-ossl", "endpoint"]
 tls-ossl = ["ngnet-quic-sys/crypto-ossl"]
+endpoint = []
+# A ready-made socket and clock for tokio. Off by default: a caller on another runtime
+# should not pay for this one, and describing a socket to this crate is a small job for
+# anyone who has to. Implies `endpoint`, since there is nothing for it to plug into
+# otherwise.
+tokio = ["endpoint", "dep:tokio"]
 
 # Exactly one *non-optional* dependency, as in `ngnet-h2` and `ngnet-h3`. A test fails the
 # build if that grows, and requires every optional one to be reachable only through a
@@ -36,3 +48,7 @@ tls-ossl = ["ngnet-quic-sys/crypto-ossl"]
 # table and not on this line.)
 [dependencies]
 ngnet-quic-sys = { workspace = true }
+
+# Optional, and reachable only through the `tokio` feature above -- which is what keeps the
+# non-optional count at one, the claim a structural test enforces.
+tokio = { workspace = true, optional = true }

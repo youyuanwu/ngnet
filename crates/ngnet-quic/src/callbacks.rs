@@ -198,13 +198,13 @@ pub(crate) unsafe extern "C" fn get_new_connection_id_cb(
     cidlen: usize,
     user_data: *mut c_void,
 ) -> core::ffi::c_int {
-    // This one *can* reach the entropy source through `user_data`, but routing it through
-    // the same `RandCtx` the `rand` callback uses keeps a single source of randomness per
-    // connection rather than two that could diverge.
-    let _ = user_data;
     if cid.is_null() || token.is_null() {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     }
+    // The entropy comes from the same `RandCtx` the `rand` callback uses, reached through a
+    // thread-local rather than through `user_data`, so that a connection has one source of
+    // randomness rather than two that could diverge.
+    //
     // SAFETY: ngtcp2 guarantees `cid` is writable and `cidlen` is within its capacity.
     unsafe {
         (*cid).datalen = cidlen;
@@ -214,6 +214,45 @@ pub(crate) unsafe extern "C" fn get_new_connection_id_cb(
         if fill_from_conn_rand(bytes).is_err() || fill_from_conn_rand(tokens).is_err() {
             return sys::NGTCP2_ERR_CALLBACK_FAILURE;
         }
+    }
+
+    // Reporting it *is* routed through `user_data`, because unlike the entropy the handler
+    // is per-connection state the bridge already carries. The bridge is absent only when no
+    // call is in progress, which for this callback cannot happen: ngtcp2 reaches it solely
+    // from frame enqueue (`ngtcp2_conn.c:3336`), never from its constructor.
+    //
+    // SAFETY: `user_data` is the slot pointer given at construction.
+    if let Some(bridge) = (unsafe { bridge(user_data) })
+        && let Some(handler) = bridge.handlers.on_new_connection_id.as_mut()
+    {
+        // SAFETY: `cid` was filled above and remains valid for this call.
+        let minted = crate::cid::ConnectionId::from_raw(unsafe { &*cid });
+        handler(&minted);
+    }
+    0
+}
+
+/// `ngtcp2_remove_connection_id`: an identifier this endpoint issued has been retired.
+///
+/// The counterpart to [`get_new_connection_id_cb`]. Without it an owner routing by
+/// identifier would keep a table that only ever grows, and would keep delivering to
+/// identifiers the peer has been told to stop using.
+pub(crate) unsafe extern "C" fn remove_connection_id_cb(
+    _conn: *mut sys::ngtcp2_conn,
+    cid: *const sys::ngtcp2_cid,
+    user_data: *mut c_void,
+) -> core::ffi::c_int {
+    if cid.is_null() {
+        return 0;
+    }
+    // SAFETY: `user_data` is the slot pointer given at construction.
+    let Some(bridge) = (unsafe { bridge(user_data) }) else {
+        return 0;
+    };
+    if let Some(handler) = bridge.handlers.on_remove_connection_id.as_mut() {
+        // SAFETY: ngtcp2 passes a live identifier valid for the duration of the call.
+        let retired = crate::cid::ConnectionId::from_raw(unsafe { &*cid });
+        handler(&retired);
     }
     0
 }

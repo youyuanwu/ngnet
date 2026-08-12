@@ -107,6 +107,13 @@ jobs:
       - name: Test (QUIC wrapper without a TLS backend)
         run: cargo test -p ngnet-quic --no-default-features
 
+      # The QUIC wrapper's asynchronous layer without a TLS backend. Distinct from the run
+      # above, which turns the endpoint off as well: this is the one configuration where the
+      # endpoint exists but address validation cannot, because writing a Retry packet needs
+      # packet protection the backend supplies. Nothing else covers it.
+      - name: Test (QUIC endpoint without a TLS backend)
+        run: cargo test -p ngnet-quic --no-default-features --features endpoint
+
       # Release matters here in a way it usually does not. ngtcp2 checks its settings and
       # transport parameters with `assert()`, and `NDEBUG` removes every one of them from a
       # release build -- so the crate performs those checks itself, and this is the run that
@@ -114,7 +121,7 @@ jobs:
       - name: Test (QUIC wrapper, release)
         run: cargo test -p ngnet-quic --release
 
-      # Ten configurations that differ only in a package and its features, so they are one
+      # Twelve configurations that differ only in a package and its features, so they are one
       # step iterating a list rather than ten near-identical steps. The list is the whole
       # point of the step: a configuration is added by adding a line, and the reason it
       # exists is written directly above it, where a reader looking at the entry will find
@@ -175,6 +182,13 @@ jobs:
           QUIC wrapper, default features           | -p ngnet-quic
           QUIC wrapper without a TLS backend       | -p ngnet-quic --no-default-features
 
+          # The asynchronous endpoint's own two. Its runtime integration is behind an
+          # off-by-default feature, and the endpoint-without-a-TLS-backend configuration
+          # compiles code no other entry reaches -- address validation is absent there,
+          # because writing a Retry packet needs packet protection the backend supplies.
+          QUIC endpoint on tokio                   | -p ngnet-quic --features tokio
+          QUIC endpoint without a TLS backend      | -p ngnet-quic --no-default-features --features endpoint
+
           # `ngnet-axum` has no feature matrix -- axum, tokio and the h2 transport are all
           # unconditional -- so unlike the crates above it needs exactly one invocation
           # rather than one per configuration.
@@ -185,7 +199,7 @@ jobs:
           client policy layer                      | -p ngnet-util
           CONFIGURATIONS
 
-      # Fifteen invocations that differ only in packages and features, collapsed the same
+      # Seventeen invocations that differ only in packages and features, collapsed the same
       # way as clippy above, and for the same reasons -- including that a `strategy.matrix`
       # would put each on its own runner and rebuild the C libraries for every one.
       #
@@ -245,6 +259,8 @@ jobs:
           QUIC wrapper, default features           | -p ngnet-quic
           QUIC wrapper without a TLS backend       | -p ngnet-quic --no-default-features
           QUIC wrapper, all features               | -p ngnet-quic --all-features
+          QUIC endpoint on tokio                   | -p ngnet-quic --features tokio
+          QUIC endpoint without a TLS backend      | -p ngnet-quic --no-default-features --features endpoint
           QUIC tests                               | -p ngnet-quic-tests
 
           # One invocation each, for the same reason as their clippy entries: no features to

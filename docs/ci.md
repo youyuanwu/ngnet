@@ -29,6 +29,7 @@ cargo test -p ngnet-h2 --no-default-features
 cargo test -p ngnet-h3 --no-default-features
 cargo test -p ngnet-quic-sys --no-default-features
 cargo test -p ngnet-quic --no-default-features
+cargo test -p ngnet-quic --no-default-features --features endpoint
 cargo test -p ngnet-quic --release
 
 # Runs each benchmark once without timing it. Benchmarks are not part of `cargo test`, so
@@ -46,7 +47,7 @@ this document.
 
 A `strategy.matrix` would have been the other way to write them, and is the wrong shape
 here: every leg is a fresh runner, and this build compiles libnghttp2, nghttp3 and ngtcp2
-from source. Ten clippy legs would mean ten cold C builds.
+from source. Twelve clippy legs would mean twelve cold C builds.
 
 `--all-targets` and `-- -D warnings` are hoisted out of the clippy list, since every entry
 has them. `--all-targets` reaches benchmarks and examples as well as tests, which is half of
@@ -61,6 +62,8 @@ cargo clippy -p ngnet-h3 --no-default-features --all-targets -- -D warnings
 cargo clippy -p ngnet-quic-sys --no-default-features --all-targets -- -D warnings
 cargo clippy -p ngnet-quic                    --all-targets -- -D warnings
 cargo clippy -p ngnet-quic --no-default-features --all-targets -- -D warnings
+cargo clippy -p ngnet-quic --features tokio   --all-targets -- -D warnings
+cargo clippy -p ngnet-quic --no-default-features --features endpoint --all-targets -- -D warnings
 
 # One entry each, not a matrix: `ngnet-axum` and `ngnet-util` have no features. axum, tokio,
 # the h2 transport and the tower `Service` impl are all unconditional, so there is no second
@@ -74,7 +77,10 @@ feature matrix matters here for a reason the repository learned the hard way: a 
 an item behind the `tokio` feature once passed `--all-features` and broke every
 configuration without it. `--all-features` alone is not a documentation check. `ngnet-h3`
 and `ngnet-quic` have matrices of their own for the same reason -- an async layer and a TLS
-backend behind default-on features.
+backend behind default-on features. `ngnet-quic` needs two entries beyond the obvious three:
+its runtime integration is off by default, and the configuration with the endpoint but no TLS
+backend is the only one where address validation is absent, because writing a Retry packet
+needs packet protection the backend supplies.
 
 ```sh
 RUSTDOCFLAGS="-D warnings"
@@ -92,6 +98,8 @@ cargo doc --no-deps -p ngnet-h3-sys -p ngnet-h3-tests -p ngnet-quic-sys
 
 cargo doc --no-deps -p ngnet-quic
 cargo doc --no-deps -p ngnet-quic --no-default-features
+cargo doc --no-deps -p ngnet-quic --features tokio
+cargo doc --no-deps -p ngnet-quic --no-default-features --features endpoint
 cargo doc --no-deps -p ngnet-quic --all-features
 cargo doc --no-deps -p ngnet-quic-tests
 
@@ -173,6 +181,21 @@ suite drives the pool against hyper's HTTP/2 **server**, a client-side crate nee
 this workspace did not write. That is precisely the arrangement in which a hyper crate
 reaches the normal graph unnoticed -- everything builds, every test passes, and only the
 graph shows it.
+
+Two of these are about `ngnet-quic` rather than about hyper, and they are asked of the
+resolved graph for a reason worth stating. `ngnet-h3` proves it owns no transport by having
+its source never name one, but `ngnet-quic` ships a ready-made socket and clock for tokio
+behind an off-by-default feature — so its source legitimately contains the word, and a
+textual scan would either fail or have to be weakened into uselessness. The graph is the
+honest place to ask. `no_async_runtime_reaches_the_quic_wrapper_by_default` asks with default
+features, which is what a caller gets by depending on the crate;
+`the_quic_endpoint_layer_alone_brings_no_runtime` asks with the asynchronous layer on and the
+runtime integration off, which is the configuration that would show the socket and clock
+seams not being seams at all.
+
+Note the division of labour with `crates/ngnet-quic/tests/invariants.rs`: that suite asserts
+what the crate's manifest *declares*, and these assert what a downstream caller actually
+builds. Neither implies the other, which is why both exist.
 
 When one of these fails it prints the offending tree and the command that finds the culprit,
 for instance `cargo tree -p ngnet-axum -e normal -i hyper`.

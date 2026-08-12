@@ -4,10 +4,15 @@ Why `ngnet-quic` is shaped the way it is. What follows is the reasoning a reader
 recover from the source: the places where the obvious design is wrong, and why.
 
 `ngnet-quic-sys` builds ngtcp2 from the vendored submodule and generates raw bindings.
-`ngnet-quic` wraps it once — a sans-I/O state machine, with no async layer, unlike the
-HTTP/2 and HTTP/3 families. `ngnet-quic-tests` is unpublished and exists so the wrapper can
-stay free of dev-dependencies while still being driven through real handshakes over real
-sockets.
+`ngnet-quic` wraps it twice, in the same shape as the other two families: a sans-I/O state
+machine that performs no I/O at all, and — behind the default-on `endpoint` feature — an
+asynchronous layer that owns a UDP socket and the connections reachable through it.
+`ngnet-quic-tests` is unpublished and exists so the wrapper can stay free of
+dev-dependencies while still being driven through real handshakes over real sockets.
+
+Everything from [The API in ngtcp2's documentation does not exist](#the-api-in-ngtcp2s-documentation-does-not-exist)
+to [Panics abort](#panics-abort) is about the state machine. The endpoint layer's own
+reasoning starts at [One driver per socket](#one-driver-per-socket).
 
 ## The API in ngtcp2's documentation does not exist
 
@@ -226,6 +231,143 @@ error cases, all fields of |dest| are assigned as described above" (`ngtcp2.h:24
 The natural Rust translation — map the error to `Err`, discard the output — would throw away
 exactly the identifiers a Version Negotiation packet has to echo back.
 
+## One driver per socket
+
+`ngnet-h3`'s asynchronous layer hands back a driver per connection, because a caller gives it
+a connection that is already established. Copying that here does not work, and the reason is
+only obvious once tried: several drivers cannot each own one UDP socket, and a driver
+returned by the first `connect` has no way to own connections created after it.
+
+So the unit of ownership is the **socket**. Building an endpoint yields a cheap cloneable
+handle and exactly one driver; `connect` and `accept` are requests posted to that driver.
+
+The driver owns its connections outright rather than sharing them behind a lock. A `Conn` is
+`Send` and deliberately not `Sync`, and every method that drives one takes `&mut self`, so
+exactly one thing may hold it — and a lock would buy nothing, because it would be taken for
+every datagram and nothing else could usefully hold it anyway. Everything a caller wants to
+do has to be sequenced against the packets arriving for that connection regardless.
+
+That has a consequence worth stating: the driver holds `Conn<'static, S>`, which is possible
+only because every handler it installs captures an `Arc` and borrows nothing. A handler that
+borrowed a driver field would make the driver self-referential.
+
+## The timer is one timer, and forgetting to rearm it looks like a hang
+
+It is natural to assume a QUIC driver needs two deadlines — one for loss recovery and the
+idle timeout, another for pacing, since ngtcp2 refuses to send before its pacing time. It
+does not. `ngtcp2_conn_get_expiry2` ends with `ngtcp2_min(res, conn->tx.pacing.next_ts)`
+(`deps/ngtcp2/lib/ngtcp2_conn.c:11387`), so what `Conn::expiry` reports is already the
+earlier of the two.
+
+The practical consequence is the whole reason this is written down. The driver rearms from
+`expiry()` after **every** pass, including a pass that only wrote. A driver that rearmed only
+after reading would send one datagram and then sleep until the peer said something — which
+during a bulk transfer is never. The symptom is a connection that establishes, transfers a
+kilobyte and stops: a hang, not a slow link.
+
+Correspondingly the driver never calls `ngtcp2_conn_update_pkt_tx_time` itself. The core's
+write paths already do, and calling it twice per packet pushes the deadline forward twice,
+halving the send rate for no visible reason.
+
+## A short header does not say how long its connection ID is
+
+This cost real debugging time and is the sort of thing that only bites after everything
+appears to work.
+
+A long-header packet carries an explicit length for each connection ID. A short header does
+not: an endpoint is expected to know how long its own identifiers are, because it chose them.
+Anything demultiplexing datagrams must therefore decode short headers with exactly that
+length, and a wrong value reads the wrong bytes as the identifier.
+
+The failure is beautifully misleading. The handshake completes perfectly, because it is all
+long-header packets. Every packet afterwards fails to route, so the connection establishes
+and then goes silent. `ConnectionId::DEFAULT_LEN` exists so the builder and the router read
+one constant rather than two that can drift.
+
+## Flow control has two windows and only one of them is obvious
+
+Reading is what earns credit back, and there are two allowances: per stream and per
+connection. Extending only the per-stream one works — for a while. The connection window is
+shared across every stream, so a transfer stalls once enough total bytes have flowed,
+proportionally late and with nothing to say why.
+
+The driver extends both, and a test sends 120 kB through a 24 kB connection window so the
+path is exercised several times over rather than incidentally.
+
+Two related things in the same area. A write is offered to the core one packet's worth at a
+time, because the core copies what it accepts and holds the copy until acknowledgement —
+offering a whole large payload on every attempt would recopy the remainder for every datagram
+produced. And the end-of-stream flag goes on the last chunk, never the first: setting it
+early closes the write side and the next attempt is refused.
+
+Running out of stream credit is likewise not a failure. ngtcp2 reports it as an error, and
+treating every error as fatal meant a caller who opened one stream too many lost the whole
+connection. It is an ordinary condition — the peer advertised a limit and this endpoint
+reached it — so the request waits for the peer to raise it.
+
+## Address validation is why a server is safe to expose
+
+A server that answers a first packet with a handshake is an amplifier. The handshake is
+several times larger than the packet that provoked it, so a spoofed source address turns the
+server into a weapon aimed at whoever the attacker names, and the attacker pays a fraction of
+what the victim receives.
+
+Retry closes that: an unvalidated first packet draws a small packet carrying an opaque token
+and **no per-connection state at all**. Only a client that genuinely holds the address it
+claimed receives the Retry and can come back with the token.
+
+The token is derived rather than remembered, and that is the point. Remembering would
+reintroduce exactly the state Retry exists to avoid — an attacker would fill the table
+instead — so tokens are authenticated with a secret only the server knows and carry the
+address and issue time inside them. `Validation::decide` takes `&self` for that reason: there
+is nowhere for per-client state to go.
+
+Two things about it are not obvious:
+
+**It needs the TLS backend, and not because of TLS.** Writing a Retry packet is not
+assembling bytes. The packet carries an AEAD integrity tag, and `ngtcp2_pkt_write_retry`
+takes an encryption callback and an initialised AEAD context to produce it. Those and the
+token helpers come from ngtcp2's crypto helper library, which `wrapper.h` includes only when
+a backend is enabled. So `validate_addresses` exists only under `tls-ossl` rather than
+existing everywhere and failing at run time.
+
+**The server must echo the identifier it used.** After verifying a token, the server has to
+set the `retry_scid` transport parameter, because the client checks that the identifier it
+was told to address really came from a Retry this server sent (`ngtcp2.h:832`). Omitting it
+produces a handshake that never completes and reports nothing — indistinguishable from an
+unreachable server, which is how it was found.
+
+Stateless reset comes with the same secret, and carries two constraints that are the
+difference between informing a peer and attacking a third party: every reset is **strictly
+smaller** than the datagram that provoked it or is not sent at all, and resets are rate
+limited by a refilling budget. Answering unmatched traffic is useful; answering a flood of it
+without limit is the attack again.
+
+## The seams are poll-shaped, and impose no `Send`
+
+`AsyncUdpSocket` and `Clock` are poll-shaped rather than `async fn` in trait, for two reasons
+that are about the driver rather than about taste. The driver does several things per wakeup
+— drain the socket, service timers, write — and must ask "is there a datagram *right now*"
+without parking, which is what `Poll` expresses and what awaiting does not. And it holds the
+socket behind a pointer, where `async fn` in trait would cost a box per datagram.
+
+Neither trait requires `Send`. Thread-per-core runtimes build their I/O on `Rc`, and
+requiring it would exclude them for nobody's benefit; auto traits propagate instead, so an
+endpoint over a `Send` socket is `Send` without anything saying so. The in-crate test sockets
+are deliberately built on `Rc` so that this is tested rather than asserted — if the bound
+crept in, they would stop compiling.
+
+The one place `Send` *is* required is the entropy factory, and it follows from the core
+rather than from this layer: a `Conn` is `Send` and owns its entropy source, so the source is
+already `Send`, and a factory that was not would have to capture thread-bound state to
+produce values that are not.
+
+The entropy source itself is supplied by the caller for the same reason the clock is. QUIC
+needs unpredictable connection identifiers and stateless reset tokens; choosing a generator
+here would choose it on the caller's behalf, and choosing a weak one would be a security
+defect nothing in the API would reveal. So `EndpointBuilder::build` refuses to produce an
+endpoint without one.
+
 ## Panics abort
 
 A panic inside a handler unwinds into a C stack frame while ngtcp2 holds connection state,
@@ -236,10 +378,11 @@ so a later stray callback cannot follow a pointer into a dead frame.
 
 ## What is not here
 
-No async layer, no socket, no runtime, no timer thread. No 0-RTT or session resumption, no
-unreliable datagrams, no connection migration, no explicit key update. No adapter to
-`ngnet-h3`'s `QuicConnection` trait — that is deliberate future work, and the reasons are in
-[`pending-work.md`](pending-work.md).
+No runtime and no timer thread: the endpoint layer names no executor, spawns nothing, and
+every future it produces is polled by the caller. No 0-RTT or session resumption, no
+unreliable datagrams, no connection migration, no explicit key update. No ECN marking and no
+datagram batching. No adapter to `ngnet-h3`'s `QuicConnection` trait — that is deliberate
+future work, and the reasons are in [`pending-work.md`](pending-work.md).
 
 Only one TLS backend is written. The seam admits others; wolfSSL, GnuTLS and BoringSSL all
 have ngtcp2 crypto helpers, and adding one should not require touching anything outside a new

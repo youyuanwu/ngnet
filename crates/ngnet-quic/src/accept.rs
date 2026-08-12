@@ -144,6 +144,124 @@ pub fn is_acceptable_initial(datagram: &[u8]) -> bool {
     rc == 0
 }
 
+/// Magic first bytes ngtcp2's crypto helper puts on the tokens it mints.
+///
+/// Restated here rather than taken from the bindings, because they are declared in
+/// `ngtcp2_crypto.h`, which `wrapper.h` includes only when a TLS backend is enabled — and
+/// classifying a token is decidable without one. The build with a backend pins these
+/// against the real constants in [`tests::the_token_magics_match_the_bindings`], so a
+/// divergence is a test failure rather than a packet silently classified wrong.
+const TOKEN_MAGIC_RETRY: u8 = 0xB6;
+/// See [`TOKEN_MAGIC_RETRY`].
+const TOKEN_MAGIC_RETRY2: u8 = 0xB7;
+/// See [`TOKEN_MAGIC_RETRY`].
+const TOKEN_MAGIC_REGULAR: u8 = 0x36;
+
+/// What a client put in the address-validation token field of an Initial packet.
+///
+/// A server that validates source addresses has to answer three questions about a first
+/// packet — is there a token, which kind is it, and is it genuine — and only the first two
+/// are decidable without the server's secret. This carries the answer to those two, and the
+/// bytes needed for the third.
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum InitialToken {
+    /// No token. A validating server answers this with a Retry.
+    Absent,
+    /// A token this server minted in a Retry packet, being presented back.
+    ///
+    /// Verifying it also recovers the original destination connection ID the client used
+    /// before the Retry, which the server needs in order to build a connection at all.
+    Retry(Vec<u8>),
+    /// A token from an earlier connection, offered to skip validation.
+    Regular(Vec<u8>),
+    /// A token whose first byte names no kind this build knows.
+    ///
+    /// Kept rather than discarded so a server can decide between ignoring it and rejecting
+    /// the packet; treating it as [`InitialToken::Absent`] would be the safe default.
+    Unknown(Vec<u8>),
+}
+
+impl InitialToken {
+    /// The token bytes, empty when absent.
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Absent => &[],
+            Self::Retry(bytes) | Self::Regular(bytes) | Self::Unknown(bytes) => bytes,
+        }
+    }
+}
+
+/// Everything a server needs from a client's first packet.
+///
+/// [`inspect`] answers "which connection is this for", which is enough to route. This
+/// answers "may I build a connection for it", which additionally needs the packet type and
+/// the address-validation token — and the token is why this exists: [`inspect`] reaches
+/// ngtcp2 through `ngtcp2_pkt_decode_version_cid`, which does not decode one, and
+/// [`is_acceptable_initial`] discards the header it decodes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub struct InitialPacket {
+    /// The QUIC version the client chose.
+    pub version: u32,
+    /// The destination connection ID the client addressed, which becomes the server's
+    /// `original_dcid` transport parameter.
+    pub dcid: ConnectionId,
+    /// The client's own source connection ID, which becomes the server's destination.
+    pub scid: ConnectionId,
+    /// The address-validation token the client presented, if any.
+    pub token: InitialToken,
+}
+
+/// Decodes a datagram that is acceptable as a new connection's first packet.
+///
+/// Returns `Ok(None)` when the datagram is not an acceptable Initial — a stray short
+/// header, a packet too small, a version not supported. That is an ordinary outcome on a
+/// public socket rather than an error, which is why it is not one.
+///
+/// # Errors
+///
+/// Returns [`ErrorKind::Protocol`] if the header decodes but carries identifiers this build
+/// cannot represent.
+///
+/// [`ErrorKind::Protocol`]: crate::ErrorKind::Protocol
+pub fn inspect_initial(datagram: &[u8]) -> Result<Option<InitialPacket>> {
+    // SAFETY: a zeroed header is the documented starting point for `ngtcp2_accept`.
+    let mut hd = unsafe { core::mem::zeroed::<sys::ngtcp2_pkt_hd>() };
+    // SAFETY: `datagram` is readable for its length, and `hd` is a writable header.
+    let rc = unsafe { sys::ngtcp2_accept(&raw mut hd, datagram.as_ptr(), datagram.len()) };
+    if rc != 0 {
+        return Ok(None);
+    }
+
+    let token = if hd.tokenlen == 0 || hd.token.is_null() {
+        InitialToken::Absent
+    } else {
+        // SAFETY: ngtcp2 reports `tokenlen` bytes readable at `token`, which points into
+        // `datagram` and so lives for this call.
+        let bytes = unsafe { core::slice::from_raw_parts(hd.token, hd.tokenlen) }.to_vec();
+        // The first byte names the kind. ngtcp2's own server switches on exactly this
+        // (`examples/server.cc:1784-1833`).
+        match bytes[0] {
+            TOKEN_MAGIC_RETRY | TOKEN_MAGIC_RETRY2 => InitialToken::Retry(bytes),
+            TOKEN_MAGIC_REGULAR => InitialToken::Regular(bytes),
+            _ => InitialToken::Unknown(bytes),
+        }
+    };
+
+    Ok(Some(InitialPacket {
+        version: hd.version,
+        dcid: ConnectionId::new(&copy_bytes(&hd.dcid))?,
+        scid: ConnectionId::new(&copy_bytes(&hd.scid))?,
+        token,
+    }))
+}
+
+/// The significant bytes of a raw identifier.
+fn copy_bytes(cid: &sys::ngtcp2_cid) -> Vec<u8> {
+    cid.data[..cid.datalen].to_vec()
+}
+
 /// Writes a Version Negotiation packet into `dest`.
 ///
 /// Sent in response to [`Inspection::UnsupportedVersion`]. The connection IDs are
@@ -334,5 +452,39 @@ mod tests {
     #[test]
     fn version_one_is_supported() {
         assert!(supported_versions().contains(&VERSION_V1));
+    }
+
+    /// Pins the restated token magics against ngtcp2's own, in the build that has them.
+    ///
+    /// The constants above are copied rather than imported, because they live in a header
+    /// that is absent without a TLS backend. A copy that drifts would misclassify every
+    /// token as [`InitialToken::Unknown`] — a server that silently stopped accepting its
+    /// own Retry tokens — so the configuration that *can* check them does.
+    #[cfg(feature = "tls-ossl")]
+    #[test]
+    fn the_token_magics_match_the_bindings() {
+        assert_eq!(u32::from(TOKEN_MAGIC_RETRY), sys::NGTCP2_CRYPTO_TOKEN_MAGIC_RETRY);
+        assert_eq!(
+            u32::from(TOKEN_MAGIC_RETRY2),
+            sys::NGTCP2_CRYPTO_TOKEN_MAGIC_RETRY2
+        );
+        assert_eq!(
+            u32::from(TOKEN_MAGIC_REGULAR),
+            sys::NGTCP2_CRYPTO_TOKEN_MAGIC_REGULAR
+        );
+    }
+
+    #[test]
+    fn a_datagram_that_is_not_an_initial_yields_nothing() {
+        assert!(inspect_initial(&[]).unwrap().is_none());
+        assert!(inspect_initial(&[0u8; 4]).unwrap().is_none());
+        // A short header is a packet for a connection that already exists, not a new one.
+        assert!(inspect_initial(&[0b0100_0000; 64]).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_absent_token_is_reported_as_absent() {
+        assert_eq!(InitialToken::Absent.bytes(), b"");
+        assert_eq!(InitialToken::Retry(vec![1, 2, 3]).bytes(), &[1, 2, 3]);
     }
 }

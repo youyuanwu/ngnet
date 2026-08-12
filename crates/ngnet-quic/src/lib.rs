@@ -40,9 +40,10 @@
 //!
 //! # Scope
 //!
-//! One connection at a time, client or server. No socket, no runtime, no connection
-//! demultiplexing. 0-RTT, unreliable datagrams, connection migration and key update are
-//! not implemented.
+//! One connection at a time from the state machine, client or server. Above it, behind the
+//! default-on `endpoint` feature, an asynchronous layer that owns a UDP socket and the
+//! connections reachable through it. 0-RTT, unreliable datagrams, connection migration and
+//! key update are not implemented.
 
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
@@ -52,9 +53,11 @@
 // above makes a stray `unsafe` anywhere else a compile error, and a test reads this exact
 // list back out of this file so the two cannot disagree.
 //
-// Module files are deliberately flat -- `tls.rs`, never `tls/mod.rs`. That test derives a
-// module's name from its file stem, so a nested file would produce a name this list never
-// mentions and be reported as using `unsafe` without a grant.
+// Core module files are deliberately flat -- `tls.rs`, never `tls/mod.rs`. That test derives
+// a module's name from its file stem, so a nested file would produce a name this list never
+// mentions and be reported as using `unsafe` without a grant. The `endpoint` subtree below
+// is the one exception, and it earns it by containing no `unsafe` at all, which a separate
+// test pins.
 #[allow(unsafe_code)]
 mod accept;
 #[allow(unsafe_code)]
@@ -84,6 +87,9 @@ mod stream_io;
 mod tls;
 #[cfg(feature = "tls-ossl")]
 #[allow(unsafe_code)]
+mod token;
+#[cfg(feature = "tls-ossl")]
+#[allow(unsafe_code)]
 mod tls_ossl;
 
 mod handlers;
@@ -92,13 +98,21 @@ mod stream;
 mod time;
 mod validate;
 
+#[cfg(feature = "endpoint")]
+pub mod endpoint;
+
 pub use accept::{
-    Inspection, VERSION_V1, inspect, is_acceptable_initial, supported_versions,
-    write_version_negotiation,
+    InitialPacket, InitialToken, Inspection, VERSION_V1, inspect, inspect_initial,
+    is_acceptable_initial, supported_versions, write_version_negotiation,
 };
-pub use cid::{ConnectionId, MAX_LEN as MAX_CID_LEN, MIN_LEN as MIN_CID_LEN};
+pub use cid::{
+    ConnectionId, DEFAULT_LEN as DEFAULT_CID_LEN, MAX_LEN as MAX_CID_LEN, MIN_LEN as MIN_CID_LEN,
+};
 pub use conn::{Conn, ConnBuilder};
-pub use error::{ApplicationErrorCode, Error, ErrorKind, NativeCode, Result, TransportErrorCode};
+pub use error::{
+    ApplicationErrorCode, CloseError, CloseReason, Error, ErrorKind, NativeCode, Result,
+    TransportErrorCode,
+};
 pub use handlers::{Handlers, StreamCloseReason};
 pub use packet::{ExpiryOutcome, ReadOutcome, WriteOutcome};
 pub use params::{
@@ -106,7 +120,7 @@ pub use params::{
     TransportParams,
 };
 pub use rand::EntropySource;
-pub use settings::Settings;
+pub use settings::{Settings, TokenKind};
 pub use stream::{Directionality, Initiator, StreamId};
 pub use stream_io::StreamWrite;
 pub use time::{Duration, Timestamp};
@@ -114,6 +128,13 @@ pub use tls::{NativeTlsHandle, Role, TlsBackend, TlsSession};
 
 #[cfg(feature = "tls-ossl")]
 pub use tls_ossl::{OsslBackend, OsslBackendBuilder, OsslSession, Verify};
+
+#[cfg(feature = "tls-ossl")]
+pub use token::{
+    MIN_RESET_RANDOM, RESET_TOKEN_LEN, TokenSecret, issue_retry_token, reset_token,
+    verify_retry_token, write_retry, write_stateless_reset,
+    write_stateless_reset_smaller_than,
+};
 
 /// The raw bindings, for capabilities the safe API does not cover yet.
 ///

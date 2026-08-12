@@ -12,6 +12,7 @@
 //!
 //! A handler must not panic: unwinding into a C stack frame aborts the process.
 
+use crate::cid::ConnectionId;
 use crate::error::ApplicationErrorCode;
 use crate::stream::StreamId;
 
@@ -40,6 +41,9 @@ type StreamDataHandler<'a> = Box<dyn FnMut(StreamId, &[u8], bool) + Send + 'a>;
 /// A handler taking a stream and an application error code.
 type StreamErrorHandler<'a> = Box<dyn FnMut(StreamId, ApplicationErrorCode) + Send + 'a>;
 
+/// A handler taking a connection identifier.
+type ConnectionIdHandler<'a> = Box<dyn FnMut(&ConnectionId) + Send + 'a>;
+
 /// The callbacks an application supplies.
 ///
 /// Every field is optional; an absent handler means the event is ignored. The defaults are
@@ -53,6 +57,8 @@ pub struct Handlers<'a> {
     pub(crate) on_stop_sending: Option<StreamErrorHandler<'a>>,
     pub(crate) on_acked_stream_data: Option<Box<dyn FnMut(StreamId, u64) + Send + 'a>>,
     pub(crate) on_handshake_completed: Option<Box<dyn FnMut() + Send + 'a>>,
+    pub(crate) on_new_connection_id: Option<ConnectionIdHandler<'a>>,
+    pub(crate) on_remove_connection_id: Option<ConnectionIdHandler<'a>>,
 }
 
 impl<'a> Handlers<'a> {
@@ -114,6 +120,33 @@ impl<'a> Handlers<'a> {
     /// Called once, when the TLS handshake completes.
     pub fn on_handshake_completed(mut self, f: impl FnMut() + Send + 'a) -> Self {
         self.on_handshake_completed = Some(Box::new(f));
+        self
+    }
+
+    /// Called when this endpoint mints a connection identifier the peer may route to.
+    ///
+    /// A connection is reachable by several identifiers at once, and the set changes over
+    /// its life: ngtcp2 issues new ones and retires old ones on its own schedule. An owner
+    /// that routes datagrams by identifier — anything multiplexing connections over one
+    /// socket — must track both this and [`Handlers::on_remove_connection_id`], or its
+    /// table goes stale the first time an identifier rotates and the connection quietly
+    /// stops receiving.
+    ///
+    /// The identifier is borrowed for the call; copy it if you need to keep it. Use
+    /// [`crate::Conn::scids`] to learn the identifiers a connection already has, which this
+    /// does not replay.
+    pub fn on_new_connection_id(mut self, f: impl FnMut(&ConnectionId) + Send + 'a) -> Self {
+        self.on_new_connection_id = Some(Box::new(f));
+        self
+    }
+
+    /// Called when an identifier this endpoint issued is retired.
+    ///
+    /// The other half of [`Handlers::on_new_connection_id`]. Ignoring it leaves a routing
+    /// table growing without bound and keeps delivering to identifiers the peer has been
+    /// told to stop using.
+    pub fn on_remove_connection_id(mut self, f: impl FnMut(&ConnectionId) + Send + 'a) -> Self {
+        self.on_remove_connection_id = Some(Box::new(f));
         self
     }
 }

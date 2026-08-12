@@ -76,6 +76,7 @@ fn the_public_surface_still_has_the_shape_it_promised() {
     let _: &[u8] = cid.as_bytes();
     let _: usize = ngnet_quic::MAX_CID_LEN;
     let _: usize = ngnet_quic::MIN_CID_LEN;
+    let _: usize = ngnet_quic::DEFAULT_CID_LEN;
 
     // --- Streams --------------------------------------------------------------------
     let stream: Result<StreamId> = StreamId::new(0);
@@ -160,6 +161,7 @@ fn the_public_surface_still_has_the_shape_it_promised() {
     // not for a signature check.
     let _: fn(&[u8]) -> bool = ngnet_quic::is_acceptable_initial;
     let _: fn(&[u8], usize) -> Result<Inspection> = ngnet_quic::inspect;
+    let _: fn(&[u8]) -> Result<Option<ngnet_quic::InitialPacket>> = ngnet_quic::inspect_initial;
     // Named through an alias, which keeps the signature readable and keeps clippy from
     // objecting to a five-argument function pointer written inline.
     type WriteVersionNegotiation =
@@ -185,6 +187,58 @@ fn the_public_surface_still_has_the_shape_it_promised() {
     }
     let _ = on_inspection;
 
+    // **Open.** A future QUIC version could define another token kind, and a caller that
+    // matched exhaustively would stop compiling for a change that concerns only servers
+    // doing address validation.
+    fn on_initial_token(token: &ngnet_quic::InitialToken) -> &[u8] {
+        match token {
+            ngnet_quic::InitialToken::Absent => &[],
+            ngnet_quic::InitialToken::Retry(bytes)
+            | ngnet_quic::InitialToken::Regular(bytes)
+            | ngnet_quic::InitialToken::Unknown(bytes) => bytes,
+            _ => &[],
+        }
+    }
+    let _ = on_initial_token;
+
+    // **Open**, for the same reason: `InitialPacket` gains fields as more of a first packet
+    // becomes useful to a server, and each is additive.
+    fn on_initial_packet(packet: &ngnet_quic::InitialPacket) {
+        let _: u32 = packet.version;
+        let _: &ConnectionId = &packet.dcid;
+        let _: &ConnectionId = &packet.scid;
+        let _: &ngnet_quic::InitialToken = &packet.token;
+    }
+    let _ = on_initial_packet;
+
+    // **Open.** A close reason is a classification of something the peer did, and QUIC can
+    // grow new ones; a caller matching exhaustively would break on a variant it has no
+    // opinion about.
+    fn on_close_error(err: &ngnet_quic::CloseError) {
+        let _: u64 = err.frame_type();
+        let _: &[u8] = err.phrase();
+        match err.reason() {
+            ngnet_quic::CloseReason::Transport(_) => {}
+            ngnet_quic::CloseReason::Application(_) => {}
+            ngnet_quic::CloseReason::VersionNegotiation => {}
+            ngnet_quic::CloseReason::IdleTimeout => {}
+            ngnet_quic::CloseReason::Dropped => {}
+            ngnet_quic::CloseReason::Retry => {}
+            _ => {}
+        }
+    }
+    let _ = on_close_error;
+
+    // **Open.** ngtcp2 already names three token types and could name a fourth.
+    fn on_token_kind(kind: ngnet_quic::TokenKind) {
+        match kind {
+            ngnet_quic::TokenKind::Retry => {}
+            ngnet_quic::TokenKind::NewToken => {}
+            _ => {}
+        }
+    }
+    let _ = on_token_kind;
+
     // --- Configuration --------------------------------------------------------------
     let _settings = Settings::new(ts)
         .initial_rtt(d)
@@ -193,7 +247,8 @@ fn the_public_surface_still_has_the_shape_it_promised() {
         .max_stream_window(1)
         .handshake_timeout(d)
         .initial_pkt_num(0)
-        .no_pmtud(false);
+        .no_pmtud(false)
+        .validated_token(b"token", ngnet_quic::TokenKind::Retry);
 
     let _params = TransportParams::new()
         .initial_max_stream_data_bidi_local(1)
@@ -220,7 +275,9 @@ fn the_public_surface_still_has_the_shape_it_promised() {
         .on_stream_reset(|_id, _code| {})
         .on_stop_sending(|_id, _code| {})
         .on_acked_stream_data(|_id, _len| {})
-        .on_handshake_completed(|| {});
+        .on_handshake_completed(|| {})
+        .on_new_connection_id(|_cid| {})
+        .on_remove_connection_id(|_cid| {});
 
     // --- Entropy --------------------------------------------------------------------
     struct Source;
@@ -344,6 +401,9 @@ fn the_connection_surface_still_has_the_shape_it_promised() {
             conn.write_connection_close(&mut buf, ApplicationErrorCode::new(0), b"", now)?;
         let _: usize = conn.write_transport_close(&mut buf, cause, b"", now)?;
         let _: usize = conn.retained_bytes();
+        let _: Vec<ConnectionId> = conn.scids();
+        let _: usize = conn.max_tx_udp_payload_size();
+        let _: ngnet_quic::CloseError = conn.close_error();
         Ok(())
     }
     let _ = uses_conn::<DummySession>;
