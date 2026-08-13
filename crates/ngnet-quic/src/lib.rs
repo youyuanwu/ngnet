@@ -124,7 +124,11 @@ pub use settings::{Settings, TokenKind};
 pub use stream::{Directionality, Initiator, StreamId};
 pub use stream_io::StreamWrite;
 pub use time::{Duration, Timestamp};
-pub use tls::{NativeTlsHandle, Role, TlsBackend, TlsSession};
+pub use tls::{
+    Backend, CryptoError, Direction, DirectionalKeys, HP_MASK_LEN, HP_SAMPLE_LEN, HeaderKey,
+    InitialKeys, Level, NativeTlsHandle, PacketKey, Role, Session, SessionEvent, TlsBackend,
+    TlsSession,
+};
 
 #[cfg(feature = "tls-ossl")]
 pub use tls_ossl::{OsslBackend, OsslBackendBuilder, OsslSession, Verify};

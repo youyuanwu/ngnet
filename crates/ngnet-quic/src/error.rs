@@ -331,6 +331,30 @@ pub struct Error {
 }
 
 impl Error {
+    /// Builds an error a TLS backend can report.
+    ///
+    /// The only publicly constructible error, and it exists for one reason: the safe TLS
+    /// seam has methods returning [`Result`], so a backend that cannot build an [`Error`]
+    /// cannot implement the seam. Everything else in this type is built from an ngtcp2
+    /// return code, which a backend has no business inventing.
+    ///
+    /// The kind is fixed at [`ErrorKind::Crypto`] rather than taken as an argument, because
+    /// the alternative is asking backend authors to classify their failure against a set of
+    /// conditions that mostly describe transport faults they cannot cause. What a backend
+    /// can usefully say is *why*, which is what `context` carries.
+    ///
+    /// Note this is for failures of the backend itself. A payload that does not
+    /// authenticate is not one of these — that is [`crate::CryptoError::Decrypt`], and
+    /// reporting it here would turn an ordinary event into a closed connection.
+    pub const fn backend(context: &'static str) -> Self {
+        Self {
+            kind: ErrorKind::Crypto,
+            native: None,
+            context,
+            unusable: false,
+        }
+    }
+
     /// Builds an error from a raw ngtcp2 code.
     pub(crate) fn native(code: i32, context: &'static str) -> Self {
         let native = NativeCode::new(code);
@@ -483,6 +507,23 @@ fn classify(native: NativeCode) -> ErrorKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A backend-reported failure carries no native code, and says so.
+    ///
+    /// The absence matters. `native_code()` is how a caller tells a fault the library
+    /// diagnosed from one an application invented, and attributing a made-up code to ngtcp2
+    /// would make that distinction useless. It is also why this constructor takes no code
+    /// rather than taking an optional one.
+    #[test]
+    fn a_backend_error_is_a_crypto_failure_with_no_native_code() {
+        let error = Error::backend("the backend could not derive a key");
+        assert_eq!(error.kind(), ErrorKind::Crypto);
+        assert_eq!(error.native_code(), None);
+        assert!(
+            format!("{error}").contains("could not derive a key"),
+            "a backend's explanation must survive into the message a caller sees"
+        );
+    }
 
     #[test]
     fn native_codes_describe_themselves_using_the_library() {
