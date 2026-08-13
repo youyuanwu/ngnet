@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::ApplicationErrorCode;
-use crate::handlers::StreamCloseReason;
 use crate::stream::{Directionality, StreamId};
 
 use super::error::{Error, ErrorKind, Result};
@@ -120,7 +119,10 @@ impl Connection {
                 Observed::Closed(stream, reason) => {
                     let slot = self.incoming.entry(stream.get()).or_default();
                     slot.finished = true;
-                    if let StreamCloseReason::Reset(code) = reason {
+                    // The receiving direction's code is the one that concerns a reader: it
+                    // says why the bytes stopped. The sending direction's belongs to writes
+                    // and is reported through the stop-sending path instead.
+                    if let Some(code) = reason.receiving() {
                         slot.reset.get_or_insert(code);
                     }
                 }

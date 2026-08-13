@@ -41,7 +41,8 @@ use super::error::{Error, ErrorKind};
 /// cannot act — they can only record. The driver drains these after the call returns, which
 /// is the same shape `ngnet-h3` uses and for the same reason.
 #[derive(Debug)]
-pub(crate) enum Observed {
+#[non_exhaustive]
+pub enum Observed {
     /// Bytes arrived on a stream, and whether they end it.
     Data(StreamId, Vec<u8>, bool),
     /// The peer opened a stream.
@@ -64,10 +65,12 @@ pub(crate) enum Observed {
     Acked(StreamId, u64),
     /// The handshake completed.
     HandshakeCompleted,
-    /// An identifier was minted.
-    IdMinted(ConnectionId),
-    /// An identifier was retired.
-    IdRetired(ConnectionId),
+    /// The peer raised how many streams this endpoint may open, to the given total.
+    ///
+    /// The only signal that a refused open may now succeed. Without it a caller that waits
+    /// for room waits forever, because opening past the limit is reported as a temporary
+    /// block and nothing else announces that the block has lifted.
+    StreamsExtended(u64),
 }
 
 /// State a connection's handle and the driver share.
@@ -92,12 +95,16 @@ pub(crate) struct ConnectionShared {
     established: AtomicBool,
     /// Bytes of stream data the peer has yet to acknowledge, for tests and diagnostics.
     retained: AtomicU64,
+    /// Whether this connection is to be handed to its caller once established.
+    detach: AtomicBool,
+    /// Whether it is to be handed to whoever is accepting, rather than to one named waiter.
+    detach_to_acceptor: AtomicBool,
 }
 
 /// The part of a connection's shared state that needs the lock.
 #[derive(Default)]
 pub(crate) struct ConnectionInner {
-    /// What handlers observed, drained by the driver after each call into ngtcp2.
+    /// What handlers observed, drained by whoever drives the connection.
     pub(crate) observed: Vec<Observed>,
     /// Why the connection ended, once it has.
     pub(crate) failure: Option<Error>,
@@ -105,7 +112,50 @@ pub(crate) struct ConnectionInner {
     pub(crate) wakers: Vec<Waker>,
     /// Work the driver should do on this connection.
     pub(crate) commands: VecDeque<Command>,
+    /// Datagrams the endpoint routed here, waiting for whoever drives the connection.
+    ///
+    /// Only used when the connection is detached; a managed connection is fed directly,
+    /// because the driver holding it has no reason to queue.
+    pub(crate) inbound: VecDeque<Vec<u8>>,
+    /// Datagrams the connection produced, waiting for the endpoint to send them.
+    pub(crate) outbound: VecDeque<Vec<u8>>,
+    /// Identifiers minted and retired, for the endpoint's routing table.
+    ///
+    /// Separate from `observed` because the two have different readers: observations belong
+    /// to whoever drives the connection, and these belong to the endpoint whichever that
+    /// is. A detached connection that kept them to itself would still be routable under the
+    /// identifier it started with and unreachable under every later one -- a connection that
+    /// works and then stops, with nothing logged.
+    pub(crate) routes: VecDeque<RouteUpdate>,
+    /// How many inbound datagrams were dropped because the queue was full.
+    pub(crate) dropped: u64,
+    /// Set by whoever drives the connection when it is finished with it.
+    pub(crate) terminal: bool,
 }
+
+/// A change to where a connection can be reached.
+#[derive(Clone, Debug)]
+pub(crate) enum RouteUpdate {
+    /// The connection now answers to this identifier as well.
+    Minted(ConnectionId),
+    /// The connection no longer answers to this identifier.
+    Retired(ConnectionId),
+}
+
+/// How many datagrams may wait in either direction for one connection.
+///
+/// Bounded in both directions, for different reasons.
+///
+/// Inbound, the endpoint reads from a single socket shared by every connection, so it
+/// cannot wait for one slow consumer without starving the rest. Past the bound it drops,
+/// which is what QUIC's loss recovery is for and is the same thing a full socket buffer
+/// would have done a layer lower.
+///
+/// Outbound, the bound is a signal rather than a place to discard: a datagram already
+/// produced cannot be un-produced, because the connection has already advanced its state
+/// to account for it. So the producer checks for room *before* producing, and this bound is
+/// what it checks against.
+pub(crate) const DATAGRAM_QUEUE: usize = 64;
 
 /// Something a handle asked the driver to do to a connection.
 #[derive(Debug)]
@@ -148,6 +198,8 @@ impl ConnectionShared {
             closed: AtomicBool::new(false),
             established: AtomicBool::new(false),
             retained: AtomicU64::new(0),
+            detach: AtomicBool::new(false),
+            detach_to_acceptor: AtomicBool::new(false),
         })
     }
 
@@ -163,6 +215,117 @@ impl ConnectionShared {
     /// Records something a handler observed.
     pub(crate) fn observe(&self, event: Observed) {
         self.lock().observed.push(event);
+    }
+
+    /// Asks that this connection be handed to its caller once the handshake completes.
+    pub(crate) fn request_detach(&self) {
+        self.detach.store(true, Ordering::Release);
+    }
+
+    /// Asks that this connection go to whoever is accepting, rather than to one waiter.
+    pub(crate) fn request_detach_to_acceptor(&self) {
+        self.detach.store(true, Ordering::Release);
+        self.detach_to_acceptor.store(true, Ordering::Release);
+    }
+
+    /// Whether this connection is to be handed over rather than driven by the endpoint.
+    pub(crate) fn wants_detach(&self) -> bool {
+        self.detach.load(Ordering::Acquire)
+    }
+
+    /// Whether it goes to an acceptor rather than to the caller who dialled it.
+    pub(crate) fn detaches_to_acceptor(&self) -> bool {
+        self.detach_to_acceptor.load(Ordering::Acquire)
+    }
+
+    /// Records an identifier change for the endpoint's routing table.
+    ///
+    /// Recorded rather than applied, because handlers run while ngtcp2 holds the connection
+    /// and may only take notes. The endpoint applies these before it sends anything the
+    /// connection produced in the same pass, so a new identifier is routable before the
+    /// packet announcing it goes out.
+    pub(crate) fn observe_route(&self, update: RouteUpdate) {
+        self.lock().routes.push_back(update);
+        self.endpoint.wake_driver();
+    }
+
+    /// Takes every pending routing change.
+    pub(crate) fn take_routes(&self) -> VecDeque<RouteUpdate> {
+        core::mem::take(&mut self.lock().routes)
+    }
+
+    /// Hands a datagram to whoever drives this connection.
+    ///
+    /// Returns `false` if the queue was full and the datagram was dropped. Dropping is
+    /// deliberate: the endpoint reads from one socket on behalf of every connection, and
+    /// blocking on a consumer that is not keeping up would stall all of them. A dropped
+    /// datagram is a lost packet, which QUIC already knows how to recover from; a stalled
+    /// endpoint is not something it can recover from.
+    pub(crate) fn deliver_inbound(&self, datagram: Vec<u8>) -> bool {
+        let mut inner = self.lock();
+        if inner.inbound.len() >= DATAGRAM_QUEUE {
+            inner.dropped += 1;
+            return false;
+        }
+        inner.inbound.push_back(datagram);
+        let wakers = core::mem::take(&mut inner.wakers);
+        drop(inner);
+        for waker in wakers {
+            waker.wake();
+        }
+        true
+    }
+
+    /// Takes the next datagram the endpoint routed here.
+    pub(crate) fn take_inbound(&self) -> Option<Vec<u8>> {
+        self.lock().inbound.pop_front()
+    }
+
+    /// How many inbound datagrams have been dropped for want of room.
+    pub(crate) fn dropped_inbound(&self) -> u64 {
+        self.lock().dropped
+    }
+
+    /// Whether there is room to produce another outgoing datagram.
+    ///
+    /// Asked *before* producing one. A datagram that has been produced cannot be withdrawn:
+    /// the connection has already accounted for the stream bytes it carries, so offering
+    /// them again would send them twice, and discarding it loses them until a retransmission
+    /// timer notices. Neither is acceptable, so the only safe place to apply back pressure
+    /// is before the connection is asked to write.
+    pub(crate) fn outbound_has_room(&self) -> bool {
+        self.lock().outbound.len() < DATAGRAM_QUEUE
+    }
+
+    /// Queues a datagram for the endpoint to send.
+    pub(crate) fn queue_outbound(&self, datagram: Vec<u8>) {
+        self.lock().outbound.push_back(datagram);
+        self.endpoint.wake_driver();
+    }
+
+    /// Whether anything is still waiting to be sent for this connection.
+    pub(crate) fn has_outbound(&self) -> bool {
+        !self.lock().outbound.is_empty()
+    }
+
+    /// Takes the next datagram this connection wants sent.
+    pub(crate) fn take_outbound(&self) -> Option<Vec<u8>> {
+        self.lock().outbound.pop_front()
+    }
+
+    /// Whether this connection's owner has finished with it.
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.lock().terminal
+    }
+
+    /// Says this connection's owner has finished with it, so the endpoint may release it.
+    ///
+    /// A detached connection's endpoint cannot ask it whether it is done -- it does not hold
+    /// the connection -- so without this its routing entry would live as long as the
+    /// endpoint does.
+    pub(crate) fn mark_terminal(&self) {
+        self.lock().terminal = true;
+        self.endpoint.wake_driver();
     }
 
     /// Whether the connection has finished.
@@ -273,6 +436,8 @@ pub(crate) struct EndpointShared {
     inner: Mutex<EndpointInner>,
     /// Whether the driver has gone, readable without the lock.
     gone: AtomicBool,
+    /// Whether connections this endpoint accepts are to be handed to their caller.
+    detached_accepts: AtomicBool,
 }
 
 /// The part of the endpoint's shared state that needs the lock.
@@ -316,6 +481,16 @@ impl EndpointShared {
     /// Takes the lock, recovering from a poisoned one.
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, EndpointInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Asks that accepted connections be handed to their caller rather than driven here.
+    pub(crate) fn request_detached_accepts(&self) {
+        self.detached_accepts.store(true, Ordering::Release);
+    }
+
+    /// Whether accepted connections are handed over.
+    pub(crate) fn detached_accepts(&self) -> bool {
+        self.detached_accepts.load(Ordering::Acquire)
     }
 
     /// Whether the driver has stopped.

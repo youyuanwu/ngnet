@@ -89,8 +89,14 @@ either owns one behind `poll_event`, which means "established connection" quietl
 expose stream-limit signalling that would answer "can this connection even start HTTP/3"
 before three unidirectional streams are attempted.
 
-None is needed for request/response over quinn, so none is present. Datagrams are the one
-with a concrete future use — WebTransport and MASQUE both need them.
+None is needed for request/response over quinn or over ngtcp2, so none is present. Datagrams
+are the one with a concrete future use — WebTransport and MASQUE both need them.
+
+The stream-limit point has since been exercised for real. `ngnet-quic-h3` returns pending from
+`poll_open_uni` when the peer's limit is exhausted, and that is safe only because ngtcp2's
+`extend_max_local_streams_*` callbacks are wrapped to wake it. This layer waits indefinitely
+by design and has no timeout underneath, so an implementation without such a signal does not
+stall — it hangs.
 
 ### Blocked streams are unblocked by retrying, not by a writability signal
 
@@ -190,7 +196,10 @@ These are decided, not pending. They are here so a reader does not mistake them 
 
 - **No QUIC or TLS implementation.** nghttp3 depends on neither and neither does this crate.
   The integration tests happen to use quinn, and that choice reaches no crate but
-  `ngnet-h3-tests`.
+  `ngnet-h3-tests`. `ngnet-quic-h3` implements this crate's transport trait over the
+  workspace's own QUIC stack, and it is a *separate crate* for exactly this reason: a
+  dependency-graph test in `ngnet-workspace-tests` fails if a QUIC implementation ever
+  appears in this crate's graph.
 - **No server push.** nghttp3 does not implement it.
 - **`FieldAction::Stop` does not cancel a field section.** QPACK is stateful, so the
   remaining fields must still be parsed; `Stop` stops them being *delivered*. A caller that

@@ -249,3 +249,67 @@ fn no_hyper_reaches_the_client_policy_layer() {
          deliberately ignores.\n\n{tree}",
     );
 }
+
+/// The HTTP/3 wrapper does not reach a QUIC implementation.
+///
+/// `ngnet-h3` is a state machine over nghttp3 and nothing else. It defines a transport
+/// abstraction and takes whatever implements it, which is what lets a caller run HTTP/3 over
+/// quinn, over this workspace's own QUIC stack, or over something not written yet.
+///
+/// The workspace now contains a crate that implements that abstraction over `ngnet-quic`. The
+/// risk this check exists for is that the adapter, or something it drags in, ends up in
+/// `ngnet-h3`'s own graph — at which point a caller who wanted HTTP/3 and a different
+/// transport is compiling ngtcp2 and OpenSSL for nothing, and the abstraction has quietly
+/// stopped being one.
+#[test]
+fn the_http3_wrapper_reaches_no_quic_implementation() {
+    let tree = cargo_tree(&["-p", "ngnet-h3", "-e", "normal"]);
+
+    for forbidden in ["ngnet-quic", "ngnet-quic-sys", "ngnet-quic-h3", "quinn"] {
+        assert!(
+            !contains_at_word_boundary(&tree, forbidden),
+            "{forbidden} reached ngnet-h3's normal dependency graph.\n\
+             Find it with:\n  cargo tree -p ngnet-h3 -e normal -i {forbidden}\n\
+             ngnet-h3 takes a transport through a trait; it must not depend on one.\n\n{tree}",
+        );
+    }
+}
+
+/// The QUIC wrapper does not reach an HTTP/3 implementation.
+///
+/// The same claim the other way round, and it needs making separately. `ngnet-quic` is
+/// useful on its own — raw QUIC streams with no HTTP anywhere — and a caller who wants that
+/// should not be compiling nghttp3 to get it.
+#[test]
+fn the_quic_wrapper_reaches_no_http3_implementation() {
+    let tree = cargo_tree(&["-p", "ngnet-quic", "-e", "normal"]);
+
+    for forbidden in ["ngnet-h3", "ngnet-h3-sys", "ngnet-quic-h3"] {
+        assert!(
+            !contains_at_word_boundary(&tree, forbidden),
+            "{forbidden} reached ngnet-quic's normal dependency graph.\n\
+             Find it with:\n  cargo tree -p ngnet-quic -e normal -i {forbidden}\n\
+             ngnet-quic is usable without HTTP/3 and must stay that way.\n\n{tree}",
+        );
+    }
+}
+
+/// The adapter is the one place the two families meet.
+///
+/// The negative checks above are only meaningful if something positive holds: that the
+/// integration genuinely depends on both. A version of this workspace where `ngnet-quic-h3`
+/// had quietly lost one of them would satisfy every check above and integrate nothing.
+#[test]
+fn the_adapter_depends_on_both_families() {
+    let tree = cargo_tree(&["-p", "ngnet-quic-h3", "-e", "normal"]);
+
+    for required in ["ngnet-h3", "ngnet-quic"] {
+        assert!(
+            contains_at_word_boundary(&tree, required),
+            "{required} is missing from ngnet-quic-h3's normal dependency graph.\n\
+             Check with:\n  cargo tree -p ngnet-quic-h3 -e normal\n\
+             This crate exists to join the two families; without both there is nothing to \
+             join.\n\n{tree}",
+        );
+    }
+}

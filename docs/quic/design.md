@@ -391,3 +391,133 @@ have ngtcp2 crypto helpers, and adding one should not require touching anything 
 - Edition 2024, built with the toolchain in `rust-toolchain.toml`. No declared MSRV.
 - System OpenSSL **3.5 or newer** is required for the default backend: ngtcp2's `ossl` helper
   uses the QUIC TLS API that first appeared there. CI pins `ubuntu-26.04` for this.
+
+## Managed and detached connections
+
+An endpoint carries two kinds of connection at once, on one socket.
+
+A **managed** connection is what the endpoint has always had: the driver owns the protocol
+state and an application reaches it through `Connection`, a handle that exchanges commands
+and observations with the driver through a mailbox.
+
+A **detached** connection is handed to a caller, who owns the protocol state and drives it:
+reading the datagrams the endpoint routes to it, producing the ones it wants sent, and firing
+its own timer. `Endpoint::connect_detached` and `Endpoint::accept_detached` produce them.
+
+### Why the second kind exists
+
+Because a mailbox cannot serve every consumer. `ngnet-h3`'s transport trait fills a packet by
+calling into its transport and expecting an answer before the call returns — the byte slices
+it offers are invalid once the closure ends. Bytes cannot reach another task in time. A
+consumer of that shape must *own* the connection, so the endpoint has to be able to give one
+up. The alternative was for `ngnet-quic` to know about HTTP/3, which is precisely what the
+crate split exists to avoid.
+
+### What the endpoint keeps
+
+Everything shared between connections: the socket, the connection-identifier routing table,
+address validation, stateless reset, version negotiation, and the handling of datagrams that
+match no connection. What moves is only the per-connection protocol state, which admits
+exactly one owner.
+
+### Hand-over happens after the handshake
+
+The endpoint completes the handshake and only then gives the connection up. Handing one over
+earlier would give the caller something that cannot yet carry anything — the HTTP/3 trait
+begins with an established connection and says so — and would duplicate the handshake, which
+is the part most worth having written once.
+
+### Identifier changes travel separately
+
+Minted and retired connection identifiers used to arrive as observations, which the driver
+drained. A detached connection's owner drains observations now, so an identifier change sent
+that way would never reach the endpoint. The connection would answer on the identifier it
+started with and on nothing else, and since a peer switches identifiers at a time of its
+choosing, that appears as a connection that works and then stops.
+
+They have their own queue, and the endpoint applies them *before* sending anything produced
+in the same pass, so an identifier is routable before the packet announcing it leaves.
+
+### The two datagram queues have opposite overflow rules
+
+Not symmetric, for reasons that are not symmetric.
+
+**Inbound**, past its bound, the endpoint drops. It reads one socket on behalf of every
+connection, so waiting for a slow consumer would starve the rest. A dropped datagram is a
+lost packet, which QUIC recovers from and which a full socket buffer would have produced a
+layer lower anyway. The count is exposed rather than hidden.
+
+**Outbound**, dropping is not available. A datagram that has been produced cannot be
+withdrawn: the connection has already accounted for the stream bytes in it, so offering them
+again would send them twice and discarding it loses them until a retransmission timer
+notices. So the producer asks for room *before* writing, and the bound is what it asks
+against.
+
+### Eviction needs the owner to say when it is done
+
+The endpoint decides a managed connection is finished by asking whether it is draining. It
+cannot ask a detached one, because it does not hold it. So the owner marks it, and until then
+the routing entry stays. Guessing either way is a leak or a connection cut off mid-close.
+
+### The clock travels with the connection
+
+A detached connection reads the *endpoint's* clock, not one of its owner's.
+
+This was found rather than reasoned out. A first attempt gave the consumer its own clock and
+ngtcp2's own assertion caught it immediately: `log.last_ts <= ts`. Two clocks have two
+origins, so timestamps from the second are not comparable with those the endpoint recorded
+while driving the handshake. In a release build that assertion is compiled out and the
+connection silently mis-times its loss detection instead.
+
+Capturing the clock means it must be cloneable and shareable, which `Clock` deliberately does
+not require: the seams in this module impose no `Send` bound so a thread-per-core runtime can
+build them on non-shared types, and the test clock is non-`Send` on purpose to keep that
+property honest. Rather than weaken it, the bound sits on a second constructor,
+`EndpointBuilder::build_detachable`, so it is asked only of callers who need what it buys.
+The test clock broke the first attempt at putting it on `build`, which is the property
+defending itself.
+
+## Both directions a stream closes in
+
+QUIC shuts a stream's two directions independently and ngtcp2 has reported a code for each
+since 1.25, through `stream_close2`. This crate bound the older `stream_close`, which reports
+one code and does not say which direction it belonged to.
+
+ngtcp2's own documentation gives the case that separates them: an endpoint receives
+STOP_SENDING and answers with RESET_STREAM carrying the same code, which belongs to the
+*sending* side, while the response body arrived intact so the *receiving* side has no code at
+all. The single-code form cannot express that.
+
+`StreamCloseReason` is therefore a struct with an optional code per direction rather than an
+enum of `Finished` and `Reset`. A struct because the two are genuinely independent — every
+combination of present and absent is meaningful — and because absent is not the same as zero:
+a direction that ended cleanly reports nothing, where code zero is a reset that carries zero.
+
+## The stream-limit notification
+
+`extend_max_local_streams_bidi` and its unidirectional counterpart are wrapped because they
+are the only signal that a refused stream open may now succeed. Opening past the peer's limit
+is reported as blocked rather than as an error, deliberately, since the condition is
+temporary — but nothing else announces that it has lifted. A caller that waits and is never
+told does not fail; it waits. `ngnet-h3` waits indefinitely by design and has no timeout
+underneath, so the absence of this callback is a hang rather than a delay.
+
+The figure they carry is the cumulative total the endpoint may now open, not an increment.
+
+## Retention holds an address, not a length
+
+`retain.rs` exists because ngtcp2 does not copy the stream data it accepts: it keeps the
+caller's pointer so it can retransmit, and requires the bytes stay intact until acknowledged
+or the stream closes. Each accepted write therefore gets its own `Box<[u8]>`, whose address
+is fixed for as long as it lives.
+
+ngtcp2 routinely accepts *less* than it is offered — a packet fills, and the remainder comes
+back as a separate write. Shrinking the allocation to the accepted prefix is the obvious
+tidy-up and is a use-after-free: the address ngtcp2 was given must stay valid, and
+reallocating changes it while ngtcp2 still holds the old one for retransmission. Nothing
+detects that on a lossless link, because nothing retransmits, and a test comparing bytes
+would pass either way since freed memory usually still reads back correctly.
+
+So the accepted *length* is recorded separately from the allocation, and the tail beyond it
+is left allocated until the chunk is released. That wastes at most one packet's worth per
+outstanding chunk. The test that guards it asserts the address.

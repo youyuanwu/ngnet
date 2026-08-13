@@ -303,6 +303,16 @@ pub enum ErrorKind {
     /// Covers the stream-count and flow-control blocks, which are ordinary conditions in a
     /// working connection rather than failures.
     Blocked,
+    /// The stream cannot carry more data, and never will.
+    ///
+    /// Its write side is closed — this endpoint finished or reset it, or the stream is gone
+    /// altogether. Distinguished from [`ErrorKind::InvalidInput`], which it used to share,
+    /// because the two call for opposite responses: invalid input is a bug to fix, while
+    /// this is a normal end that a caller must be able to recognise in order to stop
+    /// offering bytes and move on. A layer multiplexing many streams over one connection
+    /// needs to tell "this stream is finished" from "you called this wrongly" without
+    /// inspecting a message.
+    StreamClosed,
     /// Anything else, including conditions added by a future ngtcp2.
     Internal,
 }
@@ -445,11 +455,12 @@ fn classify(native: NativeCode) -> ErrorKind {
         | sys::NGTCP2_ERR_STREAM_ID_BLOCKED
         | sys::NGTCP2_ERR_CONN_ID_BLOCKED
         | sys::NGTCP2_ERR_NOBUF => ErrorKind::Blocked,
-        // Not transient: writing to a stream whose write side is closed, or naming one that
-        // does not exist, is a mistake on this side of the connection and retrying it will
-        // fail identically.
+        // Not transient, and not a caller mistake either: a stream whose write side is
+        // closed, or one that no longer exists, will refuse every further write. A caller
+        // multiplexing streams needs to recognise that and stop offering, which it cannot do
+        // if this is indistinguishable from having called the API wrongly.
         sys::NGTCP2_ERR_STREAM_SHUT_WR | sys::NGTCP2_ERR_STREAM_NOT_FOUND => {
-            ErrorKind::InvalidInput
+            ErrorKind::StreamClosed
         }
         sys::NGTCP2_ERR_CLOSING | sys::NGTCP2_ERR_DRAINING => ErrorKind::Closing,
         sys::NGTCP2_ERR_PROTO

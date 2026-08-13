@@ -50,7 +50,12 @@ pub mod testing;
 pub use clock::Clock;
 pub use config::{Config, DEFAULT_DATAGRAMS_PER_PASS};
 pub use connection::{AcceptStream, Chunk, Connection, OpenStream, ReadStream};
-pub use handle::{Accepting, Built, Connecting, Endpoint, EndpointBuilder, EndpointDriver};
+pub use shared::Observed;
+pub use handle::Sleep;
+pub use handle::{
+    Accepting, Built, Connecting, DetachedConnection, Detaching, Endpoint, EndpointBuilder,
+    EndpointDriver,
+};
 pub use error::{Error, ErrorKind, Result};
 pub use socket::{AsyncUdpSocket, Received, Sent};
 

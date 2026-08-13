@@ -1,0 +1,24 @@
+[package]
+name = "ngnet-quic-h3"
+version = "0.1.0"
+description = "HTTP/3 over ngtcp2: an ngnet-h3 transport backed by ngnet-quic"
+# Cannot be published while either crate it binds is unpublished, and both are withheld
+# while their APIs are still expected to change. See `docs/quic-h3/pending-work.md`.
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No feature table, deliberately.
+#
+# `ngnet-h3` and `ngnet-quic` each gate their async layer behind a feature, because each is
+# usable as a bare state machine without it. This crate is nothing *but* the join between
+# those two async layers: with either one disabled it has no reason to exist and would not
+# compile. A feature that can only ever be on is a lie in a manifest, so there is none.
+#
+# It does depend on both crates' default features, which is where those async layers live.
+[dependencies]
+ngnet-h3.workspace = true
+ngnet-quic.workspace = true
+bytes.workspace = true
+

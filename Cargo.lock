@@ -1121,6 +1121,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "ngnet-quic-h3"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "ngnet-h3",
+ "ngnet-quic",
+]
+
+[[package]]
+name = "ngnet-quic-h3-tests"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "ngnet-h3",
+ "ngnet-h3-tests",
+ "ngnet-quic",
+ "ngnet-quic-h3",
+ "quinn",
+ "rcgen",
+ "tokio",
+]
+
+[[package]]
 name = "ngnet-quic-sys"
 version = "0.1.0"
 dependencies = [

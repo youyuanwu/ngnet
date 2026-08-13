@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::rand::EntropySource;
-use crate::tls::TlsBackend;
+use crate::tls::{TlsBackend, TlsSession};
 
 use super::clock::Clock;
 use super::config::Config;
@@ -161,7 +161,61 @@ where
     /// # Errors
     ///
     /// Returns [`ErrorKind::InvalidInput`] if no entropy source was supplied.
+    /// Builds the endpoint and the one driver that serves it.
+    ///
+    /// Connections from this endpoint are driven by that driver. To take one over and drive
+    /// it yourself — which the HTTP/3 layer requires — use
+    /// [`EndpointBuilder::build_detachable`] instead.
+    ///
+    /// # Errors
+    ///
+    /// Fails if no source of randomness was supplied.
     pub fn build(self) -> Result<Built<Sock, Clk, B>> {
+        self.assemble(None, None)
+    }
+
+    /// Builds an endpoint whose connections may be handed to callers who drive them.
+    ///
+    /// # Why this is separate from [`EndpointBuilder::build`]
+    ///
+    /// A connection handed over must read the *same* timescale the endpoint drove its
+    /// handshake against; two clocks with different origins make every later timestamp
+    /// incomparable with the ones already recorded, which ngtcp2 catches with an assertion
+    /// in debug builds and mis-times silently in release ones. So the clock is captured here
+    /// and travels with every detached connection, which means it must be cloneable and
+    /// shareable.
+    ///
+    /// That bound is deliberately *not* on [`Clock`] itself, and deliberately not on
+    /// `build`. The seams in this module impose no `Send` requirement precisely so a
+    /// thread-per-core runtime can build them on non-shared types — a property the test
+    /// clock exists to keep honest by being non-`Send` on purpose. Putting the bound here
+    /// asks for it only from callers who need what it buys.
+    ///
+    /// # Errors
+    ///
+    /// Fails if no source of randomness was supplied.
+    pub fn build_detachable(self) -> Result<Built<Sock, Clk, B>>
+    where
+        Clk: Clone + Send + Sync + 'static,
+        Clk::Sleep: Send + 'static,
+    {
+        let timescale = {
+            let clock = self.clock.clone();
+            Arc::new(move || clock.now()) as Arc<dyn Fn() -> crate::Timestamp + Send + Sync>
+        };
+        let sleeper = {
+            let clock = self.clock.clone();
+            Arc::new(move |deadline| Box::pin(clock.sleep_until(deadline)) as Sleep)
+                as Arc<dyn Fn(crate::Timestamp) -> Sleep + Send + Sync>
+        };
+        self.assemble(Some(timescale), Some(sleeper))
+    }
+
+    fn assemble(
+        self,
+        timescale: Option<Arc<dyn Fn() -> crate::Timestamp + Send + Sync>>,
+        sleeper: Option<Arc<dyn Fn(crate::Timestamp) -> Sleep + Send + Sync>>,
+    ) -> Result<Built<Sock, Clk, B>> {
         let entropy = self.entropy.ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidInput,
@@ -170,7 +224,11 @@ where
         })?;
 
         let shared = EndpointShared::new();
+        let detached: Arc<DetachQueue<B::Session>> = Arc::default();
         let inner = Inner {
+            detached: Arc::clone(&detached),
+            timescale,
+            sleeper,
             socket: self.socket,
             clock: self.clock,
             backend: self.backend,
@@ -200,6 +258,7 @@ where
         Ok((
             Endpoint {
                 shared: Arc::clone(&shared),
+                detached,
             },
             EndpointDriver {
                 inner,
@@ -211,22 +270,297 @@ where
 }
 
 /// What [`EndpointBuilder::build`] produces: a handle and the one driver that serves it.
-pub type Built<Sock, Clk, B> = (Endpoint, EndpointDriver<Sock, Clk, B>);
+pub type Built<Sock, Clk, B> =
+    (Endpoint<<B as TlsBackend>::Session>, EndpointDriver<Sock, Clk, B>);
+
+/// Connections handed over to callers who drive them themselves.
+///
+/// Keyed by the address of the shared state each waiter holds, so a caller gets back the
+/// connection it asked for rather than whichever finished first. Zero means "any", which is
+/// what an acceptor wants.
+pub(crate) struct DetachQueue<S: TlsSession> {
+    ready: std::sync::Mutex<Vec<(usize, DetachedConnection<S>)>>,
+    wakers: std::sync::Mutex<Vec<core::task::Waker>>,
+}
+
+impl<S: TlsSession> Default for DetachQueue<S> {
+    fn default() -> Self {
+        Self {
+            ready: std::sync::Mutex::new(Vec::new()),
+            wakers: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl<S: TlsSession> DetachQueue<S> {
+    pub(crate) fn deliver(&self, key: usize, connection: DetachedConnection<S>) {
+        self.ready
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((key, connection));
+        let wakers = core::mem::take(&mut *self.wakers.lock().unwrap_or_else(|e| e.into_inner()));
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    /// Takes the connection a waiter asked for.
+    ///
+    /// Key zero means "one this endpoint accepted", which is what an acceptor wants; any
+    /// other key names one particular outbound attempt. The two must not be confused: an
+    /// acceptor that matched anything could take a connection this endpoint *dialled*, hand
+    /// it to a server, and leave the caller who dialled it waiting forever. Which of the two
+    /// completes first is not this endpoint's decision — the peer influences it.
+    fn take(&self, key: usize) -> Option<DetachedConnection<S>> {
+        let mut ready = self.ready.lock().unwrap_or_else(|e| e.into_inner());
+        let at = ready.iter().position(|(k, _)| *k == key)?;
+        Some(ready.remove(at).1)
+    }
+
+    /// Gives up a connection nobody collected, so the endpoint can reclaim it.
+    fn abandon(&self, key: usize) {
+        let mut ready = self.ready.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = ready.iter().position(|(k, _)| *k == key) {
+            let (_, connection) = ready.remove(at);
+            connection.release();
+        }
+    }
+
+    fn register(&self, waker: &core::task::Waker) {
+        let mut wakers = self.wakers.lock().unwrap_or_else(|e| e.into_inner());
+        if !wakers.iter().any(|w| w.will_wake(waker)) {
+            wakers.push(waker.clone());
+        }
+    }
+}
+
+/// An established connection handed over to its caller, with the endpoint still routing for
+/// it.
+///
+/// The caller owns the protocol state and is responsible for reading the datagrams the
+/// endpoint routes here, producing the ones it wants sent, and firing its own timer. The
+/// endpoint keeps the socket, the routing table, address validation and stateless reset —
+/// everything that is shared between connections rather than particular to one.
+///
+/// This exists because a consumer that has to reach the connection *synchronously* while it
+/// composes a packet cannot be served across a queue. The HTTP/3 layer is such a consumer:
+/// it fills a packet by asking its transport for bytes and expects an answer before the call
+/// returns.
+///
+/// Dropping one without calling [`DetachedConnection::release`] leaves the endpoint routing
+/// to a connection nobody is driving until its identifiers are cleaned up.
+#[must_use = "a detached connection makes no progress unless something drives it"]
+pub struct DetachedConnection<S: TlsSession> {
+    /// The protocol state, now this caller's to drive.
+    pub conn: crate::Conn<'static, S>,
+    /// The queues this connection exchanges datagrams and identifier changes over.
+    shared: Arc<ConnectionShared>,
+    /// Where this connection's peer is.
+    pub remote: SocketAddr,
+    /// The endpoint's clock, so both sides of the hand-over read the same timescale.
+    ///
+    /// Not a clock of the caller's own. The endpoint drove this connection's handshake
+    /// against *its* clock, and a second clock with a different origin makes every
+    /// timestamp afterwards incomparable with the ones already recorded — which ngtcp2
+    /// catches with an assertion in debug builds and silently mis-times in release ones.
+    /// Erased into a closure rather than carried as another type parameter, because a caller
+    /// has no reason to name the endpoint's clock type in order to hold a connection.
+    clock: Arc<dyn Fn() -> crate::Timestamp + Send + Sync>,
+    /// Sleeps until a deadline, on that same clock.
+    ///
+    /// Carried for the same reason and with more force than reading the time: a deadline
+    /// produced by this connection is expressed on the endpoint's timescale, so a sleep
+    /// arranged on any other clock resolves at the wrong moment. Nothing reports that; the
+    /// connection simply retransmits late, or wakes early and spins.
+    sleeper: Arc<dyn Fn(crate::Timestamp) -> Sleep + Send + Sync>,
+}
+
+/// A sleep that finishes at a deadline.
+pub type Sleep = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+impl<S: TlsSession> DetachedConnection<S> {
+    pub(crate) fn new(
+        conn: crate::Conn<'static, S>,
+        shared: Arc<ConnectionShared>,
+        remote: SocketAddr,
+        clock: Arc<dyn Fn() -> crate::Timestamp + Send + Sync>,
+        sleeper: Arc<dyn Fn(crate::Timestamp) -> Sleep + Send + Sync>,
+    ) -> Self {
+        Self {
+            conn,
+            shared,
+            remote,
+            clock,
+            sleeper,
+        }
+    }
+
+    /// Sleeps until a deadline, on the endpoint's clock.
+    ///
+    /// Always this rather than a clock of the caller's own. A deadline this connection
+    /// produced is on the endpoint's timescale, and another clock's origin differs, so the
+    /// sleep would resolve at the wrong time — late, which delays loss recovery, or
+    /// immediately, which spins.
+    pub fn sleep_until(&self, deadline: crate::Timestamp) -> Sleep {
+        (self.sleeper)(deadline)
+    }
+
+    /// The current time, on the endpoint's clock.
+    ///
+    /// Always this rather than a clock of the caller's own: see the field's documentation.
+    pub fn now(&self) -> crate::Timestamp {
+        (self.clock)()
+    }
+
+    /// Takes the next datagram the endpoint routed to this connection.
+    pub fn next_inbound(&self) -> Option<Vec<u8>> {
+        self.shared.take_inbound()
+    }
+
+    /// Takes everything this connection's handlers have recorded since the last call.
+    ///
+    /// Handlers may only take notes: ngtcp2 calls them while it holds the connection, so
+    /// nothing they see can be acted on until the call that triggered them has returned.
+    /// This is where those notes come out.
+    pub fn take_observed(&self) -> Vec<super::shared::Observed> {
+        self.shared.take_observed()
+    }
+
+    /// Whether there is room to produce another outgoing datagram.
+    ///
+    /// Checked *before* writing, never after. A datagram that has been produced cannot be
+    /// withdrawn: the connection has already accounted for the stream bytes in it, so
+    /// offering them again would send them twice and dropping it loses them until a
+    /// retransmission timer notices.
+    pub fn outbound_has_room(&self) -> bool {
+        self.shared.outbound_has_room()
+    }
+
+    /// Queues a datagram for the endpoint to send, and wakes it.
+    pub fn send(&self, datagram: Vec<u8>) {
+        self.shared.queue_outbound(datagram);
+    }
+
+    /// Registers a waker to be woken when a datagram arrives for this connection.
+    pub fn register(&self, waker: &core::task::Waker) {
+        self.shared.register(waker);
+    }
+
+    /// How many inbound datagrams were dropped because this connection was not keeping up.
+    ///
+    /// Non-zero means the endpoint discarded packets rather than stalling every other
+    /// connection on the socket behind this one. QUIC recovers from that, but it is worth
+    /// knowing it happened.
+    pub fn dropped_inbound(&self) -> u64 {
+        self.shared.dropped_inbound()
+    }
+
+    /// Tells the endpoint this connection is finished, so it can release its routes.
+    ///
+    /// The endpoint cannot work this out for itself: it does not hold the connection and
+    /// cannot ask whether it is draining. Without this the routing entries live as long as
+    /// the endpoint does.
+    pub fn release(&self) {
+        self.shared.mark_terminal();
+    }
+}
+
+impl<S: TlsSession> core::fmt::Debug for DetachedConnection<S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DetachedConnection")
+            .field("remote", &self.remote)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A connection being established and handed over.
+#[must_use = "nothing is detached until this is awaited"]
+pub struct Detaching<S: TlsSession> {
+    shared: Option<Arc<ConnectionShared>>,
+    queue: Arc<DetachQueue<S>>,
+    endpoint: Arc<EndpointShared>,
+    /// Whether this wait handed its connection over, or ended without one.
+    settled: bool,
+}
+
+impl<S: TlsSession> Drop for Detaching<S> {
+    fn drop(&mut self) {
+        // A caller that gives up before collecting must not leave a connection stranded in
+        // the queue: the endpoint would keep routing to it, and its entry and identifiers
+        // would live as long as the endpoint does. Only a keyed wait can clean up after
+        // itself; an abandoned accept is covered by the endpoint's own accept bookkeeping.
+        if self.settled {
+            return;
+        }
+        if let Some(shared) = self.shared.as_ref() {
+            let key = Arc::as_ptr(shared) as *const u8 as usize;
+            self.queue.abandon(key);
+            shared.mark_terminal();
+        }
+    }
+}
+
+impl<S: TlsSession> Future for Detaching<S> {
+    type Output = Result<DetachedConnection<S>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let key = this
+            .shared
+            .as_ref()
+            .map_or(0, |s| Arc::as_ptr(s) as *const u8 as usize);
+
+        if let Some(connection) = this.queue.take(key) {
+            this.settled = true;
+            return Poll::Ready(Ok(connection));
+        }
+        if let Some(shared) = this.shared.as_ref()
+            && shared.is_closed()
+        {
+            this.settled = true;
+            return Poll::Ready(Err(shared.failure()));
+        }
+        if this.endpoint.is_gone() {
+            this.settled = true;
+            return Poll::Ready(Err(Error::new(
+                ErrorKind::DriverGone,
+                "the endpoint driver is not running",
+            )));
+        }
+        this.queue.register(cx.waker());
+        if let Some(shared) = this.shared.as_ref() {
+            shared.register(cx.waker());
+        }
+        this.endpoint.register(cx.waker());
+        Poll::Pending
+    }
+}
 
 /// A handle to an endpoint.
 ///
 /// Cheap to clone and inert on its own: everything it does is a request to the driver, and
 /// nothing happens until that driver is polled.
 ///
-/// Deliberately not generic over the socket, clock or TLS backend. A handle only ever talks
-/// to the driver through a mailbox, so carrying those parameters would put them in every
-/// signature that mentions an endpoint for no benefit.
-#[derive(Clone)]
-pub struct Endpoint {
+/// Generic over the TLS session type but not over the socket or clock. Those two are only
+/// ever reached through a mailbox, so naming them here would put them in every signature
+/// that mentions an endpoint for no benefit. The session type earns its place because
+/// [`Endpoint::connect_detached`] and [`Endpoint::accept_detached`] hand back a connection,
+/// and a connection cannot be named without it.
+pub struct Endpoint<S: TlsSession> {
     shared: Arc<EndpointShared>,
+    detached: Arc<DetachQueue<S>>,
 }
 
-impl Endpoint {
+impl<S: TlsSession> Clone for Endpoint<S> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            detached: Arc::clone(&self.detached),
+        }
+    }
+}
+
+impl<S: TlsSession> Endpoint<S> {
     /// Opens a connection to `remote`, resolving once its handshake completes.
     ///
     /// `server_name` is presented for SNI and checked against the peer's certificate.
@@ -263,9 +597,56 @@ impl Endpoint {
             shared: Arc::clone(&self.shared),
         }
     }
+
+    /// Opens a connection and hands it over once established, for the caller to drive.
+    ///
+    /// The endpoint completes the handshake as it would for [`Endpoint::connect`], then
+    /// gives up the connection rather than the handle. Handing it over earlier would mean
+    /// giving a caller a connection that cannot yet carry anything, and would put the
+    /// handshake — the part most worth having written once — in every consumer.
+    ///
+    /// The endpoint goes on routing datagrams to it, validating addresses, and answering
+    /// datagrams that match no connection. What it stops doing is reading and writing this
+    /// connection's protocol state, because that admits exactly one owner.
+    pub fn connect_detached(&self, remote: SocketAddr, server_name: Option<&str>) -> Detaching<S> {
+        let shared = ConnectionShared::new(Arc::clone(&self.shared));
+        shared.request_detach();
+        if self.shared.is_gone() {
+            shared.fail(Error::new(
+                ErrorKind::DriverGone,
+                "the endpoint driver is not running",
+            ));
+        } else {
+            self.shared.lock().dials.push_back(Dial {
+                remote,
+                server_name: server_name.map(str::to_string),
+                shared: Arc::clone(&shared),
+            });
+            self.shared.wake_driver();
+        }
+        Detaching {
+            shared: Some(shared),
+            queue: Arc::clone(&self.detached),
+            endpoint: Arc::clone(&self.shared),
+            settled: false,
+        }
+    }
+
+    /// Waits for the next connection a peer opened and hands it over for the caller to
+    /// drive. See [`Endpoint::connect_detached`].
+    pub fn accept_detached(&self) -> Detaching<S> {
+        self.shared.request_detached_accepts();
+        self.shared.wake_driver();
+        Detaching {
+            shared: None,
+            queue: Arc::clone(&self.detached),
+            endpoint: Arc::clone(&self.shared),
+            settled: false,
+        }
+    }
 }
 
-impl core::fmt::Debug for Endpoint {
+impl<S: TlsSession> core::fmt::Debug for Endpoint<S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Endpoint").finish_non_exhaustive()
     }
@@ -493,14 +874,25 @@ where
         let (original, retried) = (packet.dcid, false);
 
         let shared = ConnectionShared::new(Arc::clone(&self.shared));
+        // An endpoint whose caller asked for detached accepts hands over every connection it
+        // accepts, once each is established. The request is made on the endpoint rather than
+        // per connection because a server does not know what is coming before it arrives.
+        if self.shared.detached_accepts() {
+            shared.request_detach_to_acceptor();
+        }
         match self
             .inner
             .accept(source, packet, &original, retried, Arc::clone(&shared))
         {
             Ok(index) => {
                 self.inner.deliver(index, datagram);
-                self.shared.lock().accepted.push_back(shared);
-                self.shared.wake_acceptors();
+                // A connection destined for a detached acceptor does not also belong on the
+                // managed accept queue: nothing would ever take it from there, and every
+                // entry left behind keeps its shared state alive for the endpoint's life.
+                if !shared.detaches_to_acceptor() {
+                    self.shared.lock().accepted.push_back(shared);
+                    self.shared.wake_acceptors();
+                }
             }
             Err(_) => {
                 // Refusing to build a connection for a first packet is not something the
@@ -575,6 +967,10 @@ where
     fn service(&mut self, cx: &mut Context<'_>) -> core::result::Result<(), Error> {
         let indices: Vec<u64> = self.inner.connections.keys().copied().collect();
         for index in &indices {
+            // Routing first: an identifier a connection has just minted must be installed
+            // before any datagram announcing it goes out, or the peer may use it before the
+            // endpoint knows about it.
+            self.inner.apply_routes(*index);
             self.inner.apply_commands(*index);
             self.inner.handle_expiry(*index);
         }

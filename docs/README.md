@@ -40,6 +40,18 @@ There are no HTTP/3 benchmarks yet.
 There are no QUIC benchmarks, and the crate has not been tested against another QUIC
 implementation.
 
+## HTTP/3 over QUIC
+
+`ngnet-quic-h3` joins the two families: HTTP/3 running on this workspace's own QUIC stack. It
+is the only crate that depends on both, which is deliberate and enforced.
+
+- [`quic-h3/design.md`](quic-h3/design.md) — why the connection is owned by the transport
+  adapter, the pump that keeps the handshake from deadlocking, and why a stream's close needs
+  a batch of its own.
+- [`quic-h3/pending-work.md`](quic-h3/pending-work.md) — what is missing, including exactly
+  what interoperability has and has not established.
+- [`quic-h3/invariants.md`](quic-h3/invariants.md) — the structural claims its suite makes.
+
 ## axum integration — [`axum/`](axum/)
 
 | Document | What it covers |

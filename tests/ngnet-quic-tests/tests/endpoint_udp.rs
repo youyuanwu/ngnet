@@ -14,7 +14,7 @@ use ngnet_quic::endpoint::{
     Config, Connection, Endpoint, EndpointBuilder, EndpointDriver, ErrorKind, TokioClock,
     TokioSocket,
 };
-use ngnet_quic::{Duration, OsslBackend, Role};
+use ngnet_quic::{Duration, OsslBackend, OsslSession, Role};
 use ngnet_quic_tests::{TEST_ALPN, TEST_SERVER_NAME, TestCredentials, TestEntropy};
 
 /// The endpoint driver these tests run.
@@ -27,7 +27,7 @@ type Driver = EndpointDriver<TokioSocket, TokioClock, OsslBackend>;
 /// identifier would then deliver one client's datagrams to the other. Real endpoints do not
 /// have this problem, which is exactly why the endpoint builder makes the caller supply the
 /// randomness rather than picking it.
-async fn client(credentials: &TestCredentials, seed: u64) -> (Endpoint, Driver) {
+async fn client(credentials: &TestCredentials, seed: u64) -> (Endpoint<OsslSession>, Driver) {
     let socket = TokioSocket::bind("127.0.0.1:0".parse().expect("valid"))
         .await
         .expect("binding a client socket");
@@ -47,7 +47,7 @@ async fn client(credentials: &TestCredentials, seed: u64) -> (Endpoint, Driver) 
 }
 
 /// Binds a server endpoint on an ephemeral port, returning the address it landed on.
-async fn server(credentials: &TestCredentials) -> (Endpoint, Driver, core::net::SocketAddr) {
+async fn server(credentials: &TestCredentials) -> (Endpoint<OsslSession>, Driver, core::net::SocketAddr) {
     let socket = TokioSocket::bind("127.0.0.1:0".parse().expect("valid"))
         .await
         .expect("binding a server socket");

@@ -116,6 +116,34 @@ impl<S: TlsSession> Conn<'_, S> {
         fin: bool,
         now: Timestamp,
     ) -> Result<StreamWrite> {
+        self.write_stream_vectored(dest, stream, &[data], fin, now)
+    }
+
+    /// Writes stream data supplied as several separate ranges, and produces one datagram.
+    ///
+    /// Behaves exactly as [`Conn::write_stream`], including its accounting: the ranges are
+    /// treated as one contiguous run of bytes, and the accepted count in
+    /// [`StreamWrite::Datagram`] covers the whole offer rather than any one range. A caller
+    /// re-offers by skipping that many bytes across the ranges.
+    ///
+    /// # Why this exists
+    ///
+    /// A caller whose payload is already in pieces — a framing layer with a header and a
+    /// body, most obviously — would otherwise have to join them itself, and that join would
+    /// be a second copy on top of the one retention already makes. This joins them *into*
+    /// the retained copy, so the byte count is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if ngtcp2 refuses; the connection is then unusable.
+    pub fn write_stream_vectored(
+        &mut self,
+        dest: &mut [u8],
+        stream: StreamId,
+        ranges: &[&[u8]],
+        fin: bool,
+        now: Timestamp,
+    ) -> Result<StreamWrite> {
         if dest.is_empty() {
             return Err(Error::invalid_input(
                 "a datagram buffer must have room to write into",
@@ -129,8 +157,9 @@ impl<S: TlsSession> Conn<'_, S> {
         };
 
         // The bytes handed to ngtcp2 must outlive this call -- see the note above -- so a
-        // copy is staged first and *that* is what ngtcp2 is given a pointer to.
-        let staged = self.retained_mut().stage(stream, data);
+        // copy is staged first and *that* is what ngtcp2 is given a pointer to. Several
+        // ranges become one staged chunk, which is why a single vector suffices below.
+        let staged = self.retained_mut().stage_many(stream, ranges);
         let (base, len) = staged.unwrap_or((core::ptr::null(), 0));
 
         let path = self.path_mut().as_raw_mut();
@@ -150,9 +179,11 @@ impl<S: TlsSession> Conn<'_, S> {
                     &mut accepted,
                     flags,
                     stream.get(),
-                    // A single vector: the coalescing `MORE` loop is deliberately not
-                    // exposed, since its "every argument must be byte-identical across
-                    // calls" rule is not expressible in a safe API without a guard type.
+                    // A single vector, because staging already joined the caller's ranges
+                    // into one chunk. The coalescing `MORE` loop is separately and
+                    // deliberately not exposed, since its "every argument must be
+                    // byte-identical across calls" rule is not expressible in a safe API
+                    // without a guard type.
                     &sys::ngtcp2_vec {
                         base: base.cast_mut(),
                         len,

@@ -350,12 +350,19 @@ pub(crate) unsafe extern "C" fn stream_open_cb(
     0
 }
 
-/// `ngtcp2_stream_close`: a stream ended.
-pub(crate) unsafe extern "C" fn stream_close_cb(
+/// `ngtcp2_stream_close2`: a stream ended.
+///
+/// The `2` form rather than the original: QUIC shuts the two directions of a stream
+/// independently and this callback reports a code for each, where the older `stream_close`
+/// collapses them into one and loses which direction it belonged to. ngtcp2 prefers whichever
+/// is registered, checking `stream_close2` first (`ngtcp2_conn.c:198`), so only this one is
+/// installed.
+pub(crate) unsafe extern "C" fn stream_close2_cb(
     _conn: *mut sys::ngtcp2_conn,
     flags: u32,
     stream_id: i64,
-    app_error_code: u64,
+    rx_app_error_code: u64,
+    tx_app_error_code: u64,
     user_data: *mut c_void,
     _stream_user_data: *mut c_void,
 ) -> core::ffi::c_int {
@@ -371,13 +378,15 @@ pub(crate) unsafe extern "C" fn stream_close_cb(
     // acknowledgement.
     bridge.retained.forget(id);
 
-    let reason = if flags & sys::NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET != 0 {
-        StreamCloseReason::Reset(ApplicationErrorCode::new(app_error_code))
-    } else {
-        StreamCloseReason::Finished
-    };
+    // Each direction reports a code only when the flag says one was set. A direction without
+    // one closed cleanly, which is not the same as closing with code zero.
+    let receiving = (flags & sys::NGTCP2_STREAM_CLOSE2_FLAG_RX_APP_ERROR_CODE_SET != 0)
+        .then(|| ApplicationErrorCode::new(rx_app_error_code));
+    let sending = (flags & sys::NGTCP2_STREAM_CLOSE2_FLAG_TX_APP_ERROR_CODE_SET != 0)
+        .then(|| ApplicationErrorCode::new(tx_app_error_code));
+
     if let Some(handler) = bridge.handlers.on_stream_close.as_mut() {
-        handler(id, reason);
+        handler(id, StreamCloseReason::new(receiving, sending));
     }
     0
 }
@@ -463,6 +472,48 @@ pub(crate) unsafe extern "C" fn handshake_completed_cb(
     };
     if let Some(handler) = bridge.handlers.on_handshake_completed.as_mut() {
         handler();
+    }
+    0
+}
+
+/// `ngtcp2_extend_max_local_streams_bidi`: the peer raised this endpoint's bidirectional
+/// stream limit.
+///
+/// `max_streams` is the cumulative total this endpoint may now open, not an increment
+/// (`ngtcp2.h:3074-3084`).
+///
+/// This is the only notification that a previously refused open may now succeed. An
+/// application that waits for it without this callback registered waits forever, because
+/// nothing else reports the limit moving — and the failure is a silent hang rather than an
+/// error.
+pub(crate) unsafe extern "C" fn extend_max_local_streams_bidi_cb(
+    _conn: *mut sys::ngtcp2_conn,
+    max_streams: u64,
+    user_data: *mut c_void,
+) -> core::ffi::c_int {
+    // SAFETY: `user_data` is the slot pointer given at construction.
+    let Some(bridge) = (unsafe { bridge(user_data) }) else {
+        return 0;
+    };
+    if let Some(handler) = bridge.handlers.on_extend_max_local_streams_bidi.as_mut() {
+        handler(max_streams);
+    }
+    0
+}
+
+/// `ngtcp2_extend_max_local_streams_uni`: the peer raised this endpoint's unidirectional
+/// stream limit. See [`extend_max_local_streams_bidi_cb`].
+pub(crate) unsafe extern "C" fn extend_max_local_streams_uni_cb(
+    _conn: *mut sys::ngtcp2_conn,
+    max_streams: u64,
+    user_data: *mut c_void,
+) -> core::ffi::c_int {
+    // SAFETY: `user_data` is the slot pointer given at construction.
+    let Some(bridge) = (unsafe { bridge(user_data) }) else {
+        return 0;
+    };
+    if let Some(handler) = bridge.handlers.on_extend_max_local_streams_uni.as_mut() {
+        handler(max_streams);
     }
     0
 }

@@ -1,0 +1,35 @@
+[package]
+name = "ngnet-quic-h3-tests"
+version = "0.1.0"
+description = "Integration tests driving HTTP/3 over ngtcp2, and against a foreign QUIC implementation"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# This crate exists so `ngnet-quic-h3` can be exercised end to end -- over real loopback UDP,
+# and against quinn -- without the crate itself acquiring a test certificate generator, a
+# runtime, or a second QUIC implementation. A workspace test asserts what `ngnet-quic-h3`
+# depends on, and anything beyond that belongs here.
+#
+# `[dependencies]` rather than `[dev-dependencies]` because the harness lives in `src/lib.rs`,
+# and a library target cannot see dev-dependencies.
+[dependencies]
+ngnet-quic-h3.workspace = true
+ngnet-quic = { workspace = true, features = ["tokio"] }
+ngnet-h3.workspace = true
+# For its quinn-backed transport, which is the foreign implementation these tests
+# interoperate against. Reused rather than written again: a second copy would drift, and the
+# point is to run against the same one the HTTP/3 crate is already tested with.
+ngnet-h3-tests = { path = "../ngnet-h3-tests" }
+
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+
+# The foreign QUIC implementation these tests interoperate against. Test-only: the crates
+# under test depend on nothing of the sort, and a dependency-graph check proves it.
+quinn.workspace = true
+rcgen.workspace = true
+tokio.workspace = true

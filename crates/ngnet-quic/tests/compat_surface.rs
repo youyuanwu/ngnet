@@ -64,6 +64,7 @@ fn the_public_surface_still_has_the_shape_it_promised() {
             ErrorKind::ConnectionUnusable => "unusable",
             ErrorKind::Closing => "closing",
             ErrorKind::Blocked => "blocked",
+            ErrorKind::StreamClosed => "stream-closed",
             ErrorKind::Internal => "internal",
             _ => "unknown",
         }
@@ -140,14 +141,26 @@ fn the_public_surface_still_has_the_shape_it_promised() {
     }
     let _ = on_stream_write;
 
-    // **Open.** A stream may come to end in ways QUIC does not define today, and adding one
-    // must not break a caller that only cares about the two it knows.
+    // **A stream that will take no more.** Distinct from invalid input: one is a normal end
+    // to recognise, the other is a bug to fix.
+    let _: ErrorKind = ErrorKind::StreamClosed;
+
+    // **Two directions, independently.** QUIC shuts a stream's halves separately, so this
+    // carries a code for each and either may be absent. A struct rather than an enum
+    // because the two are genuinely independent: any combination of present and absent is
+    // meaningful, which an enum would have to enumerate.
+    fn on_limits(handlers: Handlers<'static>) -> Handlers<'static> {
+        handlers
+            .on_extend_max_local_streams_bidi(|_max: u64| {})
+            .on_extend_max_local_streams_uni(|_max: u64| {})
+    }
+    let _ = on_limits;
+
     fn on_close(reason: StreamCloseReason) {
-        match reason {
-            StreamCloseReason::Finished => {}
-            StreamCloseReason::Reset(_code) => {}
-            _ => {}
-        }
+        let _: Option<ApplicationErrorCode> = reason.receiving();
+        let _: Option<ApplicationErrorCode> = reason.sending();
+        let _: bool = reason.is_clean();
+        let _ = StreamCloseReason::new(None, Some(ApplicationErrorCode::new(0x10c)));
     }
     let _ = on_close;
 
@@ -388,6 +401,8 @@ fn the_connection_surface_still_has_the_shape_it_promised() {
         let stream: StreamId = conn.open_bidi_stream()?;
         let _: StreamId = conn.open_uni_stream()?;
         let _: StreamWrite = conn.write_stream(&mut buf, stream, &[0], true, now)?;
+        let _: StreamWrite =
+            conn.write_stream_vectored(&mut buf, stream, &[&[0][..], &[1][..]], true, now)?;
         conn.shutdown_stream(stream, ApplicationErrorCode::new(0))?;
         conn.reset_stream(stream, ApplicationErrorCode::new(0))?;
         conn.stop_sending(stream, ApplicationErrorCode::new(0))?;
