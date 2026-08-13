@@ -19,6 +19,14 @@
 //! `read_pkt`, `writev_stream` and `write_connection_close` all state they "must not be
 //! called from inside the callback functions" (`ngtcp2.h:4256`, `:5318`, `:6665`).
 //!
+//! Note the scope of that rule, because it is narrower than it first reads: it covers the
+//! **packet-processing** entry points, not the whole API. The crypto callbacks in
+//! [`crate::tls_bridge`] are *required* to call back into the connection — installing keys
+//! and submitting handshake data from inside `client_initial` is how a handshake starts at
+//! all (`ngtcp2.h:2641-2648`). Those callbacks deliberately do not use this slot; they reach
+//! their state through the connection's TLS handle instead, so no second bridge is ever
+//! installed and the one-pointer argument above still holds.
+//!
 //! # The one callback this cannot serve
 //!
 //! `rand` receives neither the connection nor `user_data`, and fires during construction

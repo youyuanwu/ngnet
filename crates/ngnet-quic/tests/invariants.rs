@@ -219,6 +219,15 @@ fn the_allowance_list_is_the_ffi_boundary_and_nothing_else() {
         "settings",
         "stream_io",
         "tls",
+        // The generic translation between ngtcp2's crypto callbacks and the safe TLS seam.
+        //
+        // This is the module the safe seam exists to create. The `unsafe` a TLS backend
+        // used to be required to write -- filling a foreign callback table, holding a
+        // connection pointer, promising a handle outlives its connection -- is written here
+        // once, generically, instead of once per backend. The list growing by one entry so
+        // that every future backend can have none is the trade this work is making, and
+        // this is where it is recorded.
+        "tls_bridge",
         "tls_ossl",
         // Address validation. Retry tokens and stateless reset tokens are derived by
         // ngtcp2's crypto helpers, and writing a Retry packet needs packet protection --

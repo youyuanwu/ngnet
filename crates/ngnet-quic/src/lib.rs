@@ -85,6 +85,11 @@ mod settings;
 mod stream_io;
 #[allow(unsafe_code)]
 mod tls;
+// The generic translation between ngtcp2's crypto callbacks and the safe TLS seam. This is
+// where the `unsafe` a TLS backend used to be asked to write now lives, once, instead of
+// once per backend.
+#[allow(unsafe_code)]
+mod tls_bridge;
 #[cfg(feature = "tls-ossl")]
 #[allow(unsafe_code)]
 mod token;
