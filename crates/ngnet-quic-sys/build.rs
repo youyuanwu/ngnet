@@ -61,7 +61,7 @@ fn main() {
     println!("cargo::metadata=include={}", include_dir.display());
     println!("cargo::metadata=lib={}", lib_dir.display());
 
-    generate_bindings(&manifest_dir, &include_dir, openssl.as_ref());
+    generate_bindings(&manifest_dir, &include_dir, &source_dir, openssl.as_ref());
 }
 
 /// Resolve the ngtcp2 sources, preferring an explicit `NGTCP2_SOURCE_DIR`
@@ -299,6 +299,25 @@ impl bindgen::callbacks::ParseCallbacks for DurationTypes {
             | "NGTCP2_MINUTES"
             | "NGTCP2_DEFAULT_INITIAL_RTT"
             | "NGTCP2_DEFAULT_MAX_ACK_DELAY" => Some(bindgen::callbacks::IntKind::U64),
+            // The AEAD usage limits from the crypto helper's `shared.h`. Same
+            // story as the durations above, and the same cause: these are
+            // written `1ULL << 23` and `2965820ULL`, but bindgen sizes them by
+            // value, so AES-GCM's confidentiality limit arrives as a `u32`
+            // while ChaCha20-Poly1305's (1 << 62) arrives as a `u64`.
+            //
+            // Every one of them is assigned into `ngtcp2_crypto_ctx`'s
+            // `max_encryption` / `max_decryption_failure`, both `uint64_t`, and
+            // is compared against a packet count that is itself 64-bit. Leaving
+            // them mixed would put a silent `u32` in the middle of that
+            // comparison.
+            "NGTCP2_CRYPTO_MAX_ENCRYPTION_AES_GCM"
+            | "NGTCP2_CRYPTO_MAX_ENCRYPTION_CHACHA20_POLY1305"
+            | "NGTCP2_CRYPTO_MAX_ENCRYPTION_AES_CCM"
+            | "NGTCP2_CRYPTO_MAX_DECRYPTION_FAILURE_AES_GCM"
+            | "NGTCP2_CRYPTO_MAX_DECRYPTION_FAILURE_CHACHA20_POLY1305"
+            | "NGTCP2_CRYPTO_MAX_DECRYPTION_FAILURE_AES_CCM" => {
+                Some(bindgen::callbacks::IntKind::U64)
+            }
             // uint32_t. These already come out as u32 by value, but saying so
             // keeps them from following the value across a type boundary if
             // upstream ever changes one.
@@ -311,7 +330,12 @@ impl bindgen::callbacks::ParseCallbacks for DurationTypes {
     }
 }
 
-fn generate_bindings(manifest_dir: &Path, include_dir: &Path, openssl: Option<&OpenSsl>) {
+fn generate_bindings(
+    manifest_dir: &Path,
+    include_dir: &Path,
+    source_dir: &Path,
+    openssl: Option<&OpenSsl>,
+) {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
     let mut builder = bindgen::Builder::default()
@@ -337,6 +361,20 @@ fn generate_bindings(manifest_dir: &Path, include_dir: &Path, openssl: Option<&O
 
     if let Some(openssl) = openssl {
         builder = builder.clang_arg("-DNGNET_QUIC_SYS_CRYPTO_OSSL");
+        // The crypto helper's *internal* header, `shared.h`, is not installed —
+        // only `ngtcp2_crypto.h` and `ngtcp2_crypto_ossl.h` are. It declares the
+        // QUIC key schedule (`derive_initial_secrets`,
+        // `derive_packet_protection_key`, `hkdf_expand_label`) and the header
+        // protection cipher constructor, all of which are compiled into the
+        // archive with default visibility and are exactly what a TLS backend
+        // needs in order not to reimplement them.
+        //
+        // Pointing bindgen at the vendored source rather than restating those
+        // declarations by hand is what keeps the signatures honest: a change
+        // upstream becomes a compile error here, not a silent argument
+        // mismatch. The submodule is pinned, so nothing moves without a
+        // deliberate bump.
+        builder = builder.clang_arg(format!("-I{}", source_dir.join("crypto").display()));
         for dir in &openssl.include_paths {
             builder = builder.clang_arg(format!("-I{}", dir.display()));
         }
@@ -425,7 +463,56 @@ fn generate_bindings(manifest_dir: &Path, include_dir: &Path, openssl: Option<&O
             .allowlist_var("SSL_FILETYPE_PEM")
             .allowlist_var("X509_V_OK")
             .allowlist_var("X509_V_ERR_.*")
-            .allowlist_var("SSL_CTRL_CHAIN_CERT");
+            .allowlist_var("SSL_CTRL_CHAIN_CERT")
+            // ---------------------------------------------------------------
+            // OpenSSL's QUIC-TLS record layer, added in 3.5.
+            //
+            // This is the *only* part of `libngtcp2_crypto_ossl` that has to be
+            // replaced. `SSL_set_quic_tls_cbs` swaps OpenSSL's record layer for
+            // a dispatch table of our own, which is what the C helper does
+            // (`deps/ngtcp2/crypto/ossl/ossl.c:1252-1289`) -- it is an adapter
+            // over this API, not a privileged path into OpenSSL.
+            //
+            // The helper's version of this is unusable here for one specific
+            // reason: its callbacks recover the `ngtcp2_conn` by reading it
+            // back out of the `SSL`'s application data, which is what forces
+            // the TLS seam to hand a backend a connection pointer, and so what
+            // forces the seam to be `unsafe`. Driving the handshake ourselves
+            // is what removes that.
+            //
+            // Everything *else* the helper does -- packet protection, key
+            // derivation, cipher-suite discovery -- stays with the helper, so
+            // none of OpenSSL's EVP surface needs binding. See `shared.h`
+            // above.
+            //
+            // Calling `SSL_set_quic_tls_cbs` also forces TLS 1.3 as the minimum
+            // and disables middlebox compatibility, so no separate version
+            // pinning is needed.
+            .allowlist_function("SSL_set_quic_tls_cbs")
+            // Local transport parameters travel out of band rather than in the
+            // CRYPTO stream, and OpenSSL retains the buffer until it has sent
+            // them -- one of the two retention rules the backend must honour.
+            .allowlist_function("SSL_set_quic_tls_transport_params")
+            .allowlist_type("OSSL_DISPATCH")
+            // The six dispatch slots, named individually rather than by a
+            // wildcard so a slot appearing in a future OpenSSL cannot be picked
+            // up silently and left unimplemented.
+            .allowlist_var("OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_SEND")
+            .allowlist_var("OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RECV_RCD")
+            .allowlist_var("OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RELEASE_RCD")
+            .allowlist_var("OSSL_FUNC_SSL_QUIC_TLS_YIELD_SECRET")
+            .allowlist_var("OSSL_FUNC_SSL_QUIC_TLS_GOT_TRANSPORT_PARAMS")
+            .allowlist_var("OSSL_FUNC_SSL_QUIC_TLS_ALERT")
+            // OpenSSL reports secrets against its own protection levels, which
+            // have to be mapped onto ngtcp2's encryption levels.
+            .allowlist_var("OSSL_RECORD_PROTECTION_LEVEL_.*")
+            // Driving the handshake. `SSL_read` looks out of place in a QUIC
+            // stack: it is how post-handshake messages -- session tickets and
+            // key updates -- get processed once the handshake is done. The C
+            // helper calls it for exactly that reason (`ossl.c:993`), and
+            // omitting it fails silently rather than loudly.
+            .allowlist_function("SSL_do_handshake")
+            .allowlist_function("SSL_read");
     }
 
     let bindings = builder

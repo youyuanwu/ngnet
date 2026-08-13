@@ -18,6 +18,30 @@
 /* Not reached through <openssl/ssl.h>, but a TLS backend that cannot read the
    error queue can only report that a handshake failed, never why. */
 #include <openssl/err.h>
+/* The QUIC-TLS record layer's dispatch table. `<openssl/ssl.h>` declares
+   `SSL_set_quic_tls_cbs` but not the `OSSL_DISPATCH` type or the function
+   identifiers that populate it. */
+#include <openssl/core_dispatch.h>
+/* The crypto helper's internal header, which is compiled into the archive but
+   not installed. It declares the QUIC key schedule --
+   `ngtcp2_crypto_derive_initial_secrets`,
+   `ngtcp2_crypto_derive_packet_protection_key`,
+   `ngtcp2_crypto_hkdf_expand_label` -- along with the header protection cipher
+   constructor and the AEAD usage limits.
+
+   Using these is what keeps this crate out of the business of implementing the
+   QUIC key schedule. Reimplementing it would be the single highest-risk part
+   of supplying a TLS backend, because a subtly wrong salt or label produces two
+   endpoints that agree with each other and with nobody else -- which every test
+   in this repository would pass.
+
+   Depending on a header the install step does not publish is a real cost, and
+   is taken deliberately. It is bounded by the submodule being pinned, and by
+   bindgen reading the actual declarations rather than a restatement of them, so
+   a signature that changes upstream is a compile error rather than a silent
+   argument mismatch. `versioned_ffi.rs` already sets this precedent for a
+   constant restated from a private ngtcp2 header, and pins it with a test. */
+#include <shared.h>
 #endif
 
 /* ---------------------------------------------------------------------------
