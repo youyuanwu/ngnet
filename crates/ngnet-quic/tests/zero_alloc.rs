@@ -514,3 +514,165 @@ fn establishing_a_connection_bounds_its_allocations() {
     );
     eprintln!("establishing a connection allocated {allocations} times");
 }
+
+// Phase 2's region needs a driver pass over an established connection, which is the endpoint
+// layer rather than a bare `Conn`. The harness below is the in-memory, runtime-free one the
+// endpoint's own integration tests use, rebuilt here from the crate's public
+// `endpoint::testing` surface so this test needs no extra dependency.
+#[cfg(feature = "endpoint")]
+mod driver_pass {
+    use super::{StubEntropy, TEST_CERT_PEM, TEST_KEY_PEM, count_allocations};
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, Waker};
+    use ngnet_quic::endpoint::testing::{TestClock, TestSocket, socket_pair};
+    use ngnet_quic::endpoint::{Config, Connection, Endpoint, EndpointBuilder, EndpointDriver};
+    use ngnet_quic::{OsslBackend, OsslSession, Role};
+
+    type Driver = EndpointDriver<TestSocket, TestClock, OsslBackend>;
+
+    fn build(role: Role, socket: TestSocket, clock: TestClock) -> (Endpoint<OsslSession>, Driver) {
+        let backend = match role {
+            Role::Client => OsslBackend::builder(Role::Client)
+                .alpn("h3")
+                .trust_anchor_pem(TEST_CERT_PEM)
+                .use_system_trust_store(false)
+                .build()
+                .expect("a client backend"),
+            Role::Server => OsslBackend::builder(Role::Server)
+                .alpn("h3")
+                .certificate_chain_pem(TEST_CERT_PEM)
+                .private_key_pem(TEST_KEY_PEM)
+                .build()
+                .expect("a server backend"),
+        };
+        let seed = if role == Role::Client { 0 } else { 64 };
+        let mut builder = EndpointBuilder::new(socket, clock, backend)
+            .config(Config::new())
+            .entropy(move || StubEntropy(seed));
+        if role == Role::Server {
+            builder = builder.accepts(true);
+        }
+        builder.build().expect("an endpoint")
+    }
+
+    fn poll_all(drivers: &mut [Pin<Box<Driver>>], cx: &mut Context<'_>) {
+        for d in drivers.iter_mut() {
+            let _ = d.as_mut().poll(cx);
+        }
+    }
+
+    #[test]
+    fn a_driver_pass_over_an_established_connection_does_not_allocate_for_iteration() {
+        // Phase 2. `service` and `flush` each used to collect a `Vec<u64>` of connection
+        // indices on every pass, so no pass could ever report zero however little it did.
+        // With those replaced by a reusable scratch, a pass allocates only for the datagram
+        // buffer `next_datagram` still takes eagerly -- which Phase 5 removes -- and nothing
+        // for walking the connection list. The idle region below asserts exactly that: one
+        // established connection, one allocation, which the inversion (restoring the index
+        // vectors) turns into three.
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let (caddr, saddr) = (
+            "127.0.0.1:4433".parse().unwrap(),
+            "127.0.0.1:4434".parse().unwrap(),
+        );
+        let clock = TestClock::new();
+        let (cs, ss) = socket_pair(caddr, saddr);
+        let (client, cdrv) = build(Role::Client, cs, clock.clone());
+        let (server, sdrv) = build(Role::Server, ss, clock.clone());
+        let mut drivers: Vec<Pin<Box<Driver>>> = vec![Box::pin(cdrv), Box::pin(sdrv)];
+
+        let mut connecting = Box::pin(client.connect(saddr, Some("localhost")));
+        let mut accepting = Box::pin(server.accept());
+        let mut cside: Option<Connection> = None;
+        let mut sside: Option<Connection> = None;
+        for _ in 0..400 {
+            poll_all(&mut drivers, &mut cx);
+            if cside.is_none()
+                && let Poll::Ready(r) = connecting.as_mut().poll(&mut cx)
+            {
+                cside = Some(r.expect("the client handshake failed"));
+            }
+            if sside.is_none()
+                && let Poll::Ready(r) = accepting.as_mut().poll(&mut cx)
+            {
+                sside = Some(r.expect("the server accept failed"));
+            }
+            if cside.is_some() && sside.is_some() {
+                break;
+            }
+            clock.advance(2_000_000);
+        }
+        let mut cside = cside.expect("a client connection");
+        let mut sside = sside.expect("a server connection");
+        assert!(
+            cside.is_established() && sside.is_established(),
+            "the harness did not establish a connection for the pass to service"
+        );
+
+        // The pass does real work: 128 bytes of application data cross the connection under
+        // the driver's own passes, and the server accepts the stream. A region that measured
+        // a pass over a dead or empty connection would prove nothing, so this establishes
+        // that the driver is genuinely servicing a live connection before anything is counted.
+        let sid = {
+            let mut opening = cside.open_uni();
+            loop {
+                match Pin::new(&mut opening).poll(&mut cx) {
+                    Poll::Ready(r) => break r.expect("opening a stream"),
+                    Poll::Pending => {
+                        poll_all(&mut drivers, &mut cx);
+                        clock.advance(2_000_000);
+                    }
+                }
+            }
+        };
+        cside
+            .write(sid, &[0x5au8; 128], true)
+            .expect("writing stream data");
+        let mut accepted = None;
+        for _ in 0..64 {
+            poll_all(&mut drivers, &mut cx);
+            let mut accepting = sside.accept_stream();
+            if let Poll::Ready(r) = Pin::new(&mut accepting).poll(&mut cx) {
+                accepted = Some(r.expect("accepting the stream"));
+                break;
+            }
+            clock.advance(2_000_000);
+        }
+        assert!(
+            accepted.is_some(),
+            "the server never saw the stream, so the driver pass did no work"
+        );
+
+        // Quiesce, then stop the clock so no timer re-arms and no retransmission fires: what
+        // remains is a bare pass over an established, idle connection.
+        for _ in 0..64 {
+            poll_all(&mut drivers, &mut cx);
+            clock.advance(2_000_000);
+        }
+        // Warm the scratch and the armed sleep at the now-fixed clock, outside the count.
+        poll_all(&mut drivers, &mut cx);
+
+        // One idle pass of the client driver over its single established connection.
+        let (_, allocations) = count_allocations(|| {
+            let _ = drivers[0].as_mut().poll(&mut cx);
+        });
+
+        assert!(
+            cside.is_established() && sside.is_established(),
+            "the connection did not survive the pass, so the count is meaningless"
+        );
+        // At most one buffer per serviced connection, and here there is one connection. That
+        // one allocation is `next_datagram` taking a send buffer before it knows there is
+        // nothing to send -- removed in Phase 5, which is why this is `<=` rather than `==`.
+        // The point of this phase is the absence of the two index vectors, each of which the
+        // inversion check restores to push this count to three.
+        assert!(
+            allocations <= 1,
+            "an idle driver pass over one established connection allocated {allocations} \
+             times; more than one buffer means iterating the connections is still allocating"
+        );
+        eprintln!("idle driver pass allocated {allocations} times");
+    }
+}

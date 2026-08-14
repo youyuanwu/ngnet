@@ -238,6 +238,7 @@ where
             routes: HashMap::new(),
             next_index: 0,
             buffer: vec![0u8; MAX_DATAGRAM],
+            index_scratch: Vec::new(),
             accepts: self.accepts,
             outbox: std::collections::VecDeque::new(),
             #[cfg(feature = "tls-ossl")]
@@ -965,7 +966,9 @@ where
 
     /// Runs commands, services timers and writes.
     fn service(&mut self, cx: &mut Context<'_>) -> core::result::Result<(), Error> {
-        let indices: Vec<u64> = self.inner.connections.keys().copied().collect();
+        let mut indices = core::mem::take(&mut self.inner.index_scratch);
+        indices.clear();
+        indices.extend(self.inner.connections.keys().copied());
         for index in &indices {
             // Routing first: an identifier a connection has just minted must be installed
             // before any datagram announcing it goes out, or the peer may use it before the
@@ -974,6 +977,10 @@ where
             self.inner.apply_commands(*index);
             self.inner.handle_expiry(*index);
         }
+        // Restored before `flush`, which takes the same scratch. This loop has no early
+        // return, so returning it here is the only path out.
+        indices.clear();
+        self.inner.index_scratch = indices;
         self.inner.flush(cx)?;
         self.inner.evict();
         Ok(())

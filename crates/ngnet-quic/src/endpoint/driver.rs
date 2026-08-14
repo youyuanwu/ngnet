@@ -169,6 +169,13 @@ where
     pub(crate) next_index: u64,
     /// A receive buffer, reused so a pass allocates nothing.
     pub(crate) buffer: Vec<u8>,
+    /// A scratch list of connection indices, reused so iterating the connections while the
+    /// loop body mutates them costs no allocation. `service` and `flush` both need to walk
+    /// the connections without holding a borrow of the map across a body that inserts,
+    /// removes or re-borrows; each takes this with `mem::take`, fills it, and restores it,
+    /// the same discipline `buffer` above uses. They never overlap -- `service` restores it
+    /// before calling `flush` -- so one buffer serves both.
+    pub(crate) index_scratch: Vec<u64>,
     /// Whether this endpoint accepts connections it did not initiate.
     pub(crate) accepts: bool,
     /// Datagrams that belong to no connection -- Retry, Version Negotiation, stateless
@@ -887,8 +894,14 @@ where
             }
         }
 
-        let indices: Vec<u64> = self.connections.keys().copied().collect();
-        for index in indices {
+        let mut indices = core::mem::take(&mut self.index_scratch);
+        indices.clear();
+        indices.extend(self.connections.keys().copied());
+        // Indexed rather than iterated so the scratch is not borrowed across the body, which
+        // lets the error path below move it back before returning. The body re-borrows
+        // `connections`, so holding a borrow of it here would not compile anyway.
+        for i in 0..indices.len() {
+            let index = indices[i];
             while let Some(datagram) = self.next_datagram(index) {
                 let Some(tracked) = self.connections.get(&index) else {
                     break;
@@ -906,12 +919,18 @@ where
                         break;
                     }
                     Poll::Ready(Err(err)) => {
+                        // The scratch is restored on this path too, not just the normal one:
+                        // the buffer is reused across passes, so an error must not leak it.
+                        indices.clear();
+                        self.index_scratch = indices;
                         return Err(Error::new(ErrorKind::Socket, "the socket failed")
                             .with_source(SocketError(err.to_string())));
                     }
                 }
             }
         }
+        indices.clear();
+        self.index_scratch = indices;
         Ok(())
     }
 
