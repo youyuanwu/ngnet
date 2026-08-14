@@ -118,15 +118,35 @@ impl OwnedBytes {
     /// that can lend a stable slice works -- `Vec<u8>`, `Arc<Vec<u8>>`, a memory map, a
     /// caller's own buffer type.
     ///
-    /// [`AsRef::as_ref`] should return the same bytes every time it is called; ngtcp2 holds
-    /// the address across many calls. A misbehaving owner cannot cause unsoundness -- every
-    /// read is clamped to the length taken here at construction, and the release accounting
-    /// stores the length ngtcp2 was told about rather than measuring the buffer again -- but
-    /// it can corrupt its own stream. `Send + Sync` is required because the buffer is stored
-    /// behind an [`Arc`], which is `Send` only when its contents are both.
+    /// # Safety
+    ///
+    /// This is `unsafe` because the handle it returns is handed to ngtcp2 as a raw pointer
+    /// and a length, and ngtcp2 keeps that pair valid across many later calls
+    /// (`ngtcp2.h:5244-5248`). The bytes ultimately reach a C read that trusts the length,
+    /// so the caller must guarantee, for the entire life of the returned value and every
+    /// handle [`split_to`](Self::split_to) derives from it:
+    ///
+    /// - [`AsRef::as_ref`] returns a slice with the **same address and the same length**
+    ///   every time it is called. A [`Sync`] owner using interior mutability to return a
+    ///   short slice when the pointer is taken and a longer one when the length is taken
+    ///   would hand ngtcp2 a pointer valid for fewer bytes than the length claims, and C
+    ///   would read out of bounds. Clamping the length this crate records does **not**
+    ///   rescue such an owner: the pointer ngtcp2 keeps and the length it is told are read
+    ///   from `as_ref` at staging time, and a pointer and a length assembled from two
+    ///   different borrows are not a valid pair.
+    /// - The bytes those slices refer to are neither moved nor freed until this value and
+    ///   every handle derived from it are dropped. Reallocating the backing store -- again
+    ///   reachable through interior mutability under the `Sync` bound -- would dangle the
+    ///   pointer ngtcp2 still holds for retransmission.
+    ///
+    /// A well-behaved owner -- `Vec<u8>`, `Arc<[u8]>`, [`bytes::Bytes`], a read-only memory
+    /// map -- satisfies both trivially, which is why [`new`](Self::new) can wrap an
+    /// `Arc<[u8]>` from entirely safe code: an `Arc<[u8]>` cannot change its address or
+    /// length behind a shared reference. `Send + Sync` is required because the buffer is
+    /// stored behind an [`Arc`], which is `Send` only when its contents are both.
     ///
     /// [`bytes::Bytes`]: https://docs.rs/bytes
-    pub fn from_owner(owner: impl AsRef<[u8]> + Send + Sync + 'static) -> Self {
+    pub unsafe fn from_owner(owner: impl AsRef<[u8]> + Send + Sync + 'static) -> Self {
         let owner: Arc<dyn Owner> = Arc::new(owner);
         let end = owner.bytes().len();
         Self {
@@ -196,19 +216,29 @@ enum Payload {
 }
 
 impl Payload {
-    /// The fixed address ngtcp2 is handed a pointer into.
-    fn as_ptr(&self) -> *const u8 {
-        match self {
-            Self::Copied(data) => data.as_ptr(),
-            Self::Owned(bytes) => bytes.as_slice().as_ptr(),
-        }
-    }
-
     /// How many bytes were offered from this payload.
     fn len(&self) -> usize {
         match self {
             Self::Copied(data) => data.len(),
             Self::Owned(bytes) => bytes.len(),
+        }
+    }
+
+    /// The pointer and length ngtcp2 is handed, taken from a **single** borrow.
+    ///
+    /// Separate [`as_ptr`](Self::as_ptr) and [`len`](Self::len) calls would ask an
+    /// [`Owned`](Self::Owned) payload's owner for its slice twice, and a misbehaving owner
+    /// could answer differently each time -- a short slice for the pointer, a long one for
+    /// the length -- handing ngtcp2 a pointer valid for fewer bytes than the length claims.
+    /// Deriving both from one `as_slice` closes that gap: the pair ngtcp2 keeps is always
+    /// self-consistent, whatever the owner does on the next call.
+    fn ptr_and_len(&self) -> (*const u8, usize) {
+        match self {
+            Self::Copied(data) => (data.as_ptr(), data.len()),
+            Self::Owned(bytes) => {
+                let slice = bytes.as_slice();
+                (slice.as_ptr(), slice.len())
+            }
         }
     }
 }
@@ -298,8 +328,7 @@ impl Retained {
             // ngtcp2 took, and is always called before the write path returns.
             len: total,
         };
-        let ptr = chunk.data.as_ptr();
-        let len = chunk.data.len();
+        let (ptr, len) = chunk.data.ptr_and_len();
         entry.chunks.push_back(chunk);
         Some((ptr, len))
     }
@@ -329,8 +358,7 @@ impl Retained {
             start: entry.next_offset,
             len: total,
         };
-        let ptr = chunk.data.as_ptr();
-        let len = chunk.data.len();
+        let (ptr, len) = chunk.data.ptr_and_len();
         entry.chunks.push_back(chunk);
         Some((ptr, len))
     }
@@ -376,7 +404,8 @@ impl Retained {
     pub(crate) fn last_pointer(&self, stream: StreamId) -> Option<(*const u8, usize)> {
         let entry = self.streams.get(&stream.get())?;
         let chunk = entry.chunks.back()?;
-        Some((chunk.data.as_ptr(), chunk.len))
+        let (ptr, _) = chunk.data.ptr_and_len();
+        Some((ptr, chunk.len))
     }
 
     /// Releases everything acknowledged up to `offset + len` on a stream.
@@ -526,9 +555,10 @@ mod tests {
         let mut retained = Retained::default();
         let owner = CallerBuffer(vec![9u8, 8, 7]);
         let source = owner.0.as_ptr();
-        let (ptr, len) = retained
-            .stage_owned(sid(0), OwnedBytes::from_owner(owner))
-            .unwrap();
+        // SAFETY: `CallerBuffer` wraps an immutable `Vec` and lends the same slice on every
+        // call, so its address and length are stable for the life of the handle.
+        let owned = unsafe { OwnedBytes::from_owner(owner) };
+        let (ptr, len) = retained.stage_owned(sid(0), owned).unwrap();
         retained.commit(sid(0), 3);
         assert_eq!(
             ptr, source,
@@ -711,6 +741,34 @@ mod tests {
 
         // The first chunk is still where it was.
         let entry = retained.streams.get(&0).unwrap();
-        assert_eq!(entry.chunks.front().unwrap().data.as_ptr(), first);
+        assert_eq!(entry.chunks.front().unwrap().data.ptr_and_len().0, first);
+    }
+
+    /// The safe surface of `OwnedBytes` stays safe: `new` and every reader can be used from
+    /// code that forbids `unsafe` outright. `from_owner` is deliberately not exercised here
+    /// -- it is now `unsafe`, and its safety contract is what keeps the raw pointer ngtcp2
+    /// retains valid. Only `new`, which wraps an `Arc<[u8]>` that cannot misbehave, is on the
+    /// safe path to FR-007, and this proves that path needs no `unsafe` of its own.
+    #[test]
+    #[forbid(unsafe_code)]
+    fn the_safe_owned_bytes_surface_needs_no_unsafe() {
+        let mut bytes = OwnedBytes::new(vec![1u8, 2, 3, 4, 5, 6]);
+        assert_eq!(bytes.len(), 6);
+        assert!(!bytes.is_empty());
+        assert_eq!(bytes.as_slice(), &[1, 2, 3, 4, 5, 6]);
+
+        let prefix = bytes.split_to(2);
+        assert_eq!(prefix.as_slice(), &[1, 2]);
+        assert_eq!(bytes.as_slice(), &[3, 4, 5, 6]);
+        let _clone = bytes.clone();
+
+        // Staging the safely-constructed handle retains it without a copy, all from code that
+        // forbids `unsafe`.
+        let mut retained = Retained::default();
+        let (_, len) = retained
+            .stage_owned(sid(0), OwnedBytes::new(vec![7u8, 8, 9]))
+            .unwrap();
+        retained.commit(sid(0), len);
+        assert_eq!(retained.bytes_held(), 3);
     }
 }

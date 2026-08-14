@@ -454,7 +454,12 @@ fn the_owned_send_handle_still_has_the_shape_it_promised() {
             &self.0
         }
     }
-    let _: OwnedBytes = OwnedBytes::from_owner(Owned(vec![0u8]));
+    // `from_owner` is `unsafe`: the handle it yields backs a raw pointer ngtcp2 keeps, so the
+    // owner must lend a slice of stable address and length. `Owned` wraps an immutable `Vec`
+    // and satisfies that. The surface being pinned here is that it is an `unsafe fn` taking
+    // `impl AsRef<[u8]> + Send + Sync + 'static` and returning `OwnedBytes`.
+    // SAFETY: `Owned` never mutates its buffer, so `as_ref` is address- and length-stable.
+    let _: OwnedBytes = unsafe { OwnedBytes::from_owner(Owned(vec![0u8])) };
 
     let _: OwnedBytes = bytes.clone();
 }
