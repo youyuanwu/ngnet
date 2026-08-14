@@ -40,7 +40,7 @@ use ngnet_quic_sys as sys;
 use crate::error::{Error, ErrorKind, Result};
 use crate::tls::{
     Backend, CryptoError, Direction, DirectionalKeys, HP_MASK_LEN, HP_SAMPLE_LEN, HeaderKey,
-    InitialKeys, Level, PacketKey, Role, RotatedKeys, Session, SessionEvent,
+    InitialKeys, Iv, Level, PacketKey, Role, RotatedKeys, Session, SessionEvent,
 };
 
 /// The `SSL_ctrl` command behind the `SSL_set_tlsext_host_name` macro.
@@ -574,6 +574,7 @@ fn derive_keys_with(
 
     let packet = make(suite, &key)?;
     let header = OsslHeaderKey::new(suite, &hp)?;
+    let iv = Iv::new(&iv)?;
     Ok(DirectionalKeys { packet, header, iv })
 }
 
@@ -2358,8 +2359,14 @@ mod tests {
         let client = derive_initial_keys(Role::Client, v1, &dcid).unwrap();
         let server = derive_initial_keys(Role::Server, v1, &dcid).unwrap();
 
-        assert_eq!(client.tx.iv, hex("fa044b2f42a3fd3b46fb255c"));
-        assert_eq!(server.tx.iv, hex("0ac1493ca1905853b0bba03e"));
+        assert_eq!(
+            client.tx.iv.as_slice(),
+            hex("fa044b2f42a3fd3b46fb255c").as_slice()
+        );
+        assert_eq!(
+            server.tx.iv.as_slice(),
+            hex("0ac1493ca1905853b0bba03e").as_slice()
+        );
         // The roles agree on which key is whose, which is what actually has to hold.
         assert_eq!(client.rx.iv, server.tx.iv);
         assert_eq!(server.rx.iv, client.tx.iv);
@@ -2450,8 +2457,14 @@ mod tests {
         let client = derive_initial_keys(Role::Client, v2, &dcid).unwrap();
         let server = derive_initial_keys(Role::Server, v2, &dcid).unwrap();
 
-        assert_eq!(client.tx.iv, hex("91f73e2351d8fa91660e909f"));
-        assert_eq!(server.tx.iv, hex("dd13c276499c0249d3310652"));
+        assert_eq!(
+            client.tx.iv.as_slice(),
+            hex("91f73e2351d8fa91660e909f").as_slice()
+        );
+        assert_eq!(
+            server.tx.iv.as_slice(),
+            hex("dd13c276499c0249d3310652").as_slice()
+        );
 
         // And they differ from version 1's, which is what makes the assertion above mean
         // something rather than merely pass.

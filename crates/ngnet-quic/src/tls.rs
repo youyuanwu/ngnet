@@ -203,6 +203,53 @@ pub trait HeaderKey: Send + 'static {
     fn mask(&self, sample: &[u8]) -> core::result::Result<[u8; HP_MASK_LEN], CryptoError>;
 }
 
+/// A level's initialisation vector, held inline.
+///
+/// ngtcp2 accepts a vector between [`MIN_IV_LEN`](crate::validate) and
+/// [`MAX_IV_LEN`](crate::validate) bytes; both bounds guard a fixed stack buffer whose
+/// overrun release builds do not catch. Storing the bytes in an array of that maximum makes a
+/// longer one impossible to express rather than merely rejected, so no path through a backend
+/// can hand ngtcp2 an over-length vector. Construction is fallible: a backend that produces
+/// one outside the accepted range is refused here, at the seam, rather than deeper in.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Iv {
+    bytes: [u8; crate::validate::MAX_IV_LEN],
+    len: u8,
+}
+
+impl Iv {
+    /// Copies `bytes` inline, rejecting a length ngtcp2 could not handle.
+    pub fn new(bytes: &[u8]) -> Result<Self> {
+        crate::validate::iv_len(bytes.len())?;
+        let mut inline = [0u8; crate::validate::MAX_IV_LEN];
+        inline[..bytes.len()].copy_from_slice(bytes);
+        Ok(Self {
+            bytes: inline,
+            len: bytes.len() as u8,
+        })
+    }
+
+    /// The vector's bytes, without the inline padding behind them.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
+impl core::ops::Deref for Iv {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl core::fmt::Debug for Iv {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The padding behind the length is not part of the value and is not shown.
+        self.as_slice().fmt(f)
+    }
+}
+
 /// One direction's key material for one encryption level.
 ///
 /// The initialisation vector travels alongside the keys rather than inside them because
@@ -214,7 +261,7 @@ pub struct DirectionalKeys<P, H> {
     /// Masks headers.
     pub header: H,
     /// The initialisation vector the nonce is built from.
-    pub iv: Vec<u8>,
+    pub iv: Iv,
 }
 
 /// Both directions of the keys derived from a connection identifier.
@@ -247,13 +294,13 @@ pub struct RotatedKeys<P> {
     /// The new key for decrypting the peer.
     pub rx_packet: P,
     /// Its initialisation vector.
-    pub rx_iv: Vec<u8>,
+    pub rx_iv: Iv,
     /// The secret the generation after next is derived from.
     pub rx_secret: Vec<u8>,
     /// The new key for encrypting to the peer.
     pub tx_packet: P,
     /// Its initialisation vector.
-    pub tx_iv: Vec<u8>,
+    pub tx_iv: Iv,
     /// The secret the generation after next is derived from.
     pub tx_secret: Vec<u8>,
 }
