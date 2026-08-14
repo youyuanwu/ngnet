@@ -142,6 +142,36 @@ worth doing if this crate is ever used somewhere the copy matters.
 similar — alongside the copying one, so the zero-copy path is available without making the
 ordinary path require a paragraph of documentation to use safely.
 
+## Received packets are copied once more than they need to be
+
+The safe TLS seam protects payloads **in place**: `PacketKey::seal` and `PacketKey::open` take
+one `&mut [u8]` and work on it. That shape is forced on the send side. ngtcp2 encrypts in place
+— `cc->encrypt(payload, ..., payload, ...)` (`ngtcp2_ppe.c:142`) passes the same pointer as
+source and destination — and two overlapping slices, one shared and one mutable, cannot be
+formed in safe Rust at all. So the seam takes one buffer, and on the send path the bridge
+detects the aliasing and does nothing extra: sending is genuinely zero-copy, and
+`tests/zero_alloc.rs` pins that it allocates nothing.
+
+Receiving is not. ngtcp2 decrypts **out of place**, into a buffer it owns —
+`decrypt_pkt(conn->crypto.decrypt_buf.base, ..., payload, ...)`
+(`ngtcp2_conn.c:6846`, `:9457`) — so source and destination differ. The bridge therefore copies
+the ciphertext into the destination and opens it there, where the crypto helper it replaced
+handed both pointers to `EVP_DecryptUpdate` and read one while writing the other in a single
+pass. That is one extra pass over the payload of every packet received. No allocation, but a
+real memcpy of up to a full datagram.
+
+The in-place shape was applied uniformly because *encrypt* requires it. Nothing checked whether
+*decrypt* did, and it does not: ngtcp2's core never aliases the two buffers, even though its
+documented contract permits a backend to be handed aliasing pointers (`ngtcp2.h:2846`).
+
+**What would settle it:** give `open` separate `&[u8]` and `&mut [u8]` parameters. That is
+expressible in safe Rust precisely because the two never overlap here, and it removes the copy.
+The cost is that the seam then has two shapes rather than one, and a backend implementing `open`
+has to be told that its inputs may not alias — so the documentation has to carry what the type
+system currently carries for free. Worth doing if this crate is ever used somewhere the copy
+matters; worth measuring first, since a memcpy of 1200 bytes against an AEAD over the same 1200
+bytes may not show up at all.
+
 ## Mutual TLS is not implemented
 
 `Verify::RequireClientCertificate` exists and returns an error. It is there so that asking
