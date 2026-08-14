@@ -114,6 +114,17 @@ pub(crate) struct State {
     pub(crate) opened_bidi: std::collections::VecDeque<StreamId>,
     /// As above, unidirectional.
     pub(crate) opened_uni: std::collections::VecDeque<StreamId>,
+    /// A datagram buffer reused across passes.
+    ///
+    /// Every datagram this crate produces is handed to the endpoint's queue, which takes
+    /// ownership and may hold it across passes -- so one owned allocation per datagram is
+    /// forced and cannot be avoided. What this buffer avoids is a *second* allocation: the
+    /// connection writes each datagram directly into an owned buffer that is then handed
+    /// over as itself, rather than into a scratch that is copied out. The one buffer that a
+    /// pass does not send -- the one the final "nothing more to write" probe wrote into --
+    /// is kept here and reused next pass, so a settled connection's pass allocates nothing
+    /// and a pass producing `n` datagrams allocates exactly `n`.
+    pub(crate) scratch: Vec<u8>,
 }
 
 /// An established QUIC connection, in the shape the HTTP/3 layer runs over.
@@ -142,6 +153,9 @@ impl<S: Session> NgtcpConnection<S> {
                 limit_wakers: Vec::new(),
                 opened_bidi: std::collections::VecDeque::new(),
                 opened_uni: std::collections::VecDeque::new(),
+                // Sized once here, off any counted path: a connection is built after its
+                // handshake, so this allocation never falls inside a send pass.
+                scratch: vec![0u8; pump::MAX_DATAGRAM],
             },
             local: match role {
                 Role::Client => Initiator::Client,
@@ -162,6 +176,38 @@ impl<S: Session> NgtcpConnection<S> {
     /// but it is worth knowing.
     pub fn dropped_inbound(&self) -> u64 {
         self.detached.dropped_inbound()
+    }
+
+    /// Reads whatever the endpoint has routed here, and nothing more.
+    ///
+    /// Not a supported API: it exists so an allocation-counting test can leave the
+    /// connection owing an acknowledgement without also producing it, so the produce pass it
+    /// then measures starts from a known debt. This is the read half of [`pump`](pump::pump)
+    /// with the timer and the produce step removed.
+    #[doc(hidden)]
+    pub fn intake_for_test(&mut self) -> Result<()> {
+        let now = self.detached.now();
+        while let Some(datagram) = self.detached.next_inbound() {
+            self.detached
+                .conn
+                .read_pkt(&datagram, now)
+                .map_err(Error::transport)?;
+        }
+        Ok(())
+    }
+
+    /// Runs a single produce pass and reports how many datagrams it queued.
+    ///
+    /// Not a supported API: it exists so an allocation-counting test can measure the produce
+    /// pass on its own — the send path that owes acknowledgements and probes, and stages no
+    /// stream data, so the only allocation it can force is the one owned buffer per datagram
+    /// the endpoint's queue takes ownership of. Marked hidden and carrying no compatibility
+    /// promise, in the same spirit as `ngnet-quic`'s `endpoint::testing`.
+    #[doc(hidden)]
+    pub fn produce_pass_for_test(&mut self) -> Result<usize> {
+        let before = self.detached.outbound_len_for_test();
+        pump::produce(&mut self.detached, &mut self.state)?;
+        Ok(self.detached.outbound_len_for_test() - before)
     }
 
     /// Moves what the endpoint's handlers recorded into this crate's queue.
@@ -365,15 +411,23 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
         // The close datagram is produced and queued here, synchronously. The HTTP/3 driver
         // calls this last and then returns, so a close that only recorded an intention would
         // never reach the peer, which would wait out its idle timeout instead.
-        let mut buffer = vec![0u8; pump::MAX_DATAGRAM];
+        //
+        // Written straight into the buffer that is handed over, rather than into a scratch
+        // and copied: the endpoint's queue takes ownership, so this one allocation is forced
+        // and the copy that used to sit beside it is not.
+        let mut datagram = core::mem::take(&mut self.state.scratch);
+        datagram.resize(pump::MAX_DATAGRAM, 0);
         let now = self.detached.now();
         match self.detached.conn.write_connection_close(
-            &mut buffer,
+            &mut datagram,
             ApplicationErrorCode::new(code.get()),
             reason,
             now,
         ) {
-            Ok(len) if len > 0 => self.detached.send(buffer[..len].to_vec()),
+            Ok(len) if len > 0 => {
+                datagram.truncate(len);
+                self.detached.send(datagram);
+            }
             Ok(_) => {}
             Err(err) => return Err(Error::transport(err)),
         }

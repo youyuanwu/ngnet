@@ -11,6 +11,7 @@
 //!   `stream_close` callback reports one code and no direction, so a stream reset one way
 //!   and stop-sent the other is indistinguishable from either alone.
 
+use std::io::IoSlice;
 use std::sync::{Arc, Mutex};
 
 use ngnet_quic::{
@@ -495,7 +496,13 @@ fn a_vectored_write_arrives_as_one_ordered_run_of_bytes() {
     let expected: Vec<u8> = [head, middle, tail].concat();
 
     let accepted = match client
-        .write_stream_vectored(&mut buf, stream, &[head, middle, tail], true, clock.now())
+        .write_stream_vectored(
+            &mut buf,
+            stream,
+            &[IoSlice::new(head), IoSlice::new(middle), IoSlice::new(tail)],
+            true,
+            clock.now(),
+        )
         .expect("writing several ranges")
     {
         StreamWrite::Datagram { len, accepted } => {

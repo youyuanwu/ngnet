@@ -99,7 +99,6 @@ pub(crate) fn produce<S: Session>(
     detached: &mut DetachedConnection<S>,
     state: &mut State,
 ) -> Result<()> {
-    let mut buffer = vec![0u8; MAX_DATAGRAM];
     // Bounded so a connection that always has something to say cannot keep this pass from
     // returning.
     for _ in 0..64 {
@@ -107,11 +106,24 @@ pub(crate) fn produce<S: Session>(
             break;
         }
         let now = detached.now();
-        match detached.conn.write_pkt(&mut buffer, now) {
+        // Write directly into the buffer that will be handed over. `scratch` carries one
+        // reusable buffer between passes; a datagram consumes it and the next iteration
+        // allocates its replacement, so a pass producing datagrams allocates exactly one
+        // owned buffer each and a pass producing none allocates nothing.
+        let mut datagram = core::mem::take(&mut state.scratch);
+        datagram.resize(MAX_DATAGRAM, 0);
+        match detached.conn.write_pkt(&mut datagram, now) {
             Ok(WriteOutcome::Datagram { len }) => {
-                detached.send(buffer[..len].to_vec());
+                datagram.truncate(len);
+                detached.send(datagram);
             }
-            Ok(WriteOutcome::Blocked | WriteOutcome::Idle) => break,
+            Ok(WriteOutcome::Blocked | WriteOutcome::Idle) => {
+                // Nothing was produced, so this buffer is untouched storage: keep it for the
+                // next pass rather than dropping it and reallocating one.
+                datagram.clear();
+                state.scratch = datagram;
+                break;
+            }
             Err(err) => {
                 state.closed = true;
                 return Err(Error::transport(err));

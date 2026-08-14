@@ -20,7 +20,6 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
     source: &mut Src,
 ) -> Result<()> {
     let mut failure: Option<Error> = None;
-    let mut buffer = vec![0u8; MAX_DATAGRAM];
 
     // Bounded so a layer with an endless supply cannot keep this pass from returning.
     for _ in 0..64 {
@@ -33,19 +32,27 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
         }
 
         let now = detached.now();
+        // Write directly into the buffer that will be handed over -- the same reused buffer
+        // `produce` uses, and for the same reason: the endpoint's queue takes ownership, so
+        // one owned allocation per datagram is forced, but the copy out of a scratch that
+        // used to sit beside it is not.
+        let mut datagram = core::mem::take(&mut state.scratch);
+        datagram.resize(MAX_DATAGRAM, 0);
         let conn = &mut detached.conn;
-        let mut produced: Option<Vec<u8>> = None;
+        let mut produced_len: Option<usize> = None;
         let mut released: Option<(StreamId, usize)> = None;
 
         let offered = source.write_next(&mut |stream, slices, fin| {
             let Ok(id) = StreamId::new(stream.get()) else {
                 return H3WriteOutcome::Gone;
             };
-            let ranges: Vec<&[u8]> = slices.iter().map(|s| &s[..]).collect();
 
-            match conn.write_stream_vectored(&mut buffer, id, &ranges, fin, now) {
+            // The source's slices are already `IoSlice`s, and `write_stream_vectored` now
+            // takes them as such -- so they pass straight through with no per-offer vector
+            // to collect them into.
+            match conn.write_stream_vectored(&mut datagram, id, slices, fin, now) {
                 Ok(StreamWrite::Datagram { len, accepted }) => {
-                    produced = Some(buffer[..len].to_vec());
+                    produced_len = Some(len);
                     if accepted > 0 {
                         released = Some((id, accepted));
                     }
@@ -69,8 +76,14 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
             }
         });
 
-        if let Some(datagram) = produced.take() {
+        if let Some(len) = produced_len {
+            datagram.truncate(len);
             detached.send(datagram);
+        } else {
+            // No datagram was produced, so this is untouched storage: keep it for reuse
+            // rather than dropping and reallocating one next time.
+            datagram.clear();
+            state.scratch = datagram;
         }
         // The transport has taken a copy of these bytes, so the layer's own buffer is its
         // again. Reporting it here rather than on acknowledgement is what keeps a body in

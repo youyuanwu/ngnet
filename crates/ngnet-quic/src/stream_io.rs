@@ -18,6 +18,8 @@
 
 use ngnet_quic_sys as sys;
 
+use std::io::IoSlice;
+
 use crate::conn::Conn;
 use crate::error::{ApplicationErrorCode, Error, Result};
 use crate::stream::StreamId;
@@ -116,7 +118,7 @@ impl<S: Session> Conn<'_, S> {
         fin: bool,
         now: Timestamp,
     ) -> Result<StreamWrite> {
-        self.write_stream_vectored(dest, stream, &[data], fin, now)
+        self.write_stream_vectored(dest, stream, &[IoSlice::new(data)], fin, now)
     }
 
     /// Writes stream data supplied as several separate ranges, and produces one datagram.
@@ -133,6 +135,10 @@ impl<S: Session> Conn<'_, S> {
     /// be a second copy on top of the one retention already makes. This joins them *into*
     /// the retained copy, so the byte count is unchanged.
     ///
+    /// The ranges arrive as [`IoSlice`]s rather than `&[&[u8]]` so a vectored source — most
+    /// obviously the HTTP/3 layer, whose body writes are already `IoSlice`s — can pass them
+    /// through without first collecting them into a temporary vector.
+    ///
     /// # Errors
     ///
     /// Returns an error if ngtcp2 refuses; the connection is then unusable.
@@ -140,7 +146,7 @@ impl<S: Session> Conn<'_, S> {
         &mut self,
         dest: &mut [u8],
         stream: StreamId,
-        ranges: &[&[u8]],
+        ranges: &[IoSlice<'_>],
         fin: bool,
         now: Timestamp,
     ) -> Result<StreamWrite> {

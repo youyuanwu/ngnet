@@ -443,6 +443,16 @@ impl<S: Session> DetachedConnection<S> {
         self.shared.queue_outbound(datagram);
     }
 
+    /// How many datagrams this connection has queued for the endpoint to send.
+    ///
+    /// Not a supported API: an allocation-counting test uses the difference across a send
+    /// pass to learn how many datagrams that pass produced, which is what lets it assert one
+    /// allocation per datagram and nothing besides.
+    #[doc(hidden)]
+    pub fn outbound_len_for_test(&self) -> usize {
+        self.shared.outbound_len()
+    }
+
     /// Registers a waker to be woken when a datagram arrives for this connection.
     pub fn register(&self, waker: &core::task::Waker) {
         self.shared.register(waker);

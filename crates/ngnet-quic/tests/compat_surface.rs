@@ -12,6 +12,8 @@
 //! an open one is where adding a variant must not break anyone. Which is which is a
 //! deliberate decision, recorded here by how it is matched.
 
+use std::io::IoSlice;
+
 use ngnet_quic::{
     ApplicationErrorCode, Backend, ConnBuilder, ConnectionId, CryptoError, Direction,
     DirectionalKeys, Directionality, Duration, EntropySource, Error, ErrorKind, ExpiryOutcome,
@@ -449,8 +451,13 @@ fn the_connection_surface_still_has_the_shape_it_promised() {
         let stream: StreamId = conn.open_bidi_stream()?;
         let _: StreamId = conn.open_uni_stream()?;
         let _: StreamWrite = conn.write_stream(&mut buf, stream, &[0], true, now)?;
-        let _: StreamWrite =
-            conn.write_stream_vectored(&mut buf, stream, &[&[0][..], &[1][..]], true, now)?;
+        let _: StreamWrite = conn.write_stream_vectored(
+            &mut buf,
+            stream,
+            &[IoSlice::new(&[0]), IoSlice::new(&[1])],
+            true,
+            now,
+        )?;
         conn.shutdown_stream(stream, ApplicationErrorCode::new(0))?;
         conn.reset_stream(stream, ApplicationErrorCode::new(0))?;
         conn.stop_sending(stream, ApplicationErrorCode::new(0))?;
