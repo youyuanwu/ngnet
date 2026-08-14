@@ -855,13 +855,11 @@ where
         self.inner.has_pending()
     }
 
-    /// Runs the command and timer half of a pass, for the allocation-counting tests.
-    ///
-    /// Command production now offers each stream datagram it produces to the socket before
-    /// the reusable buffer is reused, so this half is where a stream send completes or is
-    /// refused -- not a place that merely stages `pending` for a later counted flush. A test
-    /// counting a complete driver send pass must count this call, which is why it takes the
-    /// task context the send needs. Hidden and unsupported.
+    /// Runs the command and timer half of a pass, without the send half, for the
+    /// allocation-counting tests. Command production offers each stream datagram it produces
+    /// to the socket, so this half completes or refuses a stream send; it does not flush, so a
+    /// datagram a test wants held as `pending` for a later counted flush stays held. It takes
+    /// the task context the send needs. Hidden and unsupported.
     #[doc(hidden)]
     pub fn service_commands_for_test(&mut self, cx: &mut Context<'_>) {
         let indices: Vec<u64> = self.inner.connections.keys().copied().collect();
@@ -870,6 +868,17 @@ where
             self.inner.apply_commands(*index, cx);
             self.inner.handle_expiry(*index);
         }
+    }
+
+    /// Runs the whole command-and-send pass -- exactly what a `poll` does apart from reading
+    /// the socket and re-arming the timer -- for the allocation-counting tests. This is the
+    /// pass that walks the connection list twice, once to service commands and once to flush,
+    /// using the driver's reusable index scratch rather than the two `Vec<u64>`s Phase 2
+    /// removed. Excluding the re-arm keeps the boxed-timer allocation, which has nothing to do
+    /// with walking the list, out of a test that counts the walk. Hidden and unsupported.
+    #[doc(hidden)]
+    pub fn service_for_test(&mut self, cx: &mut Context<'_>) -> core::result::Result<(), Error> {
+        self.service(cx)
     }
 
     /// Runs one send pass in isolation, for the allocation-counting tests. This is the half

@@ -582,7 +582,11 @@ fn sending_owned_data_allocates_nothing_where_a_borrowed_send_allocates() {
 
     // The owning send of an already-allocated buffer. The handle is built outside the count,
     // so its one allocation is not charged here; inside, only an `Arc` refcount bump happens
-    // as the handle is cloned into retention.
+    // as the handle is cloned into retention. The clock is advanced first so ngtcp2's pacer
+    // will emit a second datagram rather than returning `Blocked` at the warm-up's timestamp;
+    // the step is far below the connection's PTO, so no retransmission fires to perturb the
+    // count.
+    clock.advance(20_000_000);
     let owned = OwnedBytes::new(payload.to_vec());
     let (owned_write, owned_allocs) = count_allocations(|| {
         client
@@ -595,33 +599,58 @@ fn sending_owned_data_allocates_nothing_where_a_borrowed_send_allocates() {
          keeping the handle alive"
     );
     // Partial acceptance is real, not assumed: whatever ngtcp2 left is handed back as a view
-    // into the same allocation, and it is exactly the payload minus what was taken.
-    if let StreamWrite::Datagram { len, accepted } = owned_write.outcome {
-        assert_eq!(
-            owned_write.unsent.len(),
-            payload.len() - accepted,
-            "the unaccepted suffix must be exactly what ngtcp2 left"
-        );
-        if len > 0 {
-            server
-                .read_pkt(&buf[..len], clock.now())
-                .expect("server reads the owned datagram");
-        }
+    // into the same allocation, and it is exactly the payload minus what was taken. The
+    // counted call must actually have produced a datagram carrying owned bytes -- a `Blocked`
+    // or `Idle` outcome would send nothing, and a zero allocation count over a call that did
+    // nothing would prove nothing -- so this requires a datagram that accepted bytes.
+    let (owned_len, owned_accepted) = match owned_write.outcome {
+        StreamWrite::Datagram { len, accepted } => (len, accepted),
+        other => panic!(
+            "the owned write produced no datagram ({other:?}); a zero allocation count over a \
+             send that produced nothing proves nothing"
+        ),
+    };
+    assert!(
+        owned_accepted > 0,
+        "the owned write accepted no bytes, so the counted call sent no owned data"
+    );
+    assert_eq!(
+        owned_write.unsent.len(),
+        payload.len() - owned_accepted,
+        "the unaccepted suffix must be exactly what ngtcp2 left"
+    );
+    if owned_len > 0 {
+        server
+            .read_pkt(&buf[..owned_len], clock.now())
+            .expect("server reads the owned datagram");
     }
 
     // The borrowing send of the identical payload. It cannot keep the borrow, so every
-    // accepted byte is copied into a buffer the crate owns -- at least one allocation.
+    // accepted byte is copied into a buffer the crate owns -- at least one allocation. The
+    // clock is advanced again so the pacer emits this datagram too, and the outcome is
+    // required to be a datagram that accepted bytes so the comparison is between two sends
+    // that both did the same work -- not one against a `Blocked` no-op.
+    clock.advance(20_000_000);
     let (borrowed_write, borrowed_allocs) = count_allocations(|| {
         client
             .write_stream(&mut buf, stream, &payload, false, clock.now())
             .expect("borrowed write")
     });
-    if let StreamWrite::Datagram { len, .. } = borrowed_write {
-        if len > 0 {
-            server
-                .read_pkt(&buf[..len], clock.now())
-                .expect("server reads the borrowed datagram");
-        }
+    let (borrowed_len, borrowed_accepted) = match borrowed_write {
+        StreamWrite::Datagram { len, accepted } => (len, accepted),
+        other => panic!(
+            "the borrowing send produced no datagram ({other:?}); the comparison needs both \
+             sends to have carried the payload"
+        ),
+    };
+    assert!(
+        borrowed_accepted > 0,
+        "the borrowing send accepted no bytes, so it did not carry the payload"
+    );
+    if borrowed_len > 0 {
+        server
+            .read_pkt(&buf[..borrowed_len], clock.now())
+            .expect("server reads the borrowed datagram");
     }
     assert!(
         borrowed_allocs >= 1,
@@ -920,11 +949,12 @@ mod driver_pass {
     fn a_driver_pass_over_an_established_connection_does_not_allocate_for_iteration() {
         // Phase 2. `service` and `flush` each used to collect a `Vec<u64>` of connection
         // indices on every pass, so no pass could ever report zero however little it did.
-        // With those replaced by a reusable scratch, a pass allocates only for the datagram
-        // buffer `next_datagram` still takes eagerly -- which Phase 5 removes -- and nothing
-        // for walking the connection list. The idle region below asserts exactly that: one
-        // established connection, one allocation, which the inversion (restoring the index
-        // vectors) turns into three.
+        // With those replaced by a reusable scratch -- and, after Phase 5, with `next_datagram`
+        // writing into the driver's reusable send buffer -- a pass that walks an established
+        // connection and forwards a datagram it already owns allocates nothing. The region
+        // below proves that by giving the counted pass one observable, zero-allocation thing to
+        // do: flush a held datagram. The inversion (restoring the index vectors) pushes the
+        // count above zero.
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         let (caddr, saddr) = (
@@ -1008,26 +1038,91 @@ mod driver_pass {
         // Warm the scratch and the armed sleep at the now-fixed clock, outside the count.
         poll_all(&mut drivers, &mut cx);
 
-        // One idle pass of the client driver over its single established connection.
-        let (_, allocations) = count_allocations(|| {
-            let _ = drivers[0].as_mut().poll(&mut cx);
-        });
+        // A pass that only walks an idle connection could report zero simply because it
+        // serviced nothing, so the counted pass is given one observable thing to do that still
+        // allocates nothing: flush a datagram it already owns. The held stream is written and
+        // its datagram refused once, so the driver holds it as `pending`; the counted pass must
+        // then walk to this connection and hand that already-owned datagram to the socket, which
+        // copies nothing. The socket is a sink from here so that delivery adds no allocation of
+        // the harness's own to the count.
+        //
+        // The counted call is `service_for_test`, the whole command-and-send pass -- the two
+        // connection-list walks Phase 2 gave a reusable scratch -- minus the socket read and the
+        // timer re-arm a full `poll` also does. The re-arm allocates its boxed timer future when
+        // the deadline moves, which the send here does; that allocation has nothing to do with
+        // walking the list, so counting the walk excludes it.
+        drivers[0].as_ref().socket_for_test().set_sink(true);
+        let held_stream = {
+            let mut opening = cside.open_uni();
+            loop {
+                match Pin::new(&mut opening).poll(&mut cx) {
+                    Poll::Ready(r) => break r.expect("opening the held stream"),
+                    Poll::Pending => {
+                        poll_all(&mut drivers, &mut cx);
+                    }
+                }
+            }
+        };
+        cside
+            .write(held_stream, &[0x5au8; 128], true)
+            .expect("writing the held stream");
+        drivers[0]
+            .as_ref()
+            .socket_for_test()
+            .inject(ngnet_quic::endpoint::testing::Fault::SendWouldBlock);
+        let sent_before_stage = drivers[0].as_ref().socket_for_test().sent();
+        // The command-and-timer half only: it produces the datagram and lets the socket refuse
+        // it, holding it as `pending`, and -- unlike the send half -- does not then flush it.
+        drivers[0]
+            .as_mut()
+            .get_mut()
+            .service_commands_for_test(&mut cx);
+        assert_eq!(
+            drivers[0].as_ref().socket_for_test().sent(),
+            sent_before_stage,
+            "the staged datagram was sent, not refused, so nothing is held for the pass to flush"
+        );
+        assert!(
+            drivers[0].as_ref().has_pending_for_test(),
+            "the refused datagram was not held, so the counted pass would have nothing to flush"
+        );
+
+        // The counted pass: it walks its single established connection and flushes the held
+        // datagram.
+        let sent_before = drivers[0].as_ref().socket_for_test().sent();
+        let (result, allocations) =
+            count_allocations(|| drivers[0].as_mut().get_mut().service_for_test(&mut cx));
+        result.expect("the counted pass failed");
+        let sent_after = drivers[0].as_ref().socket_for_test().sent();
 
         assert!(
             cside.is_established() && sside.is_established(),
             "the connection did not survive the pass, so the count is meaningless"
         );
-        // Now zero: `next_datagram` no longer takes a send buffer before it knows there is
-        // anything to send -- Phase 5 gave it the driver's reusable buffer to write into --
-        // so an idle pass over an established connection allocates nothing at all. The point
-        // of this phase remains the absence of the two index vectors, each of which the
-        // inversion check restores to push this count to three.
+        // The observable action: the counted pass sent the held datagram and no longer holds
+        // it. A pass that walked no connection would have flushed nothing and left it pending,
+        // so this ties the zero count below to a pass that genuinely serviced the connection.
+        assert!(
+            sent_after > sent_before,
+            "the counted pass sent nothing, so it serviced no connection and a zero count would \
+             prove nothing"
+        );
+        assert!(
+            !drivers[0].as_ref().has_pending_for_test(),
+            "the counted pass left the held datagram unsent, so it did not service the connection"
+        );
+        // Zero: walking the connection list uses a reusable scratch rather than a fresh
+        // `Vec<u64>`, `next_datagram` writes into the driver's reusable send buffer instead of
+        // taking one of its own, and the held datagram is forwarded as itself. So a pass that
+        // services an established connection -- flushing a datagram it already owns -- allocates
+        // nothing at all. The inversion check restores the two index vectors, each of which
+        // pushes this count above zero.
         assert_eq!(
             allocations, 0,
-            "an idle driver pass over one established connection allocated {allocations} \
-             times; it is supposed to allocate nothing once the send buffer is reused"
+            "a driver pass that serviced one established connection allocated {allocations} \
+             times; walking the connection list and forwarding an owned datagram is supposed to \
+             allocate nothing"
         );
-        eprintln!("idle driver pass allocated {allocations} times");
     }
 
     /// A clock two endpoints can share across the `Send + Sync` bound that `build_detachable`
