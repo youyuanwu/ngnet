@@ -14,8 +14,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use ngnet_quic::{
-    Backend as TlsBackend, ConnBuilder, EntropySource, Handlers, OsslBackend, Result, Role,
-    Settings, Timestamp, TransportParams, Verify, WriteOutcome,
+    Backend as TlsBackend, ConnBuilder, EntropySource, Handlers, Inspection, OsslBackend,
+    OsslSession, ReadOutcome, Result, Role, Settings, StreamWrite, Timestamp, TransportParams,
+    Verify, WriteOutcome, inspect,
 };
 
 thread_local! {
@@ -122,17 +123,33 @@ fn writing_packets_allocates_nothing_in_the_wrapper() {
     let _ = conn.write_pkt(&mut buf, start);
 
     let mut when = 2_000_000u64;
-    let (_, allocations) = count_allocations(|| {
+    // A count of zero proves nothing if the loop produced no datagram, so the region also
+    // records how many bytes it wrote and asserts a datagram genuinely came out. The
+    // warm-up above consumes the first Initial; the client still has a second one to send,
+    // so at least one pass here writes a real packet.
+    let ((datagrams, bytes), allocations) = count_allocations(|| {
+        let mut datagrams = 0usize;
+        let mut bytes = 0usize;
         for _ in 0..8 {
             let now = Timestamp::from_nanos(when).unwrap();
             when += 2_000_000;
             match conn.write_pkt(&mut buf, now) {
-                Ok(WriteOutcome::Datagram { .. } | WriteOutcome::Idle | WriteOutcome::Blocked) => {}
+                Ok(WriteOutcome::Datagram { len }) => {
+                    datagrams += 1;
+                    bytes += len;
+                }
+                Ok(WriteOutcome::Idle | WriteOutcome::Blocked) => {}
                 Err(_) => break,
             }
         }
+        (datagrams, bytes)
     });
 
+    assert!(
+        datagrams > 0 && bytes > 0,
+        "the send loop produced no datagram ({datagrams} datagrams, {bytes} bytes), so a \
+         zero allocation count would prove nothing"
+    );
     assert_eq!(
         allocations, 0,
         "the send loop allocated {allocations} times; the wrapper is supposed to write \
@@ -162,15 +179,31 @@ fn asking_for_the_expiry_allocates_nothing() {
     .build(Handlers::new())
     .unwrap();
 
-    let (_, allocations) = count_allocations(|| {
+    // A count of zero is vacuous if the queries never ran, so the region reports the last
+    // expiry it read and how many times it read one. The assertions below require both a
+    // concrete deadline and that the loop actually executed -- a region that queried nothing
+    // would satisfy neither.
+    let ((ran, deadline), allocations) = count_allocations(|| {
+        let mut ran = 0usize;
+        let mut deadline = None;
         for _ in 0..64 {
-            let _ = conn.expiry();
+            deadline = conn.expiry();
             let _ = conn.in_closing_period();
             let _ = conn.in_draining_period();
             let _ = conn.is_handshake_completed();
+            ran += 1;
         }
+        (ran, deadline)
     });
 
+    assert!(
+        ran > 0,
+        "the query loop never ran, so a zero count proves nothing"
+    );
+    assert!(
+        deadline.is_some(),
+        "the connection reported no expiry, so the region queried nothing concrete"
+    );
     assert_eq!(allocations, 0, "querying a connection should be free");
 }
 
@@ -198,4 +231,286 @@ fn the_counter_is_disarmed_outside_a_measured_region() {
         before, after,
         "allocations outside a measured region must not be counted"
     );
+}
+
+// The read and handshake regions below need two connections that have actually completed a
+// handshake, driven entirely in memory. The wrapper is sans-I/O, so a datagram is moved from
+// one side to the other by hand; there is no socket and no runtime. The certificate is the
+// committed test one -- generating it would need a dev-dependency the crate forbids.
+
+/// The committed self-signed certificate for `localhost`.
+const TEST_CERT_PEM: &str = include_str!("data/test-cert.pem");
+/// Its private key. Public and worthless; see `tests/data/README.md`.
+const TEST_KEY_PEM: &str = include_str!("data/test-key.pem");
+
+/// A clock the harness advances by hand.
+///
+/// ngtcp2 paces its sending, so a clock that never moves yields one datagram and then
+/// silence. Advancing time between passes is what lets a handshake finish.
+struct HandClock {
+    now: Cell<u64>,
+}
+
+impl HandClock {
+    fn new() -> Self {
+        // Non-zero: ngtcp2 reads a zero start as a real instant an eternity ago.
+        Self {
+            now: Cell::new(1_000_000_000),
+        }
+    }
+
+    fn now(&self) -> Timestamp {
+        Timestamp::from_nanos(self.now.get()).unwrap()
+    }
+
+    fn advance(&self, nanos: u64) {
+        self.now.set(self.now.get() + nanos);
+    }
+
+    fn advance_to(&self, when: Timestamp) {
+        let target = when.as_nanos();
+        if target > self.now.get() {
+            self.now.set(target);
+        }
+    }
+}
+
+/// A connection under test.
+type HandConn = ngnet_quic::Conn<'static, OsslSession>;
+
+fn client_backend() -> OsslBackend {
+    OsslBackend::builder(Role::Client)
+        .alpn("h3")
+        .verify(Verify::DangerouslyAcceptAnyCertificate)
+        .build()
+        .expect("a client backend")
+}
+
+fn server_backend() -> OsslBackend {
+    OsslBackend::builder(Role::Server)
+        .alpn("h3")
+        .certificate_chain_pem(TEST_CERT_PEM)
+        .private_key_pem(TEST_KEY_PEM)
+        .build()
+        .expect("a server backend")
+}
+
+/// Drains a connection's outbound datagrams, advancing the clock for pacing.
+fn drain(conn: &mut HandConn, clock: &HandClock) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 1500];
+    for _ in 0..64 {
+        match conn
+            .write_pkt(&mut buf, clock.now())
+            .expect("writing a packet")
+        {
+            WriteOutcome::Datagram { len } => {
+                out.push(buf[..len].to_vec());
+                clock.advance(2_000_000);
+            }
+            WriteOutcome::Idle | WriteOutcome::Blocked => break,
+        }
+    }
+    out
+}
+
+/// Relays datagrams between two connections until both go quiet, honouring their deadlines.
+fn pump(client: &mut HandConn, server: &mut HandConn, clock: &HandClock, rounds: usize) {
+    for _ in 0..rounds {
+        let mut progressed = false;
+        for datagram in drain(client, clock) {
+            progressed = true;
+            if server
+                .read_pkt(&datagram, clock.now())
+                .expect("server read")
+                != ReadOutcome::Processed
+            {
+                return;
+            }
+        }
+        for datagram in drain(server, clock) {
+            progressed = true;
+            if client
+                .read_pkt(&datagram, clock.now())
+                .expect("client read")
+                != ReadOutcome::Processed
+            {
+                return;
+            }
+        }
+        if client.is_handshake_completed() && server.is_handshake_completed() && !progressed {
+            break;
+        }
+        if !progressed {
+            let next = [client.expiry(), server.expiry()]
+                .into_iter()
+                .flatten()
+                .min();
+            match next {
+                Some(deadline) => {
+                    clock.advance_to(deadline);
+                    clock.advance(1);
+                    let _ = client.handle_expiry(clock.now());
+                    let _ = server.handle_expiry(clock.now());
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// Builds a client and a server and drives them to a completed handshake, in memory.
+///
+/// The server can only be built from what the client's first packet carries, because
+/// `original_dcid` is the client's initial destination identifier and ngtcp2 requires a
+/// server to be told it.
+fn establish(
+    client_backend: &OsslBackend,
+    server_backend: &OsslBackend,
+    clock: &HandClock,
+) -> (HandConn, HandConn) {
+    let client_session = client_backend
+        .new_session(Role::Client, Some("localhost"))
+        .expect("a client session");
+    let mut client = ConnBuilder::new(
+        Role::Client,
+        Settings::new(clock.now()),
+        TransportParams::new(),
+        Box::new(StubEntropy(0)),
+        client_session,
+        "127.0.0.1:1000".parse().unwrap(),
+        "127.0.0.1:2000".parse().unwrap(),
+    )
+    .build(Handlers::new())
+    .expect("building the client");
+
+    let first_flight = drain(&mut client, clock);
+    assert!(
+        !first_flight.is_empty(),
+        "a fresh client must have a first flight to send"
+    );
+
+    let (original_dcid, client_scid) = match inspect(&first_flight[0], 8).expect("decoding") {
+        Inspection::Supported { dcid, scid, .. } => (dcid, scid),
+        other => panic!("the first flight should be a supported long header, got {other:?}"),
+    };
+
+    let server_session = server_backend
+        .new_session(Role::Server, None)
+        .expect("a server session");
+    let mut server = ConnBuilder::new(
+        Role::Server,
+        Settings::new(clock.now()),
+        TransportParams::new().original_dcid(&original_dcid),
+        Box::new(StubEntropy(64)),
+        server_session,
+        "127.0.0.1:2000".parse().unwrap(),
+        "127.0.0.1:1000".parse().unwrap(),
+    )
+    .dcid(client_scid)
+    .build(Handlers::new())
+    .expect("building the server");
+
+    for datagram in &first_flight {
+        let _ = server.read_pkt(datagram, clock.now());
+    }
+    pump(&mut client, &mut server, clock, 32);
+
+    (client, server)
+}
+
+#[test]
+fn reading_a_packet_allocates_nothing_and_is_processed() {
+    // SC-008. Reading a datagram on an established connection decrypts in place, so it must
+    // allocate nothing -- and a zero count would be vacuous unless the packet was genuinely
+    // taken in, so the region asserts the read reported `Processed`.
+    let client_backend = client_backend();
+    let server_backend = server_backend();
+    let clock = HandClock::new();
+    let (mut client, mut server) = establish(&client_backend, &server_backend, &clock);
+    assert!(
+        client.is_handshake_completed() && server.is_handshake_completed(),
+        "the harness did not establish a connection to read on"
+    );
+
+    // A 1-RTT datagram carrying stream data, produced outside the count. This is the packet
+    // the server will read inside it.
+    let stream = client.open_uni_stream().expect("opening a stream");
+    let mut buf = vec![0u8; 1500];
+    let payload = [0x5au8; 64];
+    let datagram = loop {
+        match client
+            .write_stream(&mut buf, stream, &payload, true, clock.now())
+            .expect("writing stream data")
+        {
+            StreamWrite::Datagram { len, .. } if len > 0 => break buf[..len].to_vec(),
+            StreamWrite::Datagram { .. } => clock.advance(2_000_000),
+            other => panic!("the client produced no datagram to read: {other:?}"),
+        }
+    };
+
+    // Warm the read path once, outside the count, so any lazily-initialised state is ready.
+    // A duplicate 1-RTT packet is dropped rather than rejected, so this does not consume the
+    // ability to observe a processed read below -- both report `Processed`.
+    assert_eq!(
+        server.read_pkt(&datagram, clock.now()).expect("warm read"),
+        ReadOutcome::Processed
+    );
+
+    let (outcome, allocations) = count_allocations(|| {
+        server
+            .read_pkt(&datagram, clock.now())
+            .expect("counted read")
+    });
+
+    assert_eq!(
+        outcome,
+        ReadOutcome::Processed,
+        "the packet was not processed, so a zero allocation count would prove nothing"
+    );
+    assert_eq!(
+        allocations, 0,
+        "reading a packet on an established connection allocated {allocations} times; \
+         ngtcp2 decrypts in place and the wrapper is supposed to add no copy"
+    );
+}
+
+#[test]
+fn establishing_a_connection_bounds_its_allocations() {
+    // SC-006 (counting half) and FR-011. Establishing a connection is not allocation-free --
+    // a handshake sets up TLS, transport parameters and stream state, and this in-memory
+    // harness copies each datagram it relays. So this region is a BOUND, not an attribution:
+    // it records the total the code produces today and fails only if a change pushes it
+    // higher. Other forced allocations share this region, which is why it does not assert
+    // zero. Its non-vacuity comes from asserting both roles reached a completed handshake.
+    let client_backend = client_backend();
+    let server_backend = server_backend();
+
+    // Warm the backends and the allocator's own lazy state outside the count.
+    {
+        let clock = HandClock::new();
+        let _ = establish(&client_backend, &server_backend, &clock);
+    }
+
+    let clock = HandClock::new();
+    let ((client, server), allocations) =
+        count_allocations(|| establish(&client_backend, &server_backend, &clock));
+
+    assert!(
+        client.is_handshake_completed() && server.is_handshake_completed(),
+        "the handshake did not complete for both roles, so the recorded total is meaningless"
+    );
+
+    // The recorded bound. The observed total on this harness is 156 in both debug and
+    // release; the handshake is deterministic in its allocation count even though its key
+    // exchange is not. The bound sits a little above that so an OpenSSL or allocator
+    // difference between environments does not fail it, while a change that allocates per
+    // datagram or per pass -- the kind this audit removes -- would push it well past.
+    const BOUND: usize = 220;
+    assert!(
+        allocations <= BOUND,
+        "establishing a connection allocated {allocations} times, above the recorded bound \
+         of {BOUND}; if this is an intended increase, raise the bound deliberately"
+    );
+    eprintln!("establishing a connection allocated {allocations} times");
 }
