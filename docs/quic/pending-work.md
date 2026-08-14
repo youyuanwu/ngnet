@@ -67,12 +67,20 @@ HANDSHAKE level (`crypto/shared.c:502-507`). Any future API that assumes a singl
 ## Only one TLS backend
 
 The seam admits others — wolfSSL, GnuTLS, BoringSSL and Picotls all have ngtcp2 crypto
-helpers — and adding one should not require touching anything outside a new `tls_*.rs` module
-and a feature in `ngnet-quic-sys`.
+helpers, and a Rust stack needs no helper at all — and adding one should not require touching
+anything outside a new module and, if it binds a C library, a feature in `ngnet-quic-sys`.
 
-Nobody has tried, so "should" is unverified. The seam was designed against one
-implementation, which is the classic way to end up with an abstraction that fits exactly that
-one. The second backend is the test of it.
+"Should" is now partly verified. There are two implementations: the OpenSSL backend, and the
+dependency-free one in `crates/ngnet-quic/tests/safe_backend.rs` that carries real connections
+under `forbid(unsafe_code)`. The second was written against the seam rather than alongside it,
+and it found three things the first never had to notice — that handshake data arrives as a
+stream rather than as messages, that a handshake must be a round trip, and that a server's
+reply belongs at the Initial level.
+
+What is still unverified is a *production* second backend. rustls is the obvious candidate and
+`docs/quic/design.md` sets out how it would map, including the one real gap: rustls never
+surfaces a header protection mask, only applies it, so such a backend would have to reconstruct
+header protection from the negotiated secret.
 
 Note also that ngtcp2 selects a crypto backend by **symbol probing**, not by version: the
 presence of `SSL_provide_quic_data` selects quictls, `SSL_set_quic_tls_cbs` selects the

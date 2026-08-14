@@ -55,45 +55,68 @@ One constant there is restated from a **private** ngtcp2 header:
 so `tests/versioned_ffi.rs` reads the value back out of the vendored source rather than
 trusting the line.
 
-## One type owns all three TLS objects
+## The TLS seam is safe, and what that cost
 
-This is the highest-risk area in the crate, and the reason the TLS backend landed before
-anything that depends on it.
+This is the highest-risk area in the crate, and it was rebuilt once the rest of it worked.
 
-A connection's TLS involves three C objects: an `SSL`, an `ngtcp2_crypto_ossl_ctx` wrapping
-it, and an `ngtcp2_crypto_conn_ref` that OpenSSL holds as the `SSL`'s application data.
-They refer to each other in a cycle, and must be destroyed in exactly this order
-(`deps/ngtcp2/examples/tls_session_base_ossl.cc:39-48`):
+The seam was originally two `unsafe` traits. A backend had to hand ngtcp2 an untyped pointer,
+fill in a foreign callback table by hand, and promise lifetimes the compiler could not check.
+It is now three safe traits — `Backend`, `Session` and `Handshaking` — that traffic in byte
+slices, arrays and associated types. Implementing one requires no `unsafe`, names no raw
+pointer, and cannot mention ngtcp2 at all. `crates/ngnet-quic/tests/safe_backend.rs` is a
+complete backend in a file that `forbid`s unsafe code, carrying two real connections through a
+handshake; it exists to make that claim checkable rather than aspirational.
 
-```text
-SSL_set_app_data(ssl, NULL)  →  SSL_free(ssl)  →  ngtcp2_crypto_ossl_ctx_del(ctx)
-```
+The `unsafe` did not disappear. It moved into `src/tls_bridge.rs`, where it is written once,
+generically over the session type, instead of once per backend. That is the trade: the
+allowance list in `lib.rs` gained `tls_bridge` and lost `tls`.
 
-Every step guards a use-after-free. `SSL_free` releases outstanding CRYPTO records, which
-calls into `ossl_crypto_release_rcd` (`deps/ngtcp2/crypto/ossl/ossl.c:1191`); that reads the
-app data, calls `conn_ref->get_conn(conn_ref)`, dereferences the `ngtcp2_conn`, and writes
-through the ossl context. Clearing the app data first makes it return early — the helper's
-own comment at `ossl.c:1196-1200` says that is precisely why the escape hatch exists. And
-`ngtcp2_crypto_ossl_ctx_del` frees a `remote_params` buffer OpenSSL borrows until then.
+### Three C objects became two, and the cycle went away
 
-Rust drops struct fields in declaration order. Relying on that would make a correctness
-requirement invisible — a reordering during an unrelated refactor would be a memory-safety
-bug with nothing to catch it. So `OsslSession` owns all three and implements `Drop` by hand,
-and the parts are never exposed as independently droppable values.
+The old design had an `SSL`, an `ngtcp2_crypto_ossl_ctx` wrapping it, and an
+`ngtcp2_crypto_conn_ref` that OpenSSL held as application data and that pointed back at the
+`ngtcp2_conn`. They referred to each other in a cycle and had to be destroyed in exactly one
+order, because `SSL_free` releases outstanding CRYPTO records by calling back into the helper,
+which followed the reference to the connection and dereferenced it. Every departure from the
+order was a use-after-free rather than a leak.
 
-The connection's own `Drop` completes the picture: `ngtcp2_conn_del` runs **first**, while
-the TLS session is still alive, because the helper's callbacks can reach the connection
-during teardown.
+`SSL_set_quic_tls_cbs` takes a callback argument. The backend passes its own state through it,
+so OpenSSL holds nothing belonging to ngtcp2, and the reference disappears. What remains is
+ordinary ownership — the engine outlives the `SSL` that reads it, and the helper context
+outlives both — and `OsslSession` still implements `Drop` by hand to say so, because relying on
+field declaration order would make a correctness requirement invisible to a later refactor.
 
-### `NativeTlsHandle` exists to prevent one specific mistake
+The old seam also needed a `NativeTlsHandle` newtype, whose entire purpose was to stop a
+backend passing the `SSL *` where the `ngtcp2_crypto_ossl_ctx *` was wanted — a mistake that
+compiled cleanly and corrupted memory at run time. There is now nothing to get wrong: the
+connection stores a pointer to the session it owns, and a backend never sees or supplies it.
 
-`ngtcp2_conn_set_tls_native_handle` takes a `void *`, and the value it wants for this
-backend is the `ngtcp2_crypto_ossl_ctx *` — **not** the `SSL *`
-(`deps/ngtcp2/examples/tls_session_base_ossl.cc:50-52`). An experienced OpenSSL user would
-reach for the `SSL`. It compiles cleanly and corrupts memory at run time.
+### Some of the seam had to be synchronous, and finding out cost a phase
 
-Wrapping the pointer in a newtype only a backend can construct makes the mistake
-unrepresentable outside the module that knows which is which.
+The obvious design has a session *report* what happened and the crate apply it afterwards. It
+means a backend cannot get the ordering wrong, which is worth a great deal. It also cannot
+serve a server, for a reason that only appears against another implementation:
+
+- A server's own transport parameters name the version it settled on, which ngtcp2 fills in
+  only while decoding the peer's (`ngtcp2_conn.c:11732-11737`). Encoded earlier, the field is
+  zero, which the peer rejects as malformed (`ngtcp2_transport_params.c:743`).
+- They also carry the server's connection identifier, filled only inside
+  `ngtcp2_conn_install_tx_handshake_key` (`:11132`).
+- Both must land before the TLS stack writes the message carrying them, which it does without
+  returning from the call that delivered the peer's.
+
+So there is no moment between those steps at which the crate is in control. `Handshaking` is
+the answer: a session is *lent* the connection for the length of one call, with four operations
+that take effect before they return — take the peer's parameters, produce this endpoint's,
+install a level's keys, submit handshake bytes. Everything with no such constraint stays on the
+queue and keeps its ordering guarantee.
+
+The fourth operation is there for a separate reason. A TLS stack must be told how much of what
+it offered was taken before it returns, so queuing the bytes means answering before the answer
+exists — and the only answer available in advance is a claim that all of it was accepted.
+
+The capability is borrowed rather than owned, so a backend that keeps it does not compile. A
+`compile_fail` doctest on the trait asserts exactly that.
 
 ### `ngtcp2_crypto_ossl_free` is deliberately never called
 
@@ -105,26 +128,30 @@ objects the first is still using.
 So `init` runs once behind a `Once` and `_free` is never called. A bounded one-off leak of a
 handful of static objects is the right trade against corrupting a live connection.
 
-## Why the TLS trait is `unsafe`, and why it carries the callback table
-
-It would be tidier for the seam to hand back an opaque handle and let the connection install
-a fixed callback set. That does not work, for two reasons.
+### Why the seam is a trait at all
 
 Each TLS backend compiles **its own copy** of ngtcp2's shared crypto code, with
 backend-specific implementations behind identically-named symbols — `ngtcp2_crypto_ctx_tls`
-exists separately in `ossl.c`, `wolfssl.c` and `gnutls.c`. The callback set is part of the
-backend, not something a generic connection can name.
+exists separately in `ossl.c`, `wolfssl.c` and `gnutls.c`. And those symbols do not always
+exist: `crates/ngnet-quic-sys/wrapper.h:10-18` includes the crypto headers only when a backend
+feature is on, so with `--no-default-features` there is no `ngtcp2_crypto_*` symbol in the
+bindings at all. The seam is what lets the crate build with no TLS stack, exposing the
+interface and nothing behind it.
 
-And those symbols do not always exist. `crates/ngnet-quic-sys/wrapper.h:10-18` includes the
-crypto headers only when a backend feature is on, so with `--no-default-features` there is no
-`ngtcp2_crypto_*` symbol in the bindings at all. Code naming them directly would not compile.
-Routing them through the trait is what lets the crate build with no TLS stack, exposing the
-seam and nothing behind it.
+### What a rustls backend would have to do
 
-The trait is `unsafe` because implementing it means promising things the compiler cannot
-check: that the native handle stays valid, and that the objects behind it are destroyed in
-the order the C library requires. Callers of a `Conn` remain entirely safe; only writing a
-*new backend* requires care.
+The seam was shaped so one is possible; none is written. `rustls::quic` maps closely but not
+exactly:
+
+- `PacketKey` is near-identical — rustls protects in place, with `encrypt_in_place` and
+  `decrypt_in_place`, and exposes `confidentiality_limit` and `integrity_limit` under those
+  names.
+- `HeaderKey` is **not** a match, and this is the one real gap. ngtcp2 asks for a five-byte
+  mask from a sample; rustls's `HeaderProtectionKey` only ever applies protection in place and
+  never surfaces the mask. A rustls backend would have to reconstruct header protection from
+  the negotiated secret rather than delegating to it. That is a capability gap, not a
+  representational one.
+- `KeyChange` and `Keys` correspond to what `Handshaking::install_keys` takes.
 
 ## Entropy travels through `rand_ctx`, not the callback bridge
 
