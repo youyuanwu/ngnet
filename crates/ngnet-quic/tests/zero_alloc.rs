@@ -562,6 +562,190 @@ mod driver_pass {
         }
     }
 
+    /// Builds a client and a server on an in-memory socket pair and drives them to an
+    /// established connection on both sides, returning the drivers, the two connection
+    /// handles, and the shared clock. The receive and send regions below all start here.
+    fn establish(
+        cx: &mut Context<'_>,
+    ) -> (Vec<Pin<Box<Driver>>>, Connection, Connection, TestClock) {
+        let (caddr, saddr) = (
+            "127.0.0.1:4433".parse().unwrap(),
+            "127.0.0.1:4434".parse().unwrap(),
+        );
+        let clock = TestClock::new();
+        let (cs, ss) = socket_pair(caddr, saddr);
+        let (client, cdrv) = build(Role::Client, cs, clock.clone());
+        let (server, sdrv) = build(Role::Server, ss, clock.clone());
+        let mut drivers: Vec<Pin<Box<Driver>>> = vec![Box::pin(cdrv), Box::pin(sdrv)];
+
+        let mut connecting = Box::pin(client.connect(saddr, Some("localhost")));
+        let mut accepting = Box::pin(server.accept());
+        let mut cside: Option<Connection> = None;
+        let mut sside: Option<Connection> = None;
+        for _ in 0..400 {
+            poll_all(&mut drivers, cx);
+            if cside.is_none()
+                && let Poll::Ready(r) = connecting.as_mut().poll(cx)
+            {
+                cside = Some(r.expect("the client handshake failed"));
+            }
+            if sside.is_none()
+                && let Poll::Ready(r) = accepting.as_mut().poll(cx)
+            {
+                sside = Some(r.expect("the server accept failed"));
+            }
+            if cside.is_some() && sside.is_some() {
+                break;
+            }
+            clock.advance(2_000_000);
+        }
+        let cside = cside.expect("a client connection");
+        let sside = sside.expect("a server connection");
+        assert!(
+            cside.is_established() && sside.is_established(),
+            "the harness did not establish a connection"
+        );
+        (drivers, cside, sside, clock)
+    }
+
+    #[test]
+    fn a_receive_pass_to_an_attached_connection_does_not_allocate() {
+        // Phase 3, SC-002. Every datagram received for an attached connection used to be
+        // copied out of the reusable receive buffer with `to_vec` before dispatch, for no
+        // reason -- the core reads it in place and keeps nothing. With that copy gone, a
+        // receive pass that delivers to attached connections allocates nothing.
+        //
+        // The count is taken over `read_datagrams` alone, not a whole `poll`: the send half
+        // still takes a datagram buffer eagerly until Phase 5, so a full pass could not
+        // report zero yet. This isolates the receive half, which is what this phase changed.
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let (mut drivers, mut cside, mut sside, clock) = establish(&mut cx);
+
+        // A stream the client will carry to the server. Opened and confirmed live before
+        // anything is counted, so the region measures a genuine delivery.
+        let sid = {
+            let mut opening = cside.open_uni();
+            loop {
+                match Pin::new(&mut opening).poll(&mut cx) {
+                    Poll::Ready(r) => break r.expect("opening a stream"),
+                    Poll::Pending => {
+                        poll_all(&mut drivers, &mut cx);
+                        clock.advance(2_000_000);
+                    }
+                }
+            }
+        };
+
+        // Round one warms the read path and captures what the client sent: the client
+        // writes, only the client driver is polled so the datagrams pile up in the server's
+        // socket, and the server's inbox is then drained so the test owns those bytes.
+        let first = [0xa5u8; 256];
+        cside.write(sid, &first, true).expect("stream write");
+        for _ in 0..16 {
+            let _ = drivers[0].as_mut().poll(&mut cx);
+            clock.advance(2_000_000);
+        }
+        let captured = drivers[1].as_ref().socket_for_test().drain_inbox();
+        assert!(
+            !captured.is_empty(),
+            "the client produced no datagram for the server to receive"
+        );
+        // Keep only the 1-RTT (short-header) packets: those route to the established
+        // connection and are read in place. A long-header straggler would route nowhere and
+        // reach the stateless-reset path instead, which allocates for reasons unrelated to
+        // this phase.
+        let onertt: Vec<(_, Vec<u8>)> = captured
+            .into_iter()
+            .filter(|(_, d)| !d.is_empty() && d[0] & 0x80 == 0)
+            .collect();
+        assert!(
+            !onertt.is_empty(),
+            "the client sent no 1-RTT datagram carrying the stream"
+        );
+
+        // Deliver them once, uncounted, so the core takes the stream data in and warms every
+        // lazily-initialised path. This read stores bytes and so does allocate; it is not
+        // what the region measures.
+        for (source, datagram) in &onertt {
+            drivers[1]
+                .as_ref()
+                .socket_for_test()
+                .deliver(*source, datagram);
+        }
+        let _ = drivers[1]
+            .as_mut()
+            .get_mut()
+            .read_datagrams_for_test(&mut cx)
+            .expect("warm read");
+
+        // Drive both sides and read the whole stream back on the server, outside the count.
+        // This confirms the warmed delivery arrived intact, and -- crucially for the
+        // measurement below -- it drains the connection's observed-event queue. A read pass
+        // that left events unconsumed would reallocate that queue when it hands the events
+        // back to the application, which is the connection's own plumbing rather than the
+        // receive-buffer copy this phase removed.
+        let mut received = Vec::new();
+        let mut fin = false;
+        let mut accepted = None;
+        for _ in 0..200 {
+            poll_all(&mut drivers, &mut cx);
+            if accepted.is_none() {
+                let mut a = sside.accept_stream();
+                if let Poll::Ready(r) = Pin::new(&mut a).poll(&mut cx) {
+                    accepted = Some(r.expect("accepting the stream"));
+                }
+            }
+            if let Some(stream) = accepted {
+                let mut reading = sside.read(stream);
+                if let Poll::Ready(r) = Pin::new(&mut reading).poll(&mut cx) {
+                    let chunk = r.expect("reading the stream");
+                    received.extend_from_slice(&chunk.bytes);
+                    fin = chunk.fin;
+                }
+            }
+            if fin {
+                break;
+            }
+            clock.advance(2_000_000);
+        }
+        assert!(fin, "the server never saw the end of the stream");
+        assert_eq!(
+            received, first,
+            "the delivered bytes did not survive the receive pass intact"
+        );
+
+        // Now deliver the *same* datagrams again and count that pass. Their packet numbers
+        // have already been seen, so the core reads each in place, recognises it as a
+        // duplicate, and drops it, storing nothing and observing nothing. With the stream
+        // already consumed there is no queued event to hand back either, so the only thing
+        // that could allocate is a copy of the datagram itself -- exactly what this phase
+        // removed.
+        for (source, datagram) in &onertt {
+            drivers[1]
+                .as_ref()
+                .socket_for_test()
+                .deliver(*source, datagram);
+        }
+        let (progressed, allocations) = count_allocations(|| {
+            drivers[1]
+                .as_mut()
+                .get_mut()
+                .read_datagrams_for_test(&mut cx)
+                .expect("counted read")
+        });
+
+        assert!(
+            progressed,
+            "the receive pass read no datagram, so a zero allocation count would prove nothing"
+        );
+        assert_eq!(
+            allocations, 0,
+            "a receive pass delivering to an attached connection allocated {allocations} \
+             times; the core reads in place and the wrapper is supposed to add no copy"
+        );
+    }
+
     #[test]
     fn a_driver_pass_over_an_established_connection_does_not_allocate_for_iteration() {
         // Phase 2. `service` and `flush` each used to collect a `Vec<u64>` of connection

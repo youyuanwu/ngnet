@@ -112,6 +112,15 @@ impl TestSocket {
     pub fn deliver(&self, source: SocketAddr, datagram: &[u8]) {
         self.inbox.borrow_mut().push(source, datagram.to_vec());
     }
+
+    /// Removes and returns everything currently waiting to be received.
+    ///
+    /// Lets a test capture the datagrams a peer produced so it can re-deliver them — a
+    /// duplicate 1-RTT packet is processed and then dropped, which is how a receive pass can
+    /// be counted while it does real work but stores nothing.
+    pub fn drain_inbox(&self) -> Vec<(SocketAddr, Vec<u8>)> {
+        self.inbox.borrow_mut().datagrams.drain(..).collect()
+    }
 }
 
 impl AsyncUdpSocket for TestSocket {

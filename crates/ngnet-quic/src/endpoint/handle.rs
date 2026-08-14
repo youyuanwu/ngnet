@@ -790,9 +790,16 @@ where
             match outcome {
                 Poll::Ready(Ok(received)) => {
                     progressed = true;
-                    let datagram = buffer[..received.len].to_vec();
+                    // The buffer is a local, not a field, for the duration of the dispatch:
+                    // that is what lets a borrow of it be handed to `&mut self` methods
+                    // without copying first. No dispatch destination retains the borrow --
+                    // `read_pkt` passes it to ngtcp2 only for the call, `accept` stores
+                    // owned state, the detached path copies it into its own queue, and the
+                    // Retry and stateless-reset paths read it only while composing separate
+                    // outgoing buffers -- so the compiler is free to end the borrow here,
+                    // before the buffer goes back to `self.inner`.
+                    self.dispatch(&buffer[..received.len], received.source);
                     self.inner.buffer = buffer;
-                    self.dispatch(&datagram, received.source);
                 }
                 Poll::Ready(Err(err)) => {
                     self.inner.buffer = buffer;
@@ -806,6 +813,27 @@ where
             }
         }
         Ok(progressed)
+    }
+
+    /// Runs one receive pass in isolation, for the allocation-counting tests.
+    ///
+    /// The public `poll` reads and then services, and the send half still allocates until
+    /// the whole audit lands, so a test that needs to count only the receive half cannot go
+    /// through `poll`. This exposes that half and nothing else. Hidden and unsupported, like
+    /// everything in `endpoint::testing`.
+    #[doc(hidden)]
+    pub fn read_datagrams_for_test(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> core::result::Result<bool, Error> {
+        self.read_datagrams(cx)
+    }
+
+    /// Borrows the socket, for the allocation-counting tests that inject and re-inject
+    /// datagrams. Hidden and unsupported, like everything in `endpoint::testing`.
+    #[doc(hidden)]
+    pub fn socket_for_test(&self) -> &Sock {
+        &self.inner.socket
     }
 
     /// Delivers one datagram to whatever should have it.
