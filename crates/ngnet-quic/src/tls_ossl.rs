@@ -1670,8 +1670,9 @@ unsafe impl Sync for OsslBackend {}
 /// OpenSSL calls back into. They must be destroyed in that order, and Rust's field-order drop
 /// would make the ordering invisible, so [`Drop`] is written by hand.
 pub struct OsslSession {
-    /// The ossl helper context. **This**, not `ssl`, is what ngtcp2 wants as the native
-    /// handle.
+    /// The crypto helper context, kept only so the negotiated cipher suite can be read out of
+    /// it. ngtcp2 is **not** given this — it receives a pointer to the session, which the
+    /// connection owns — and that is why there is no longer a wrong pointer to pass.
     ossl_ctx: *mut sys::ngtcp2_crypto_ossl_ctx,
     ssl: *mut sys::SSL,
     /// A share of the backend's ALPN offer list, keeping it alive for the selection

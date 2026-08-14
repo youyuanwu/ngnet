@@ -6,7 +6,7 @@ failure is the only warning you get.
 
 This is a separate suite from the HTTP/2 and HTTP/3 ones rather than a widened version of
 them, because the crate makes different promises: it carries obligations — struct-version
-constants, a TLS object cycle — that neither framing crate has, and where they permit
+constants, key material crossing a foreign callback table — that neither framing crate has, and where they permit
 asynchrony throughout a subtree, this crate's core forbids it entirely and confines it to
 `src/endpoint/`.
 

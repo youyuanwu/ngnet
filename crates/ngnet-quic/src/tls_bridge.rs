@@ -96,6 +96,12 @@ pub(crate) struct Exchange {
     local_yielded: bool,
     /// Whether the handshake write key is installed, which is what completes a server's set.
     handshake_tx_installed: bool,
+    /// How long the application keys' initialisation vectors are.
+    ///
+    /// Recorded because a key update has to produce vectors of exactly this length: ngtcp2
+    /// sized the buffers it hands the update callback from the generation being replaced, and
+    /// a longer one writes past them.
+    onertt_iv_len: Option<usize>,
 }
 
 /// The connection, lent to a session for the length of one call.
@@ -162,6 +168,7 @@ impl<S: Session> crate::tls::Handshaking<S::PacketKey, S::HeaderKey> for ConnHan
         keys: DirectionalKeys<S::PacketKey, S::HeaderKey>,
         secret: &[u8],
     ) -> Result<()> {
+        let iv_len = keys.iv.len();
         // SAFETY: `conn` is live.
         let rv = unsafe { install_level::<S>(self.conn, level, direction, keys, secret) };
         if rv != 0 {
@@ -169,6 +176,9 @@ impl<S: Session> crate::tls::Handshaking<S::PacketKey, S::HeaderKey> for ConnHan
         }
         if level == Level::Handshake && direction == Direction::Write {
             self.exchange.handshake_tx_installed = true;
+        }
+        if level == Level::OneRtt {
+            self.exchange.onertt_iv_len = Some(iv_len);
         }
         Ok(())
     }
@@ -343,10 +353,13 @@ unsafe fn install_initial<S: Session>(
     // SAFETY: `conn` is live; the context is a value ngtcp2 copies.
     unsafe { sys::ngtcp2_conn_set_initial_crypto_ctx(conn, &raw const ctx) };
 
-    let ivlen = keys.rx.iv.len();
-    if ivlen != keys.tx.iv.len() {
+    // Checked before anything is boxed or handed over. A backend supplies these lengths as
+    // ordinary `Vec` lengths, and ngtcp2's own bounds are `assert`s that release builds delete
+    // -- see `crate::validate::iv_len`.
+    if crate::validate::iv_pair(keys.rx.iv.len(), keys.tx.iv.len()).is_err() {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     }
+    let ivlen = keys.rx.iv.len();
 
     let rx_packet = box_packet_key(keys.rx.packet);
     let rx_header = box_header_key(keys.rx.header);
@@ -407,6 +420,9 @@ unsafe fn install_level<S: Session>(
         Level::Initial => {}
     }
 
+    if crate::validate::iv_len(keys.iv.len()).is_err() {
+        return sys::NGTCP2_ERR_CALLBACK_FAILURE;
+    }
     let ivlen = keys.iv.len();
     let packet = box_packet_key(keys.packet);
     let header = box_header_key(keys.header);
@@ -693,6 +709,11 @@ unsafe extern "C" fn version_negotiation<S: Session>(
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     };
 
+    // Both, and matching: ngtcp2 takes one length for the pair, so an unchecked shorter
+    // transmit vector would be read at the receive vector's length.
+    if crate::validate::iv_pair(keys.rx.iv.len(), keys.tx.iv.len()).is_err() {
+        return sys::NGTCP2_ERR_CALLBACK_FAILURE;
+    }
     let ivlen = keys.rx.iv.len();
     let rx_packet = box_packet_key(keys.rx.packet);
     let rx_header = box_header_key(keys.rx.header);
@@ -856,26 +877,33 @@ unsafe extern "C" fn update_key<S: Session>(
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     };
 
-    // A key update rotates payload protection only; header protection keys stay as they
-    // were, which is why the returned type has no place for them.
-    // SAFETY: ngtcp2 provides buffers of `secretlen` and of the IV length it expects.
+    // **Everything is checked before anything is written or boxed.** Both orderings matter:
+    //
+    // ngtcp2 sized the four buffers it handed this callback from the generation being
+    // replaced -- the initialisation vectors at the installed application key's length, the
+    // secrets at `secretlen` -- so a backend returning anything longer writes past them. And
+    // boxing the new keys before the checks would leak them, because ngtcp2 adopts the
+    // contexts only when the callback succeeds (`ngtcp2_conn.c:8778-8787`); a failure after
+    // boxing leaves two allocations with nothing to collect them.
+    let expected_iv = slot.exchange.onertt_iv_len.unwrap_or(0);
+    if crate::validate::iv_pair(next.rx_iv.len(), next.tx_iv.len()).is_err()
+        || next.rx_iv.len() != expected_iv
+        || crate::validate::secret_len(next.rx_secret.len(), secretlen).is_err()
+        || crate::validate::secret_len(next.tx_secret.len(), secretlen).is_err()
+    {
+        return sys::NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+
+    // A key update rotates payload protection only; header protection keys stay as they were,
+    // which is why the returned type has no place for them.
+    // SAFETY: every length was checked against what ngtcp2 allocated, immediately above.
     unsafe {
         core::ptr::copy_nonoverlapping(next.rx_iv.as_ptr(), rx_iv, next.rx_iv.len());
         core::ptr::copy_nonoverlapping(next.tx_iv.as_ptr(), tx_iv, next.tx_iv.len());
-        *rx_aead_ctx = box_packet_key(next.rx_packet);
-        *tx_aead_ctx = box_packet_key(next.tx_packet);
-    }
-
-    // The new secrets are what the *next* rotation starts from, so they have to be handed
-    // back rather than kept. ngtcp2 sizes both buffers at `secretlen`, so a secret of any
-    // other length would write past them.
-    if next.rx_secret.len() != secretlen || next.tx_secret.len() != secretlen {
-        return sys::NGTCP2_ERR_CALLBACK_FAILURE;
-    }
-    // SAFETY: both buffers are `secretlen` long, as just checked.
-    unsafe {
         core::ptr::copy_nonoverlapping(next.rx_secret.as_ptr(), rx_secret, secretlen);
         core::ptr::copy_nonoverlapping(next.tx_secret.as_ptr(), tx_secret, secretlen);
+        *rx_aead_ctx = box_packet_key(next.rx_packet);
+        *tx_aead_ctx = box_packet_key(next.tx_packet);
     }
     0
 }
@@ -993,6 +1021,38 @@ mod tests {
         exchange.handshake_tx_installed = true;
         exchange.local_yielded = true;
         assert!(exchange.peer_taken && exchange.handshake_tx_installed && exchange.local_yielded);
+    }
+
+    /// A backend's dimensions are checked before they cross into C.
+    ///
+    /// This is the one place a *safe* backend could still have caused undefined behaviour, and
+    /// it is not hypothetical. ngtcp2 builds a packet's nonce in `uint8_t nonce[64]` guarded
+    /// only by `assert(sizeof(nonce) >= ckm->iv.len)` (`ngtcp2_conn.c:5920-5926`, with a `TODO`
+    /// above it saying as much), and derives it with `dest += ivlen - sizeof(uint64_t)`
+    /// (`ngtcp2_crypto.c:100-112`) guarded only by `assert(ivlen >= sizeof(n))`. Release builds
+    /// contain neither assertion. So an initialisation vector of 65 bytes overruns a stack
+    /// buffer on every packet received, and one of 4 bytes wraps a pointer -- both reachable
+    /// from a backend that never writes `unsafe`.
+    ///
+    /// A seam that is safe only in debug builds is not safe, which is why these bounds are
+    /// restated in `crate::validate` and enforced here.
+    #[test]
+    fn a_backend_cannot_hand_the_library_a_vector_it_cannot_handle() {
+        use crate::validate::{iv_len, iv_pair};
+
+        // The lengths a real AEAD produces.
+        assert!(iv_len(12).is_ok());
+        assert!(iv_pair(12, 12).is_ok());
+
+        // Below ngtcp2's floor: the pointer subtraction wraps.
+        assert!(iv_len(0).is_err());
+        assert!(iv_len(7).is_err());
+        // Above its ceiling: the 64-byte stack buffer overruns.
+        assert!(iv_len(65).is_err());
+        assert!(iv_len(usize::MAX).is_err());
+        // Mismatched: ngtcp2 takes one length for both directions, so the shorter one would be
+        // read at the longer one's length.
+        assert!(iv_pair(12, 16).is_err());
     }
 
     /// A slot is the session and the crate's record of it, in one allocation.

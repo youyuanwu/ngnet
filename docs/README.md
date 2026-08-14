@@ -33,7 +33,7 @@ There are no HTTP/3 benchmarks yet.
 
 | Document | What it covers |
 | --- | --- |
-| [`quic/design.md`](quic/design.md) | Why the QUIC crates are shaped the way they are: the API ngtcp2 documents but does not export, why validation is duplicated in Rust, the three-object TLS teardown order, why entropy cannot travel through the callback bridge, why one driver owns a whole socket, and the two lengths and two flow-control windows that make a working connection go silent when either is got wrong. |
+| [`quic/design.md`](quic/design.md) | Why the QUIC crates are shaped the way they are: the API ngtcp2 documents but does not export, why validation is duplicated in Rust, why the TLS seam is safe and what removing its object cycle cost, why entropy cannot travel through the callback bridge, why one driver owns a whole socket, and the two lengths and two flow-control windows that make a working connection go silent when either is got wrong. |
 | [`quic/pending-work.md`](quic/pending-work.md) | Known gaps and deferred decisions, with what would settle each. |
 | [`quic/invariants.md`](quic/invariants.md) | The properties the `ngnet-quic` suite pins, and where each is enforced. |
 

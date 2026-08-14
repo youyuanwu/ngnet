@@ -232,6 +232,71 @@ pub(crate) const fn transport_params_role(
 ///
 /// Reserved versions exist to exercise version negotiation and must never be chosen as the
 /// actual version by a server.
+/// The shortest initialisation vector ngtcp2 will accept.
+///
+/// `ngtcp2_crypto_create_nonce` does `dest += ivlen - sizeof(uint64_t)`
+/// (`ngtcp2_crypto.c:100-112`). With a shorter vector that subtraction wraps, and the write
+/// that follows lands wherever it points. ngtcp2 guards it with `assert(ivlen >= sizeof(n))`,
+/// which is not there in release.
+pub(crate) const MIN_IV_LEN: usize = 8;
+
+/// The longest initialisation vector ngtcp2 will accept.
+///
+/// `decrypt_pkt` builds the nonce in `uint8_t nonce[64]` — with a `/* TODO nonce is limited to
+/// 64 bytes. */` above it and `assert(sizeof(nonce) >= ckm->iv.len)` below
+/// (`ngtcp2_conn.c:5920-5926`). A longer vector overruns that stack buffer on every packet
+/// received, in release builds only.
+pub(crate) const MAX_IV_LEN: usize = 64;
+
+/// Checks an initialisation vector a TLS backend produced.
+///
+/// # Why this is here rather than left to the backend
+///
+/// The TLS seam is safe: a backend supplies `iv` as an ordinary `Vec<u8>` and the compiler
+/// has nothing to say about its length. ngtcp2's own bounds are two `assert`s, and release
+/// builds delete both — so without this check, safe backend code could overrun a stack buffer
+/// or wrap a pointer, which is precisely the kind of hole the seam exists to close. A seam
+/// that is safe only in debug builds is not safe.
+pub(crate) fn iv_len(len: usize) -> Result<()> {
+    if !(MIN_IV_LEN..=MAX_IV_LEN).contains(&len) {
+        return Err(Error::invalid_input(
+            "a TLS backend produced an initialisation vector outside the length the QUIC \
+             library can handle",
+        ));
+    }
+    Ok(())
+}
+
+/// Checks that two initialisation vectors a backend produced are the same length.
+///
+/// ngtcp2 installs both directions with a single length parameter, so a backend that returns
+/// vectors of different lengths would have one of them read at the other's length.
+pub(crate) fn iv_pair(rx: usize, tx: usize) -> Result<()> {
+    iv_len(rx)?;
+    iv_len(tx)?;
+    if rx != tx {
+        return Err(Error::invalid_input(
+            "a TLS backend produced initialisation vectors of different lengths for the two \
+             directions",
+        ));
+    }
+    Ok(())
+}
+
+/// Checks a traffic secret a backend produced against the length ngtcp2 allocated for it.
+///
+/// A key update hands ngtcp2 the secrets the *next* update will start from, and ngtcp2 sized
+/// those buffers from the current generation. A longer secret writes past them.
+pub(crate) fn secret_len(len: usize, expected: usize) -> Result<()> {
+    if len != expected {
+        return Err(Error::invalid_input(
+            "a TLS backend produced a traffic secret of the wrong length for the negotiated \
+             cipher suite",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn server_version(server: bool, client_chosen_version: u32) -> Result<()> {
     if server && crate::ffi::is_reserved_version(client_chosen_version) {
         return Err(Error::invalid_input(
@@ -244,6 +309,42 @@ pub(crate) fn server_version(server: bool, client_chosen_version: u32) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_initialisation_vector_outside_the_librarys_range_is_rejected() {
+        // Both bounds are enforced by `assert` in C and therefore absent from release builds,
+        // which is the whole reason they are restated here. Below the floor a pointer
+        // subtraction wraps; above the ceiling a 64-byte stack buffer overruns on every packet
+        // received.
+        assert!(iv_len(0).is_err());
+        assert!(iv_len(MIN_IV_LEN - 1).is_err());
+        assert!(iv_len(MIN_IV_LEN).is_ok());
+        assert!(iv_len(12).is_ok(), "the length every real AEAD uses");
+        assert!(iv_len(MAX_IV_LEN).is_ok());
+        assert!(iv_len(MAX_IV_LEN + 1).is_err());
+        assert!(iv_len(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn two_directions_must_agree_on_the_vector_length() {
+        // ngtcp2 takes one length for both, so a mismatch reads one of them at the other's
+        // length.
+        assert!(iv_pair(12, 12).is_ok());
+        assert!(iv_pair(12, 16).is_err());
+        assert!(iv_pair(12, 4).is_err());
+        assert!(
+            iv_pair(4, 4).is_err(),
+            "both out of range is still out of range"
+        );
+    }
+
+    #[test]
+    fn a_traffic_secret_must_match_the_buffer_it_is_copied_into() {
+        assert!(secret_len(32, 32).is_ok());
+        assert!(secret_len(33, 32).is_err());
+        assert!(secret_len(31, 32).is_err());
+    }
+
     use crate::error::ErrorKind;
 
     /// A settings tuple that passes, so each test can vary one field.

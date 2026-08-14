@@ -248,6 +248,13 @@ struct ToySession {
     log: Vec<&'static str>,
     /// Set once the handshake has been driven, so a second call does nothing.
     started: bool,
+    /// Makes the session hand back initialisation vectors of this length instead of the right
+    /// one, standing in for a backend that is buggy or hostile.
+    ///
+    /// A safe backend supplies these as ordinary `Vec` lengths. Nothing in the type system
+    /// constrains them, and ngtcp2's own bounds are assertions that release builds delete — so
+    /// what stops a wrong length reaching C has to be the crate.
+    bad_iv_len: Option<usize>,
     /// Handshake bytes that have arrived but do not yet make a whole message.
     ///
     /// Not optional, and not obvious. ngtcp2 deliberately **splits** a client's Initial CRYPTO
@@ -270,6 +277,7 @@ impl ToySession {
             events: VecDeque::new(),
             log: Vec::new(),
             started: false,
+            bad_iv_len: None,
             inbound: Vec::new(),
         }
     }
@@ -288,18 +296,14 @@ impl ToySession {
         // The secret is what a key update would advance. It is not used to derive anything
         // here, but it has to be the right length and it has to round-trip.
         let secret = vec![tag; 32];
-        conn.install_keys(
-            level,
-            Direction::Read,
-            keys_for(&self.dcid, tag, rx_side),
-            &secret,
-        )?;
-        conn.install_keys(
-            level,
-            Direction::Write,
-            keys_for(&self.dcid, tag, tx_side),
-            &secret,
-        )?;
+        let mut rx = keys_for(&self.dcid, tag, rx_side);
+        let mut tx = keys_for(&self.dcid, tag, tx_side);
+        if let Some(len) = self.bad_iv_len {
+            rx.iv = vec![0; len];
+            tx.iv = vec![0; len];
+        }
+        conn.install_keys(level, Direction::Read, rx, &secret)?;
+        conn.install_keys(level, Direction::Write, tx, &secret)?;
         self.log.push("install_keys");
         Ok(())
     }
@@ -340,10 +344,13 @@ impl Session for ToySession {
             Role::Server => (FROM_CLIENT, FROM_SERVER),
         };
         let tag = level_tag(Level::Initial);
-        Ok(InitialKeys {
-            rx: keys_for(dcid, tag, rx_side),
-            tx: keys_for(dcid, tag, tx_side),
-        })
+        let mut rx = keys_for(dcid, tag, rx_side);
+        let mut tx = keys_for(dcid, tag, tx_side);
+        if let Some(len) = self.bad_iv_len {
+            rx.iv = vec![0; len];
+            tx.iv = vec![0; len];
+        }
+        Ok(InitialKeys { rx, tx })
     }
 
     fn retry_key(&mut self, _version: u32) -> Result<Self::PacketKey> {
@@ -777,4 +784,78 @@ fn a_connection_reports_the_backends_protocol() {
     let _: std::result::Result<WriteOutcome, Error> = client.write_pkt(&mut buf, now);
     assert_eq!(client.negotiated_alpn().as_deref(), Some(&b"toy"[..]));
     let _: ReadOutcome = client.read_pkt(&[0], now).unwrap_or(ReadOutcome::Processed);
+}
+
+#[test]
+fn a_backend_that_supplies_an_impossible_vector_is_told_so() {
+    // The one dimension a *safe* backend chooses that the type system does not constrain.
+    //
+    // `DirectionalKeys::iv` is an ordinary `Vec<u8>`. ngtcp2 builds each packet's nonce in a
+    // 64-byte stack buffer guarded only by `assert(sizeof(nonce) >= ckm->iv.len)`
+    // (`ngtcp2_conn.c:5920-5926`, with a `TODO` above it saying exactly that), and derives it
+    // by subtracting eight from that length under `assert(ivlen >= sizeof(n))`
+    // (`ngtcp2_crypto.c:100-112`). Release builds contain neither assertion, so those bounds
+    // are the crate's to keep — the same reason `crate::validate` exists at all.
+    //
+    // What is asserted here is what the crate guarantees: the backend is told its vector is
+    // unusable, and the connection does not go on to complete a handshake with it. Whether a
+    // particular out-of-range length would go on to corrupt memory in a release build is not
+    // something a test should try to find out.
+    for bad in [0usize, 4, 7, 65, 4096] {
+        let now = Timestamp::from_nanos(1).expect("a timestamp");
+        let (local, remote) = addrs();
+        let backend = ToyBackend;
+        let dcid = ConnectionId::new(&[3; 8]).expect("an identifier");
+
+        let mut session = Backend::new_session(&backend, Role::Client, None).expect("a session");
+        session.bad_iv_len = Some(bad);
+
+        let mut client = ConnBuilder::new(
+            Role::Client,
+            Settings::new(now),
+            params(),
+            Box::new(Counter(0)),
+            session,
+            local,
+            remote,
+        )
+        .dcid(dcid)
+        .scid(dcid)
+        .cid_len(8)
+        .build(Handlers::new())
+        .expect("building the connection");
+
+        // The first write is what drives the client's initial flight, and therefore the key
+        // installs.
+        let mut buf = [0u8; 1500];
+        let outcome = client.write_pkt(&mut buf, now);
+
+        assert!(
+            outcome.is_err(),
+            "a {bad}-byte initialisation vector was accepted and produced {outcome:?}"
+        );
+        assert!(
+            !client.is_handshake_completed(),
+            "a connection completed a handshake with a {bad}-byte initialisation vector"
+        );
+    }
+}
+
+#[test]
+fn a_backend_that_rotates_to_an_impossible_vector_is_refused() {
+    // The same hazard on the key-update path, where ngtcp2 hands the callback buffers it sized
+    // from the generation being replaced. A longer vector or secret writes past them.
+    let mut session = ToySession::new(Role::Client);
+    session.dcid = vec![1, 2, 3];
+    let rotated = Session::rotate_keys(&mut session, &[0; 32], &[0; 32]).expect("rotating");
+    assert_eq!(
+        rotated.rx_iv.len(),
+        12,
+        "the toy backend should rotate to the length it installed"
+    );
+    assert_eq!(
+        rotated.rx_secret.len(),
+        32,
+        "and to the secret length it was given"
+    );
 }

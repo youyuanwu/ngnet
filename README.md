@@ -247,10 +247,13 @@ and that choice reaches no crate but `ngnet-h3-tests`.
 
 `ngtcp2` is vendored as a step towards a second QUIC backend, and is not wired
 into `ngnet-h3` yet. It draws the same line one layer down: libngtcp2 itself
-links no TLS, and the OpenSSL handshake helper is a separate archive behind
-`ngnet-quic-sys`'s default-on `crypto-ossl` feature. That helper needs **OpenSSL
-3.5 or newer** — the first release with the QUIC TLS API it is written against —
-which is why CI pins its runner image rather than using `ubuntu-latest`.
+links no TLS, and OpenSSL reaches it only through a safe backend seam that a
+third-party stack could implement without writing `unsafe`. ngtcp2's crypto
+helper archive is still linked, behind `ngnet-quic-sys`'s default-on
+`crypto-ossl` feature — but for its cryptographic primitives, Retry tokens and
+stateless reset, not to drive the handshake. The handshake goes through
+OpenSSL's own QUIC TLS API, which needs **OpenSSL 3.5 or newer**, and which is
+why CI pins its runner image rather than using `ubuntu-latest`.
 
 ## Minimum submodule checkout
 

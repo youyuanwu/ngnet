@@ -15,9 +15,11 @@
 //! `user_data` pointer, `settings.rand_ctx.native_handle`, and `path.user_data` (unused
 //! here). Those live in boxes this type owns.
 //!
-//! Once the TLS handle is installed there is a fifth, and it points the other way: the
-//! connection holds the TLS session, and OpenSSL holds a reference back to the connection.
-//! That cycle is what the TLS session's hand-written `Drop` exists to unwind safely.
+//! Once the TLS handle is installed there is a fifth, and it points at the session this type
+//! owns. ngtcp2 treats it as opaque — it stores the pointer and hands it back — so the crypto
+//! callbacks recover the session from it and nothing points the other way. That used to be a
+//! cycle, with the TLS library holding a reference back to the connection; removing it is most
+//! of what the safe TLS seam bought.
 
 // The read/write entry points that use `with_bridge`, `raw` and `path_mut` arrive with the
 // packet paths. The connection is built and dropped by the tests below regardless.
@@ -505,14 +507,18 @@ impl<'h, S: Session> Conn<'h, S> {
 
 impl<S: Session> Drop for Conn<'_, S> {
     fn drop(&mut self) {
-        // Order matters. The connection is destroyed first, while the TLS session is still
-        // alive: the helper's callbacks may run during teardown and reach the connection
-        // through the reference OpenSSL holds. Freeing the TLS session first would leave
-        // that reference dangling.
+        // Order matters, though for a narrower reason than it once did. The connection is
+        // destroyed first, while the TLS session is still alive, because `ngtcp2_conn_del`
+        // releases the key material the session produced -- and it does that by calling the
+        // delete callbacks, which reconstruct each key as the session's own key type. Freeing
+        // the session first would leave those callbacks reconstructing a type whose backend
+        // has gone.
         //
-        // The TLS session's own `Drop` then runs -- clearing OpenSSL's app data before
-        // `SSL_free`, and freeing the helper context last -- followed by the boxes ngtcp2
-        // was holding pointers into, which nothing can reach any more.
+        // It is no longer because the TLS library holds a reference back to the connection. It
+        // does not; the safe seam removed that.
+        //
+        // The session's own `Drop` then runs, followed by the boxes ngtcp2 was holding
+        // pointers into, which nothing can reach any more.
         if !self.raw.is_null() {
             // SAFETY: the pointer came from a connection constructor and is freed exactly
             // once. The allocator it dereferences here is still alive, since it is dropped
