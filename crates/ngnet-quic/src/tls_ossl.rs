@@ -748,7 +748,7 @@ struct Engine {
     /// OpenSSL can yield a secret, some handshake bytes and the peer's transport parameters
     /// from inside one `SSL_do_handshake`, and the connection must apply them in that order
     /// or install a key before the transport parameters its installation depends on.
-    events: std::collections::VecDeque<SessionEvent<OsslPacketKey, OsslHeaderKey>>,
+    events: std::collections::VecDeque<SessionEvent>,
     /// Inbound handshake bytes OpenSSL has not released.
     inbound: Inbound,
     /// The local transport parameters, owned until OpenSSL has sent them.
@@ -769,6 +769,20 @@ struct Engine {
     version: u32,
     /// The helper context, kept only so the negotiated suite can be read from it.
     ossl_ctx: *mut sys::ngtcp2_crypto_ossl_ctx,
+    /// The connection, lent for the length of one call into OpenSSL.
+    ///
+    /// Set immediately before `SSL_do_handshake` and cleared immediately after, because the
+    /// only thing that may use it is a callback OpenSSL makes from inside that call. A stale
+    /// one would be a pointer into a borrow that has ended, so it is never left set.
+    conn: *mut (dyn crate::tls::Handshaking<OsslPacketKey, OsslHeaderKey> + 'static),
+    /// Which side this is. A server produces its transport parameters mid-handshake; a client
+    /// supplied them before it started.
+    role: Role,
+    /// Whether this endpoint's transport parameters have been given to OpenSSL.
+    ///
+    /// They are sent once. A second `SSL_set_quic_tls_transport_params` would replace a buffer
+    /// OpenSSL may still be reading.
+    local_params_sent: bool,
     /// Why a callback failed, when the failure could not be described by its return value.
     failure: Option<String>,
     /// Whether `SSL_do_handshake` has succeeded.
@@ -795,11 +809,17 @@ impl Engine {
         Some(unsafe { &mut *arg.cast::<Self>() })
     }
 
-    /// Derives and queues one direction's keys from a secret OpenSSL yielded.
-    fn yield_keys(&mut self, level: Level, direction: Direction, secret: &[u8]) -> Result<()> {
+    /// Derives one direction's keys from a secret OpenSSL yielded and installs them.
+    ///
+    /// Installed rather than queued: on a server, installing the handshake write key is what
+    /// completes this endpoint's transport parameters
+    /// (`ngtcp2_conn_commit_local_transport_params`, reached only from
+    /// `ngtcp2_conn_install_tx_handshake_key` at `ngtcp2_conn.c:11132`), and OpenSSL writes
+    /// the message carrying them without returning from this callback.
+    fn install(&mut self, level: Level, direction: Direction, secret: &[u8]) -> Result<()> {
         let suite = match level {
-            // The Initial suite is fixed by the specification and needs no negotiation --
-            // and no secret is ever yielded at that level anyway.
+            // The Initial suite is fixed by the specification and needs no negotiation -- and
+            // no secret is ever yielded at that level anyway.
             Level::Initial => Suite::initial(),
             _ => match self.suite {
                 Some(suite) => suite,
@@ -818,13 +838,14 @@ impl Engine {
             Direction::Read => derive_rx_keys(&suite, self.version, secret)?,
             Direction::Write => derive_keys(&suite, self.version, secret)?,
         };
-        self.events.push_back(SessionEvent::Keys {
-            level,
-            direction,
-            keys,
-            secret: secret.to_vec(),
-        });
-        Ok(())
+
+        if self.conn.is_null() {
+            return Err(Error::backend("a secret was yielded outside a call"));
+        }
+        // SAFETY: the pointer was set for the duration of the call this is running inside,
+        // and is cleared before that call returns.
+        let conn = unsafe { &mut *self.conn };
+        conn.install_keys(level, direction, keys, secret)
     }
 }
 
@@ -853,15 +874,25 @@ unsafe extern "C" fn ossl_crypto_send(
     let Some(engine) = (unsafe { Engine::from_arg(arg) }) else {
         return 1;
     };
-    // SAFETY: OpenSSL guarantees `buf` is readable for `buflen` for the duration of the
-    // call, which is why the bytes are copied out rather than referenced.
-    let data = unsafe { core::slice::from_raw_parts(buf, buflen) }.to_vec();
+    // SAFETY: OpenSSL guarantees `buf` is readable for `buflen` for the duration of the call.
+    let data = unsafe { core::slice::from_raw_parts(buf, buflen) };
     let level = engine.tx_level;
-    engine
-        .events
-        .push_back(SessionEvent::Handshake { level, data });
-    // Reporting fewer than offered would make OpenSSL retry the remainder, and the queue
-    // above has no back pressure, so all of it is always taken.
+
+    if engine.conn.is_null() {
+        engine.failure = Some("handshake data was produced outside a call".to_owned());
+        return 0;
+    }
+    // SAFETY: the pointer was set for the duration of the call this is running inside.
+    let conn = unsafe { &mut *engine.conn };
+
+    // Submitted **now**, and reported consumed only if that succeeded. Queuing it would mean
+    // answering "how much did you take?" before the answer existed, and the only answer
+    // available in advance is a claim that all of it was accepted -- which is exactly what the
+    // seam forbids, because handshake data lost that way goes missing with no error anywhere.
+    if let Err(error) = conn.submit_handshake(level, data) {
+        engine.failure = Some(format!("handshake data was not submitted: {error}"));
+        return 0;
+    }
     // SAFETY: OpenSSL provides a writable out-parameter.
     unsafe { *consumed = buflen };
     1
@@ -910,7 +941,7 @@ unsafe extern "C" fn ossl_crypto_release_rcd(
 
 /// Derives the keys for a secret OpenSSL produced.
 unsafe extern "C" fn ossl_yield_secret(
-    _ssl: *mut sys::SSL,
+    ssl: *mut sys::SSL,
     ossl_level: u32,
     direction: c_int,
     secret: *const c_uchar,
@@ -934,14 +965,49 @@ unsafe extern "C" fn ossl_yield_secret(
     // SAFETY: OpenSSL guarantees the secret is readable for `secretlen` for this call.
     let secret = unsafe { core::slice::from_raw_parts(secret, secretlen) };
 
-    if let Err(error) = engine.yield_keys(level, direction, secret) {
-        engine.failure = Some(format!("could not derive keys: {error}"));
+    if let Err(error) = engine.install(level, direction, secret) {
+        engine.failure = Some(format!("could not install keys: {error}"));
         return 0;
     }
-    // Set only after the keys are queued, so a failed derivation cannot leave the level
+    // Set only after the keys are installed, so a failed derivation cannot leave the level
     // advanced with no key to go with it.
     if direction == Direction::Write {
         engine.tx_level = level;
+    }
+
+    // And, on a server, its transport parameters -- here and at no other moment. The key just
+    // installed is what completed them (`ngtcp2_conn.c:11132`), so anything earlier yields an
+    // incomplete set; and OpenSSL writes the message carrying them before this call returns,
+    // so anything later is too late. ngtcp2's own helper gates it identically
+    // (`shared.c:502-503`). A client's went in before the handshake started and must not be
+    // replaced.
+    if engine.role == Role::Server
+        && level == Level::Handshake
+        && direction == Direction::Write
+        && !engine.local_params_sent
+    {
+        if engine.conn.is_null() {
+            engine.failure = Some("a secret was yielded outside a call".to_owned());
+            return 0;
+        }
+        // SAFETY: the pointer was set for the duration of the call this is running inside.
+        let conn = unsafe { &mut *engine.conn };
+        let local = match conn.local_transport_params() {
+            Ok(local) => local,
+            Err(error) => {
+                engine.failure = Some(format!("no transport parameters to send: {error}"));
+                return 0;
+            }
+        };
+        engine.local_params = Some(local);
+        let stored = engine.local_params.as_ref().expect("just set");
+        let (ptr, len) = (stored.as_ptr(), stored.len());
+        // SAFETY: `ssl` is valid and the buffer lives in the engine, which outlives it.
+        if unsafe { sys::SSL_set_quic_tls_transport_params(ssl, ptr, len) } != 1 {
+            engine.failure = Some("OpenSSL would not take the transport parameters".to_owned());
+            return 0;
+        }
+        engine.local_params_sent = true;
     }
     1
 }
@@ -957,11 +1023,27 @@ unsafe extern "C" fn ossl_got_transport_params(
     let Some(engine) = (unsafe { Engine::from_arg(arg) }) else {
         return 1;
     };
-    // SAFETY: OpenSSL guarantees the buffer is readable for this call, so it is copied.
-    let params = unsafe { core::slice::from_raw_parts(params, paramslen) }.to_vec();
-    engine
-        .events
-        .push_back(SessionEvent::PeerTransportParams(params));
+    // SAFETY: OpenSSL guarantees the buffer is readable for this call.
+    let peer = unsafe { core::slice::from_raw_parts(params, paramslen) };
+
+    if engine.conn.is_null() {
+        engine.failure = Some("the peer's transport parameters arrived outside a call".to_owned());
+        return 0;
+    }
+    // SAFETY: the pointer was set for the duration of the call this is running inside.
+    let conn = unsafe { &mut *engine.conn };
+
+    // Handed over here and nowhere else, because this is where they arrive and because a
+    // server's own set cannot be produced until they have been. This endpoint's are *not*
+    // fetched here: OpenSSL refuses `SSL_set_quic_tls_transport_params` from inside this
+    // callback with "bad extension", and on a server they would be incomplete anyway. They go
+    // in at the next yielded secret -- see `ossl_yield_secret`.
+    if let Err(error) = conn.set_peer_transport_params(peer) {
+        engine.failure = Some(format!(
+            "the peer's transport parameters were rejected: {error}"
+        ));
+        return 0;
+    }
     1
 }
 
@@ -1507,6 +1589,72 @@ impl Drop for Pkey {
     }
 }
 
+/// Lends the connection to the engine for the length of one call into OpenSSL.
+struct LentConn {
+    engine: *mut Engine,
+}
+
+impl LentConn {
+    fn install(
+        engine: *mut Engine,
+        conn: &mut dyn crate::tls::Handshaking<OsslPacketKey, OsslHeaderKey>,
+    ) -> Self {
+        // The lifetime is erased because the pointer is stored in a `'static` field. Nothing
+        // reads it outside this guard's scope: the guard clears it on drop, and the only
+        // readers are callbacks OpenSSL makes from inside the calls the guard brackets.
+        let erased: *mut (dyn crate::tls::Handshaking<OsslPacketKey, OsslHeaderKey> + '_) = conn;
+        // SAFETY: the engine is live, no callback is running yet, and the erased lifetime is
+        // reinstated by the guard clearing the field before the borrow ends.
+        unsafe {
+            (*engine).conn = core::mem::transmute::<
+                *mut (dyn crate::tls::Handshaking<OsslPacketKey, OsslHeaderKey> + '_),
+                *mut (dyn crate::tls::Handshaking<OsslPacketKey, OsslHeaderKey> + 'static),
+            >(erased);
+        }
+        Self { engine }
+    }
+}
+
+impl Drop for LentConn {
+    fn drop(&mut self) {
+        // SAFETY: the engine is live and OpenSSL has returned, so no callback holds this.
+        unsafe { (*self.engine).conn = no_conn() };
+    }
+}
+
+/// The "no call in progress" value for [`Engine::conn`].
+///
+/// A null *fat* pointer needs a concrete type to build its vtable half from, so this exists
+/// solely to name one. It is never constructed and its methods are never reached: the field is
+/// null-checked before it is ever dereferenced.
+struct NoConn;
+
+impl crate::tls::Handshaking<OsslPacketKey, OsslHeaderKey> for NoConn {
+    fn set_peer_transport_params(&mut self, _peer: &[u8]) -> Result<()> {
+        unreachable!("the null connection handle is never dereferenced")
+    }
+    fn local_transport_params(&mut self) -> Result<Vec<u8>> {
+        unreachable!("the null connection handle is never dereferenced")
+    }
+    fn install_keys(
+        &mut self,
+        _level: Level,
+        _direction: Direction,
+        _keys: DirectionalKeys<OsslPacketKey, OsslHeaderKey>,
+        _secret: &[u8],
+    ) -> Result<()> {
+        unreachable!("the null connection handle is never dereferenced")
+    }
+    fn submit_handshake(&mut self, _level: Level, _data: &[u8]) -> Result<()> {
+        unreachable!("the null connection handle is never dereferenced")
+    }
+}
+
+/// A null handle, meaning no call into OpenSSL is in progress.
+fn no_conn() -> *mut (dyn crate::tls::Handshaking<OsslPacketKey, OsslHeaderKey> + 'static) {
+    core::ptr::null_mut::<NoConn>()
+}
+
 /// A configured OpenSSL TLS stack.
 pub struct OsslBackend {
     /// Declared first so it is dropped first: `SSL_CTX_free` must run before the ALPN
@@ -1669,6 +1817,9 @@ impl OsslSession {
                     tx_level: Level::Initial,
                     version: sys::NGTCP2_PROTO_VER_V1,
                     ossl_ctx,
+                    conn: no_conn(),
+                    role,
+                    local_params_sent: false,
                     failure: None,
                     handshake_completed: false,
                 }));
@@ -1939,9 +2090,18 @@ impl OsslSession {
     /// handshake completes. ngtcp2's helper does the same, for the same reason
     /// (`ossl.c:993`), and omitting it produces a connection that completes and then
     /// quietly ignores everything the peer says at the TLS layer.
-    fn drive(&mut self) -> Result<()> {
+    fn drive(
+        &mut self,
+        conn: &mut dyn crate::tls::Handshaking<OsslPacketKey, OsslHeaderKey>,
+    ) -> Result<()> {
         let engine = self.engine_ptr()?;
         let ssl = self.ssl;
+
+        // Lent for exactly the length of the calls below. The guard clears it on drop --
+        // including while unwinding -- so a later callback can never follow it into a borrow
+        // that has ended. The same discipline as `callbacks::BridgeGuard`, for the same
+        // reason.
+        let _lent = LentConn::install(engine, conn);
 
         // SAFETY: reading a plain field through the pointer; no borrow is held across the
         // OpenSSL calls below, which is what keeps the callbacks' `&mut` exclusive.
@@ -2037,14 +2197,27 @@ impl Session for OsslSession {
         if rc != 1 {
             return Err(tls_error("SSL_set_quic_tls_transport_params failed"));
         }
+        // Recorded so the server path in `ossl_yield_secret` does not later replace a buffer
+        // OpenSSL may still be reading. A client never reaches that path, but saying so here
+        // rather than relying on the role check keeps the two independent.
+        // SAFETY: the pointer is live and no callback can be running.
+        unsafe { (*engine).local_params_sent = true };
         Ok(())
     }
 
-    fn start_handshake(&mut self) -> Result<()> {
-        self.drive()
+    fn start_handshake(
+        &mut self,
+        conn: &mut dyn crate::tls::Handshaking<OsslPacketKey, OsslHeaderKey>,
+    ) -> Result<()> {
+        self.drive(conn)
     }
 
-    fn read_handshake(&mut self, _level: Level, data: &[u8]) -> Result<()> {
+    fn read_handshake(
+        &mut self,
+        _level: Level,
+        data: &[u8],
+        conn: &mut dyn crate::tls::Handshaking<OsslPacketKey, OsslHeaderKey>,
+    ) -> Result<()> {
         let engine = self.engine_ptr()?;
         // The level is not passed on. OpenSSL's record layer infers it from the keys it has
         // installed, and ngtcp2 already refuses handshake data at a level whose keys are not
@@ -2052,10 +2225,10 @@ impl Session for OsslSession {
         // with those two.
         // SAFETY: the pointer is live and no callback can be running.
         unsafe { (*engine).inbound.push(data) };
-        self.drive()
+        self.drive(conn)
     }
 
-    fn poll_event(&mut self) -> Option<SessionEvent<Self::PacketKey, Self::HeaderKey>> {
+    fn poll_event(&mut self) -> Option<SessionEvent> {
         if self.engine.is_null() {
             return None;
         }
@@ -2523,23 +2696,14 @@ mod tests {
             .session
             .set_local_transport_params(b"client")
             .unwrap();
-        server
-            .session
-            .set_local_transport_params(b"server")
-            .unwrap();
-        client.session.start_handshake().unwrap();
-        client.drain();
+        client.start();
 
         for _ in 0..8 {
-            let flight = core::mem::take(&mut client.outbound);
-            for (level, data) in flight {
-                server.session.read_handshake(level, &data).unwrap();
-                server.drain();
+            for (level, data) in client.take_outbound() {
+                server.feed(level, &data);
             }
-            let flight = core::mem::take(&mut server.outbound);
-            for (level, data) in flight {
-                client.session.read_handshake(level, &data).unwrap();
-                client.drain();
+            for (level, data) in server.take_outbound() {
+                client.feed(level, &data);
             }
             if client.completed && server.completed {
                 break;
@@ -2550,8 +2714,8 @@ mod tests {
         assert!(server.completed, "the server handshake did not complete");
 
         // Each side received the other's transport parameters, exactly as given.
-        assert_eq!(client.peer_params.as_deref(), Some(&b"server"[..]));
-        assert_eq!(server.peer_params.as_deref(), Some(&b"client"[..]));
+        assert_eq!(client.peer_params(), Some(&b"server"[..]));
+        assert_eq!(server.peer_params(), Some(&b"client"[..]));
 
         // And ALPN was negotiated, which only happens if the extension actually travelled.
         assert_eq!(
@@ -2656,8 +2820,79 @@ mod tests {
         let mut session =
             TlsBackend::new_session(&backend, Role::Client, Some("example.com")).unwrap();
         assert!(session.set_local_transport_params(b"x").is_err());
-        assert!(session.start_handshake().is_err());
+        assert!(session.start_handshake(&mut Recorder::new(b"x")).is_err());
         assert!(Session::poll_event(&mut session).is_none());
+    }
+
+    /// A stand-in connection, for handshakes run with no connection behind them.
+    ///
+    /// It records what the session did rather than doing it: a fixed blob as this endpoint's
+    /// parameters, the peer's kept for inspection, and keys and handshake bytes collected. The
+    /// seam asks nothing more of it — the real implementation decodes into ngtcp2 and encodes
+    /// back out, but nothing in the TLS layer depends on the parameters meaning anything.
+    #[derive(Default)]
+    struct Recorder {
+        local: Vec<u8>,
+        peer: Option<Vec<u8>>,
+        outbound: Vec<(Level, Vec<u8>)>,
+        sent_levels: Vec<Level>,
+        keys: Vec<ReportedKeys>,
+        /// Set to make `submit_handshake` fail, so the "never reported consumed unless
+        /// submitted" rule can be checked rather than assumed.
+        refuse_submissions: bool,
+        /// Set to refuse this endpoint's parameters, standing in for a server asked too early.
+        refuse_local: bool,
+    }
+
+    impl Recorder {
+        fn new(local: &[u8]) -> Self {
+            Self {
+                local: local.to_vec(),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl crate::tls::Handshaking<OsslPacketKey, OsslHeaderKey> for Recorder {
+        fn set_peer_transport_params(&mut self, peer: &[u8]) -> Result<()> {
+            if self.peer.is_some() {
+                return Err(Error::backend("the peer's parameters were offered twice"));
+            }
+            self.peer = Some(peer.to_vec());
+            Ok(())
+        }
+
+        fn local_transport_params(&mut self) -> Result<Vec<u8>> {
+            if self.refuse_local {
+                return Err(Error::backend("asked too early"));
+            }
+            Ok(self.local.clone())
+        }
+
+        fn install_keys(
+            &mut self,
+            level: Level,
+            direction: Direction,
+            keys: DirectionalKeys<OsslPacketKey, OsslHeaderKey>,
+            secret: &[u8],
+        ) -> Result<()> {
+            self.keys.push(ReportedKeys {
+                level,
+                direction,
+                keys,
+                secret: secret.to_vec(),
+            });
+            Ok(())
+        }
+
+        fn submit_handshake(&mut self, level: Level, data: &[u8]) -> Result<()> {
+            if self.refuse_submissions {
+                return Err(Error::backend("submission refused"));
+            }
+            self.sent_levels.push(level);
+            self.outbound.push((level, data.to_vec()));
+            Ok(())
+        }
     }
 
     /// A backend a safe-seam client session can be made from.
@@ -2677,14 +2912,10 @@ mod tests {
         secret: Vec<u8>,
     }
 
-    /// One side of a handshake, plus everything the seam reported to it.
+    /// One side of a handshake, plus everything it did to its connection.
     struct Handshake {
         session: OsslSession,
-        outbound: Vec<(Level, Vec<u8>)>,
-        /// Every level anything was ever sent at, which `outbound` loses as it is drained.
-        sent: Vec<Level>,
-        keys: Vec<ReportedKeys>,
-        peer_params: Option<Vec<u8>>,
+        conn: Recorder,
         completed: bool,
     }
 
@@ -2701,51 +2932,62 @@ mod tests {
             };
             let server_name = (role == Role::Client).then_some("example.com");
             let session = Backend::new_session(&backend, role, server_name).unwrap();
+            let local: &[u8] = if role == Role::Client {
+                b"client"
+            } else {
+                b"server"
+            };
             Self {
                 session,
-                outbound: Vec::new(),
-                sent: Vec::new(),
-                keys: Vec::new(),
-                peer_params: None,
+                conn: Recorder::new(local),
                 completed: false,
             }
         }
 
-        /// Drains everything the session has to report, recording it in order.
+        /// Starts the handshake, then records what it reported afterwards.
+        fn start(&mut self) {
+            self.session.start_handshake(&mut self.conn).unwrap();
+            self.drain();
+        }
+
+        /// Feeds one flight, then records what it reported afterwards.
+        fn feed(&mut self, level: Level, data: &[u8]) {
+            self.session
+                .read_handshake(level, data, &mut self.conn)
+                .unwrap();
+            self.drain();
+        }
+
+        /// Drains the two things that are still reported rather than performed.
         fn drain(&mut self) {
             while let Some(event) = self.session.poll_event() {
                 match event {
-                    SessionEvent::Handshake { level, data } => {
-                        self.sent.push(level);
-                        self.outbound.push((level, data));
-                    }
-                    SessionEvent::Keys {
-                        level,
-                        direction,
-                        keys,
-                        secret,
-                    } => self.keys.push(ReportedKeys {
-                        level,
-                        direction,
-                        keys,
-                        secret,
-                    }),
-                    SessionEvent::PeerTransportParams(params) => self.peer_params = Some(params),
                     SessionEvent::HandshakeComplete => self.completed = true,
                     SessionEvent::Alert(code) => panic!("unexpected TLS alert {code}"),
                 }
             }
         }
 
+        /// Everything queued to send, taken.
+        fn take_outbound(&mut self) -> Vec<(Level, Vec<u8>)> {
+            core::mem::take(&mut self.conn.outbound)
+        }
+
+        fn peer_params(&self) -> Option<&[u8]> {
+            self.conn.peer.as_deref()
+        }
+
         fn key(&self, level: Level, direction: Direction) -> Option<(&OsslPacketKey, &[u8])> {
-            self.keys
+            self.conn
+                .keys
                 .iter()
                 .find(|k| k.level == level && k.direction == direction)
                 .map(|k| (&k.keys.packet, k.keys.iv.as_slice()))
         }
 
         fn secret(&self, level: Level, direction: Direction) -> &[u8] {
-            self.keys
+            self.conn
+                .keys
                 .iter()
                 .find(|k| k.level == level && k.direction == direction)
                 .map(|k| k.secret.as_slice())
@@ -2761,21 +3003,14 @@ mod tests {
             .session
             .set_local_transport_params(b"client")
             .unwrap();
-        server
-            .session
-            .set_local_transport_params(b"server")
-            .unwrap();
-        client.session.start_handshake().unwrap();
-        client.drain();
+        client.start();
 
         for _ in 0..8 {
-            for (level, data) in core::mem::take(&mut client.outbound) {
-                server.session.read_handshake(level, &data).unwrap();
-                server.drain();
+            for (level, data) in client.take_outbound() {
+                server.feed(level, &data);
             }
-            for (level, data) in core::mem::take(&mut server.outbound) {
-                client.session.read_handshake(level, &data).unwrap();
-                client.drain();
+            for (level, data) in server.take_outbound() {
+                client.feed(level, &data);
             }
             if client.completed && server.completed {
                 break;
@@ -2803,19 +3038,78 @@ mod tests {
         drop(backend);
 
         let mut client = Handshake::new(Role::Client);
-        Session::set_local_transport_params(&mut server, b"server").unwrap();
         client
             .session
             .set_local_transport_params(b"client")
             .unwrap();
-        client.session.start_handshake().unwrap();
-        client.drain();
+        client.start();
 
-        for (level, data) in core::mem::take(&mut client.outbound) {
-            server.read_handshake(level, &data).unwrap();
+        let mut conn = Recorder::new(b"server");
+        for (level, data) in client.take_outbound() {
+            Session::read_handshake(&mut server, level, &data, &mut conn).unwrap();
         }
         // Reaching here at all is the assertion: selecting ALPN dereferences the offer list.
-        assert!(server.poll_event().is_some());
+        assert!(!conn.outbound.is_empty());
+    }
+
+    #[test]
+    fn handshake_data_is_never_reported_consumed_unless_it_was_submitted() {
+        // FR-018, and the reason submission is on the capability rather than the queue. A TLS
+        // stack must be told how much it consumed before it returns, so an implementation that
+        // queues the bytes has to answer before the answer exists -- and the only answer
+        // available in advance is "all of it", which is a claim that handshake data was
+        // accepted when it may have been dropped. Data lost that way goes missing with no
+        // error anywhere.
+        //
+        // Here the connection refuses every submission. The session must fail rather than
+        // report a successful flight.
+        let mut client = Handshake::new(Role::Client);
+        client
+            .session
+            .set_local_transport_params(b"client")
+            .unwrap();
+        client.conn.refuse_submissions = true;
+
+        let result = client.session.start_handshake(&mut client.conn);
+        assert!(
+            result.is_err(),
+            "a refused submission must fail the handshake, not be reported as consumed"
+        );
+        assert!(
+            client.conn.outbound.is_empty(),
+            "nothing was submitted, so nothing may be recorded as sent"
+        );
+    }
+
+    #[test]
+    fn the_peers_transport_parameters_cannot_be_offered_twice() {
+        // ngtcp2 accepts a second set without complaint, so the refusal has to be ours. A peer
+        // that sends two sets has contradicted itself, and silently keeping the later one
+        // would mean negotiating against limits the peer never agreed.
+        let mut conn = Recorder::new(b"local");
+        use crate::tls::Handshaking as _;
+        conn.set_peer_transport_params(b"first").unwrap();
+        assert!(conn.set_peer_transport_params(b"second").is_err());
+    }
+
+    #[test]
+    fn a_session_asked_for_parameters_it_cannot_produce_fails_rather_than_inventing_them() {
+        // Standing in for the server-side ordering rule the bridge enforces: asked before it
+        // can answer, the connection refuses. The failure has to surface through the session
+        // rather than being swallowed, or the handshake completes locally and stalls at the
+        // peer -- which is exactly how the design this replaced failed.
+        let mut client = Handshake::new(Role::Client);
+        client
+            .session
+            .set_local_transport_params(b"client")
+            .unwrap();
+        client.conn.refuse_local = true;
+
+        // The client never asks, so its handshake still starts. The point is that the refusal
+        // is expressible at all, and that nothing invents a substitute.
+        client.session.start_handshake(&mut client.conn).unwrap();
+        use crate::tls::Handshaking as _;
+        assert!(client.conn.local_transport_params().is_err());
     }
 
     #[test]
@@ -2832,7 +3126,7 @@ mod tests {
         let (client, server) = completed_handshake();
 
         assert!(
-            server.sent.contains(&Level::OneRtt),
+            server.conn.sent_levels.contains(&Level::OneRtt),
             "the server sent nothing at the application level after the handshake completed"
         );
         // SAFETY: the engine is live for as long as the session, and no callback is running.
@@ -2900,19 +3194,13 @@ mod tests {
         client.session.set_local_transport_params(&params).unwrap();
         params.fill(0xff);
 
-        server
-            .session
-            .set_local_transport_params(b"server")
-            .unwrap();
-        client.session.start_handshake().unwrap();
-        client.drain();
-        for (level, data) in core::mem::take(&mut client.outbound) {
-            server.session.read_handshake(level, &data).unwrap();
-            server.drain();
+        client.start();
+        for (level, data) in client.take_outbound() {
+            server.feed(level, &data);
         }
 
         assert_eq!(
-            server.peer_params.as_deref(),
+            server.peer_params(),
             Some(&b"the original parameters"[..]),
             "the peer received what the caller's buffer became, not what it was"
         );

@@ -360,35 +360,135 @@ pub struct RotatedKeys<P> {
     pub tx_secret: Vec<u8>,
 }
 
-/// Everything a session tells the connection about, in the order it happened.
+/// The connection, lent to a session for the length of one call.
 ///
-/// A single ordered stream rather than a set of accessors, because order is load-bearing and
-/// easy to lose. A TLS stack reports a secret, some handshake bytes, the peer's transport
-/// parameters and possibly an alert from inside one call, and the connection must apply them
-/// in that order: keys before the bytes they protect, transport parameters before the keys
-/// whose installation depends on them being set.
-#[derive(Debug)]
-pub enum SessionEvent<P, H> {
-    /// Handshake bytes to send at this level.
-    Handshake {
-        /// The level to send them at.
+/// # Why this exists at all
+///
+/// The seam would be simpler if a session only ever *reported* things and the crate applied
+/// them afterwards. That was this crate's original design, and it is wrong — not stylistically,
+/// but in a way that produces a QUIC server no other implementation will talk to. Three facts
+/// combine:
+///
+/// 1. A server's own transport parameters name the version it settled on, and the QUIC library
+///    fills that in only while decoding the *peer's* parameters. Encoded before that, the field
+///    is zero, which the peer rejects as malformed.
+/// 2. They also carry the connection identifier the server is using, which the library fills in
+///    only while installing the handshake write key. Encoded before that, the parameter is
+///    absent, and the peer rejects the set as incomplete.
+/// 3. Both must land before the TLS stack writes the message carrying them, which it does
+///    without returning from the call that delivered the peer's.
+///
+/// There is therefore no moment *between* those steps at which the crate is in control. These
+/// operations have to take effect while the TLS stack is still on the stack, so a session
+/// performs them rather than reporting them.
+///
+/// Both failure modes were found by running handshakes rather than by reading headers, and both
+/// looked identical from this side: everything local succeeded, and the peer went quiet.
+///
+/// # Why it is not a hole in the safety claim
+///
+/// It carries bytes and key objects. It names nothing belonging to the QUIC library, offers no
+/// operation beyond these four, and — being borrowed rather than owned — cannot be kept past
+/// the call that lent it. The compiler enforces that last point rather than the documentation:
+///
+/// ```compile_fail
+/// use ngnet_quic::{Handshaking, Level, Result, Session};
+/// # use ngnet_quic::{CryptoError, HeaderKey, InitialKeys, PacketKey, RotatedKeys, SessionEvent};
+/// # struct K;
+/// # impl PacketKey for K {
+/// #     fn seal(&self, _: &mut [u8], _: usize, _: &[u8], _: &[u8]) -> core::result::Result<(), CryptoError> { Ok(()) }
+/// #     fn open(&self, _: &mut [u8], n: usize, _: &[u8], _: &[u8]) -> core::result::Result<usize, CryptoError> { Ok(n) }
+/// #     fn tag_len(&self) -> usize { 16 }
+/// #     fn confidentiality_limit(&self) -> u64 { 1 }
+/// #     fn integrity_limit(&self) -> u64 { 1 }
+/// # }
+/// # impl HeaderKey for K {
+/// #     fn mask(&self, _: &[u8]) -> core::result::Result<[u8; 5], CryptoError> { Ok([0; 5]) }
+/// # }
+/// // A backend that keeps the connection instead of using it and letting it go.
+/// struct Hoarder<'a> {
+///     kept: Option<&'a mut dyn Handshaking<K, K>>,
+/// }
+///
+/// impl Session for Hoarder<'static> {
+///     type PacketKey = K;
+///     type HeaderKey = K;
+///
+///     fn read_handshake(
+///         &mut self,
+///         _level: Level,
+///         _data: &[u8],
+///         conn: &mut dyn Handshaking<K, K>,
+///     ) -> Result<()> {
+///         self.kept = Some(conn); // the borrow does not outlive the call, so this cannot compile
+///         Ok(())
+///     }
+/// #   fn initial_keys(&mut self, _: u32, _: &[u8]) -> Result<InitialKeys<K, K>> { unimplemented!() }
+/// #   fn retry_key(&mut self, _: u32) -> Result<K> { unimplemented!() }
+/// #   fn set_local_transport_params(&mut self, _: &[u8]) -> Result<()> { Ok(()) }
+/// #   fn start_handshake(&mut self, _: &mut dyn Handshaking<K, K>) -> Result<()> { Ok(()) }
+/// #   fn poll_event(&mut self) -> Option<SessionEvent> { None }
+/// #   fn rotate_keys(&mut self, _: &[u8], _: &[u8]) -> Result<RotatedKeys<K>> { unimplemented!() }
+/// #   fn negotiated_alpn(&self) -> Option<Vec<u8>> { None }
+/// }
+/// ```
+pub trait Handshaking<P, H> {
+    /// Hands over the peer's transport parameters, exactly as they arrived.
+    ///
+    /// Must come before [`Handshaking::local_transport_params`], because on a server it is what
+    /// determines part of this endpoint's own set. Offering them twice is an error: a peer that
+    /// sends two sets has contradicted itself, and the QUIC library will not notice.
+    fn set_peer_transport_params(&mut self, peer: &[u8]) -> Result<()>;
+
+    /// Returns this endpoint's transport parameters, encoded and ready to send.
+    ///
+    /// A **server** must call this only after installing its handshake write key, because that
+    /// is the moment the QUIC library completes the set. Calling it earlier is an error rather
+    /// than a short answer — the library will otherwise encode an incomplete set quite happily,
+    /// and the mistake surfaces as a peer that stops responding.
+    ///
+    /// A **client** does not call it at all: its parameters are settled before the handshake
+    /// begins and arrive through [`Session::set_local_transport_params`].
+    fn local_transport_params(&mut self) -> Result<Vec<u8>>;
+
+    /// Installs one direction's key material for one encryption level.
+    ///
+    /// Immediate rather than reported, because installing the handshake write key is one of the
+    /// two steps that complete a server's transport parameters.
+    fn install_keys(
+        &mut self,
         level: Level,
-        /// The bytes.
-        data: Vec<u8>,
-    },
-    /// A key became available.
-    Keys {
-        /// Which level it protects.
-        level: Level,
-        /// Which direction it protects.
         direction: Direction,
-        /// The key material.
         keys: DirectionalKeys<P, H>,
-        /// The traffic secret it was derived from, which a key update rotates.
-        secret: Vec<u8>,
-    },
-    /// The peer's transport parameters, exactly as they arrived.
-    PeerTransportParams(Vec<u8>),
+        secret: &[u8],
+    ) -> Result<()>;
+
+    /// Submits outbound handshake bytes at a level.
+    ///
+    /// Immediate for a different reason: a TLS stack must be told how much of what it offered
+    /// was taken *before* it returns. Deferring the submission means answering that question
+    /// before the answer exists, and the only answer available in advance — "all of it" — is a
+    /// claim that handshake data was accepted when it may not have been.
+    ///
+    /// All of `data` is submitted or none of it is. There is no partial success to report.
+    fn submit_handshake(&mut self, level: Level, data: &[u8]) -> Result<()>;
+}
+
+/// The things a session reports that nothing has to observe before its call returns.
+///
+/// Two, and no more. Everything else a session has to say — handshake bytes, key material, the
+/// peer's transport parameters — has an effect something downstream depends on immediately,
+/// and so travels through [`Handshaking`] instead. What is left here genuinely can wait: a
+/// completed handshake and an alert are both facts about what has *already* happened, and
+/// nothing the TLS stack does next reads them back.
+///
+/// A queue rather than a pair of flags because order still matters between the two. A
+/// handshake that completes and then alerts is a different connection from one that alerts
+/// and then completes.
+///
+/// No longer generic over the key types, because keys no longer travel this way.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SessionEvent {
     /// The TLS handshake completed. Distinct from the QUIC handshake being confirmed.
     HandshakeComplete,
     /// The peer must be told the handshake failed, with this alert code.
@@ -440,21 +540,36 @@ pub trait Session: Send + 'static {
 
     /// Hands the session the local transport parameters to send.
     ///
-    /// Called before they are needed, which for a client is before the first flight and for
-    /// a server is before its handshake keys are installed.
+    /// The **client's** route, and only the client's: a client's parameters are final before
+    /// its first flight. A server's are not final until the handshake is under way, so a
+    /// server obtains them through [`Handshaking::local_transport_params`] instead.
     fn set_local_transport_params(&mut self, params: &[u8]) -> Result<()>;
 
     /// Starts the handshake. Clients only; a server starts when the client's first flight
     /// arrives.
-    fn start_handshake(&mut self) -> Result<()>;
+    ///
+    /// `conn` is lent for the duration of the call and cannot be retained.
+    fn start_handshake(
+        &mut self,
+        conn: &mut dyn Handshaking<Self::PacketKey, Self::HeaderKey>,
+    ) -> Result<()>;
 
     /// Feeds the session handshake bytes that arrived at `level`.
-    fn read_handshake(&mut self, level: Level, data: &[u8]) -> Result<()>;
+    ///
+    /// `conn` is lent on the same terms. Everything the session must make happen *while the
+    /// TLS stack is still running* goes through it; everything else is reported afterwards
+    /// through [`Session::poll_event`].
+    fn read_handshake(
+        &mut self,
+        level: Level,
+        data: &[u8],
+        conn: &mut dyn Handshaking<Self::PacketKey, Self::HeaderKey>,
+    ) -> Result<()>;
 
     /// Takes the next thing the session has to report, or `None` when it has nothing.
     ///
     /// Drained to exhaustion after every call that can produce events.
-    fn poll_event(&mut self) -> Option<SessionEvent<Self::PacketKey, Self::HeaderKey>>;
+    fn poll_event(&mut self) -> Option<SessionEvent>;
 
     /// Rotates the application keys, given the secrets currently in use.
     ///

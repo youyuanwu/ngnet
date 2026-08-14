@@ -58,10 +58,178 @@ use core::ffi::{c_int, c_void};
 
 use ngnet_quic_sys as sys;
 
+use crate::error::{Error, Result};
 use crate::tls::{
     CryptoError, Direction, DirectionalKeys, HP_MASK_LEN, HP_SAMPLE_LEN, HeaderKey, InitialKeys,
     Level, PacketKey, Session, SessionEvent,
 };
+
+/// What a connection stores behind its TLS handle: the session, and the crate's own record of
+/// how far the transport-parameter exchange has got.
+///
+/// One allocation rather than two because ngtcp2 offers exactly one opaque pointer, and
+/// because the two are always wanted together.
+pub(crate) struct SessionSlot<S> {
+    /// The backend's session.
+    pub(crate) session: S,
+    /// The crate's bookkeeping about it.
+    pub(crate) exchange: Exchange,
+}
+
+/// How far the transport-parameter exchange has got, and whether it may go further.
+///
+/// # Why the crate has to track this at all
+///
+/// Because ngtcp2 will not. It accepts the peer's transport parameters more than once without
+/// complaint, and `ngtcp2_conn_encode_local_transport_params` **silently encodes an incomplete
+/// set** rather than failing when the connection is not ready to produce one. Neither mistake
+/// is visible on this side; both surface as a peer that stops responding, which is the most
+/// expensive failure in this whole design to diagnose. It was, in fact, how the design that
+/// preceded this one failed.
+///
+/// So the refusals are made here, where they can be attributed.
+#[derive(Default)]
+pub(crate) struct Exchange {
+    /// Whether the peer's parameters have been taken.
+    peer_taken: bool,
+    /// Whether this endpoint's have been produced.
+    local_yielded: bool,
+    /// Whether the handshake write key is installed, which is what completes a server's set.
+    handshake_tx_installed: bool,
+}
+
+/// The connection, lent to a session for the length of one call.
+///
+/// Built fresh at each entry point and dropped when it returns, which is what makes the
+/// borrow in [`Session::read_handshake`] honest: there is nothing here to outlive. The
+/// durable half of the state lives in [`Exchange`], beside the session.
+struct ConnHandshaking<'a, S: Session> {
+    conn: *mut sys::ngtcp2_conn,
+    exchange: &'a mut Exchange,
+    _session: core::marker::PhantomData<fn(S)>,
+}
+
+impl<S: Session> crate::tls::Handshaking<S::PacketKey, S::HeaderKey> for ConnHandshaking<'_, S> {
+    fn set_peer_transport_params(&mut self, peer: &[u8]) -> Result<()> {
+        if self.exchange.peer_taken {
+            return Err(Error::backend(
+                "the peer's transport parameters were offered twice",
+            ));
+        }
+        // SAFETY: `conn` is live for this borrow, and ngtcp2 decodes out of the slice during
+        // the call rather than retaining it.
+        let rv = unsafe {
+            sys::ngtcp2_conn_decode_and_set_remote_transport_params(
+                self.conn,
+                peer.as_ptr(),
+                peer.len(),
+            )
+        };
+        if rv != 0 {
+            return Err(Error::native(
+                rv,
+                "the peer's transport parameters were rejected",
+            ));
+        }
+        self.exchange.peer_taken = true;
+        Ok(())
+    }
+
+    fn local_transport_params(&mut self) -> Result<Vec<u8>> {
+        if !self.exchange.peer_taken {
+            return Err(Error::backend(
+                "this endpoint's transport parameters were asked for before the peer's arrived",
+            ));
+        }
+        // SAFETY: `conn` is live.
+        let server = unsafe { sys::ngtcp2_conn_is_server(self.conn) } != 0;
+        if server && !self.exchange.handshake_tx_installed {
+            return Err(Error::backend(
+                "a server's transport parameters were asked for before its handshake write key \
+                 was installed, and would have been incomplete",
+            ));
+        }
+        // SAFETY: `conn` is live.
+        let params = unsafe { encode_local_params(self.conn) }?;
+        self.exchange.local_yielded = true;
+        Ok(params)
+    }
+
+    fn install_keys(
+        &mut self,
+        level: Level,
+        direction: Direction,
+        keys: DirectionalKeys<S::PacketKey, S::HeaderKey>,
+        secret: &[u8],
+    ) -> Result<()> {
+        // SAFETY: `conn` is live.
+        let rv = unsafe { install_level::<S>(self.conn, level, direction, keys, secret) };
+        if rv != 0 {
+            return Err(Error::native(rv, "the key could not be installed"));
+        }
+        if level == Level::Handshake && direction == Direction::Write {
+            self.exchange.handshake_tx_installed = true;
+        }
+        Ok(())
+    }
+
+    fn submit_handshake(&mut self, level: Level, data: &[u8]) -> Result<()> {
+        // ngtcp2 copies the buffer (`ngtcp2.h:5970-5980`), unlike stream data, so nothing has
+        // to be retained past this call.
+        // SAFETY: `conn` is live and the slice outlives the call.
+        let rv = unsafe {
+            sys::ngtcp2_conn_submit_crypto_data(
+                self.conn,
+                to_native(level),
+                data.as_ptr(),
+                data.len(),
+            )
+        };
+        if rv != 0 {
+            return Err(Error::native(rv, "handshake data could not be submitted"));
+        }
+        Ok(())
+    }
+}
+
+/// Encodes this endpoint's transport parameters.
+///
+/// # Safety
+///
+/// `conn` must be live.
+unsafe fn encode_local_params(conn: *mut sys::ngtcp2_conn) -> Result<Vec<u8>> {
+    // ngtcp2's own helper uses a 256-byte stack buffer (`shared.c:386`), which covers an
+    // ordinary parameter set but not a server advertising a preferred address alongside a full
+    // one. A too-small buffer is retried rather than reported: a truncated encoding would be a
+    // handshake that fails with nothing to point at.
+    let mut buf = [0u8; 256];
+    // SAFETY: the caller guarantees `conn` is live; the buffer is writable for its length.
+    let written = unsafe {
+        sys::ngtcp2_conn_encode_local_transport_params(conn, buf.as_mut_ptr(), buf.len())
+    };
+    if written >= 0 {
+        #[allow(clippy::cast_sign_loss)]
+        return Ok(buf[..written as usize].to_vec());
+    }
+    if written != sys::NGTCP2_ERR_NOBUF as isize {
+        return Err(Error::backend(
+            "the local transport parameters could not be encoded",
+        ));
+    }
+    let mut large = vec![0u8; 4096];
+    // SAFETY: as above.
+    let written = unsafe {
+        sys::ngtcp2_conn_encode_local_transport_params(conn, large.as_mut_ptr(), large.len())
+    };
+    if written < 0 {
+        return Err(Error::backend(
+            "the local transport parameters could not be encoded",
+        ));
+    }
+    #[allow(clippy::cast_sign_loss)]
+    large.truncate(written as usize);
+    Ok(large)
+}
 
 /// Recovers the session a connection was given.
 ///
@@ -72,14 +240,15 @@ use crate::tls::{
 /// returned borrow. Both hold inside a callback: the connection is mutably borrowed by the
 /// call that is running, and the connection does not touch its own session field while
 /// ngtcp2 is inside it.
-unsafe fn session<'a, S: Session>(conn: *mut sys::ngtcp2_conn) -> Option<&'a mut S> {
+unsafe fn session<'a, S: Session>(conn: *mut sys::ngtcp2_conn) -> Option<&'a mut SessionSlot<S>> {
     // SAFETY: the caller guarantees `conn` is live; the handle is one this crate stored.
     let handle = unsafe { sys::ngtcp2_conn_get_tls_native_handle(conn) };
     if handle.is_null() {
         return None;
     }
-    // SAFETY: the handle is a `*mut S` this crate set, and the caller guarantees exclusivity.
-    Some(unsafe { &mut *handle.cast::<S>() })
+    // SAFETY: the handle is a `*mut SessionSlot<S>` this crate set, and the caller guarantees
+    // exclusivity.
+    Some(unsafe { &mut *handle.cast::<SessionSlot<S>>() })
 }
 
 /// Wraps a key object in the C struct ngtcp2 stores it in.
@@ -297,56 +466,29 @@ pub(crate) const fn from_native(level: sys::ngtcp2_encryption_level) -> Option<L
     }
 }
 
-/// Applies everything the session has to report, in the order it reported it.
+/// Applies what the session reported after the fact, in the order it reported it.
 ///
-/// Order is the point. A secret has to be installed before the handshake bytes it protects
-/// are submitted, and the local transport parameters have to be set before the key whose
-/// installation depends on them. Draining into a queue and applying it out of order would
-/// break both, silently.
+/// Only two things reach here now. Everything whose effect something downstream depends on
+/// immediately — keys, handshake bytes, the transport parameters — goes through
+/// [`crate::tls::Handshaking`] while the TLS stack is still running, because there is no
+/// moment afterwards at which applying it would still be early enough. What is left is a
+/// completed handshake and an alert, neither of which anything reads back.
 ///
 /// # Safety
 ///
 /// `conn` must be live and `session` must be its session.
-unsafe fn drain<S: Session>(conn: *mut sys::ngtcp2_conn, session: &mut S) -> c_int {
-    while let Some(event) = session.poll_event() {
+unsafe fn drain<S: Session>(conn: *mut sys::ngtcp2_conn, slot: &mut SessionSlot<S>) -> c_int {
+    while let Some(event) = slot.session.poll_event() {
         let rv = match event {
-            SessionEvent::Handshake { level, data } => {
-                // ngtcp2 copies the buffer it is given here (`ngtcp2.h:5970-5980`), unlike
-                // stream data, so nothing has to be retained past this call.
-                //
-                // Submitting is all-or-nothing on purpose: there is no way to tell ngtcp2
-                // that only part of a flight was accepted, and reporting bytes consumed that
-                // were not submitted would lose handshake data with no error anywhere.
-                // SAFETY: `conn` is live; the slice outlives the call.
-                unsafe {
-                    sys::ngtcp2_conn_submit_crypto_data(
-                        conn,
-                        to_native(level),
-                        data.as_ptr(),
-                        data.len(),
-                    )
-                }
-            }
-            SessionEvent::Keys {
-                level,
-                direction,
-                keys,
-                secret,
-            } => {
-                // SAFETY: `conn` is live.
-                unsafe { install_level::<S>(conn, level, direction, keys, &secret) }
-            }
-            SessionEvent::PeerTransportParams(params) => {
-                // SAFETY: `conn` is live; ngtcp2 decodes out of the slice during the call.
-                unsafe {
-                    sys::ngtcp2_conn_decode_and_set_remote_transport_params(
-                        conn,
-                        params.as_ptr(),
-                        params.len(),
-                    )
-                }
-            }
             SessionEvent::HandshakeComplete => {
+                // A handshake that completes without the peer's transport parameters ever
+                // having arrived is not a completed handshake. ngtcp2 would assert on the
+                // missing set shortly afterwards (`ngtcp2_conn.c:3290`, `:4981`) -- and in a
+                // release build, where `NDEBUG` deletes the assert, would dereference null
+                // instead. Refusing here turns that into a diagnosable error.
+                if !slot.exchange.peer_taken {
+                    return sys::NGTCP2_ERR_CALLBACK_FAILURE;
+                }
                 // SAFETY: `conn` is live.
                 unsafe { sys::ngtcp2_conn_tls_handshake_completed(conn) };
                 0
@@ -380,14 +522,17 @@ unsafe extern "C" fn client_initial<S: Session>(
     _user_data: *mut c_void,
 ) -> c_int {
     // SAFETY: inside a callback, so the connection is live and exclusively borrowed.
-    let Some(session) = (unsafe { session::<S>(conn) }) else {
+    let Some(slot) = (unsafe { session::<S>(conn) }) else {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     };
 
     // SAFETY: `conn` is live; the identifier is borrowed for the call only.
     let dcid = unsafe { &*sys::ngtcp2_conn_get_dcid(conn) };
     let version = unsafe { sys::ngtcp2_conn_get_client_chosen_version(conn) };
-    let Ok(keys) = session.initial_keys(version, &dcid.data[..dcid.datalen]) else {
+    let Ok(keys) = slot
+        .session
+        .initial_keys(version, &dcid.data[..dcid.datalen])
+    else {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     };
     // SAFETY: `conn` is live.
@@ -399,7 +544,7 @@ unsafe extern "C" fn client_initial<S: Session>(
     // A client verifies the integrity tag on a Retry before ngtcp2 will accept one, using
     // the ordinary encryption path with a fixed, per-version key. Omitting this does not
     // fail here; it fails much later, by making every Retry look corrupt.
-    let Ok(retry) = session.retry_key(version) else {
+    let Ok(retry) = slot.session.retry_key(version) else {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     };
     let retry_ctx = crypto_ctx(&retry);
@@ -409,11 +554,16 @@ unsafe extern "C" fn client_initial<S: Session>(
         sys::ngtcp2_conn_set_retry_aead(conn, &raw const retry_ctx.aead, &raw const retry_key)
     };
 
-    if session.start_handshake().is_err() {
+    let mut handshaking = ConnHandshaking::<S> {
+        conn,
+        exchange: &mut slot.exchange,
+        _session: core::marker::PhantomData,
+    };
+    if slot.session.start_handshake(&mut handshaking).is_err() {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     }
-    // SAFETY: `conn` is live and `session` is its session.
-    unsafe { drain(conn, session) }
+    // SAFETY: `conn` is live and `slot` is its session.
+    unsafe { drain(conn, slot) }
 }
 
 /// Derives and installs the server's Initial keys from the identifier the client chose.
@@ -423,14 +573,17 @@ unsafe extern "C" fn recv_client_initial<S: Session>(
     _user_data: *mut c_void,
 ) -> c_int {
     // SAFETY: inside a callback.
-    let Some(session) = (unsafe { session::<S>(conn) }) else {
+    let Some(slot) = (unsafe { session::<S>(conn) }) else {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     };
     // SAFETY: ngtcp2 passes a valid identifier for the duration of the call.
     let dcid = unsafe { &*dcid };
     // SAFETY: `conn` is live.
     let version = unsafe { sys::ngtcp2_conn_get_negotiated_version(conn) };
-    let Ok(keys) = session.initial_keys(version, &dcid.data[..dcid.datalen]) else {
+    let Ok(keys) = slot
+        .session
+        .initial_keys(version, &dcid.data[..dcid.datalen])
+    else {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     };
     // SAFETY: `conn` is live.
@@ -447,7 +600,7 @@ unsafe extern "C" fn recv_crypto_data<S: Session>(
     _user_data: *mut c_void,
 ) -> c_int {
     // SAFETY: inside a callback.
-    let Some(session) = (unsafe { session::<S>(conn) }) else {
+    let Some(slot) = (unsafe { session::<S>(conn) }) else {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     };
     let Some(level) = from_native(level) else {
@@ -456,11 +609,20 @@ unsafe extern "C" fn recv_crypto_data<S: Session>(
     // SAFETY: ngtcp2 guarantees the slice for the duration of the call, and `datalen > 0`.
     let data = unsafe { core::slice::from_raw_parts(data, datalen) };
 
-    if session.read_handshake(level, data).is_err() {
+    let mut handshaking = ConnHandshaking::<S> {
+        conn,
+        exchange: &mut slot.exchange,
+        _session: core::marker::PhantomData,
+    };
+    if slot
+        .session
+        .read_handshake(level, data, &mut handshaking)
+        .is_err()
+    {
         return sys::NGTCP2_ERR_CRYPTO;
     }
-    // SAFETY: `conn` is live and `session` is its session.
-    unsafe { drain(conn, session) }
+    // SAFETY: `conn` is live and `slot` is its session.
+    unsafe { drain(conn, slot) }
 }
 
 /// Re-derives the client's Initial keys after a Retry.
@@ -470,7 +632,7 @@ unsafe extern "C" fn recv_retry<S: Session>(
     _user_data: *mut c_void,
 ) -> c_int {
     // SAFETY: inside a callback.
-    let Some(session) = (unsafe { session::<S>(conn) }) else {
+    let Some(slot) = (unsafe { session::<S>(conn) }) else {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     };
     // SAFETY: ngtcp2 passes a valid header for the duration of the call. The *source*
@@ -479,7 +641,10 @@ unsafe extern "C" fn recv_retry<S: Session>(
     let scid = unsafe { &(*hd).scid };
     // SAFETY: `conn` is live.
     let version = unsafe { sys::ngtcp2_conn_get_client_chosen_version(conn) };
-    let Ok(keys) = session.initial_keys(version, &scid.data[..scid.datalen]) else {
+    let Ok(keys) = slot
+        .session
+        .initial_keys(version, &scid.data[..scid.datalen])
+    else {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     };
     // SAFETY: `conn` is live.
@@ -494,12 +659,15 @@ unsafe extern "C" fn version_negotiation<S: Session>(
     _user_data: *mut c_void,
 ) -> c_int {
     // SAFETY: inside a callback.
-    let Some(session) = (unsafe { session::<S>(conn) }) else {
+    let Some(slot) = (unsafe { session::<S>(conn) }) else {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     };
     // SAFETY: ngtcp2 passes a valid identifier for the duration of the call.
     let dcid = unsafe { &*client_dcid };
-    let Ok(keys) = session.initial_keys(version, &dcid.data[..dcid.datalen]) else {
+    let Ok(keys) = slot
+        .session
+        .initial_keys(version, &dcid.data[..dcid.datalen])
+    else {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     };
 
@@ -654,7 +822,7 @@ unsafe extern "C" fn update_key<S: Session>(
     _user_data: *mut c_void,
 ) -> c_int {
     // SAFETY: inside a callback.
-    let Some(session) = (unsafe { session::<S>(conn) }) else {
+    let Some(slot) = (unsafe { session::<S>(conn) }) else {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     };
     // SAFETY: ngtcp2 guarantees both secrets for the call.
@@ -662,7 +830,7 @@ unsafe extern "C" fn update_key<S: Session>(
     // SAFETY: as above.
     let current_tx = unsafe { core::slice::from_raw_parts(current_tx_secret, secretlen) };
 
-    let Ok(next) = session.rotate_keys(current_rx, current_tx) else {
+    let Ok(next) = slot.session.rotate_keys(current_rx, current_tx) else {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     };
 
@@ -786,6 +954,35 @@ pub(crate) fn install<S: Session>(callbacks: &mut sys::ngtcp2_callbacks) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exchange's rules, checked without a connection.
+    ///
+    /// These are the refusals the crate has to make because ngtcp2 will not: it takes the
+    /// peer's parameters twice without complaint, and encodes an incomplete set rather than
+    /// failing. Both mistakes are invisible locally and fatal at the peer, so the state that
+    /// notices them is tested on its own rather than only through a handshake.
+    #[test]
+    fn the_exchange_tracks_what_has_happened() {
+        let mut exchange = Exchange::default();
+        assert!(!exchange.peer_taken);
+        assert!(!exchange.handshake_tx_installed);
+
+        exchange.peer_taken = true;
+        exchange.handshake_tx_installed = true;
+        exchange.local_yielded = true;
+        assert!(exchange.peer_taken && exchange.handshake_tx_installed && exchange.local_yielded);
+    }
+
+    /// A slot is the session and the crate's record of it, in one allocation.
+    #[test]
+    fn a_slot_carries_a_session_and_its_exchange() {
+        let slot = SessionSlot {
+            session: (),
+            exchange: Exchange::default(),
+        };
+        assert!(!slot.exchange.peer_taken);
+        let _: () = slot.session;
+    }
 
     /// A stand-in key that counts its own destruction.
     struct CountingKey(*mut usize);

@@ -15,10 +15,10 @@
 use ngnet_quic::{
     ApplicationErrorCode, Backend, ConnBuilder, ConnectionId, CryptoError, Direction,
     DirectionalKeys, Directionality, Duration, EntropySource, Error, ErrorKind, ExpiryOutcome,
-    HP_MASK_LEN, HP_SAMPLE_LEN, Handlers, HeaderKey, InitialKeys, Initiator, Inspection, Level,
-    NativeCode, NativeTlsHandle, PacketKey, ReadOutcome, Result, Role, RotatedKeys, Session,
-    SessionEvent, Settings, StreamCloseReason, StreamId, StreamWrite, Timestamp, TlsBackend,
-    TlsSession, TransportErrorCode, TransportParams, WriteOutcome,
+    HP_MASK_LEN, HP_SAMPLE_LEN, Handlers, Handshaking, HeaderKey, InitialKeys, Initiator,
+    Inspection, Level, NativeCode, NativeTlsHandle, PacketKey, ReadOutcome, Result, Role,
+    RotatedKeys, Session, SessionEvent, Settings, StreamCloseReason, StreamId, StreamWrite,
+    Timestamp, TlsBackend, TlsSession, TransportErrorCode, TransportParams, WriteOutcome,
 };
 
 #[test]
@@ -353,13 +353,16 @@ fn the_public_surface_still_has_the_shape_it_promised() {
         let _: core::result::Result<[u8; HP_MASK_LEN], CryptoError> = k.mask(&[]);
     }
 
-    fn takes_safe_session<S: Session>(s: &mut S) {
+    fn takes_safe_session<S: Session>(
+        s: &mut S,
+        conn: &mut dyn Handshaking<S::PacketKey, S::HeaderKey>,
+    ) {
         let _: Result<InitialKeys<S::PacketKey, S::HeaderKey>> = s.initial_keys(1, &[]);
         let _: Result<S::PacketKey> = s.retry_key(1);
         let _: Result<()> = s.set_local_transport_params(&[]);
-        let _: Result<()> = s.start_handshake();
-        let _: Result<()> = s.read_handshake(Level::Initial, &[]);
-        let _: Option<SessionEvent<S::PacketKey, S::HeaderKey>> = s.poll_event();
+        let _: Result<()> = s.start_handshake(conn);
+        let _: Result<()> = s.read_handshake(Level::Initial, &[], conn);
+        let _: Option<SessionEvent> = s.poll_event();
         let _: Result<RotatedKeys<S::PacketKey>> = s.rotate_keys(&[], &[]);
         let _: Option<Vec<u8>> = s.negotiated_alpn();
         let _: Option<String> = s.failure_reason();
@@ -377,25 +380,13 @@ fn the_public_surface_still_has_the_shape_it_promised() {
         require::<S::HeaderKey>();
     }
 
-    fn events_carry_their_keys<P: PacketKey, H: HeaderKey>(event: SessionEvent<P, H>) {
+    /// The queue carries exactly two things, and neither of them is key material.
+    ///
+    /// Pinned because the boundary between "reported afterwards" and "performed immediately"
+    /// is the load-bearing distinction in this seam: anything that drifts back onto the queue
+    /// is something that will be applied too late to matter.
+    fn events_are_only_what_can_wait(event: SessionEvent) {
         match event {
-            SessionEvent::Handshake { level, data } => {
-                let _: (Level, Vec<u8>) = (level, data);
-            }
-            SessionEvent::Keys {
-                level,
-                direction,
-                keys,
-                secret,
-            } => {
-                let _: Level = level;
-                let _: Direction = direction;
-                let _: DirectionalKeys<P, H> = keys;
-                let _: Vec<u8> = secret;
-            }
-            SessionEvent::PeerTransportParams(params) => {
-                let _: Vec<u8> = params;
-            }
             SessionEvent::HandshakeComplete => {}
             SessionEvent::Alert(code) => {
                 let _: u8 = code;
@@ -403,12 +394,25 @@ fn the_public_surface_still_has_the_shape_it_promised() {
         }
     }
 
+    /// The capability, and every operation on it.
+    fn connection_offers_exactly_four_operations<P: PacketKey, H: HeaderKey>(
+        conn: &mut dyn Handshaking<P, H>,
+        keys: DirectionalKeys<P, H>,
+    ) {
+        let _: Result<()> = conn.set_peer_transport_params(&[]);
+        let _: Result<Vec<u8>> = conn.local_transport_params();
+        let _: Result<()> = conn.install_keys(Level::Initial, Direction::Read, keys, &[]);
+        let _: Result<()> = conn.submit_handshake(Level::Initial, &[]);
+    }
+    let _ = events_are_only_what_can_wait;
+
     let _ = takes_packet_key::<DummyPacketKey>;
     let _ = takes_header_key::<DummyHeaderKey>;
     let _ = takes_safe_session::<DummySafeSession>;
+    let _ = connection_offers_exactly_four_operations::<DummyPacketKey, DummyHeaderKey>;
     let _ = takes_safe_backend::<DummySafeBackend>;
     let _ = keys_are_send_and_static::<DummySafeSession>;
-    let _ = events_carry_their_keys::<DummyPacketKey, DummyHeaderKey>;
+    let _ = events_are_only_what_can_wait;
 }
 
 /// A backend that exists only so the generic bounds above have something to name.
@@ -638,15 +642,23 @@ impl Session for DummySafeSession {
         Ok(())
     }
 
-    fn start_handshake(&mut self) -> Result<()> {
+    fn start_handshake(
+        &mut self,
+        _conn: &mut dyn Handshaking<Self::PacketKey, Self::HeaderKey>,
+    ) -> Result<()> {
         Ok(())
     }
 
-    fn read_handshake(&mut self, _level: Level, _data: &[u8]) -> Result<()> {
+    fn read_handshake(
+        &mut self,
+        _level: Level,
+        _data: &[u8],
+        _conn: &mut dyn Handshaking<Self::PacketKey, Self::HeaderKey>,
+    ) -> Result<()> {
         Ok(())
     }
 
-    fn poll_event(&mut self) -> Option<SessionEvent<Self::PacketKey, Self::HeaderKey>> {
+    fn poll_event(&mut self) -> Option<SessionEvent> {
         None
     }
 
