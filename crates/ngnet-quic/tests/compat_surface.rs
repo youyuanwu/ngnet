@@ -333,7 +333,7 @@ fn the_public_surface_still_has_the_shape_it_promised() {
 
     fn takes_packet_key<K: PacketKey>(k: &K, buf: &mut [u8]) {
         let _: core::result::Result<(), CryptoError> = k.seal(buf, 0, &[], &[]);
-        let _: core::result::Result<usize, CryptoError> = k.open(buf, 0, &[], &[]);
+        let _: core::result::Result<usize, CryptoError> = k.open(buf, &[], &[], &[]);
         let _: usize = k.tag_len();
         let _: u64 = k.confidentiality_limit();
         let _: u64 = k.integrity_limit();
@@ -553,8 +553,8 @@ impl PacketKey for DummyPacketKey {
 
     fn open(
         &self,
-        _buf: &mut [u8],
-        _ciphertext_len: usize,
+        _dest: &mut [u8],
+        _ciphertext: &[u8],
         _nonce: &[u8],
         _aad: &[u8],
     ) -> core::result::Result<usize, CryptoError> {

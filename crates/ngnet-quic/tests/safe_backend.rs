@@ -120,25 +120,29 @@ impl PacketKey for ToyPacketKey {
 
     fn open(
         &self,
-        buf: &mut [u8],
-        ciphertext_len: usize,
+        dest: &mut [u8],
+        ciphertext: &[u8],
         nonce: &[u8],
         aad: &[u8],
     ) -> std::result::Result<usize, CryptoError> {
+        let ciphertext_len = ciphertext.len();
         let Some(plaintext_len) = ciphertext_len.checked_sub(TAG_LEN) else {
             return Err(CryptoError::Decrypt);
         };
-        if buf.len() < ciphertext_len {
+        if dest.len() < plaintext_len {
             return Err(CryptoError::Fatal);
         }
-        let expected = self.tag(&buf[..plaintext_len], nonce, aad);
-        if buf[plaintext_len..ciphertext_len] != expected {
+        // Authenticated from the ciphertext, and the plaintext written into the destination:
+        // the two are separate buffers, as the seam now requires, so nothing is decrypted in
+        // place and nothing is copied first.
+        let expected = self.tag(&ciphertext[..plaintext_len], nonce, aad);
+        if ciphertext[plaintext_len..ciphertext_len] != expected {
             // A forged or reordered packet. Not a failure of the backend, and it must not end
             // the connection.
             return Err(CryptoError::Decrypt);
         }
-        for (i, b) in buf[..plaintext_len].iter_mut().enumerate() {
-            *b ^= self.stream(nonce, i);
+        for (i, b) in dest[..plaintext_len].iter_mut().enumerate() {
+            *b = ciphertext[i] ^ self.stream(nonce, i);
         }
         Ok(plaintext_len)
     }
@@ -689,7 +693,7 @@ fn a_backend_that_forbids_unsafe_completes_a_connection_in_both_roles() {
 }
 
 #[test]
-fn the_toy_protection_is_invertible_in_place_and_rejects_forgery() {
+fn the_toy_protection_is_invertible_and_rejects_forgery() {
     // The two properties ngtcp2 depends on, checked directly rather than inferred from a
     // handshake that happened to work.
     let keys = keys_for(&[1, 2, 3], level_tag(Level::OneRtt), FROM_CLIENT);
@@ -708,25 +712,29 @@ fn the_toy_protection_is_invertible_in_place_and_rejects_forgery() {
         "nothing was protected"
     );
 
-    // Same buffer in and out, which is the shape the seam requires.
-    let len = buf.len();
+    // Ciphertext in, plaintext out into a distinct buffer, which is the shape the seam now
+    // requires: ngtcp2's core always decrypts a packet into a buffer separate from the
+    // packet it received.
+    let mut plain = vec![0u8; plaintext.len()];
     let recovered = keys
         .packet
-        .open(&mut buf, len, nonce, aad)
+        .open(&mut plain, &buf, nonce, aad)
         .expect("opening");
-    assert_eq!(&buf[..recovered], &plaintext[..]);
+    assert_eq!(&plain[..recovered], &plaintext[..]);
 
     // A forged packet is an ordinary event, not a failed backend.
-    let mut forged = vec![0u8; plaintext.len() + TAG_LEN];
+    let forged = vec![0u8; plaintext.len() + TAG_LEN];
+    let mut out = vec![0u8; plaintext.len()];
     assert_eq!(
-        keys.packet.open(&mut forged, len, nonce, aad).unwrap_err(),
+        keys.packet.open(&mut out, &forged, nonce, aad).unwrap_err(),
         CryptoError::Decrypt
     );
 
     // And a packet too short to hold a tag, which is what a truncating attacker sends.
-    let mut short = vec![0u8; 4];
+    let short = vec![0u8; 4];
+    let mut out = vec![0u8; 4];
     assert_eq!(
-        keys.packet.open(&mut short, 4, nonce, aad).unwrap_err(),
+        keys.packet.open(&mut out, &short, nonce, aad).unwrap_err(),
         CryptoError::Decrypt
     );
 }
@@ -748,12 +756,12 @@ fn the_two_sides_derive_each_others_keys() {
             .packet
             .seal(&mut buf, plaintext.len(), &client_tx.iv, b"h")
             .expect("sealing");
-        let len = buf.len();
+        let mut plain = vec![0u8; plaintext.len()];
         let n = server_rx
             .packet
-            .open(&mut buf, len, &server_rx.iv, b"h")
+            .open(&mut plain, &buf, &server_rx.iv, b"h")
             .expect("opening");
-        assert_eq!(&buf[..n], &plaintext[..]);
+        assert_eq!(&plain[..n], &plaintext[..]);
     }
 }
 

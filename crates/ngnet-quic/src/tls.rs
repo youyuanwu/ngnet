@@ -147,14 +147,25 @@ pub trait PacketKey: Send + 'static {
         aad: &[u8],
     ) -> core::result::Result<(), CryptoError>;
 
-    /// Unprotects `buf[..ciphertext_len]` in place, returning the plaintext length.
+    /// Unprotects `ciphertext` into `dest`, returning the plaintext length.
+    ///
+    /// On entry `ciphertext` holds the protected payload followed by its authentication tag.
+    /// On success the first `ciphertext.len() - tag_len()` bytes of `dest` hold the
+    /// plaintext, and that length is returned; `dest` must be at least that long.
+    ///
+    /// The destination and the ciphertext are separate, non-overlapping buffers. ngtcp2's
+    /// core always decrypts a received packet into a buffer distinct from the packet itself,
+    /// so this crate's bridge never hands a backend two aliasing pointers — even though the C
+    /// header permits it (`ngtcp2.h:2846`). A backend whose primitive decrypts in place must
+    /// copy `ciphertext` into `dest` itself; this crate's own does not, which is the copy
+    /// this seam exists to avoid.
     ///
     /// Returns [`CryptoError::Decrypt`] when the payload does not authenticate. That is not
     /// a failure of the backend and must not end the connection.
     fn open(
         &self,
-        buf: &mut [u8],
-        ciphertext_len: usize,
+        dest: &mut [u8],
+        ciphertext: &[u8],
         nonce: &[u8],
         aad: &[u8],
     ) -> core::result::Result<usize, CryptoError>;
@@ -284,7 +295,7 @@ pub struct RotatedKeys<P> {
 /// # struct K;
 /// # impl PacketKey for K {
 /// #     fn seal(&self, _: &mut [u8], _: usize, _: &[u8], _: &[u8]) -> core::result::Result<(), CryptoError> { Ok(()) }
-/// #     fn open(&self, _: &mut [u8], n: usize, _: &[u8], _: &[u8]) -> core::result::Result<usize, CryptoError> { Ok(n) }
+/// #     fn open(&self, dest: &mut [u8], ciphertext: &[u8], _: &[u8], _: &[u8]) -> core::result::Result<usize, CryptoError> { dest[..ciphertext.len()].copy_from_slice(ciphertext); Ok(ciphertext.len()) }
 /// #     fn tag_len(&self) -> usize { 16 }
 /// #     fn confidentiality_limit(&self) -> u64 { 1 }
 /// #     fn integrity_limit(&self) -> u64 { 1 }

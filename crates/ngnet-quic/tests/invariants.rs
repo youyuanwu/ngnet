@@ -280,6 +280,46 @@ fn the_tls_seam_names_nothing_a_backend_cannot_have() {
 }
 
 #[test]
+fn the_decrypt_bridge_copies_nothing() {
+    // Phase 7. ngtcp2's core decrypts a received packet into a buffer distinct from the
+    // packet, never aliasing the two, so the bridge hands the key its destination and its
+    // ciphertext as separate slices and decrypts straight across -- no copy of the
+    // ciphertext into the destination first. That is a property of a specific span of code,
+    // and it is the kind that decays silently: one `copy_from_slice` added back for the
+    // convenience of an in-place primitive would restore exactly the copy this phase removed
+    // and never fail a functional test.
+    //
+    // So the span is named in the source and read textually. Naming it, rather than scanning
+    // the whole file, keeps this from tripping over an unrelated copy elsewhere in the
+    // bridge -- the sealing path, for one, is allowed its own.
+    let source = std::fs::read_to_string(crate_root().join("src/tls_bridge.rs"))
+        .expect("reading tls_bridge.rs");
+    let start = source
+        .find("// region:decrypt-no-copy")
+        .expect("the decrypt region is named at its start");
+    let end = source
+        .find("// endregion:decrypt-no-copy")
+        .expect("the decrypt region is named at its end");
+    assert!(start < end, "the decrypt region markers are out of order");
+    // Strip comments so the prose inside the region -- which talks about copying precisely
+    // because the code does not -- cannot be mistaken for the code doing it.
+    let region = strip_comments_and_literals(&source[start..end]);
+
+    for forbidden in [
+        "copy_from_slice",
+        "copy_nonoverlapping",
+        "to_vec",
+        "extend_from_slice",
+    ] {
+        assert!(
+            !region.contains(forbidden),
+            "the decrypt bridge uses `{forbidden}`, which copies the ciphertext it is \
+             supposed to decrypt across without touching -- the copy this phase removed"
+        );
+    }
+}
+
+#[test]
 fn the_safe_backend_proves_the_seam_needs_no_unsafe() {
     // The strongest available statement, and it is structural rather than asserted: a whole
     // TLS backend lives in a file that *forbids* unsafe code. `forbid` rather than `deny`

@@ -876,18 +876,26 @@ unsafe extern "C" fn decrypt<S: Session>(
     let Some(key) = (unsafe { key_from::<S::PacketKey>(aead_ctx) }) else {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     };
+    // region:decrypt-no-copy
+    // ngtcp2's header permits `dest` and `ciphertext` to be the same buffer
+    // (`ngtcp2.h:2846`), but its core never makes them so: a received packet is always
+    // decrypted into `conn->crypto.decrypt_buf`, which is distinct from the packet itself.
+    // At both call sites the source is `payload = pkt + hdpktlen` and the destination is
+    // `decrypt_buf.base` (`ngtcp2_conn.c:6846` and `:9457`). So the two are handed to the
+    // key as separate slices and nothing is copied out of the ciphertext first. A backend
+    // reached only through this bridge therefore never sees the two overlap; the header's
+    // permission to alias is not relied upon here, though a third-party bridge could.
     // SAFETY: `dest` has room for the plaintext, which is shorter than the ciphertext.
-    let buf = unsafe { core::slice::from_raw_parts_mut(dest, ciphertextlen) };
-    if !core::ptr::eq(dest.cast_const(), ciphertext) {
-        // SAFETY: the regions do not overlap, and both are valid for `ciphertextlen`.
-        unsafe { core::ptr::copy_nonoverlapping(ciphertext, dest, ciphertextlen) };
-    }
+    let dest = unsafe { core::slice::from_raw_parts_mut(dest, ciphertextlen) };
+    // SAFETY: ngtcp2 guarantees `ciphertext` for `ciphertextlen`, and it does not overlap
+    // `dest` -- see above.
+    let ciphertext = unsafe { core::slice::from_raw_parts(ciphertext, ciphertextlen) };
     // SAFETY: ngtcp2 guarantees both slices for the call.
     let nonce = unsafe { core::slice::from_raw_parts(nonce, noncelen) };
     // SAFETY: as above.
     let aad = unsafe { core::slice::from_raw_parts(aad, aadlen) };
 
-    match key.open(buf, ciphertextlen, nonce, aad) {
+    match key.open(dest, ciphertext, nonce, aad) {
         Ok(_) => 0,
         // The distinction the seam exists to preserve. A payload that does not authenticate
         // is an ordinary event -- a forged datagram, or one reordered past its key's
@@ -896,6 +904,7 @@ unsafe extern "C" fn decrypt<S: Session>(
         Err(CryptoError::Decrypt) => sys::NGTCP2_ERR_DECRYPT,
         Err(CryptoError::Fatal) => sys::NGTCP2_ERR_CALLBACK_FAILURE,
     }
+    // endregion:decrypt-no-copy
 }
 
 /// Produces the mask ngtcp2 applies to a packet header.
@@ -1208,12 +1217,12 @@ mod tests {
         }
         fn open(
             &self,
-            _buf: &mut [u8],
-            ciphertext_len: usize,
+            _dest: &mut [u8],
+            ciphertext: &[u8],
             _nonce: &[u8],
             _aad: &[u8],
         ) -> core::result::Result<usize, CryptoError> {
-            Ok(ciphertext_len)
+            Ok(ciphertext.len())
         }
         fn tag_len(&self) -> usize {
             16
