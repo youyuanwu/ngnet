@@ -71,6 +71,36 @@ The `unsafe` did not disappear. It moved into `src/tls_bridge.rs`, where it is w
 generically over the session type, instead of once per backend. That is the trade: the
 allowance list in `lib.rs` gained `tls_bridge` and lost `tls`.
 
+### The seam changed shape twice, and both are breaking
+
+The copy/allocation audit made two changes to the seam's public surface. Both were taken
+deliberately, on the owner's decision that a one-commit-old seam with two in-repository
+backends is the cheapest moment to change it — the cost only grows once a third party depends
+on it.
+
+- **`PacketKey::open` now takes the destination and the ciphertext as separate slices** —
+  `open(&mut dest, ciphertext, nonce, aad)` rather than one `&mut [u8]` unprotected in place.
+  ngtcp2's core always decrypts a received packet into a buffer distinct from the packet
+  itself (`ngtcp2_conn.c:6846`, `:9457`), never aliasing the two, even though the header
+  permits it (`ngtcp2.h:2846`). With the two slices separate, this crate's bridge decrypts
+  straight across and no longer copies the ciphertext into the destination first — the copy
+  removed on the receive path. `seal` is unchanged: ngtcp2 encrypts in place
+  (`ngtcp2_ppe.c:142`), and two overlapping slices, one shared and one mutable, cannot be
+  formed in safe Rust, so sealing keeps its single `&mut [u8]`. A backend whose own primitive
+  decrypts in place must now copy `ciphertext` into `dest` itself; the obligation the type
+  system used to carry for free is documentation the backend author has to read. A structural
+  test, `the_decrypt_bridge_copies_nothing`, pins that this crate's bridge does not copy.
+- **A level's initialisation vector is a fixed-capacity `Iv`, not a `Vec<u8>`.** `Iv` holds up
+  to `validate::MAX_IV_LEN` (64) bytes inline, with fallible construction that refuses anything
+  longer. It replaces the `Vec<u8>` in `DirectionalKeys::iv` and `RotatedKeys::{rx_iv, tx_iv}`,
+  so a level's IV no longer reaches the heap and a length ngtcp2 could not handle — the bounds
+  guard a fixed stack buffer whose overrun release builds do not catch — has no representation
+  rather than merely being rejected. It derefs to `[u8]`, so a reader sees the bytes and not the
+  padding behind them. `compat_surface.rs` names it and asserts it has no heap representation.
+
+Both appear in the pinned-surface test (`tests/compat_surface.rs`); a caller or backend that
+implemented the old shapes will not compile against the new ones.
+
 ### Three C objects became two, and the cycle went away
 
 The old design had an `SSL`, an `ngtcp2_crypto_ossl_ctx` wrapping it, and an
@@ -143,9 +173,13 @@ interface and nothing behind it.
 The seam was shaped so one is possible; none is written. `rustls::quic` maps closely but not
 exactly:
 
-- `PacketKey` is near-identical — rustls protects in place, with `encrypt_in_place` and
-  `decrypt_in_place`, and exposes `confidentiality_limit` and `integrity_limit` under those
-  names.
+- `PacketKey` is close but no longer identical — rustls protects in place, with
+  `encrypt_in_place` and `decrypt_in_place`. `seal` maps directly. `open` now takes the
+  destination and the ciphertext as separate slices (see above), so a rustls backend's
+  `decrypt_in_place` would have to copy `ciphertext` into `dest` before unprotecting it —
+  which is what this crate's own bridge avoids by giving ngtcp2's already-separate buffers
+  straight to the key. rustls still exposes `confidentiality_limit` and `integrity_limit`
+  under those names.
 - `HeaderKey` is **not** a match, and this is the one real gap. ngtcp2 asks for a five-byte
   mask from a sample; rustls's `HeaderProtectionKey` only ever applies protection in place and
   never surfaces the mask. A rustls backend would have to reconstruct header protection from
@@ -175,7 +209,7 @@ dependency, so it has no RNG to reach for, and one seeded from a clock would pro
 predictable connection identifiers — a real weakness, since an observer who can guess the
 identifiers an endpoint will issue can correlate or interfere with its connections.
 
-## Sent stream data has to be copied
+## Sent stream data is copied unless ownership is handed over
 
 ngtcp2 does not copy what `writev_stream` accepts — it keeps the caller's pointer so it can
 retransmit, and requires the bytes stay intact "until `acked_stream_data_offset` indicates
@@ -189,13 +223,35 @@ anyone.
 
 So `src/retain.rs` keeps a copy of every accepted byte and hands ngtcp2 a pointer into that,
 releasing it when the acknowledgement arrives or the stream closes. Each accepted write is
-its own `Box<[u8]>`: a growing `Vec` would reallocate and move bytes ngtcp2 still points at.
+retained at a fixed address — a borrowed write in its own `Box<[u8]>`, an owned one behind an
+`Arc` — because a growing `Vec` would reallocate and move bytes ngtcp2 still points at.
 
-The cost is one copy of everything sent, held until acknowledged. `ngnet-h3` avoids the
-equivalent copy by making its callers hand over ownership; this crate takes the copy instead,
-because the safety of an ordinary `&[u8]` parameter should not depend on the caller having
-read a paragraph of documentation. An ownership-taking alternative is in
-[`pending-work.md`](pending-work.md).
+The cost of the borrowing write is one copy of everything sent, held until acknowledged. That
+copy is the price of an ordinary `&[u8]` parameter whose safety does not depend on the caller
+having read a paragraph of documentation, and `Conn::write_stream` and `write_stream_vectored`
+keep it. `write_stream_vectored` now takes its ranges as `&[IoSlice]` rather than `&[&[u8]]`, so
+a vectored source — the HTTP/3 layer, whose body writes are already `IoSlice`s — passes them
+through without first collecting them into a temporary vector; the bytes still join *into* the
+single retained copy, so the byte count is unchanged.
+
+### The owned write hands the buffer over instead of copying
+
+`Conn::write_stream_owned` sits beside the borrowing writes for a caller that can give up its
+buffer. It takes an `OwnedBytes` — a reference-counted handle this crate defines, since the
+crate acquires no `bytes` dependency — and retains it by keeping the handle alive rather than
+by copying: ngtcp2 is handed a pointer straight into the `Arc`, whose address is fixed for as
+long as any handle survives. `OwnedBytes::from_owner` lets a caller who already holds a
+reference-counted buffer (a `bytes::Bytes`, a memory map, its own type) hand it over without a
+copy of its own.
+
+ngtcp2 routinely accepts a prefix and leaves the rest, so `write_stream_owned` returns an
+`OwnedWrite`: the outcome, plus `unsent`, the unaccepted suffix handed back as a second handle
+into the *same* allocation via `OwnedBytes::split_to`. The accepted prefix stays retained at a
+stable address and the suffix is offered again, neither side copied. Both the borrowing and the
+owning path retain until acknowledged; the difference is that the owning path allocates nothing
+where the borrowing one allocates a retained copy, which `tests/zero_alloc.rs` pins by counting
+both. The HTTP/3 layer still uses the borrowing path; why, and what changing it would take, is
+in [`pending-work.md`](pending-work.md).
 
 ## `Idle` and `Blocked` are different answers
 
@@ -535,8 +591,10 @@ The figure they carry is the cumulative total the endpoint may now open, not an 
 
 `retain.rs` exists because ngtcp2 does not copy the stream data it accepts: it keeps the
 caller's pointer so it can retransmit, and requires the bytes stay intact until acknowledged
-or the stream closes. Each accepted write therefore gets its own `Box<[u8]>`, whose address
-is fixed for as long as it lives.
+or the stream closes. Each accepted write therefore gets an allocation whose address is fixed
+for as long as it lives — a `Box<[u8]>` for a borrowed write, copied in; or, for an owned write
+handed over through `write_stream_owned`, the caller's `OwnedBytes` handle kept alive so no copy
+is made. Either way the address does not move.
 
 ngtcp2 routinely accepts *less* than it is offered — a packet fills, and the remainder comes
 back as a separate write. Shrinking the allocation to the accepted prefix is the obvious

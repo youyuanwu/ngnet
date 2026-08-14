@@ -205,12 +205,12 @@ pub trait HeaderKey: Send + 'static {
 
 /// A level's initialisation vector, held inline.
 ///
-/// ngtcp2 accepts a vector between [`MIN_IV_LEN`](crate::validate) and
-/// [`MAX_IV_LEN`](crate::validate) bytes; both bounds guard a fixed stack buffer whose
-/// overrun release builds do not catch. Storing the bytes in an array of that maximum makes a
-/// longer one impossible to express rather than merely rejected, so no path through a backend
-/// can hand ngtcp2 an over-length vector. Construction is fallible: a backend that produces
-/// one outside the accepted range is refused here, at the seam, rather than deeper in.
+/// ngtcp2 accepts a vector between `MIN_IV_LEN` (8) and `MAX_IV_LEN` (64) bytes; both bounds
+/// guard a fixed stack buffer whose overrun release builds do not catch. Storing the bytes in
+/// an array of that maximum makes a longer one impossible to express rather than merely
+/// rejected, so no path through a backend can hand ngtcp2 an over-length vector. Construction
+/// is fallible: a backend that produces one outside the accepted range is refused here, at the
+/// seam, rather than deeper in.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Iv {
     bytes: [u8; crate::validate::MAX_IV_LEN],
