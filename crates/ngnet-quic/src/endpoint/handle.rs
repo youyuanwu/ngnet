@@ -238,6 +238,7 @@ where
             routes: HashMap::new(),
             next_index: 0,
             buffer: vec![0u8; MAX_DATAGRAM],
+            send_buffer: vec![0u8; MAX_DATAGRAM],
             index_scratch: Vec::new(),
             accepts: self.accepts,
             outbox: std::collections::VecDeque::new(),
@@ -817,10 +818,9 @@ where
 
     /// Runs one receive pass in isolation, for the allocation-counting tests.
     ///
-    /// The public `poll` reads and then services, and the send half still allocates until
-    /// the whole audit lands, so a test that needs to count only the receive half cannot go
-    /// through `poll`. This exposes that half and nothing else. Hidden and unsupported, like
-    /// everything in `endpoint::testing`.
+    /// A test that needs to count only the receive half cannot go through `poll`, which
+    /// reads, services and sends in one call. This exposes that half and nothing else.
+    /// Hidden and unsupported, like everything in `endpoint::testing`.
     #[doc(hidden)]
     pub fn read_datagrams_for_test(
         &mut self,
@@ -834,6 +834,26 @@ where
     #[doc(hidden)]
     pub fn socket_for_test(&self) -> &Sock {
         &self.inner.socket
+    }
+
+    /// Runs the command and timer half of a pass, without the send half, for the
+    /// allocation-counting tests. Lets a test stage a connection's pending datagram outside
+    /// the region that counts the send. Hidden and unsupported.
+    #[doc(hidden)]
+    pub fn service_commands_for_test(&mut self) {
+        let indices: Vec<u64> = self.inner.connections.keys().copied().collect();
+        for index in &indices {
+            self.inner.apply_routes(*index);
+            self.inner.apply_commands(*index);
+            self.inner.handle_expiry(*index);
+        }
+    }
+
+    /// Runs one send pass in isolation, for the allocation-counting tests. This is the half
+    /// Phase 5 made allocate nothing when its datagrams complete. Hidden and unsupported.
+    #[doc(hidden)]
+    pub fn flush_for_test(&mut self, cx: &mut Context<'_>) -> core::result::Result<(), Error> {
+        self.inner.flush(cx)
     }
 
     /// Delivers one datagram to whatever should have it.

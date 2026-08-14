@@ -851,15 +851,15 @@ mod driver_pass {
             cside.is_established() && sside.is_established(),
             "the connection did not survive the pass, so the count is meaningless"
         );
-        // At most one buffer per serviced connection, and here there is one connection. That
-        // one allocation is `next_datagram` taking a send buffer before it knows there is
-        // nothing to send -- removed in Phase 5, which is why this is `<=` rather than `==`.
-        // The point of this phase is the absence of the two index vectors, each of which the
+        // Now zero: `next_datagram` no longer takes a send buffer before it knows there is
+        // anything to send -- Phase 5 gave it the driver's reusable buffer to write into --
+        // so an idle pass over an established connection allocates nothing at all. The point
+        // of this phase remains the absence of the two index vectors, each of which the
         // inversion check restores to push this count to three.
-        assert!(
-            allocations <= 1,
+        assert_eq!(
+            allocations, 0,
             "an idle driver pass over one established connection allocated {allocations} \
-             times; more than one buffer means iterating the connections is still allocating"
+             times; it is supposed to allocate nothing once the send buffer is reused"
         );
         eprintln!("idle driver pass allocated {allocations} times");
     }
@@ -1129,5 +1129,239 @@ mod driver_pass {
             "the two passes did not hold independent bytes"
         );
         eprintln!("detached receive pass allocated {allocations} times");
+    }
+
+    #[test]
+    fn a_completing_send_pass_allocates_nothing() {
+        // Phase 5, SC-001. `next_datagram` used to hand back an owned `Vec` on every call,
+        // allocating a datagram buffer before the socket's disposition was known. Now a
+        // core-produced datagram is written into a buffer the driver owns and reuses, and an
+        // already-owned datagram is forwarded as itself -- so a send pass whose datagrams all
+        // complete allocates nothing.
+        //
+        // The socket is put in sink mode: a completed send is counted but its bytes are
+        // dropped rather than copied into the peer's queue, so the harness's own delivery
+        // copy stays out of the count and what remains is `flush` alone.
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let (mut drivers, mut cside, _sside, clock) = establish(&mut cx);
+
+        let sid = {
+            let mut opening = cside.open_uni();
+            loop {
+                match Pin::new(&mut opening).poll(&mut cx) {
+                    Poll::Ready(r) => break r.expect("opening a stream"),
+                    Poll::Pending => {
+                        poll_all(&mut drivers, &mut cx);
+                        clock.advance(2_000_000);
+                    }
+                }
+            }
+        };
+        // Queue a write and run the command half so the datagram is staged into `pending`
+        // -- the one forced copy `write_stream` owes, paid here outside the count. What the
+        // counted flush then does is send that already-owned datagram, which must be free.
+        cside
+            .write(sid, &[0x5au8; 256], true)
+            .expect("stream write");
+        drivers[0].as_mut().get_mut().service_commands_for_test();
+
+        drivers[0].as_ref().socket_for_test().set_sink(true);
+        let before = drivers[0].as_ref().socket_for_test().sent();
+        let (_, allocations) = count_allocations(|| {
+            drivers[0]
+                .as_mut()
+                .get_mut()
+                .flush_for_test(&mut cx)
+                .expect("counted flush");
+        });
+        let after = drivers[0].as_ref().socket_for_test().sent();
+
+        assert!(
+            after > before,
+            "the flush sent no datagram, so a zero allocation count would prove nothing"
+        );
+        assert_eq!(
+            allocations, 0,
+            "a send pass whose datagrams all complete allocated {allocations} times; a \
+             completed send is supposed to reuse the driver's buffer and copy nothing"
+        );
+    }
+
+    #[test]
+    fn a_core_produced_datagram_costs_nothing_to_send_and_one_to_retain() {
+        // Phase 5, SC-001, the two dispositions of a datagram the core writes into the
+        // reusable buffer. When the socket accepts it, nothing is allocated: the bytes are
+        // left in the buffer to be overwritten by the next datagram. When the socket refuses
+        // it -- `WouldBlock` or `Pending` -- it must be retained across the pass, and since
+        // the next pass will overwrite the buffer it has to be copied into one of its own.
+        // That copy is the single allocation the send path can owe.
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let (mut drivers, mut cside, _sside, clock) = establish(&mut cx);
+
+        let sid = {
+            let mut opening = cside.open_uni();
+            loop {
+                match Pin::new(&mut opening).poll(&mut cx) {
+                    Poll::Ready(r) => break r.expect("opening a stream"),
+                    Poll::Pending => {
+                        poll_all(&mut drivers, &mut cx);
+                        clock.advance(2_000_000);
+                    }
+                }
+            }
+        };
+
+        // Make the server owe an acknowledgement: the client writes ack-eliciting stream
+        // data, only the client is polled so its datagrams pile up in the server's socket,
+        // the server reads them, and the clock is moved past the acknowledgement delay. The
+        // server's next flush then produces the ACK by writing it into the reusable buffer --
+        // a genuine core-produced datagram.
+        cside.write(sid, &[0x11u8; 256], true).expect("first write");
+        for _ in 0..16 {
+            let _ = drivers[0].as_mut().poll(&mut cx);
+            clock.advance(2_000_000);
+        }
+        let _ = drivers[1]
+            .as_mut()
+            .get_mut()
+            .read_datagrams_for_test(&mut cx)
+            .expect("server reads the ack-eliciting data");
+        clock.advance(50_000_000);
+
+        // Complete disposition: the socket accepts the ACK, so flush allocates nothing.
+        drivers[1].as_ref().socket_for_test().set_sink(true);
+        let sent_before = drivers[1].as_ref().socket_for_test().sent();
+        let (_, complete_allocs) = count_allocations(|| {
+            drivers[1]
+                .as_mut()
+                .get_mut()
+                .flush_for_test(&mut cx)
+                .expect("completing flush");
+        });
+        let sent_after = drivers[1].as_ref().socket_for_test().sent();
+        assert!(
+            sent_after > sent_before,
+            "the server sent no ack datagram, so the completing region did no work"
+        );
+        assert_eq!(
+            complete_allocs, 0,
+            "a core-produced datagram that the socket accepts allocated {complete_allocs} \
+             times; a completed send is supposed to leave its bytes in the reusable buffer"
+        );
+
+        // Retain disposition: make the server owe a fresh ACK, refuse the send once, and the
+        // datagram must be copied out of the reusable buffer to survive the pass -- exactly
+        // one allocation.
+        cside
+            .write(sid, &[0x22u8; 256], true)
+            .expect("second write");
+        for _ in 0..16 {
+            let _ = drivers[0].as_mut().poll(&mut cx);
+            clock.advance(2_000_000);
+        }
+        let _ = drivers[1]
+            .as_mut()
+            .get_mut()
+            .read_datagrams_for_test(&mut cx)
+            .expect("server reads the second batch");
+        clock.advance(50_000_000);
+
+        drivers[1]
+            .as_ref()
+            .socket_for_test()
+            .inject(ngnet_quic::endpoint::testing::Fault::SendWouldBlock);
+        let sent_before = drivers[1].as_ref().socket_for_test().sent();
+        let (_, retain_allocs) = count_allocations(|| {
+            drivers[1]
+                .as_mut()
+                .get_mut()
+                .flush_for_test(&mut cx)
+                .expect("retaining flush");
+        });
+        let sent_after = drivers[1].as_ref().socket_for_test().sent();
+        assert_eq!(
+            sent_after, sent_before,
+            "the refused send still counted as sent, so the retain path was not exercised"
+        );
+        assert_eq!(
+            retain_allocs, 1,
+            "a core-produced datagram the socket refuses allocated {retain_allocs} times; it \
+             must be copied out of the reusable buffer exactly once to be retained"
+        );
+    }
+
+    #[test]
+    fn datagrams_sharing_the_reused_buffer_keep_their_own_bytes() {
+        // Phase 5, SC-012. The send path now reuses one buffer across every datagram in a
+        // pass, which is the correctness risk of buffer reuse: a datagram must still hold its
+        // own bytes even as the buffer is rewritten for the next. A large payload forces many
+        // datagrams through that single buffer and a refused send in the middle forces the
+        // retain-and-copy path. This is an end-to-end check: it proves the transfer arrives
+        // byte-for-byte under heavy reuse, and it would fail outright on any *systematic*
+        // corruption of the buffer. It does not isolate a single transiently corrupted
+        // datagram, which QUIC would retransmit and recover -- that soundness rests instead
+        // on the retain copying out of the buffer (`buffer[..len].to_vec()`) and the borrow
+        // checker refusing to let a datagram keep a borrow of the buffer across a pass.
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let (mut drivers, mut cside, mut sside, clock) = establish(&mut cx);
+
+        let sid = {
+            let mut opening = cside.open_uni();
+            loop {
+                match Pin::new(&mut opening).poll(&mut cx) {
+                    Poll::Ready(r) => break r.expect("opening a stream"),
+                    Poll::Pending => {
+                        poll_all(&mut drivers, &mut cx);
+                        clock.advance(2_000_000);
+                    }
+                }
+            }
+        };
+
+        // A payload several packets long, each byte a function of its index so any datagram
+        // written into the wrong place would show up as a mismatch.
+        let payload: Vec<u8> = (0..24_000u32).map(|i| (i % 251) as u8).collect();
+        cside.write(sid, &payload, true).expect("stream write");
+
+        // Refuse one send early to drive the retain-and-copy path while the transfer is still
+        // in flight, then let it recover.
+        drivers[0]
+            .as_ref()
+            .socket_for_test()
+            .inject(ngnet_quic::endpoint::testing::Fault::SendWouldBlock);
+
+        let mut received = Vec::new();
+        let mut fin = false;
+        let mut accepted = None;
+        for _ in 0..2_000 {
+            poll_all(&mut drivers, &mut cx);
+            if accepted.is_none() {
+                let mut a = sside.accept_stream();
+                if let Poll::Ready(r) = Pin::new(&mut a).poll(&mut cx) {
+                    accepted = Some(r.expect("accepting the stream"));
+                }
+            }
+            if let Some(stream) = accepted {
+                let mut reading = sside.read(stream);
+                if let Poll::Ready(r) = Pin::new(&mut reading).poll(&mut cx) {
+                    let chunk = r.expect("reading the stream");
+                    received.extend_from_slice(&chunk.bytes);
+                    fin = chunk.fin;
+                }
+            }
+            if fin {
+                break;
+            }
+            clock.advance(2_000_000);
+        }
+
+        assert!(fin, "the server never saw the end of the stream");
+        assert_eq!(
+            received, payload,
+            "a datagram carried the wrong bytes; reusing the send buffer corrupted the stream"
+        );
     }
 }
