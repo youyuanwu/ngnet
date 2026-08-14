@@ -443,9 +443,21 @@ pub trait Session: Send + 'static {
 
     /// Feeds the session handshake bytes that arrived at `level`.
     ///
-    /// `conn` is lent on the same terms. Everything the session must make happen *while the
-    /// TLS stack is still running* goes through it; everything else is reported afterwards
-    /// through [`Session::poll_event`].
+    /// # This is a stream, not a message
+    ///
+    /// One call does **not** mean one handshake message. The QUIC library deliberately splits
+    /// a client's first flight across CRYPTO frames, so the first thing a server sees here is
+    /// typically a few bytes of a message tens of bytes long, followed by the rest across
+    /// several more calls. A backend must reassemble.
+    ///
+    /// This is worth stating plainly because a real TLS stack already does it — OpenSSL's
+    /// record layer buffers, so the OpenSSL backend never had to think about it — and a
+    /// backend written against the obvious reading of this signature fails on the first
+    /// connection it makes. That is exactly how it was found here.
+    ///
+    /// `conn` is lent on the same terms as above. Everything the session must make happen
+    /// *while the TLS stack is still running* goes through it; everything else is reported
+    /// afterwards through [`Session::poll_event`].
     fn read_handshake(
         &mut self,
         level: Level,
