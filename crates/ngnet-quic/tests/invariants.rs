@@ -251,6 +251,49 @@ fn the_allowance_list_is_the_ffi_boundary_and_nothing_else() {
 }
 
 #[test]
+fn the_tls_seam_names_nothing_a_backend_cannot_have() {
+    // SC-004. The claim is that implementing the seam requires no `unsafe`, no raw pointer and
+    // no knowledge of the QUIC library. The first part is enforced structurally -- `tls` has no
+    // allowance, so any `unsafe` in it fails to compile -- but the other two are not, because
+    // a signature can name a foreign type perfectly safely and still leak the library into an
+    // interface that is supposed to hide it.
+    //
+    // Read textually rather than through the type system, because that is the only way to
+    // check "does not mention" as opposed to "does not depend on".
+    let source = std::fs::read_to_string(crate_root().join("src/tls.rs")).expect("reading tls.rs");
+    // The seam only, not its tests. Those deliberately compare the seam's constants against
+    // the raw bindings -- that cross-check is the reason the constants can be restated at all,
+    // and it is not part of what a backend author reads.
+    let seam = match source.find("#[cfg(test)]") {
+        Some(at) => &source[..at],
+        None => &source[..],
+    };
+    let code = strip_comments_and_literals(seam);
+
+    for forbidden in ["*mut ", "*const ", "sys::", "ngtcp2_", "c_void"] {
+        assert!(
+            !code.contains(forbidden),
+            "the TLS seam mentions `{forbidden}`, which a backend author would then have to \
+             understand -- the point of the seam is that they do not"
+        );
+    }
+}
+
+#[test]
+fn the_safe_backend_proves_the_seam_needs_no_unsafe() {
+    // The strongest available statement, and it is structural rather than asserted: a whole
+    // TLS backend lives in a file that *forbids* unsafe code. `forbid` rather than `deny`
+    // matters -- a `deny` can be silenced from inside by an allowance, and `forbid` cannot.
+    let source = std::fs::read_to_string(crate_root().join("tests/safe_backend.rs"))
+        .expect("reading safe_backend.rs");
+    assert!(
+        source.contains("#![forbid(unsafe_code)]"),
+        "the proof backend stopped forbidding unsafe code, which is the only thing that makes \
+         it a proof rather than an example"
+    );
+}
+
+#[test]
 fn all_core_module_files_are_flat() {
     // Not style. The scan above derives a module's name from its file stem, so a nested
     // `foo/bar.rs` would be scanned as `bar` -- a name `lib.rs` never declares -- and would
