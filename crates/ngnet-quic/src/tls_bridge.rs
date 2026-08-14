@@ -257,9 +257,13 @@ unsafe fn install_level<S: Session>(
                 ivlen,
                 &raw const header,
             ),
-            (Level::ZeroRtt, _) => {
-                sys::ngtcp2_conn_install_0rtt_key(conn, &raw const packet, iv, ivlen, &raw const header)
-            }
+            (Level::ZeroRtt, _) => sys::ngtcp2_conn_install_0rtt_key(
+                conn,
+                &raw const packet,
+                iv,
+                ivlen,
+                &raw const header,
+            ),
             (Level::Initial, _) => sys::NGTCP2_ERR_INVALID_ARGUMENT,
         }
     };
@@ -401,7 +405,9 @@ unsafe extern "C" fn client_initial<S: Session>(
     let retry_ctx = crypto_ctx(&retry);
     let retry_key = box_packet_key(retry);
     // SAFETY: `conn` is live and takes ownership of the context.
-    unsafe { sys::ngtcp2_conn_set_retry_aead(conn, &raw const retry_ctx.aead, &raw const retry_key) };
+    unsafe {
+        sys::ngtcp2_conn_set_retry_aead(conn, &raw const retry_ctx.aead, &raw const retry_key)
+    };
 
     if session.start_handshake().is_err() {
         return sys::NGTCP2_ERR_CALLBACK_FAILURE;
