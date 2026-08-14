@@ -96,12 +96,39 @@ pub(crate) struct Exchange {
     local_yielded: bool,
     /// Whether the handshake write key is installed, which is what completes a server's set.
     handshake_tx_installed: bool,
-    /// How long the application keys' initialisation vectors are.
+    /// How long the application keys' initialisation vectors are, per direction.
     ///
-    /// Recorded because a key update has to produce vectors of exactly this length: ngtcp2
-    /// sized the buffers it hands the update callback from the generation being replaced, and
-    /// a longer one writes past them.
-    onertt_iv_len: Option<usize>,
+    /// Both, and not one, because a key update is sized from the **receive** key alone:
+    /// `conn_commit_key_update` reads `ivlen = rx_ckm->iv.len` and allocates *both* new buffers
+    /// at it (`ngtcp2_conn.c:8759-8774`). A backend installing twelve bytes one way and sixteen
+    /// the other would then be allowed to return sixteen for both, and the transmit copy would
+    /// write four bytes past a twelve-byte allocation. So the two are recorded separately, are
+    /// required to agree, and the update is checked against the receive length.
+    onertt_rx_iv_len: Option<usize>,
+    /// The transmit half of the above.
+    onertt_tx_iv_len: Option<usize>,
+    /// Which levels and directions have had keys installed.
+    ///
+    /// ngtcp2 refuses a second install only through `assert(!pktns->crypto.rx.ckm)`
+    /// (`ngtcp2_conn.c:11090`, `:11121`, `:11202`, `:11249`), which release builds delete.
+    /// Without that assertion a second install overwrites the pointer to the first, leaking the
+    /// boxed key it referred to and losing the ability to ever release it.
+    installed: [bool; 8],
+}
+
+/// Indexes [`Exchange::installed`] by level and direction.
+const fn install_slot(level: Level, direction: Direction) -> usize {
+    let level = match level {
+        Level::Initial => 0,
+        Level::ZeroRtt => 1,
+        Level::Handshake => 2,
+        Level::OneRtt => 3,
+    };
+    let direction = match direction {
+        Direction::Read => 0,
+        Direction::Write => 1,
+    };
+    level * 2 + direction
 }
 
 /// The connection, lent to a session for the length of one call.
@@ -169,16 +196,47 @@ impl<S: Session> crate::tls::Handshaking<S::PacketKey, S::HeaderKey> for ConnHan
         secret: &[u8],
     ) -> Result<()> {
         let iv_len = keys.iv.len();
+
+        // Refused before anything is boxed. A second install at the same level and direction
+        // would overwrite the pointer ngtcp2 holds to the first, leaking that key with nothing
+        // left able to release it -- and ngtcp2 catches it only with an assertion that release
+        // builds do not contain.
+        let slot = install_slot(level, direction);
+        if self.exchange.installed[slot] {
+            return Err(Error::backend(
+                "a TLS backend installed keys twice for the same level and direction",
+            ));
+        }
+
+        // The two application directions must agree, because a key update is sized from the
+        // receive key alone and applies that size to both.
+        if level == Level::OneRtt {
+            let other = match direction {
+                Direction::Read => self.exchange.onertt_tx_iv_len,
+                Direction::Write => self.exchange.onertt_rx_iv_len,
+            };
+            if let Some(other) = other {
+                crate::validate::iv_pair(iv_len, other)?;
+            } else {
+                crate::validate::iv_len(iv_len)?;
+            }
+        }
+
         // SAFETY: `conn` is live.
         let rv = unsafe { install_level::<S>(self.conn, level, direction, keys, secret) };
         if rv != 0 {
             return Err(Error::native(rv, "the key could not be installed"));
         }
+
+        self.exchange.installed[slot] = true;
         if level == Level::Handshake && direction == Direction::Write {
             self.exchange.handshake_tx_installed = true;
         }
         if level == Level::OneRtt {
-            self.exchange.onertt_iv_len = Some(iv_len);
+            match direction {
+                Direction::Read => self.exchange.onertt_rx_iv_len = Some(iv_len),
+                Direction::Write => self.exchange.onertt_tx_iv_len = Some(iv_len),
+            }
         }
         Ok(())
     }
@@ -885,7 +943,11 @@ unsafe extern "C" fn update_key<S: Session>(
     // boxing the new keys before the checks would leak them, because ngtcp2 adopts the
     // contexts only when the callback succeeds (`ngtcp2_conn.c:8778-8787`); a failure after
     // boxing leaves two allocations with nothing to collect them.
-    let expected_iv = slot.exchange.onertt_iv_len.unwrap_or(0);
+    // The **receive** length, because that is the one ngtcp2 sized both buffers from
+    // (`ngtcp2_conn.c:8759-8774`). `install_keys` has already required the two directions to
+    // agree, so this is also the transmit length; taking it from the receive side is what makes
+    // that true rather than assumed.
+    let expected_iv = slot.exchange.onertt_rx_iv_len.unwrap_or(0);
     if crate::validate::iv_pair(next.rx_iv.len(), next.tx_iv.len()).is_err()
         || next.rx_iv.len() != expected_iv
         || crate::validate::secret_len(next.rx_secret.len(), secretlen).is_err()
@@ -1053,6 +1115,46 @@ mod tests {
         // Mismatched: ngtcp2 takes one length for both directions, so the shorter one would be
         // read at the longer one's length.
         assert!(iv_pair(12, 16).is_err());
+    }
+
+    /// The two application directions must agree on their vector length.
+    ///
+    /// Not a tidiness rule. `conn_commit_key_update` reads `ivlen = rx_ckm->iv.len` and
+    /// allocates **both** of the update callback's buffers at it (`ngtcp2_conn.c:8759-8774`).
+    /// A backend that installed twelve bytes for receive and sixteen for transmit could then
+    /// return sixteen for both and write four bytes past a twelve-byte allocation -- and every
+    /// individual length involved is one ngtcp2 accepts, so nothing else would notice.
+    #[test]
+    fn the_two_application_directions_must_share_a_vector_length() {
+        use crate::validate::iv_pair;
+        assert!(iv_pair(12, 12).is_ok());
+        assert!(iv_pair(12, 16).is_err());
+        assert!(iv_pair(16, 12).is_err());
+    }
+
+    /// Every level and direction is a distinct install slot, and there are eight of them.
+    ///
+    /// A second install at the same slot overwrites the pointer ngtcp2 holds to the first,
+    /// leaking that key with nothing left able to release it. ngtcp2 catches it only with
+    /// `assert(!pktns->crypto.rx.ckm)`, which release builds do not contain.
+    #[test]
+    fn each_level_and_direction_has_its_own_install_slot() {
+        let mut seen = std::collections::BTreeSet::new();
+        for level in [
+            Level::Initial,
+            Level::ZeroRtt,
+            Level::Handshake,
+            Level::OneRtt,
+        ] {
+            for direction in [Direction::Read, Direction::Write] {
+                assert!(
+                    seen.insert(install_slot(level, direction)),
+                    "{level:?}/{direction:?} collides with another slot"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 8);
+        assert!(seen.iter().all(|s| *s < 8), "a slot index is out of range");
     }
 
     /// A slot is the session and the crate's record of it, in one allocation.
