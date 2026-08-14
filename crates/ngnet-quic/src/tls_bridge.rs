@@ -107,28 +107,42 @@ pub(crate) struct Exchange {
     onertt_rx_iv_len: Option<usize>,
     /// The transmit half of the above.
     onertt_tx_iv_len: Option<usize>,
-    /// Which levels and directions have had keys installed.
+    /// Which of ngtcp2's key slots have been filled.
     ///
     /// ngtcp2 refuses a second install only through `assert(!pktns->crypto.rx.ckm)`
-    /// (`ngtcp2_conn.c:11090`, `:11121`, `:11202`, `:11249`), which release builds delete.
-    /// Without that assertion a second install overwrites the pointer to the first, leaking the
-    /// boxed key it referred to and losing the ability to ever release it.
-    installed: [bool; 8],
+    /// (`ngtcp2_conn.c:11090`, `:11121`, `:11202`, `:11249`) and the equivalent for early data
+    /// (`:11162-11163`), which release builds delete. Without those assertions a second install
+    /// overwrites the pointer to the first, leaking the boxed key it referred to and losing the
+    /// ability to ever release it.
+    installed: [bool; 7],
 }
 
-/// Indexes [`Exchange::installed`] by level and direction.
+/// Indexes [`Exchange::installed`] by the ngtcp2 slot a level and direction actually fill.
+///
+/// Seven, not eight, and that asymmetry is ngtcp2's rather than a simplification. Handshake and
+/// application keys are stored per direction, but **0-RTT is one key**: both directions call
+/// `ngtcp2_conn_install_0rtt_key`, which writes the single `conn->early.ckm`, and infers which
+/// direction it protects from the connection's role rather than from an argument
+/// (`ngtcp2_conn.c:11156-11180`). Giving the two directions separate slots here would let a
+/// backend install early keys twice, overwrite ngtcp2's one pointer, and leak the first pair.
 const fn install_slot(level: Level, direction: Direction) -> usize {
-    let level = match level {
-        Level::Initial => 0,
-        Level::ZeroRtt => 1,
-        Level::Handshake => 2,
-        Level::OneRtt => 3,
-    };
-    let direction = match direction {
-        Direction::Read => 0,
-        Direction::Write => 1,
-    };
-    level * 2 + direction
+    match level {
+        // One slot, whichever direction it was offered as.
+        Level::ZeroRtt => 6,
+        _ => {
+            let level = match level {
+                Level::Initial => 0,
+                Level::Handshake => 1,
+                Level::OneRtt => 2,
+                Level::ZeroRtt => unreachable!(),
+            };
+            let direction = match direction {
+                Direction::Read => 0,
+                Direction::Write => 1,
+            };
+            level * 2 + direction
+        }
+    }
 }
 
 /// The connection, lent to a session for the length of one call.
@@ -1132,20 +1146,26 @@ mod tests {
         assert!(iv_pair(16, 12).is_err());
     }
 
-    /// Every level and direction is a distinct install slot, and there are eight of them.
+    /// The install slots mirror ngtcp2's key storage, not the seam's vocabulary.
     ///
     /// A second install at the same slot overwrites the pointer ngtcp2 holds to the first,
     /// leaking that key with nothing left able to release it. ngtcp2 catches it only with
-    /// `assert(!pktns->crypto.rx.ckm)`, which release builds do not contain.
+    /// assertions release builds do not contain.
     #[test]
-    fn each_level_and_direction_has_its_own_install_slot() {
+    fn the_install_slots_match_the_librarys_key_storage() {
+        // Handshake and application keys are stored per direction. **0-RTT is a single key**:
+        // both directions call `ngtcp2_conn_install_0rtt_key`, which writes the one
+        // `conn->early.ckm` and infers the direction from the connection's role
+        // (`ngtcp2_conn.c:11156-11180`). Two slots for it would let a backend install early
+        // keys twice and leak the first pair.
+        assert_eq!(
+            install_slot(Level::ZeroRtt, Direction::Read),
+            install_slot(Level::ZeroRtt, Direction::Write),
+            "0-RTT is one key in the library, so it must be one slot here"
+        );
+
         let mut seen = std::collections::BTreeSet::new();
-        for level in [
-            Level::Initial,
-            Level::ZeroRtt,
-            Level::Handshake,
-            Level::OneRtt,
-        ] {
+        for level in [Level::Initial, Level::Handshake, Level::OneRtt] {
             for direction in [Direction::Read, Direction::Write] {
                 assert!(
                     seen.insert(install_slot(level, direction)),
@@ -1153,8 +1173,9 @@ mod tests {
                 );
             }
         }
-        assert_eq!(seen.len(), 8);
-        assert!(seen.iter().all(|s| *s < 8), "a slot index is out of range");
+        seen.insert(install_slot(Level::ZeroRtt, Direction::Read));
+        assert_eq!(seen.len(), 7);
+        assert!(seen.iter().all(|s| *s < 7), "a slot index is out of range");
     }
 
     /// A slot is the session and the crate's record of it, in one allocation.
