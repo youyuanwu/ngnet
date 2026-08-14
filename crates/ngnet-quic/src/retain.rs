@@ -127,13 +127,15 @@ impl OwnedBytes {
     /// handle [`split_to`](Self::split_to) derives from it:
     ///
     /// - [`AsRef::as_ref`] returns a slice with the **same address and the same length**
-    ///   every time it is called. A [`Sync`] owner using interior mutability to return a
-    ///   short slice when the pointer is taken and a longer one when the length is taken
-    ///   would hand ngtcp2 a pointer valid for fewer bytes than the length claims, and C
-    ///   would read out of bounds. Clamping the length this crate records does **not**
-    ///   rescue such an owner: the pointer ngtcp2 keeps and the length it is told are read
-    ///   from `as_ref` at staging time, and a pointer and a length assembled from two
-    ///   different borrows are not a valid pair.
+    ///   every time it is called. This crate takes the pointer and the length together from
+    ///   a single borrow, so the two cannot disagree at the moment of staging; the
+    ///   requirement is that they still describe the same bytes at every *later* point that
+    ///   consults the owner -- construction, staging, [`split_to`](Self::split_to), commit
+    ///   and release accounting each borrow it afresh. An owner that shortened itself
+    ///   between staging and a retransmission would leave ngtcp2 holding a pointer valid for
+    ///   fewer bytes than the length it was told, and C would read out of bounds. Clamping
+    ///   the length this crate records does **not** rescue such an owner, because the pair
+    ///   ngtcp2 keeps was taken before the change.
     /// - The bytes those slices refer to are neither moved nor freed until this value and
     ///   every handle derived from it are dropped. Reallocating the backing store -- again
     ///   reachable through interior mutability under the `Sync` bound -- would dangle the
@@ -474,11 +476,9 @@ mod tests {
     #[test]
     fn an_empty_owned_write_stages_nothing() {
         let mut retained = Retained::default();
-        assert!(
-            retained
-                .stage_owned(sid(0), OwnedBytes::new(Vec::new()))
-                .is_none()
-        );
+        assert!(retained
+            .stage_owned(sid(0), OwnedBytes::new(Vec::new()))
+            .is_none());
         assert_eq!(retained.bytes_held(), 0);
     }
 
