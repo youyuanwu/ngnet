@@ -35,16 +35,192 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io::IoSlice;
+use std::sync::Arc;
 
 use crate::stream::StreamId;
 
+/// A buffer whose ownership the caller hands over, retained without a copy.
+///
+/// The borrowing write path copies every accepted byte, because a `&[u8]` the caller may
+/// reuse the instant the call returns cannot be handed to ngtcp2, which keeps the pointer
+/// until acknowledgement (`ngtcp2.h:5244-5248`). A caller who *can* give up ownership avoids
+/// that copy: the bytes live behind an [`Arc`] whose address is fixed for as long as any
+/// handle to it survives, so ngtcp2's pointer stays valid without a copy of its own.
+///
+/// Shareable because one allocation may be offered in pieces -- ngtcp2 routinely accepts a
+/// prefix and leaves the rest -- and [`split_to`](Self::split_to) hands back the unaccepted
+/// suffix as a second handle into the same allocation, with no copy and no second address to
+/// account for.
+///
+/// This is deliberately not [`bytes::Bytes`]. That would be the obvious choice, but the crate
+/// declares a fixed set of dependencies that a test enforces, so the handle is defined here.
+/// [`OwnedBytes::from_owner`] is how a caller who *does* have a `Bytes` -- or any other
+/// reference-counted buffer -- hands it over without a copy.
+///
+/// [`bytes::Bytes`]: https://docs.rs/bytes
+#[derive(Clone)]
+pub struct OwnedBytes {
+    store: Store,
+    start: usize,
+    end: usize,
+}
+
+/// Where the bytes actually live.
+///
+/// Two cases rather than one because the crate has no `bytes` dependency to name in its own
+/// types, but a caller who has one should not have to copy to use this API. The erased case
+/// costs a second pointer indirection on every read; the owned case stays flat.
+#[derive(Clone)]
+enum Store {
+    Owned(Arc<[u8]>),
+    Erased(Arc<dyn Owner>),
+}
+
+/// A buffer whose bytes stay put for as long as it is alive.
+///
+/// Sealed by being private: the blanket implementation below covers every type that can
+/// satisfy it, so there is nothing for a caller to implement.
+trait Owner: Send + Sync {
+    fn bytes(&self) -> &[u8];
+}
+
+impl<T: AsRef<[u8]> + Send + Sync + 'static> Owner for T {
+    fn bytes(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
+impl Store {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Owned(buffer) => buffer,
+            Self::Erased(owner) => owner.bytes(),
+        }
+    }
+}
+
+impl OwnedBytes {
+    /// Takes ownership of a buffer.
+    pub fn new(bytes: impl Into<Arc<[u8]>>) -> Self {
+        let buffer: Arc<[u8]> = bytes.into();
+        let end = buffer.len();
+        Self {
+            store: Store::Owned(buffer),
+            start: 0,
+            end,
+        }
+    }
+
+    /// Retains a buffer this crate cannot name, without copying it.
+    ///
+    /// The motivating case is [`bytes::Bytes`]: it is reference-counted already, so copying
+    /// it into an `Arc<[u8]>` to satisfy [`new`](Self::new) would defeat the point. Anything
+    /// that can lend a stable slice works -- `Vec<u8>`, `Arc<Vec<u8>>`, a memory map, a
+    /// caller's own buffer type.
+    ///
+    /// [`AsRef::as_ref`] should return the same bytes every time it is called; ngtcp2 holds
+    /// the address across many calls. A misbehaving owner cannot cause unsoundness -- every
+    /// read is clamped to the length taken here at construction, and the release accounting
+    /// stores the length ngtcp2 was told about rather than measuring the buffer again -- but
+    /// it can corrupt its own stream. `Send + Sync` is required because the buffer is stored
+    /// behind an [`Arc`], which is `Send` only when its contents are both.
+    ///
+    /// [`bytes::Bytes`]: https://docs.rs/bytes
+    pub fn from_owner(owner: impl AsRef<[u8]> + Send + Sync + 'static) -> Self {
+        let owner: Arc<dyn Owner> = Arc::new(owner);
+        let end = owner.bytes().len();
+        Self {
+            store: Store::Erased(owner),
+            start: 0,
+            end,
+        }
+    }
+
+    /// The bytes this handle refers to.
+    pub fn as_slice(&self) -> &[u8] {
+        // Clamped rather than indexed. The bounds cannot be wrong for an owner that behaves,
+        // and for one that does not this is fewer bytes rather than a panic that would unwind
+        // into a C frame and abort.
+        let all = self.store.bytes();
+        let end = self.end.min(all.len());
+        let start = self.start.min(end);
+        &all[start..end]
+    }
+
+    /// How many bytes this handle refers to.
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    /// Whether this handle refers to no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Splits off the first `n` bytes, leaving the remainder here.
+    ///
+    /// Both halves share one allocation, which is what lets a partially accepted write keep
+    /// its accepted prefix retained while the suffix is offered again -- neither is copied,
+    /// and the address ngtcp2 was handed does not move.
+    pub fn split_to(&mut self, n: usize) -> Self {
+        let n = n.min(self.len());
+        let head = Self {
+            store: self.store.clone(),
+            start: self.start,
+            end: self.start + n,
+        };
+        self.start += n;
+        head
+    }
+}
+
+impl core::fmt::Debug for OwnedBytes {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The bytes, not the sharing behind them: a handle prints as the run it refers to.
+        f.debug_struct("OwnedBytes")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+/// What a chunk's retained bytes are, and where they came from.
+///
+/// The two arms are the two write paths: a borrowed write is copied into a boxed slice this
+/// module owns, and an owned write keeps the caller's [`OwnedBytes`] handle alive without a
+/// copy. Either way the address is fixed for the chunk's life, which is all ngtcp2 requires.
+enum Payload {
+    /// A copy of a borrowed write.
+    Copied(Box<[u8]>),
+    /// A handle to a buffer the caller gave up, retained without a copy.
+    Owned(OwnedBytes),
+}
+
+impl Payload {
+    /// The fixed address ngtcp2 is handed a pointer into.
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            Self::Copied(data) => data.as_ptr(),
+            Self::Owned(bytes) => bytes.as_slice().as_ptr(),
+        }
+    }
+
+    /// How many bytes were offered from this payload.
+    fn len(&self) -> usize {
+        match self {
+            Self::Copied(data) => data.len(),
+            Self::Owned(bytes) => bytes.len(),
+        }
+    }
+}
+
 /// One accepted write, held at a fixed address.
 struct Chunk {
-    /// The bytes, boxed so the address does not move.
+    /// The bytes, at an address that does not move.
     ///
-    /// This is the *allocation*, which is what ngtcp2 holds a pointer into. It is never
+    /// This is the *allocation*, which is what ngtcp2 holds a pointer into. Whether it is a
+    /// copy of a borrowed write or a handle to a buffer the caller gave up, it is never
     /// reallocated, moved, or shrunk for as long as the chunk lives — see [`Chunk::len`].
-    data: Box<[u8]>,
+    data: Payload,
     /// Offset in the stream of this chunk's first byte.
     start: u64,
     /// How many of `data`'s bytes ngtcp2 actually accepted.
@@ -116,10 +292,41 @@ impl Retained {
         }
         let entry = self.streams.entry(stream.get()).or_default();
         let chunk = Chunk {
-            data: buffer.into_boxed_slice(),
+            data: Payload::Copied(buffer.into_boxed_slice()),
             start: entry.next_offset,
             // Provisional: the whole staged buffer is on offer. `commit` records how much
             // ngtcp2 took, and is always called before the write path returns.
+            len: total,
+        };
+        let ptr = chunk.data.as_ptr();
+        let len = chunk.data.len();
+        entry.chunks.push_back(chunk);
+        Some((ptr, len))
+    }
+
+    /// Retains an owned buffer without copying it, and returns a pointer to hand to ngtcp2.
+    ///
+    /// Unlike [`stage_many`](Self::stage_many), nothing is copied: the caller gave up
+    /// ownership, so the [`OwnedBytes`] handle is kept alive here and ngtcp2 is handed a
+    /// pointer straight into it. The returned pointer stays valid until
+    /// [`acknowledge`](Self::acknowledge) covers it or [`forget`](Self::forget) is called,
+    /// which is exactly ngtcp2's contract.
+    ///
+    /// Returns `None` for an empty buffer; ngtcp2 treats a zero-length write specially and
+    /// there is nothing to retain.
+    pub(crate) fn stage_owned(
+        &mut self,
+        stream: StreamId,
+        bytes: OwnedBytes,
+    ) -> Option<(*const u8, usize)> {
+        let total = bytes.len();
+        if total == 0 {
+            return None;
+        }
+        let entry = self.streams.entry(stream.get()).or_default();
+        let chunk = Chunk {
+            data: Payload::Owned(bytes),
+            start: entry.next_offset,
             len: total,
         };
         let ptr = chunk.data.as_ptr();
@@ -214,6 +421,122 @@ mod tests {
 
     fn sid(id: i64) -> StreamId {
         StreamId::new(id).unwrap()
+    }
+
+    #[test]
+    fn an_owned_write_is_retained_without_a_copy() {
+        // The point of the owned path: the caller's bytes are handed over, and ngtcp2 is
+        // pointed straight into them. The pointer retained here is the buffer's own address,
+        // not a copy's.
+        let mut retained = Retained::default();
+        let buffer: Arc<[u8]> = Arc::from(vec![1u8, 2, 3, 4].into_boxed_slice());
+        let source = buffer.as_ptr();
+        let (ptr, len) = retained
+            .stage_owned(sid(0), OwnedBytes::new(buffer))
+            .unwrap();
+        retained.commit(sid(0), 4);
+        assert_eq!(len, 4);
+        assert_eq!(ptr, source, "ngtcp2 is pointed into the caller's buffer");
+        // SAFETY: the retained handle keeps the allocation alive.
+        let held = unsafe { core::slice::from_raw_parts(ptr, len) };
+        assert_eq!(held, &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn an_empty_owned_write_stages_nothing() {
+        let mut retained = Retained::default();
+        assert!(
+            retained
+                .stage_owned(sid(0), OwnedBytes::new(Vec::new()))
+                .is_none()
+        );
+        assert_eq!(retained.bytes_held(), 0);
+    }
+
+    #[test]
+    fn a_partially_accepted_owned_write_keeps_the_prefix_and_leaves_the_suffix_intact() {
+        // The partial-acceptance contract for the owned path, checked directly. The accepted
+        // prefix stays retained at the address ngtcp2 was handed, and the unaccepted suffix
+        // -- a second handle into the same allocation -- reads back the bytes that were not
+        // taken, ready to be offered again.
+        let mut retained = Retained::default();
+        let mut data = OwnedBytes::new(vec![1u8, 2, 3, 4, 5, 6, 7, 8]);
+        let (staged, offered) = retained.stage_owned(sid(0), data.clone()).unwrap();
+        assert_eq!(offered, 8);
+
+        // A packet fills after three bytes.
+        retained.commit(sid(0), 3);
+
+        let (held, len) = retained.last_pointer(sid(0)).unwrap();
+        assert_eq!(len, 3, "only the accepted prefix counts as retained");
+        assert_eq!(
+            staged, held,
+            "the allocation ngtcp2 points into must not move"
+        );
+
+        // The suffix the caller keeps shares the same allocation and holds exactly the bytes
+        // ngtcp2 did not take.
+        let _prefix = data.split_to(3);
+        assert_eq!(data.as_slice(), &[4, 5, 6, 7, 8]);
+        assert_eq!(retained.bytes_held(), 3);
+    }
+
+    #[test]
+    fn an_owned_suffix_offered_again_starts_where_the_prefix_ended() {
+        // Offering the suffix as a fresh owned write must number the stream from where the
+        // accepted prefix ended, exactly as a borrowed re-offer does.
+        let mut retained = Retained::default();
+        let mut data = OwnedBytes::new(vec![1u8, 2, 3, 4, 5, 6, 7, 8]);
+        retained.stage_owned(sid(0), data.clone());
+        retained.commit(sid(0), 3);
+        let _prefix = data.split_to(3);
+
+        retained.stage_owned(sid(0), data);
+        retained.commit(sid(0), 5);
+        assert_eq!(retained.bytes_held(), 8);
+
+        // Acknowledging the first three releases exactly the first chunk.
+        retained.acknowledge(sid(0), 0, 3);
+        assert_eq!(retained.bytes_held(), 5);
+        let (ptr, len) = retained.last_pointer(sid(0)).unwrap();
+        // SAFETY: the chunk is alive.
+        let held = unsafe { core::slice::from_raw_parts(ptr, len) };
+        assert_eq!(held, &[4, 5, 6, 7, 8], "offsets follow the accepted length");
+    }
+
+    #[test]
+    fn a_rejected_owned_write_retains_nothing() {
+        let mut retained = Retained::default();
+        retained.stage_owned(sid(0), OwnedBytes::new(vec![1u8, 2, 3]));
+        retained.commit(sid(0), 0);
+        assert_eq!(retained.bytes_held(), 0);
+    }
+
+    #[test]
+    fn an_erased_owner_is_retained_without_a_copy_too() {
+        // A caller with its own buffer type hands it over through `from_owner` and is not
+        // made to copy it into an `Arc<[u8]>` first.
+        struct CallerBuffer(Vec<u8>);
+        impl AsRef<[u8]> for CallerBuffer {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+
+        let mut retained = Retained::default();
+        let owner = CallerBuffer(vec![9u8, 8, 7]);
+        let source = owner.0.as_ptr();
+        let (ptr, len) = retained
+            .stage_owned(sid(0), OwnedBytes::from_owner(owner))
+            .unwrap();
+        retained.commit(sid(0), 3);
+        assert_eq!(
+            ptr, source,
+            "ngtcp2 is pointed into the caller's own buffer"
+        );
+        // SAFETY: the retained handle keeps the owner alive.
+        let held = unsafe { core::slice::from_raw_parts(ptr, len) };
+        assert_eq!(held, &[9, 8, 7]);
     }
 
     #[test]

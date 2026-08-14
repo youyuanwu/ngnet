@@ -18,9 +18,9 @@ use ngnet_quic::{
     ApplicationErrorCode, Backend, ConnBuilder, ConnectionId, CryptoError, Direction,
     DirectionalKeys, Directionality, Duration, EntropySource, Error, ErrorKind, ExpiryOutcome,
     HP_MASK_LEN, HP_SAMPLE_LEN, Handlers, Handshaking, HeaderKey, InitialKeys, Initiator,
-    Inspection, Iv, Level, NativeCode, PacketKey, ReadOutcome, Result, Role, RotatedKeys, Session,
-    SessionEvent, Settings, StreamCloseReason, StreamId, StreamWrite, Timestamp,
-    TransportErrorCode, TransportParams, WriteOutcome,
+    Inspection, Iv, Level, NativeCode, OwnedBytes, OwnedWrite, PacketKey, ReadOutcome, Result,
+    Role, RotatedKeys, Session, SessionEvent, Settings, StreamCloseReason, StreamId, StreamWrite,
+    Timestamp, TransportErrorCode, TransportParams, WriteOutcome,
 };
 
 #[test]
@@ -433,6 +433,32 @@ fn the_initialisation_vector_is_stored_inline() {
     assert!(core::mem::size_of::<Iv>() >= 64);
 }
 
+/// The owned-send handle offers exactly the operations promised.
+///
+/// `OwnedBytes` is the buffer a caller hands to [`Conn::write_stream_owned`] to be retained
+/// without a copy. Its surface is pinned here: a wrapping constructor over anything shaped
+/// like bytes, an erasing one over an owner the crate cannot see inside, read access, and the
+/// split that hands back an unaccepted suffix as a view into the same allocation.
+#[test]
+fn the_owned_send_handle_still_has_the_shape_it_promised() {
+    let mut bytes: OwnedBytes = OwnedBytes::new(vec![1u8, 2, 3, 4]);
+    let _: usize = bytes.len();
+    let _: bool = bytes.is_empty();
+    let _: &[u8] = bytes.as_slice();
+    let suffix: OwnedBytes = bytes.split_to(2);
+    let _: OwnedBytes = suffix;
+
+    struct Owned(Vec<u8>);
+    impl AsRef<[u8]> for Owned {
+        fn as_ref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+    let _: OwnedBytes = OwnedBytes::from_owner(Owned(vec![0u8]));
+
+    let _: OwnedBytes = bytes.clone();
+}
+
 /// A backend that exists only so the generic bounds above have something to name.
 #[test]
 fn the_types_a_connection_owns_are_send_because_the_connection_is() {
@@ -486,6 +512,10 @@ fn the_connection_surface_still_has_the_shape_it_promised() {
             true,
             now,
         )?;
+        let owned = OwnedBytes::new(vec![0u8]);
+        let handed: OwnedWrite = conn.write_stream_owned(&mut buf, stream, owned, true, now)?;
+        let _: StreamWrite = handed.outcome;
+        let _: OwnedBytes = handed.unsent;
         conn.shutdown_stream(stream, ApplicationErrorCode::new(0))?;
         conn.reset_stream(stream, ApplicationErrorCode::new(0))?;
         conn.stop_sending(stream, ApplicationErrorCode::new(0))?;

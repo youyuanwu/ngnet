@@ -22,6 +22,7 @@ use std::io::IoSlice;
 
 use crate::conn::Conn;
 use crate::error::{ApplicationErrorCode, Error, Result};
+use crate::retain::OwnedBytes;
 use crate::stream::StreamId;
 use crate::time::Timestamp;
 use crate::tls::Session;
@@ -51,6 +52,24 @@ pub enum StreamWrite {
     Blocked,
     /// Nothing to send at the moment.
     Idle,
+}
+
+/// The result of an owned write: what happened, and what the caller must offer again.
+///
+/// Distinct from [`StreamWrite`] because an owned write hands ownership *back* for whatever
+/// ngtcp2 did not take. A partial acceptance is ordinary — a packet fills before the buffer
+/// is exhausted — and the unaccepted suffix has to go somewhere. It goes here, as a handle
+/// into the same allocation the accepted prefix is retained from, so nothing is copied on
+/// either side of the split.
+#[derive(Debug)]
+pub struct OwnedWrite {
+    /// What the write did, exactly as a borrowed write would report it.
+    pub outcome: StreamWrite,
+    /// The bytes ngtcp2 did not accept, to be offered again. Empty when it took everything.
+    ///
+    /// Shares its allocation with the retained prefix, so holding it costs no copy; a caller
+    /// that drops it simply abandons the unsent tail.
+    pub unsent: OwnedBytes,
 }
 
 impl<S: Session> Conn<'_, S> {
@@ -168,12 +187,93 @@ impl<S: Session> Conn<'_, S> {
         let staged = self.retained_mut().stage_many(stream, ranges);
         let (base, len) = staged.unwrap_or((core::ptr::null(), 0));
 
+        self.submit_one_vec(dest, stream, base, len, staged.is_some(), flags, now)
+    }
+
+    /// Writes a buffer whose ownership the caller hands over, retaining it without a copy.
+    ///
+    /// The counterpart to [`write_stream`](Self::write_stream), for a caller who can give up
+    /// the buffer. ngtcp2 keeps the pointer until acknowledgement (`ngtcp2.h:5244-5248`), and
+    /// the borrowing writes satisfy that by copying every accepted byte into a buffer this
+    /// crate owns. A caller who hands over an [`OwnedBytes`] skips that copy: the bytes are
+    /// retained by keeping the handle alive, and ngtcp2 is given a pointer straight into it.
+    ///
+    /// # Partial acceptance
+    ///
+    /// ngtcp2 routinely takes a prefix and leaves the rest — a packet fills before the buffer
+    /// is exhausted. The accepted prefix stays retained at a fixed address, and the unaccepted
+    /// suffix is returned in [`OwnedWrite::unsent`] as a handle into the *same* allocation, to
+    /// be offered again. Neither side of that split is copied. When ngtcp2 takes everything,
+    /// `unsent` is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if ngtcp2 refuses; the connection is then unusable. On any error the
+    /// buffer is dropped, since the connection cannot carry it.
+    pub fn write_stream_owned(
+        &mut self,
+        dest: &mut [u8],
+        stream: StreamId,
+        mut data: OwnedBytes,
+        fin: bool,
+        now: Timestamp,
+    ) -> Result<OwnedWrite> {
+        if dest.is_empty() {
+            return Err(Error::invalid_input(
+                "a datagram buffer must have room to write into",
+            ));
+        }
+
+        let flags = if fin {
+            sys::NGTCP2_WRITE_STREAM_FLAG_FIN
+        } else {
+            sys::NGTCP2_WRITE_STREAM_FLAG_NONE
+        };
+
+        // The handle is cloned into retention -- an `Arc` bump, not a copy of the bytes --
+        // and *that* is what ngtcp2 is given a pointer into, so the address survives the call
+        // even if the caller drops the original the instant it returns.
+        let staged = self.retained_mut().stage_owned(stream, data.clone());
+        let (base, len) = staged.unwrap_or((core::ptr::null(), 0));
+
+        let outcome = self.submit_one_vec(dest, stream, base, len, staged.is_some(), flags, now)?;
+
+        // Split off what ngtcp2 took. The prefix is already retained above; the suffix shares
+        // the same allocation and is handed back for the caller to offer again. On anything
+        // but a datagram nothing was taken, so the whole buffer comes back.
+        let taken = match outcome {
+            StreamWrite::Datagram { accepted, .. } => accepted,
+            _ => 0,
+        };
+        let _accepted_prefix = data.split_to(taken);
+        Ok(OwnedWrite {
+            outcome,
+            unsent: data,
+        })
+    }
+
+    /// Issues one already-staged stream write to ngtcp2 and reports what it did.
+    ///
+    /// Shared by the borrowing and owning write paths, which differ only in how the bytes at
+    /// `base` were retained. `base`/`len` describe the single vector handed over, `staged`
+    /// says whether a chunk was pushed (so its accepted length can be committed), and the
+    /// outcome is mapped exactly as each caller documents.
+    fn submit_one_vec(
+        &mut self,
+        dest: &mut [u8],
+        stream: StreamId,
+        base: *const u8,
+        len: usize,
+        staged: bool,
+        flags: u32,
+        now: Timestamp,
+    ) -> Result<StreamWrite> {
         let path = self.path_mut().as_raw_mut();
         let mut accepted: sys::ngtcp2_ssize = 0;
         let written = self.with_bridge(|raw| {
             // SAFETY: `raw` is live, `path` points into storage the connection owns, `dest`
-            // is writable for its length, and `base` points into the retained copy, which
-            // outlives this call and is released only on acknowledgement or stream close.
+            // is writable for its length, and `base` points into the retained bytes, which
+            // outlive this call and are released only on acknowledgement or stream close.
             unsafe {
                 let mut pi = sys::ngtcp2_pkt_info { ecn: 0 };
                 crate::ffi::conn_writev_stream(
@@ -207,7 +307,7 @@ impl<S: Session> Conn<'_, S> {
         } else {
             0
         };
-        if staged.is_some() {
+        if staged {
             self.retained_mut().commit(stream, taken);
         }
 

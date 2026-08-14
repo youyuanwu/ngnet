@@ -15,8 +15,8 @@ use std::cell::Cell;
 
 use ngnet_quic::{
     Backend as TlsBackend, ConnBuilder, EntropySource, Handlers, Inspection, OsslBackend,
-    OsslSession, ReadOutcome, Result, Role, Settings, StreamWrite, Timestamp, TransportParams,
-    Verify, WriteOutcome, inspect,
+    OsslSession, OwnedBytes, ReadOutcome, Result, Role, Settings, StreamWrite, Timestamp,
+    TransportParams, Verify, WriteOutcome, inspect,
 };
 
 thread_local! {
@@ -513,6 +513,148 @@ fn establishing_a_connection_bounds_its_allocations() {
          of {BOUND}; if this is an intended increase, raise the bound deliberately"
     );
     eprintln!("establishing a connection allocated {allocations} times");
+}
+
+#[test]
+fn sending_owned_data_allocates_nothing_where_a_borrowed_send_allocates() {
+    // SC-007 and FR-007. Both writes retain the bytes ngtcp2 accepts until they are
+    // acknowledged. The borrowing write must copy them, because the caller may reuse its
+    // buffer the moment the call returns; the owning write is handed the buffer and copies
+    // nothing. The proof is the *difference*: the same payload, sent the two ways, allocates
+    // at least once as a borrow and not at all as an owned send.
+    let client_backend = client_backend();
+    let server_backend = server_backend();
+    let clock = HandClock::new();
+    let (mut client, mut server) = establish(&client_backend, &server_backend, &clock);
+    assert!(
+        client.is_handshake_completed() && server.is_handshake_completed(),
+        "the harness did not establish a connection to send on"
+    );
+
+    let stream = client.open_uni_stream().expect("opening a stream");
+    let mut buf = vec![0u8; 1500];
+    let payload = [0x5au8; 256];
+
+    // Warm what the first write to a stream lazily allocates -- the stream's retention queue
+    // and the map node that holds it -- outside the count. The accepted chunk is left live
+    // and undelivered, so the queue keeps its capacity and the map keeps the entry; a later
+    // push reuses that room instead of allocating. Warming is not cheating: the property
+    // under test is that *sending owned data* copies nothing, not that the first touch of a
+    // brand-new stream is free.
+    let warm = client
+        .write_stream(&mut buf, stream, &payload, false, clock.now())
+        .expect("warm-up write");
+    let warm_len = match warm {
+        StreamWrite::Datagram { len, accepted } if accepted > 0 => len,
+        other => panic!("the warm-up write was not accepted, so nothing was primed: {other:?}"),
+    };
+    if warm_len > 0 {
+        server
+            .read_pkt(&buf[..warm_len], clock.now())
+            .expect("server reads the warm-up datagram");
+    }
+    assert!(
+        client.retained_bytes() > 0,
+        "the warm-up write should be retained until acknowledged"
+    );
+
+    // The owning send of an already-allocated buffer. The handle is built outside the count,
+    // so its one allocation is not charged here; inside, only an `Arc` refcount bump happens
+    // as the handle is cloned into retention.
+    let owned = OwnedBytes::new(payload.to_vec());
+    let (owned_write, owned_allocs) = count_allocations(|| {
+        client
+            .write_stream_owned(&mut buf, stream, owned, false, clock.now())
+            .expect("owned write")
+    });
+    assert_eq!(
+        owned_allocs, 0,
+        "sending owned data allocated {owned_allocs} times; it copies nothing and retains by \
+         keeping the handle alive"
+    );
+    // Partial acceptance is real, not assumed: whatever ngtcp2 left is handed back as a view
+    // into the same allocation, and it is exactly the payload minus what was taken.
+    if let StreamWrite::Datagram { len, accepted } = owned_write.outcome {
+        assert_eq!(
+            owned_write.unsent.len(),
+            payload.len() - accepted,
+            "the unaccepted suffix must be exactly what ngtcp2 left"
+        );
+        if len > 0 {
+            server
+                .read_pkt(&buf[..len], clock.now())
+                .expect("server reads the owned datagram");
+        }
+    }
+
+    // The borrowing send of the identical payload. It cannot keep the borrow, so every
+    // accepted byte is copied into a buffer the crate owns -- at least one allocation.
+    let (borrowed_write, borrowed_allocs) = count_allocations(|| {
+        client
+            .write_stream(&mut buf, stream, &payload, false, clock.now())
+            .expect("borrowed write")
+    });
+    if let StreamWrite::Datagram { len, .. } = borrowed_write {
+        if len > 0 {
+            server
+                .read_pkt(&buf[..len], clock.now())
+                .expect("server reads the borrowed datagram");
+        }
+    }
+    assert!(
+        borrowed_allocs >= 1,
+        "the borrowing send must allocate the retained copy, but allocated {borrowed_allocs}"
+    );
+    assert!(
+        borrowed_allocs > owned_allocs,
+        "the difference is the whole proof: borrowed allocated {borrowed_allocs}, owned \
+         {owned_allocs}"
+    );
+
+    // Both sends retain until acknowledged. Something is still held now; once every datagram
+    // has reached the server and its acknowledgements have come back, retention drains away.
+    assert!(
+        client.retained_bytes() > 0,
+        "the accepted sends must stay retained until they are acknowledged"
+    );
+    // A tolerant relay: unlike `pump`, it does not stop when a datagram is a duplicate, since
+    // the stream data was already delivered by hand above and the retransmissions this
+    // provokes are expected to be dropped. It runs until acknowledgements have drained
+    // retention or a generous round cap is reached.
+    for _ in 0..256 {
+        if client.retained_bytes() == 0 {
+            break;
+        }
+        let mut progressed = false;
+        for datagram in drain(&mut client, &clock) {
+            progressed = true;
+            let _ = server.read_pkt(&datagram, clock.now());
+        }
+        for datagram in drain(&mut server, &clock) {
+            progressed = true;
+            let _ = client.read_pkt(&datagram, clock.now());
+        }
+        if !progressed {
+            let next = [client.expiry(), server.expiry()]
+                .into_iter()
+                .flatten()
+                .min();
+            match next {
+                Some(deadline) => {
+                    clock.advance_to(deadline);
+                    clock.advance(1);
+                    let _ = client.handle_expiry(clock.now());
+                    let _ = server.handle_expiry(clock.now());
+                }
+                None => break,
+            }
+        }
+    }
+    assert_eq!(
+        client.retained_bytes(),
+        0,
+        "once acknowledged, both the borrowed and the owned sends must be released"
+    );
 }
 
 // Phase 2's region needs a driver pass over an established connection, which is the endpoint
