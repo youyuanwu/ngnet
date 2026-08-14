@@ -611,6 +611,13 @@ fn a_caller_never_needs_unsafe() {
         // Installs a counting `GlobalAlloc`, which is an unsafe trait for reasons that have
         // nothing to do with this crate's API.
         "zero_alloc",
+        // Pins `OwnedBytes::from_owner`, which is deliberately `unsafe`: its contract -- that
+        // the erased owner lends a slice of stable address and length -- cannot be checked, so
+        // it cannot be a safe fn. That is not a hole in the safe API; `OwnedBytes::new` is the
+        // safe path and is complete. Pinning that `from_owner` is an `unsafe fn` is the one
+        // thing this file must say that it cannot say without writing `unsafe`, exactly as
+        // `versioned_ffi` cannot prove the raw symbols link without naming them.
+        "compat_surface",
     ]
     .into_iter()
     .collect();
