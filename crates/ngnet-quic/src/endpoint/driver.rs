@@ -252,7 +252,16 @@ where
         };
         let Some(conn) = tracked.conn.as_mut() else {
             // Detached: the datagram belongs to whoever holds the connection, and reading it
-            // here would be a second reader of state that admits only one.
+            // here would be a second reader of state that admits only one. So it is queued
+            // for that owner to read on a pass of its own.
+            //
+            // This copy is forced, and once the attached path stops copying it is the only
+            // one left on the receive path. `datagram` borrows the endpoint's reusable
+            // receive buffer, whose contents the next `poll_recv` overwrites: the borrow's
+            // lifetime ends when this pass does. The owner may not collect until a later
+            // pass, so the bytes have to outlive the borrow, which means owning them.
+            // Handing the owner a borrow that reached across passes would alias a buffer the
+            // endpoint reuses, so it is not an option -- the copy stays.
             let shared = Arc::clone(&tracked.shared);
             shared.deliver_inbound(datagram.to_vec());
             return;

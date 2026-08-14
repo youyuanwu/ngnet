@@ -526,8 +526,12 @@ mod driver_pass {
     use core::pin::Pin;
     use core::task::{Context, Poll, Waker};
     use ngnet_quic::endpoint::testing::{TestClock, TestSocket, socket_pair};
-    use ngnet_quic::endpoint::{Config, Connection, Endpoint, EndpointBuilder, EndpointDriver};
-    use ngnet_quic::{OsslBackend, OsslSession, Role};
+    use ngnet_quic::endpoint::{
+        Clock, Config, Connection, Endpoint, EndpointBuilder, EndpointDriver,
+    };
+    use ngnet_quic::{OsslBackend, OsslSession, Role, Timestamp};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     type Driver = EndpointDriver<TestSocket, TestClock, OsslBackend>;
 
@@ -858,5 +862,272 @@ mod driver_pass {
              times; more than one buffer means iterating the connections is still allocating"
         );
         eprintln!("idle driver pass allocated {allocations} times");
+    }
+
+    /// A clock two endpoints can share across the `Send + Sync` bound that `build_detachable`
+    /// requires. `TestClock` is built on `Rc` and so cannot cross that bound; this is the
+    /// same hand-moved clock built on an atomic instead. It registers no wakers because the
+    /// tests below drive with a busy poll over a no-op waker and move time by hand between
+    /// polls, so a sleeper only has to resolve once its deadline has passed.
+    #[derive(Clone)]
+    struct SharedClock {
+        now: Arc<AtomicU64>,
+    }
+
+    impl SharedClock {
+        fn new() -> Self {
+            Self {
+                now: Arc::new(AtomicU64::new(1_000_000_000)),
+            }
+        }
+
+        fn advance(&self, nanos: u64) {
+            self.now.fetch_add(nanos, Ordering::Relaxed);
+        }
+    }
+
+    struct SharedSleep {
+        deadline: u64,
+        now: Arc<AtomicU64>,
+    }
+
+    impl Future for SharedSleep {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            if self.now.load(Ordering::Relaxed) >= self.deadline {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl Clock for SharedClock {
+        type Sleep = Pin<Box<SharedSleep>>;
+
+        fn now(&self) -> Timestamp {
+            Timestamp::from_nanos(self.now.load(Ordering::Relaxed))
+                .expect("the shared clock stays in range")
+        }
+
+        fn sleep_until(&self, deadline: Timestamp) -> Self::Sleep {
+            Box::pin(SharedSleep {
+                deadline: deadline.as_nanos(),
+                now: Arc::clone(&self.now),
+            })
+        }
+    }
+
+    type DetDriver = EndpointDriver<TestSocket, SharedClock, OsslBackend>;
+
+    /// Builds an endpoint that can hand its connections over, on the shared clock. Same as
+    /// `build`, but `build_detachable` rather than `build`, which is what makes a connection
+    /// reach the detached branch this phase measures.
+    fn build_detachable(
+        role: Role,
+        socket: TestSocket,
+        clock: SharedClock,
+    ) -> (Endpoint<OsslSession>, DetDriver) {
+        let backend = match role {
+            Role::Client => OsslBackend::builder(Role::Client)
+                .alpn("h3")
+                .trust_anchor_pem(TEST_CERT_PEM)
+                .use_system_trust_store(false)
+                .build()
+                .expect("a client backend"),
+            Role::Server => OsslBackend::builder(Role::Server)
+                .alpn("h3")
+                .certificate_chain_pem(TEST_CERT_PEM)
+                .private_key_pem(TEST_KEY_PEM)
+                .build()
+                .expect("a server backend"),
+        };
+        let seed = if role == Role::Client { 0 } else { 64 };
+        let mut builder = EndpointBuilder::new(socket, clock, backend)
+            .config(Config::new())
+            .entropy(move || StubEntropy(seed));
+        if role == Role::Server {
+            builder = builder.accepts(true);
+        }
+        builder.build_detachable().expect("a detachable endpoint")
+    }
+
+    #[test]
+    fn a_receive_pass_to_a_detached_connection_allocates_one_buffer_per_datagram() {
+        // Phase 4, SC-003 and SC-012. A connection whose owner has detached it is no longer
+        // read by the endpoint: the endpoint routes datagrams to it but the protocol state
+        // has one owner, elsewhere. So the receive pass copies each datagram into that
+        // owner's queue instead of reading it. That copy is forced -- the datagram borrows
+        // the endpoint's reusable receive buffer, which the next read overwrites, while the
+        // owner may not collect until a later pass -- so this phase proves the copy costs
+        // exactly one buffer per datagram, not that it can be removed.
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let (caddr, saddr) = (
+            "127.0.0.1:4453".parse().unwrap(),
+            "127.0.0.1:4454".parse().unwrap(),
+        );
+        let clock = SharedClock::new();
+        let (cs, ss) = socket_pair(caddr, saddr);
+        let (client, cdrv) = build_detachable(Role::Client, cs, clock.clone());
+        let (server, sdrv) = build_detachable(Role::Server, ss, clock.clone());
+        let mut drivers: Vec<Pin<Box<DetDriver>>> = vec![Box::pin(cdrv), Box::pin(sdrv)];
+
+        // The server hands its connection over the moment the handshake completes; the client
+        // keeps a managed handle so it can drive a stream from the other end.
+        let mut connecting = Box::pin(client.connect(saddr, Some("localhost")));
+        let mut detaching = Box::pin(server.accept_detached());
+        let mut cside: Option<Connection> = None;
+        let mut detached = None;
+        for _ in 0..800 {
+            for d in drivers.iter_mut() {
+                let _ = d.as_mut().poll(&mut cx);
+            }
+            if cside.is_none()
+                && let Poll::Ready(r) = connecting.as_mut().poll(&mut cx)
+            {
+                cside = Some(r.expect("the client handshake failed"));
+            }
+            if detached.is_none()
+                && let Poll::Ready(r) = detaching.as_mut().poll(&mut cx)
+            {
+                detached = Some(r.expect("the server detach failed"));
+            }
+            if cside.is_some() && detached.is_some() {
+                break;
+            }
+            clock.advance(2_000_000);
+        }
+        let mut cside = cside.expect("a client connection");
+        let detached = detached.expect("a detached server connection");
+        assert!(
+            cside.is_established() && detached.conn.is_handshake_completed(),
+            "the harness did not establish a connection to detach"
+        );
+
+        // A stream the client carries. The credit for it came from the server's transport
+        // parameters during the handshake, so the client can open and write it with only its
+        // own driver running -- the detached server no longer answers on the endpoint.
+        let sid = {
+            let mut opening = cside.open_uni();
+            let mut sid = None;
+            for _ in 0..200 {
+                if let Poll::Ready(r) = Pin::new(&mut opening).poll(&mut cx) {
+                    sid = Some(r.expect("opening a stream"));
+                    break;
+                }
+                let _ = drivers[0].as_mut().poll(&mut cx);
+                clock.advance(2_000_000);
+            }
+            sid.expect("a stream id")
+        };
+        let payload = [0xc3u8; 256];
+        cside.write(sid, &payload, true).expect("stream write");
+        for _ in 0..16 {
+            let _ = drivers[0].as_mut().poll(&mut cx);
+            clock.advance(2_000_000);
+        }
+        // Keep the short-header datagrams: those route to the detached connection and reach
+        // the copy under test. A long-header straggler routes nowhere and takes the
+        // stateless-reset path, which allocates for reasons unrelated to this phase.
+        let onertt: Vec<(_, Vec<u8>)> = drivers[1]
+            .as_ref()
+            .socket_for_test()
+            .drain_inbox()
+            .into_iter()
+            .filter(|(_, d)| !d.is_empty() && d[0] & 0x80 == 0)
+            .collect();
+        assert!(
+            !onertt.is_empty(),
+            "the client sent no 1-RTT datagram to route to the detached connection"
+        );
+
+        // Warm the owner's queue so it already holds the capacity the count needs. A fresh
+        // `VecDeque` allocates its ring on the first push, which would show up in the count
+        // as an allocation that is not the per-datagram copy. Delivering the datagrams once
+        // and collecting them back grows that ring outside the count and leaves it in place.
+        for (source, datagram) in &onertt {
+            drivers[1]
+                .as_ref()
+                .socket_for_test()
+                .deliver(*source, datagram);
+        }
+        let _ = drivers[1]
+            .as_mut()
+            .get_mut()
+            .read_datagrams_for_test(&mut cx)
+            .expect("warm read");
+        let mut warmed = Vec::new();
+        while let Some(bytes) = detached.next_inbound() {
+            warmed.push(bytes);
+        }
+        assert_eq!(
+            warmed.len(),
+            onertt.len(),
+            "the warm delivery did not queue every datagram for the owner"
+        );
+        for (expected, got) in onertt.iter().zip(&warmed) {
+            assert_eq!(
+                &expected.1, got,
+                "the queued bytes did not match what was sent"
+            );
+        }
+
+        // Deliver the same datagrams again and count that pass. Each reaches the detached
+        // branch and is copied into the owner's queue -- one owned buffer per datagram, and
+        // nothing else, because the queue already has room and the endpoint reads none of it.
+        for (source, datagram) in &onertt {
+            drivers[1]
+                .as_ref()
+                .socket_for_test()
+                .deliver(*source, datagram);
+        }
+        let (progressed, allocations) = count_allocations(|| {
+            drivers[1]
+                .as_mut()
+                .get_mut()
+                .read_datagrams_for_test(&mut cx)
+                .expect("counted read")
+        });
+
+        assert!(
+            progressed,
+            "the receive pass read no datagram, so a fixed allocation count would prove nothing"
+        );
+        assert_eq!(
+            allocations,
+            onertt.len(),
+            "a receive pass delivering {} datagrams to a detached connection allocated \
+             {allocations} buffers; the forced copy should cost exactly one each",
+            onertt.len()
+        );
+
+        // SC-012. The owner collects on this later pass and the bytes are intact and its own:
+        // each queued buffer is a separate owned copy, so re-delivering the same datagram
+        // does not alias the earlier one and nothing the endpoint reuses reaches through.
+        let mut collected = Vec::new();
+        while let Some(bytes) = detached.next_inbound() {
+            collected.push(bytes);
+        }
+        assert_eq!(
+            collected.len(),
+            onertt.len(),
+            "the owner did not receive one datagram per delivery on the later pass"
+        );
+        for (expected, got) in onertt.iter().zip(&collected) {
+            assert_eq!(
+                &expected.1, got,
+                "a datagram the owner collected on a later pass did not survive intact"
+            );
+        }
+        // The two passes queued distinct buffers: had the copy aliased the reusable receive
+        // buffer, the first collection would not still match after the second delivery
+        // overwrote it. Both do, so the buffers are independent.
+        assert_eq!(
+            warmed, collected,
+            "the two passes did not hold independent bytes"
+        );
+        eprintln!("detached receive pass allocated {allocations} times");
     }
 }
