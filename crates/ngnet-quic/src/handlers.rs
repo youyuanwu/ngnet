@@ -10,6 +10,12 @@
 //! (`ngtcp2.h:4256`, `:5318`, `:6665`). Anything a handler wants to *do* should be recorded
 //! and acted on after the call returns.
 //!
+//! That restriction is about *these* handlers rather than about callbacks in general. The
+//! crypto callbacks in [`crate::tls_bridge`] run in the same position and must do the
+//! opposite: ngtcp2 requires them to install keys and submit handshake data on the very
+//! connection that invoked them. The difference is which entry points are involved, not
+//! whether a callback is running.
+//!
 //! A handler must not panic: unwinding into a C stack frame aborts the process.
 
 use crate::cid::ConnectionId;

@@ -8,7 +8,7 @@
 use core::task::{Context, Poll};
 
 use ngnet_quic::endpoint::DetachedConnection;
-use ngnet_quic::{TlsSession, WriteOutcome};
+use ngnet_quic::{Session, WriteOutcome};
 
 use crate::connection::{Shared, State};
 use crate::error::{Error, ErrorKind, Result};
@@ -26,7 +26,7 @@ pub(crate) const MAX_DATAGRAM: usize = 1500;
 /// first.
 ///
 /// Registers `cx` so the connection is polled again when a datagram arrives.
-pub(crate) fn pump<S: TlsSession>(
+pub(crate) fn pump<S: Session>(
     detached: &mut DetachedConnection<S>,
     shared: &Shared,
     state: &mut State,
@@ -95,7 +95,7 @@ pub(crate) fn pump<S: TlsSession>(
 }
 
 /// Produces datagrams the connection wants to send, subject to the queue having room.
-pub(crate) fn produce<S: TlsSession>(
+pub(crate) fn produce<S: Session>(
     detached: &mut DetachedConnection<S>,
     state: &mut State,
 ) -> Result<()> {
@@ -125,7 +125,7 @@ pub(crate) fn produce<S: TlsSession>(
 ///
 /// The HTTP/3 driver parks on this crate's waker, and nothing else will wake it when a
 /// timer expires — the endpoint's timer covers only connections the endpoint drives.
-pub(crate) fn poll_timer<S: TlsSession>(
+pub(crate) fn poll_timer<S: Session>(
     detached: &DetachedConnection<S>,
     state: &mut State,
     cx: &mut Context<'_>,

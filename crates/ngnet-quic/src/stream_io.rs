@@ -22,7 +22,7 @@ use crate::conn::Conn;
 use crate::error::{ApplicationErrorCode, Error, Result};
 use crate::stream::StreamId;
 use crate::time::Timestamp;
-use crate::tls::TlsSession;
+use crate::tls::Session;
 
 /// What happened when stream data was offered to the connection.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -51,7 +51,7 @@ pub enum StreamWrite {
     Idle,
 }
 
-impl<S: TlsSession> Conn<'_, S> {
+impl<S: Session> Conn<'_, S> {
     /// Opens a bidirectional stream.
     ///
     /// # Errors

@@ -13,10 +13,12 @@
 //! deliberate decision, recorded here by how it is matched.
 
 use ngnet_quic::{
-    ApplicationErrorCode, ConnBuilder, ConnectionId, Directionality, Duration, EntropySource,
-    Error, ErrorKind, ExpiryOutcome, Handlers, Initiator, Inspection, NativeCode, NativeTlsHandle,
-    ReadOutcome, Result, Role, Settings, StreamCloseReason, StreamId, StreamWrite, Timestamp,
-    TlsBackend, TlsSession, TransportErrorCode, TransportParams, WriteOutcome,
+    ApplicationErrorCode, Backend, ConnBuilder, ConnectionId, CryptoError, Direction,
+    DirectionalKeys, Directionality, Duration, EntropySource, Error, ErrorKind, ExpiryOutcome,
+    HP_MASK_LEN, HP_SAMPLE_LEN, Handlers, Handshaking, HeaderKey, InitialKeys, Initiator,
+    Inspection, Level, NativeCode, PacketKey, ReadOutcome, Result, Role, RotatedKeys, Session,
+    SessionEvent, Settings, StreamCloseReason, StreamId, StreamWrite, Timestamp,
+    TransportErrorCode, TransportParams, WriteOutcome,
 };
 
 #[test]
@@ -308,54 +310,100 @@ fn the_public_surface_still_has_the_shape_it_promised() {
     }
     let _: bool = Role::Server.is_server();
 
-    fn takes_session<S: TlsSession>(s: &S) {
-        let _: NativeTlsHandle = s.native_handle();
+    // --- The safe TLS seam ----------------------------------------------------------
+    // Named by bound rather than by implementation, because the property being pinned is
+    // what an implementor has to supply. Note that nothing here mentions a pointer or a
+    // `sys::` type: that absence is the whole point of the seam, and Phase 7 turns it into
+    // a check that reads the source rather than relying on this file's good behaviour.
+    match Level::Initial {
+        Level::Initial | Level::ZeroRtt | Level::Handshake | Level::OneRtt => {}
+    }
+    match Direction::Read {
+        Direction::Read | Direction::Write => {}
+    }
+    // **Closed**, and deliberately two-valued. A third variant would blur the one
+    // distinction the type exists to make.
+    match CryptoError::Decrypt {
+        CryptoError::Decrypt | CryptoError::Fatal => {}
+    }
+    let _: usize = HP_MASK_LEN;
+    let _: usize = HP_SAMPLE_LEN;
+
+    fn takes_packet_key<K: PacketKey>(k: &K, buf: &mut [u8]) {
+        let _: core::result::Result<(), CryptoError> = k.seal(buf, 0, &[], &[]);
+        let _: core::result::Result<usize, CryptoError> = k.open(buf, 0, &[], &[]);
+        let _: usize = k.tag_len();
+        let _: u64 = k.confidentiality_limit();
+        let _: u64 = k.integrity_limit();
+    }
+
+    fn takes_header_key<K: HeaderKey>(k: &K) {
+        let _: core::result::Result<[u8; HP_MASK_LEN], CryptoError> = k.mask(&[]);
+    }
+
+    fn takes_safe_session<S: Session>(
+        s: &mut S,
+        conn: &mut dyn Handshaking<S::PacketKey, S::HeaderKey>,
+    ) {
+        let _: Result<InitialKeys<S::PacketKey, S::HeaderKey>> = s.initial_keys(1, &[]);
+        let _: Result<S::PacketKey> = s.retry_key(1);
+        let _: Result<()> = s.set_local_transport_params(&[]);
+        let _: Result<()> = s.start_handshake(conn);
+        let _: Result<()> = s.read_handshake(Level::Initial, &[], conn);
+        let _: Option<SessionEvent> = s.poll_event();
+        let _: Result<RotatedKeys<S::PacketKey>> = s.rotate_keys(&[], &[]);
         let _: Option<Vec<u8>> = s.negotiated_alpn();
         let _: Option<String> = s.failure_reason();
     }
-    let _ = takes_session::<DummySession>;
 
-    fn takes_backend<B: TlsBackend>(b: &B) -> Result<B::Session> {
+    fn takes_safe_backend<B: Backend>(b: &B) -> Result<B::Session> {
         b.new_session(Role::Client, Some("example.com"))
     }
-    let _ = takes_backend::<DummyBackend>;
+
+    // A session's keys must be usable from wherever ngtcp2 hands them back, which is why
+    // the seam bounds them `Send + 'static` rather than leaving it to each backend.
+    fn keys_are_send_and_static<S: Session>() {
+        fn require<T: Send + 'static>() {}
+        require::<S::PacketKey>();
+        require::<S::HeaderKey>();
+    }
+
+    /// The queue carries exactly two things, and neither of them is key material.
+    ///
+    /// Pinned because the boundary between "reported afterwards" and "performed immediately"
+    /// is the load-bearing distinction in this seam: anything that drifts back onto the queue
+    /// is something that will be applied too late to matter.
+    fn events_are_only_what_can_wait(event: SessionEvent) {
+        match event {
+            SessionEvent::HandshakeComplete => {}
+            SessionEvent::Alert(code) => {
+                let _: u8 = code;
+            }
+        }
+    }
+
+    /// The capability, and every operation on it.
+    fn connection_offers_exactly_four_operations<P: PacketKey, H: HeaderKey>(
+        conn: &mut dyn Handshaking<P, H>,
+        keys: DirectionalKeys<P, H>,
+    ) {
+        let _: Result<()> = conn.set_peer_transport_params(&[]);
+        let _: Result<Vec<u8>> = conn.local_transport_params();
+        let _: Result<()> = conn.install_keys(Level::Initial, Direction::Read, keys, &[]);
+        let _: Result<()> = conn.submit_handshake(Level::Initial, &[]);
+    }
+    let _ = events_are_only_what_can_wait;
+
+    let _ = takes_packet_key::<DummyPacketKey>;
+    let _ = takes_header_key::<DummyHeaderKey>;
+    let _ = takes_safe_session::<DummySafeSession>;
+    let _ = connection_offers_exactly_four_operations::<DummyPacketKey, DummyHeaderKey>;
+    let _ = takes_safe_backend::<DummySafeBackend>;
+    let _ = keys_are_send_and_static::<DummySafeSession>;
+    let _ = events_are_only_what_can_wait;
 }
 
 /// A backend that exists only so the generic bounds above have something to name.
-struct DummyBackend;
-
-/// Deliberately `Send`, so the auto-trait assertions above are about `Conn` rather than
-/// about this stand-in.
-struct DummySession;
-
-// SAFETY: never used to build a connection; it exists to pin the trait's shape.
-unsafe impl TlsSession for DummySession {
-    unsafe fn bind_connection(&mut self, _conn: *mut core::ffi::c_void) {}
-    unsafe fn install_callbacks(&self, _callbacks: *mut core::ffi::c_void) {}
-    fn native_handle(&self) -> NativeTlsHandle {
-        // SAFETY: never handed to ngtcp2.
-        unsafe { NativeTlsHandle::new(core::ptr::null_mut()) }
-    }
-    fn negotiated_alpn(&self) -> Option<Vec<u8>> {
-        None
-    }
-}
-
-// SAFETY: as above.
-unsafe impl TlsBackend for DummyBackend {
-    type Session = DummySession;
-    fn new_session(&self, _role: Role, _server_name: Option<&str>) -> Result<Self::Session> {
-        Ok(DummySession)
-    }
-}
-
-/// A `Conn` is `Send`, and it owns its handlers and its entropy source. Both must therefore
-/// be `Send` themselves, or the unsafe impl on `Conn` launders non-`Send` state across a
-/// thread boundary -- an `Rc` captured by a handler, cloned before the connection is moved,
-/// is a data race on a non-atomic refcount reachable from entirely safe code.
-///
-/// The compiler will not catch that: `unsafe impl Send` is precisely the escape hatch that
-/// silences it. So it is asserted here.
 #[test]
 fn the_types_a_connection_owns_are_send_because_the_connection_is() {
     fn assert_send<T: Send>() {}
@@ -369,17 +417,17 @@ fn the_types_a_connection_owns_are_send_because_the_connection_is() {
     assert_send::<ConnectionId>();
 
     // And the connection itself, for a `Send` session.
-    fn conn_is_send<S: TlsSession + Send>() {
+    fn conn_is_send<S: Session + Send>() {
         assert_send::<ngnet_quic::Conn<'static, S>>();
     }
-    let _ = conn_is_send::<DummySession>;
+    let _ = conn_is_send::<DummySafeSession>;
 }
 
 #[test]
 fn the_connection_surface_still_has_the_shape_it_promised() {
     // Named through a generic function rather than instantiated, so this pins the signatures
     // without needing a TLS backend or a live connection.
-    fn uses_conn<S: TlsSession>(conn: &mut ngnet_quic::Conn<'_, S>, cause: &Error) -> Result<()> {
+    fn uses_conn<S: Session>(conn: &mut ngnet_quic::Conn<'_, S>, cause: &Error) -> Result<()> {
         let now = Timestamp::from_nanos(1)?;
         let mut buf = [0u8; 1500];
 
@@ -421,9 +469,9 @@ fn the_connection_surface_still_has_the_shape_it_promised() {
         let _: ngnet_quic::CloseError = conn.close_error();
         Ok(())
     }
-    let _ = uses_conn::<DummySession>;
+    let _ = uses_conn::<DummySafeSession>;
 
-    fn builds<S: TlsSession>(
+    fn builds<S: Session>(
         settings: Settings,
         params: TransportParams,
         entropy: Box<dyn EntropySource + Send>,
@@ -439,7 +487,7 @@ fn the_connection_surface_still_has_the_shape_it_promised() {
             .cid_len(8)
             .build(Handlers::new())
     }
-    let _ = builds::<DummySession>;
+    let _ = builds::<DummySafeSession>;
 }
 
 #[cfg(feature = "tls-ossl")]
@@ -469,7 +517,125 @@ fn the_openssl_backend_surface_still_has_the_shape_it_promised() {
     let _ = on_verify;
 
     fn takes_ossl_session(s: &OsslSession) -> Option<Vec<u8>> {
-        s.negotiated_alpn()
+        // Named through the trait: the type now implements both seams, and the safe one is
+        // what a caller should be reaching for.
+        Session::negotiated_alpn(s)
     }
     let _ = takes_ossl_session;
+}
+
+/// Stand-ins for the seam.
+///
+/// Worth noticing what is absent: these implement the **entire** seam — a backend, a session,
+/// both key kinds — and contain no `unsafe`, no raw pointer and no reference to the raw
+/// bindings. The stand-ins they replaced needed three `unsafe` blocks and an exemption in
+/// `invariants.rs` to be allowed to write `unsafe` at all. That difference is the whole of
+/// this work, expressed in the smallest possible implementation.
+struct DummyPacketKey;
+
+impl PacketKey for DummyPacketKey {
+    fn seal(
+        &self,
+        _buf: &mut [u8],
+        _plaintext_len: usize,
+        _nonce: &[u8],
+        _aad: &[u8],
+    ) -> core::result::Result<(), CryptoError> {
+        Err(CryptoError::Fatal)
+    }
+
+    fn open(
+        &self,
+        _buf: &mut [u8],
+        _ciphertext_len: usize,
+        _nonce: &[u8],
+        _aad: &[u8],
+    ) -> core::result::Result<usize, CryptoError> {
+        Err(CryptoError::Decrypt)
+    }
+
+    fn tag_len(&self) -> usize {
+        16
+    }
+
+    fn confidentiality_limit(&self) -> u64 {
+        1
+    }
+
+    fn integrity_limit(&self) -> u64 {
+        1
+    }
+}
+
+struct DummyHeaderKey;
+
+impl HeaderKey for DummyHeaderKey {
+    fn mask(&self, _sample: &[u8]) -> core::result::Result<[u8; HP_MASK_LEN], CryptoError> {
+        Ok([0; HP_MASK_LEN])
+    }
+}
+
+struct DummySafeSession;
+
+impl Session for DummySafeSession {
+    type PacketKey = DummyPacketKey;
+    type HeaderKey = DummyHeaderKey;
+
+    fn initial_keys(
+        &mut self,
+        _version: u32,
+        _dcid: &[u8],
+    ) -> Result<InitialKeys<Self::PacketKey, Self::HeaderKey>> {
+        Err(Error::backend("stand-in"))
+    }
+
+    fn retry_key(&mut self, _version: u32) -> Result<Self::PacketKey> {
+        Err(Error::backend("stand-in"))
+    }
+
+    fn set_local_transport_params(&mut self, _params: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    fn start_handshake(
+        &mut self,
+        _conn: &mut dyn Handshaking<Self::PacketKey, Self::HeaderKey>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn read_handshake(
+        &mut self,
+        _level: Level,
+        _data: &[u8],
+        _conn: &mut dyn Handshaking<Self::PacketKey, Self::HeaderKey>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn poll_event(&mut self) -> Option<SessionEvent> {
+        None
+    }
+
+    fn rotate_keys(
+        &mut self,
+        _rx_secret: &[u8],
+        _tx_secret: &[u8],
+    ) -> Result<RotatedKeys<Self::PacketKey>> {
+        Err(Error::backend("stand-in"))
+    }
+
+    fn negotiated_alpn(&self) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+struct DummySafeBackend;
+
+impl Backend for DummySafeBackend {
+    type Session = DummySafeSession;
+
+    fn new_session(&self, _role: Role, _server_name: Option<&str>) -> Result<Self::Session> {
+        Ok(DummySafeSession)
+    }
 }

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ngnet_quic::{
     ConnBuilder, ConnectionId, EntropySource, ExpiryOutcome, Handlers, OsslBackend, OsslSession,
-    ReadOutcome, Result, Role, Settings, Timestamp, TlsBackend, TransportParams, WriteOutcome,
+    ReadOutcome, Result, Role, Settings, Timestamp, Backend as TlsBackend, TransportParams, WriteOutcome,
 };
 
 pub mod udp;

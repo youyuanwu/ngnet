@@ -127,7 +127,7 @@ fn server_conn_with<'h>(
     client_scid: ngnet_quic::ConnectionId,
     params: TransportParams,
 ) -> ngnet_quic::Result<TestConn<'h>> {
-    use ngnet_quic::{ConnBuilder, Role, Settings, TlsBackend};
+    use ngnet_quic::{ConnBuilder, Role, Settings, Backend as TlsBackend};
     let session = backend.new_session(Role::Server, None)?;
     ConnBuilder::new(
         Role::Server,
