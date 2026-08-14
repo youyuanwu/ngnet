@@ -855,6 +855,20 @@ where
         self.inner.has_pending()
     }
 
+    /// Clones every datagram a connection is currently holding in its `pending` slot, for
+    /// the SC-012 tests. A close datagram waits here as an owned buffer of its own while the
+    /// driver reuses its send buffer for other connections' work, so capturing these bytes
+    /// before and after that work is how a test observes the held datagram keeps its own
+    /// bytes without decrypting it. Hidden and unsupported.
+    #[doc(hidden)]
+    pub fn held_datagrams_for_test(&self) -> Vec<Vec<u8>> {
+        self.inner
+            .connections
+            .values()
+            .filter_map(|t| t.pending.clone())
+            .collect()
+    }
+
     /// Runs the command and timer half of a pass, without the send half, for the
     /// allocation-counting tests. Command production offers each stream datagram it produces
     /// to the socket, so this half completes or refuses a stream send; it does not flush, so a

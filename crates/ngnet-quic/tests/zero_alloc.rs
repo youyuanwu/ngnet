@@ -724,7 +724,7 @@ mod driver_pass {
     use ngnet_quic::endpoint::{
         Clock, Config, Connection, Endpoint, EndpointBuilder, EndpointDriver,
     };
-    use ngnet_quic::{OsslBackend, OsslSession, Role, Timestamp};
+    use ngnet_quic::{ApplicationErrorCode, OsslBackend, OsslSession, Role, Timestamp};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1717,6 +1717,293 @@ mod driver_pass {
         assert_eq!(
             received, payload,
             "a datagram carried the wrong bytes; reusing the send buffer corrupted the stream"
+        );
+    }
+
+    /// Builds an endpoint whose per-connection entropy starts at a distinct seed, so two
+    /// connections on one endpoint derive different connection identifiers instead of
+    /// colliding -- two connections between the same address pair are told apart by
+    /// identifier, never by address.
+    fn build_distinct(
+        role: Role,
+        socket: TestSocket,
+        clock: TestClock,
+        base_seed: u8,
+    ) -> (Endpoint<OsslSession>, Driver) {
+        let backend = match role {
+            Role::Client => OsslBackend::builder(Role::Client)
+                .alpn("h3")
+                .trust_anchor_pem(TEST_CERT_PEM)
+                .use_system_trust_store(false)
+                .build()
+                .expect("a client backend"),
+            Role::Server => OsslBackend::builder(Role::Server)
+                .alpn("h3")
+                .certificate_chain_pem(TEST_CERT_PEM)
+                .private_key_pem(TEST_KEY_PEM)
+                .build()
+                .expect("a server backend"),
+        };
+        let next = Arc::new(AtomicU64::new(base_seed as u64));
+        let mut builder = EndpointBuilder::new(socket, clock, backend)
+            .config(Config::new())
+            .entropy(move || StubEntropy((next.fetch_add(37, Ordering::Relaxed) & 0xff) as u8));
+        if role == Role::Server {
+            builder = builder.accepts(true);
+        }
+        builder.build().expect("an endpoint")
+    }
+
+    /// Drives two client connections to one server to establishment over a single socket
+    /// pair. Returns the drivers, the two client connections, the two server connections in
+    /// acceptance order (not necessarily paired with the client order), and the clock.
+    fn establish_two(
+        cx: &mut Context<'_>,
+    ) -> (
+        Vec<Pin<Box<Driver>>>,
+        (Connection, Connection),
+        (Connection, Connection),
+        TestClock,
+    ) {
+        let (caddr, saddr) = (
+            "127.0.0.1:4455".parse().unwrap(),
+            "127.0.0.1:4456".parse().unwrap(),
+        );
+        let clock = TestClock::new();
+        let (cs, ss) = socket_pair(caddr, saddr);
+        let (client, cdrv) = build_distinct(Role::Client, cs, clock.clone(), 1);
+        let (server, sdrv) = build_distinct(Role::Server, ss, clock.clone(), 128);
+        let mut drivers: Vec<Pin<Box<Driver>>> = vec![Box::pin(cdrv), Box::pin(sdrv)];
+
+        let mut connecting_a = Box::pin(client.connect(saddr, Some("localhost")));
+        let mut connecting_b = Box::pin(client.connect(saddr, Some("localhost")));
+        let mut accepting = Box::pin(server.accept());
+        let mut ca: Option<Connection> = None;
+        let mut cb: Option<Connection> = None;
+        let mut servers: Vec<Connection> = Vec::new();
+        for _ in 0..1200 {
+            poll_all(&mut drivers, cx);
+            if ca.is_none()
+                && let Poll::Ready(r) = connecting_a.as_mut().poll(cx)
+            {
+                ca = Some(r.expect("the first client handshake failed"));
+            }
+            if cb.is_none()
+                && let Poll::Ready(r) = connecting_b.as_mut().poll(cx)
+            {
+                cb = Some(r.expect("the second client handshake failed"));
+            }
+            if servers.len() < 2
+                && let Poll::Ready(r) = accepting.as_mut().poll(cx)
+            {
+                servers.push(r.expect("a server accept failed"));
+                accepting = Box::pin(server.accept());
+            }
+            if ca.is_some() && cb.is_some() && servers.len() == 2 {
+                break;
+            }
+            clock.advance(2_000_000);
+        }
+        let ca = ca.expect("a first client connection");
+        let cb = cb.expect("a second client connection");
+        assert_eq!(
+            servers.len(),
+            2,
+            "the server did not accept both connections"
+        );
+        let mut servers = servers.into_iter();
+        let sa = servers.next().unwrap();
+        let sb = servers.next().unwrap();
+        assert!(
+            ca.is_established()
+                && cb.is_established()
+                && sa.is_established()
+                && sb.is_established(),
+            "the harness did not establish both connections"
+        );
+        (drivers, (ca, cb), (sa, sb), clock)
+    }
+
+    #[test]
+    fn a_second_connection_in_the_same_pass_keeps_its_own_bytes() {
+        // SC-012, the cross-connection half. One send pass now walks every connection through
+        // a single reusable buffer, so a second connection's datagram is composed in the very
+        // buffer the first just used. This observes the datagrams that one pass produces
+        // directly: they are captured off the wire and delivered to the server exactly once,
+        // and the client is never polled again so it cannot retransmit. A datagram whose bytes
+        // had been overwritten by the other connection's would fail its authentication tag and
+        // its stream would arrive short, and with retransmission impossible nothing could
+        // paper over it -- which is why this does not rely on the transfer recovering.
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let (mut drivers, (mut ca, mut cb), (mut sa, mut sb), clock) = establish_two(&mut cx);
+
+        let open_uni =
+            |c: &mut Connection, drivers: &mut [Pin<Box<Driver>>], cx: &mut Context<'_>| {
+                let mut opening = c.open_uni();
+                loop {
+                    match Pin::new(&mut opening).poll(cx) {
+                        Poll::Ready(r) => break r.expect("opening a stream"),
+                        Poll::Pending => {
+                            poll_all(drivers, cx);
+                            clock.advance(2_000_000);
+                        }
+                    }
+                }
+            };
+        let sid_a = open_uni(&mut ca, &mut drivers, &mut cx);
+        let sid_b = open_uni(&mut cb, &mut drivers, &mut cx);
+
+        const PAYLOAD: usize = 256;
+        let payload_a = [0xaau8; PAYLOAD];
+        let payload_b = [0xbbu8; PAYLOAD];
+
+        // Release the pacer, then clear whatever the handshakes left in the server's socket so
+        // the capture below is exactly what the one measured pass produces.
+        clock.advance(20_000_000);
+        let _ = drivers[1].as_ref().socket_for_test().drain_inbox();
+
+        // Both connections are given data, then a single client send pass composes a datagram
+        // for each through the one reusable buffer.
+        ca.write(sid_a, &payload_a, true).expect("client A write");
+        cb.write(sid_b, &payload_b, true).expect("client B write");
+        let sent_before = drivers[0].as_ref().socket_for_test().sent();
+        drivers[0]
+            .as_mut()
+            .get_mut()
+            .service_for_test(&mut cx)
+            .expect("the client send pass failed");
+        let sent_after = drivers[0].as_ref().socket_for_test().sent();
+        assert!(
+            sent_after - sent_before >= 2,
+            "a single pass produced fewer than two datagrams, so it never exercised two \
+             connections sharing the buffer"
+        );
+        let captured = drivers[1].as_ref().socket_for_test().drain_inbox();
+
+        // The client is not polled again, so it cannot retransmit: whatever the server reads
+        // now comes solely from this single delivery of the captured datagrams.
+        for (source, datagram) in &captured {
+            drivers[1]
+                .as_ref()
+                .socket_for_test()
+                .deliver(*source, datagram);
+        }
+
+        let read_stream = |s: &mut Connection,
+                           drivers: &mut [Pin<Box<Driver>>],
+                           cx: &mut Context<'_>|
+         -> Vec<u8> {
+            let mut stream = None;
+            for _ in 0..200 {
+                let mut a = s.accept_stream();
+                if let Poll::Ready(r) = Pin::new(&mut a).poll(cx) {
+                    stream = Some(r.expect("accepting a stream"));
+                    break;
+                }
+                let _ = drivers[1].as_mut().poll(cx);
+            }
+            let stream = stream.expect("the server never saw the stream");
+            let mut bytes = Vec::new();
+            for _ in 0..200 {
+                let mut reading = s.read(stream);
+                if let Poll::Ready(r) = Pin::new(&mut reading).poll(cx) {
+                    let chunk = r.expect("reading a stream");
+                    bytes.extend_from_slice(&chunk.bytes);
+                    if chunk.fin {
+                        break;
+                    }
+                }
+                let _ = drivers[1].as_mut().poll(cx);
+            }
+            bytes
+        };
+        let got_a = read_stream(&mut sa, &mut drivers, &mut cx);
+        let got_b = read_stream(&mut sb, &mut drivers, &mut cx);
+
+        // Pairing-agnostic: whichever server connection carried which stream, both payloads
+        // must appear intact and distinct, which they cannot if a datagram took the other's
+        // bytes out of the shared buffer.
+        let mut seen = [got_a, got_b];
+        seen.sort();
+        let mut want = [payload_a.to_vec(), payload_b.to_vec()];
+        want.sort();
+        assert_eq!(
+            seen, want,
+            "a datagram from the shared pass carried the wrong connection's bytes"
+        );
+    }
+
+    #[test]
+    fn a_held_close_datagram_keeps_its_own_bytes_while_the_buffer_is_reused() {
+        // SC-012, the held-datagram half. A connection close is written into a buffer of its
+        // own and parked in the connection's `pending` slot to be sent on a later pass. While
+        // it waits, the driver goes on reusing its send buffer for another connection's work.
+        // This captures the parked close bytes, drives a second connection's stream through
+        // the reusable buffer repeatedly, then captures the parked bytes again: they must be
+        // unchanged. It observes the held buffer directly rather than trusting a delivered
+        // close, which a retransmitted close could otherwise repair.
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let (mut drivers, (ca, mut cb), (_sa, _sb), clock) = establish_two(&mut cx);
+
+        // The second connection carries a stream: the work that reuses the send buffer.
+        let sid_b = {
+            let mut opening = cb.open_uni();
+            loop {
+                match Pin::new(&mut opening).poll(&mut cx) {
+                    Poll::Ready(r) => break r.expect("opening a stream"),
+                    Poll::Pending => {
+                        poll_all(&mut drivers, &mut cx);
+                        clock.advance(2_000_000);
+                    }
+                }
+            }
+        };
+
+        // Close the first connection, then run the command half alone so the close is composed
+        // and parked in `pending` without being flushed.
+        ca.close(ApplicationErrorCode::new(0x4242), b"held-close");
+        clock.advance(20_000_000);
+        drivers[0]
+            .as_mut()
+            .get_mut()
+            .service_commands_for_test(&mut cx);
+
+        let held_before = drivers[0].as_ref().held_datagrams_for_test();
+        assert_eq!(
+            held_before.len(),
+            1,
+            "closing one connection should park exactly one held datagram"
+        );
+        assert!(
+            !held_before[0].is_empty(),
+            "the parked close datagram is empty"
+        );
+
+        // Further work: the second connection writes repeatedly, each write composing a
+        // datagram in the driver's reusable send buffer -- the buffer that would be corrupted
+        // if the parked close had kept a borrow of it rather than its own copy.
+        for i in 0..8u8 {
+            let chunk = [0x30 + i; 256];
+            cb.write(sid_b, &chunk, false).expect("client B write");
+            clock.advance(20_000_000);
+            drivers[0]
+                .as_mut()
+                .get_mut()
+                .service_commands_for_test(&mut cx);
+        }
+
+        let held_after = drivers[0].as_ref().held_datagrams_for_test();
+        assert_eq!(
+            held_after.len(),
+            1,
+            "the parked close datagram went missing while the buffer was reused"
+        );
+        assert_eq!(
+            held_after[0], held_before[0],
+            "the parked close datagram's bytes changed while the send buffer was reused for \
+             another connection"
         );
     }
 }
