@@ -846,15 +846,28 @@ where
         &self.inner.socket
     }
 
-    /// Runs the command and timer half of a pass, without the send half, for the
-    /// allocation-counting tests. Lets a test stage a connection's pending datagram outside
-    /// the region that counts the send. Hidden and unsupported.
+    /// Whether any connection is holding a datagram the socket has not yet taken, for the
+    /// allocation-counting tests. A stream datagram the socket accepts is sent straight from
+    /// the reusable buffer and leaves nothing here; only one the socket refuses is copied
+    /// into `pending` and shows up. Hidden and unsupported.
     #[doc(hidden)]
-    pub fn service_commands_for_test(&mut self) {
+    pub fn has_pending_for_test(&self) -> bool {
+        self.inner.has_pending()
+    }
+
+    /// Runs the command and timer half of a pass, for the allocation-counting tests.
+    ///
+    /// Command production now offers each stream datagram it produces to the socket before
+    /// the reusable buffer is reused, so this half is where a stream send completes or is
+    /// refused -- not a place that merely stages `pending` for a later counted flush. A test
+    /// counting a complete driver send pass must count this call, which is why it takes the
+    /// task context the send needs. Hidden and unsupported.
+    #[doc(hidden)]
+    pub fn service_commands_for_test(&mut self, cx: &mut Context<'_>) {
         let indices: Vec<u64> = self.inner.connections.keys().copied().collect();
         for index in &indices {
             self.inner.apply_routes(*index);
-            self.inner.apply_commands(*index);
+            self.inner.apply_commands(*index, cx);
             self.inner.handle_expiry(*index);
         }
     }
@@ -1032,7 +1045,7 @@ where
             // before any datagram announcing it goes out, or the peer may use it before the
             // endpoint knows about it.
             self.inner.apply_routes(*index);
-            self.inner.apply_commands(*index);
+            self.inner.apply_commands(*index, cx);
             self.inner.handle_expiry(*index);
         }
         // Restored before `flush`, which takes the same scratch. This loop has no early

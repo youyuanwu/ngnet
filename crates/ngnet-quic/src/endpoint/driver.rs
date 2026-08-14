@@ -428,7 +428,7 @@ where
     }
 
     /// Runs whatever a handle asked for on one connection.
-    pub(crate) fn apply_commands(&mut self, index: u64) {
+    pub(crate) fn apply_commands(&mut self, index: u64, cx: &mut Context<'_>) {
         let Some(tracked) = self.connections.get(&index) else {
             return;
         };
@@ -468,7 +468,7 @@ where
                     }
                 }
                 Command::Write { stream, data, fin } => {
-                    self.write_stream(index, stream, &data, fin);
+                    self.write_stream(index, stream, &data, fin, cx);
                 }
                 Command::Reset(stream, code) => {
                     let _ = conn.reset_stream(stream, code);
@@ -503,7 +503,14 @@ where
     /// until the peer acknowledges it, so offering a whole large payload on every attempt
     /// would recopy the remainder for every datagram produced. One packet's worth per
     /// offer keeps that bounded.
-    pub(crate) fn write_stream(&mut self, index: u64, stream: StreamId, data: &[u8], fin: bool) {
+    pub(crate) fn write_stream(
+        &mut self,
+        index: u64,
+        stream: StreamId,
+        data: &[u8],
+        fin: bool,
+        cx: &mut Context<'_>,
+    ) {
         let now = self.clock.now();
         // The core writes into the reusable send buffer, taken out for the call the way
         // `flush` takes it and restored on every path out. A write that produces no datagram
@@ -545,22 +552,39 @@ where
 
         match outcome {
             Ok(StreamWrite::Datagram { len, accepted }) => {
-                // The one allocation this can owe. `pending` outlives the reusable buffer --
-                // a later write for another connection in the same pass would overwrite it,
-                // and `flush` reuses it again after -- so a produced datagram has to be
-                // copied into a buffer of its own. Forced, and paid only when a datagram is
-                // actually produced.
-                tracked.pending = Some(buffer[..len].to_vec());
+                // The datagram is written into the reusable buffer. Offer it to the socket
+                // *before* the buffer is reused, exactly as `flush` does with a core-produced
+                // datagram: a datagram the socket accepts immediately is sent straight from
+                // the buffer and never copied. Only one the socket refuses is copied into a
+                // buffer of its own as `tracked.pending`, because a later write in the same
+                // pass -- or `flush` reusing the buffer afterwards -- would overwrite it.
+                // That copy is the single allocation this path can owe, and it is paid only
+                // on refusal, not on every produced datagram.
                 let held = conn.retained_bytes() as u64;
-                tracked.shared.set_retained(held);
-                // Whatever was not accepted -- which may be everything, since a packet can
-                // fill with control frames instead -- goes back on the queue.
-                if accepted < data.len() {
-                    tracked.shared.push(Command::Write {
-                        stream,
-                        data: data[accepted..].to_vec(),
-                        fin,
-                    });
+                let remote = tracked.remote;
+                let disposition = self.socket.poll_send(cx, remote, &buffer[..len]);
+                if let Some(tracked) = self.connections.get_mut(&index) {
+                    match disposition {
+                        // Sent. The bytes stay in the reusable buffer to be overwritten by
+                        // the next datagram; nothing is allocated.
+                        Poll::Ready(Ok(Sent::Complete)) => {}
+                        // Refused (`WouldBlock`/`Pending`) or the socket errored: keep the
+                        // datagram so a busy socket does not silently lose it. A socket error
+                        // is resurfaced by `flush` on the next pass when it retries `pending`.
+                        _ => {
+                            tracked.pending = Some(buffer[..len].to_vec());
+                        }
+                    }
+                    tracked.shared.set_retained(held);
+                    // Whatever was not accepted -- which may be everything, since a packet
+                    // can fill with control frames instead -- goes back on the queue.
+                    if accepted < data.len() {
+                        tracked.shared.push(Command::Write {
+                            stream,
+                            data: data[accepted..].to_vec(),
+                            fin,
+                        });
+                    }
                 }
             }
             Ok(StreamWrite::StreamBlocked

@@ -24,6 +24,13 @@ thread_local! {
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
     /// Whether this thread is currently counting.
     static COUNTING: Cell<bool> = const { Cell::new(false) };
+    /// Allocations larger than `LARGE_THRESHOLD` observed while armed.
+    static LARGE: Cell<usize> = const { Cell::new(0) };
+    /// Only allocations strictly larger than this are tallied in `LARGE`. A test measuring a
+    /// send path sets this to the stream payload size so that the core's own copy of the
+    /// accepted bytes -- which is exactly the payload -- is excluded and only a whole-datagram
+    /// copy, which wraps the payload in QUIC framing and so is strictly larger, is counted.
+    static LARGE_THRESHOLD: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
 struct Counting;
@@ -32,7 +39,7 @@ struct Counting;
 // thread-local and never affect the pointers returned.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        note();
+        note(layout.size());
         // SAFETY: forwarding the caller's own contract.
         unsafe { System.alloc(layout) }
     }
@@ -43,23 +50,26 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        note();
+        note(new_size);
         // SAFETY: forwarding the caller's own contract.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        note();
+        note(layout.size());
         // SAFETY: forwarding the caller's own contract.
         unsafe { System.alloc_zeroed(layout) }
     }
 }
 
-/// Records an allocation, if counting is armed.
-fn note() {
+/// Records an allocation of `size` bytes, if counting is armed.
+fn note(size: usize) {
     COUNTING.with(|counting| {
         if counting.get() {
             ALLOCATIONS.with(|count| count.set(count.get() + 1));
+            if size > LARGE_THRESHOLD.with(Cell::get) {
+                LARGE.with(|count| count.set(count.get() + 1));
+            }
         }
     });
 }
@@ -69,12 +79,24 @@ static ALLOCATOR: Counting = Counting;
 
 /// Runs `f` with allocation counting armed, and reports how many were seen.
 fn count_allocations<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let (value, total, _) = count_allocations_larger_than(usize::MAX, f);
+    (value, total)
+}
+
+/// Runs `f` with allocation counting armed and reports both the total number of allocations
+/// and how many were strictly larger than `threshold`. The large count lets a send-path test
+/// distinguish a whole-datagram copy from the smaller allocations the core makes regardless.
+fn count_allocations_larger_than<T>(threshold: usize, f: impl FnOnce() -> T) -> (T, usize, usize) {
     ALLOCATIONS.with(|count| count.set(0));
+    LARGE.with(|count| count.set(0));
+    LARGE_THRESHOLD.with(|t| t.set(threshold));
     COUNTING.with(|counting| counting.set(true));
     let value = f();
     COUNTING.with(|counting| counting.set(false));
-    let seen = ALLOCATIONS.with(Cell::get);
-    (value, seen)
+    LARGE_THRESHOLD.with(|t| t.set(usize::MAX));
+    let total = ALLOCATIONS.with(Cell::get);
+    let large = LARGE.with(Cell::get);
+    (value, total, large)
 }
 
 /// A counter, adequate because these tests do not depend on unpredictability.
@@ -663,7 +685,9 @@ fn sending_owned_data_allocates_nothing_where_a_borrowed_send_allocates() {
 // `endpoint::testing` surface so this test needs no extra dependency.
 #[cfg(feature = "endpoint")]
 mod driver_pass {
-    use super::{StubEntropy, TEST_CERT_PEM, TEST_KEY_PEM, count_allocations};
+    use super::{
+        StubEntropy, TEST_CERT_PEM, TEST_KEY_PEM, count_allocations, count_allocations_larger_than,
+    };
     use core::future::Future;
     use core::pin::Pin;
     use core::task::{Context, Poll, Waker};
@@ -1274,59 +1298,153 @@ mod driver_pass {
     }
 
     #[test]
-    fn a_completing_send_pass_allocates_nothing() {
-        // Phase 5, SC-001. `next_datagram` used to hand back an owned `Vec` on every call,
-        // allocating a datagram buffer before the socket's disposition was known. Now a
-        // core-produced datagram is written into a buffer the driver owns and reuses, and an
-        // already-owned datagram is forwarded as itself -- so a send pass whose datagrams all
-        // complete allocates nothing.
+    fn a_completing_send_pass_copies_a_datagram_only_when_the_socket_refuses_it() {
+        // Phase 5, SC-001, and the correction of a test that used to prove less than it
+        // claimed. `write_stream` used to copy every produced stream datagram into
+        // `tracked.pending` *before* the socket was consulted, and the old test paid that
+        // copy outside the counted region by running the command half first, then counted
+        // only the forwarding of an already-owned datagram. It never measured a completing
+        // driver send pass.
         //
-        // The socket is put in sink mode: a completed send is counted but its bytes are
-        // dropped rather than copied into the peer's queue, so the harness's own delivery
-        // copy stays out of the count and what remains is `flush` alone.
+        // Command production now offers each stream datagram it produces to the socket before
+        // the reusable buffer is reused, exactly as `flush` does for a core-produced
+        // datagram. So a complete driver send pass -- command production and send counted
+        // together -- copies the datagram out of the reusable buffer into `tracked.pending`
+        // only when the socket refuses it; a datagram the socket accepts is sent straight from
+        // the buffer and never copied.
+        //
+        // The proof is two otherwise identical complete send passes -- an accepting one and a
+        // refusing one, each a first write to a fresh stream -- watched two ways. First,
+        // `has_pending` reports directly whether the driver kept a copy: false after the
+        // accepting pass, true after the refusing one. Second, allocation counting filtered to
+        // sizes larger than the stream payload isolates a whole-datagram copy from the core's
+        // own copy of the accepted bytes (which is exactly the payload, not larger): the
+        // accepting pass makes no over-payload allocation, the refusing pass makes exactly one.
+        // The inversion is built in both ways: were `write_stream` to copy into `pending`
+        // unconditionally again, the accepting pass would report a pending copy and an
+        // over-payload allocation too, and both assertions on it would fail.
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         let (mut drivers, mut cside, _sside, clock) = establish(&mut cx);
 
-        let sid = {
-            let mut opening = cside.open_uni();
-            loop {
-                match Pin::new(&mut opening).poll(&mut cx) {
-                    Poll::Ready(r) => break r.expect("opening a stream"),
-                    Poll::Pending => {
-                        poll_all(&mut drivers, &mut cx);
-                        clock.advance(2_000_000);
+        let open_uni =
+            |cside: &mut Connection, drivers: &mut [Pin<Box<Driver>>], cx: &mut Context<'_>| {
+                let mut opening = cside.open_uni();
+                loop {
+                    match Pin::new(&mut opening).poll(cx) {
+                        Poll::Ready(r) => break r.expect("opening a stream"),
+                        Poll::Pending => {
+                            poll_all(drivers, cx);
+                            clock.advance(2_000_000);
+                        }
                     }
                 }
-            }
-        };
-        // Queue a write and run the command half so the datagram is staged into `pending`
-        // -- the one forced copy `write_stream` owes, paid here outside the count. What the
-        // counted flush then does is send that already-owned datagram, which must be free.
-        cside
-            .write(sid, &[0x5au8; 256], true)
-            .expect("stream write");
-        drivers[0].as_mut().get_mut().service_commands_for_test();
+            };
+        let anchor_stream = open_uni(&mut cside, &mut drivers, &mut cx);
+        let accept_stream = open_uni(&mut cside, &mut drivers, &mut cx);
+        let refuse_stream = open_uni(&mut cside, &mut drivers, &mut cx);
 
+        // The payload each counted write carries, and the threshold that separates a
+        // whole-datagram copy from the core's own copy of the accepted bytes. The core keeps
+        // exactly the payload it accepted; a datagram wraps that payload in QUIC framing and so
+        // is strictly larger. Counting only allocations larger than the payload therefore sees
+        // the `pending` datagram copy and nothing the core does on every send.
+        const PAYLOAD: usize = 256;
+
+        // Command production now performs the send: `write_stream` offers each datagram it
+        // produces to the socket before the reusable buffer is reused. So a complete driver
+        // send pass for a stream command is exactly `service_commands_for_test`, which is what
+        // the counted regions below measure. The socket is a sink so a completed send is
+        // counted but its bytes are dropped, keeping the harness's own delivery copy out of
+        // the count.
         drivers[0].as_ref().socket_for_test().set_sink(true);
-        let before = drivers[0].as_ref().socket_for_test().sent();
-        let (_, allocations) = count_allocations(|| {
+
+        // The anchor: one small write, left unacknowledged, so the driver's send buffer, index
+        // scratch, retention map, and any lazy allocator state all warm here, outside every
+        // counted region.
+        cside
+            .write(anchor_stream, &[0x5au8; 64], false)
+            .expect("anchor write");
+        drivers[0]
+            .as_mut()
+            .get_mut()
+            .service_commands_for_test(&mut cx);
+        drivers[0]
+            .as_mut()
+            .get_mut()
+            .flush_for_test(&mut cx)
+            .expect("anchor flush");
+        clock.advance(1_000_000);
+
+        // The accepting pass: a complete send pass whose stream datagram the socket accepts
+        // straight from the reusable buffer. No `pending` copy is made, so no over-payload
+        // allocation happens and the driver holds nothing afterwards.
+        cside
+            .write(accept_stream, &[0x5au8; PAYLOAD], true)
+            .expect("accept-stream write");
+        let sent_before = drivers[0].as_ref().socket_for_test().sent();
+        let (_, accept_allocs, accept_large) = count_allocations_larger_than(PAYLOAD, || {
             drivers[0]
                 .as_mut()
                 .get_mut()
-                .flush_for_test(&mut cx)
-                .expect("counted flush");
+                .service_commands_for_test(&mut cx);
         });
-        let after = drivers[0].as_ref().socket_for_test().sent();
-
+        let sent_after = drivers[0].as_ref().socket_for_test().sent();
+        let accept_pending = drivers[0].as_ref().has_pending_for_test();
         assert!(
-            after > before,
-            "the flush sent no datagram, so a zero allocation count would prove nothing"
+            sent_after > sent_before,
+            "the accepting pass sent no datagram, so a zero pending copy would prove nothing"
+        );
+        assert!(
+            accept_allocs >= 1,
+            "the accepting pass allocated nothing, so it produced no datagram and measured no \
+             send"
+        );
+        assert!(
+            !accept_pending,
+            "the driver kept a copy of a datagram the socket accepted; an accepted datagram is \
+             sent from the reusable buffer and must not be copied into `pending`"
         );
         assert_eq!(
-            allocations, 0,
-            "a send pass whose datagrams all complete allocated {allocations} times; a \
-             completed send is supposed to reuse the driver's buffer and copy nothing"
+            accept_large, 0,
+            "the accepting pass made {accept_large} allocation(s) larger than the {PAYLOAD}-byte \
+             payload; a datagram the socket accepts must not be copied, so nothing datagram-sized \
+             should be allocated"
+        );
+        clock.advance(1_000_000);
+
+        // The refusing pass: identical work, but the socket refuses the stream datagram once.
+        // `write_stream` must then copy it out of the reusable buffer into `pending` -- the one
+        // over-payload allocation a refusal adds -- and the driver holds it afterwards.
+        cside
+            .write(refuse_stream, &[0x5au8; PAYLOAD], true)
+            .expect("refuse-stream write");
+        let refused_before = drivers[0].as_ref().socket_for_test().sent();
+        drivers[0]
+            .as_ref()
+            .socket_for_test()
+            .inject(ngnet_quic::endpoint::testing::Fault::SendWouldBlock);
+        let (_, _refuse_allocs, refuse_large) = count_allocations_larger_than(PAYLOAD, || {
+            drivers[0]
+                .as_mut()
+                .get_mut()
+                .service_commands_for_test(&mut cx);
+        });
+        let refused_after = drivers[0].as_ref().socket_for_test().sent();
+        let refuse_pending = drivers[0].as_ref().has_pending_for_test();
+        assert_eq!(
+            refused_after, refused_before,
+            "the refused send still counted as sent, so the refusal path was not exercised"
+        );
+        assert!(
+            refuse_pending,
+            "the socket refused the datagram but the driver kept no copy; a refused datagram \
+             must be copied into `pending` so the reused buffer does not overwrite it"
+        );
+        assert_eq!(
+            refuse_large, 1,
+            "a refused stream datagram must cost exactly one over-payload allocation -- the \
+             `pending` copy -- but the refusing pass made {refuse_large}"
         );
     }
 
