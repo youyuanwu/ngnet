@@ -41,7 +41,7 @@ use crate::packet::{ExpiryOutcome, ReadOutcome, WriteOutcome};
 use crate::stream::StreamId;
 use crate::stream_io::StreamWrite;
 use crate::time::Timestamp;
-use crate::tls::{Role, TlsBackend, TlsSession};
+use crate::tls::{Backend as TlsBackend, Role, Session};
 
 use super::clock::Clock;
 use super::config::Config;
@@ -68,7 +68,7 @@ pub(crate) type EntropyFactory =
 pub(crate) const MAX_DATAGRAM: usize = 1500;
 
 /// One connection the driver owns, with the state its handle shares.
-pub(crate) struct Tracked<S: TlsSession> {
+pub(crate) struct Tracked<S: Session> {
     /// The connection, when this endpoint is the one driving it.
     ///
     /// `'static` because its handlers capture an `Arc` rather than borrowing anything the

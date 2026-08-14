@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::rand::EntropySource;
-use crate::tls::{TlsBackend, TlsSession};
+use crate::tls::{Backend as TlsBackend, Session};
 
 use super::clock::Clock;
 use super::config::Config;
@@ -278,12 +278,12 @@ pub type Built<Sock, Clk, B> =
 /// Keyed by the address of the shared state each waiter holds, so a caller gets back the
 /// connection it asked for rather than whichever finished first. Zero means "any", which is
 /// what an acceptor wants.
-pub(crate) struct DetachQueue<S: TlsSession> {
+pub(crate) struct DetachQueue<S: Session> {
     ready: std::sync::Mutex<Vec<(usize, DetachedConnection<S>)>>,
     wakers: std::sync::Mutex<Vec<core::task::Waker>>,
 }
 
-impl<S: TlsSession> Default for DetachQueue<S> {
+impl<S: Session> Default for DetachQueue<S> {
     fn default() -> Self {
         Self {
             ready: std::sync::Mutex::new(Vec::new()),
@@ -292,7 +292,7 @@ impl<S: TlsSession> Default for DetachQueue<S> {
     }
 }
 
-impl<S: TlsSession> DetachQueue<S> {
+impl<S: Session> DetachQueue<S> {
     pub(crate) fn deliver(&self, key: usize, connection: DetachedConnection<S>) {
         self.ready
             .lock()
@@ -350,7 +350,7 @@ impl<S: TlsSession> DetachQueue<S> {
 /// Dropping one without calling [`DetachedConnection::release`] leaves the endpoint routing
 /// to a connection nobody is driving until its identifiers are cleaned up.
 #[must_use = "a detached connection makes no progress unless something drives it"]
-pub struct DetachedConnection<S: TlsSession> {
+pub struct DetachedConnection<S: Session> {
     /// The protocol state, now this caller's to drive.
     pub conn: crate::Conn<'static, S>,
     /// The queues this connection exchanges datagrams and identifier changes over.
@@ -378,7 +378,7 @@ pub struct DetachedConnection<S: TlsSession> {
 /// A sleep that finishes at a deadline.
 pub type Sleep = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-impl<S: TlsSession> DetachedConnection<S> {
+impl<S: Session> DetachedConnection<S> {
     pub(crate) fn new(
         conn: crate::Conn<'static, S>,
         shared: Arc<ConnectionShared>,
@@ -465,7 +465,7 @@ impl<S: TlsSession> DetachedConnection<S> {
     }
 }
 
-impl<S: TlsSession> core::fmt::Debug for DetachedConnection<S> {
+impl<S: Session> core::fmt::Debug for DetachedConnection<S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DetachedConnection")
             .field("remote", &self.remote)
@@ -475,7 +475,7 @@ impl<S: TlsSession> core::fmt::Debug for DetachedConnection<S> {
 
 /// A connection being established and handed over.
 #[must_use = "nothing is detached until this is awaited"]
-pub struct Detaching<S: TlsSession> {
+pub struct Detaching<S: Session> {
     shared: Option<Arc<ConnectionShared>>,
     queue: Arc<DetachQueue<S>>,
     endpoint: Arc<EndpointShared>,
@@ -483,7 +483,7 @@ pub struct Detaching<S: TlsSession> {
     settled: bool,
 }
 
-impl<S: TlsSession> Drop for Detaching<S> {
+impl<S: Session> Drop for Detaching<S> {
     fn drop(&mut self) {
         // A caller that gives up before collecting must not leave a connection stranded in
         // the queue: the endpoint would keep routing to it, and its entry and identifiers
@@ -500,7 +500,7 @@ impl<S: TlsSession> Drop for Detaching<S> {
     }
 }
 
-impl<S: TlsSession> Future for Detaching<S> {
+impl<S: Session> Future for Detaching<S> {
     type Output = Result<DetachedConnection<S>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -546,12 +546,12 @@ impl<S: TlsSession> Future for Detaching<S> {
 /// that mentions an endpoint for no benefit. The session type earns its place because
 /// [`Endpoint::connect_detached`] and [`Endpoint::accept_detached`] hand back a connection,
 /// and a connection cannot be named without it.
-pub struct Endpoint<S: TlsSession> {
+pub struct Endpoint<S: Session> {
     shared: Arc<EndpointShared>,
     detached: Arc<DetachQueue<S>>,
 }
 
-impl<S: TlsSession> Clone for Endpoint<S> {
+impl<S: Session> Clone for Endpoint<S> {
     fn clone(&self) -> Self {
         Self {
             shared: Arc::clone(&self.shared),
@@ -560,7 +560,7 @@ impl<S: TlsSession> Clone for Endpoint<S> {
     }
 }
 
-impl<S: TlsSession> Endpoint<S> {
+impl<S: Session> Endpoint<S> {
     /// Opens a connection to `remote`, resolving once its handshake completes.
     ///
     /// `server_name` is presented for SNI and checked against the peer's certificate.
@@ -646,7 +646,7 @@ impl<S: TlsSession> Endpoint<S> {
     }
 }
 
-impl<S: TlsSession> core::fmt::Debug for Endpoint<S> {
+impl<S: Session> core::fmt::Debug for Endpoint<S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Endpoint").finish_non_exhaustive()
     }

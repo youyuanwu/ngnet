@@ -23,7 +23,7 @@ use ngnet_quic_sys as sys;
 use crate::conn::Conn;
 use crate::error::{Error, Result};
 use crate::time::Timestamp;
-use crate::tls::TlsSession;
+use crate::tls::Session;
 
 /// What happened to a datagram handed to [`Conn::read_pkt`].
 ///
@@ -86,7 +86,7 @@ pub enum ExpiryOutcome {
     Terminal,
 }
 
-impl<S: TlsSession> Conn<'_, S> {
+impl<S: Session> Conn<'_, S> {
     /// Feeds a received datagram to the connection.
     ///
     /// `now` is a reading from the caller's clock, in the same timescale as every other

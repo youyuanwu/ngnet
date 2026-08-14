@@ -9,7 +9,7 @@ use ngnet_h3::{ErrorCode, Timestamp as H3Timestamp};
 use ngnet_quic::endpoint::{DetachedConnection, Endpoint, Observed};
 use ngnet_quic::{
     ApplicationErrorCode, Directionality, ErrorKind as QuicErrorKind, Initiator, Role, StreamId,
-    Timestamp, TlsSession,
+    Timestamp, Session,
 };
 
 use crate::error::{Error, ErrorKind, Result};
@@ -121,14 +121,14 @@ pub(crate) struct State {
 /// Obtained from [`connect`] or [`accept`], both of which drive the handshake first: the
 /// abstraction this implements begins with an established connection, and handing over an
 /// unfinished one would give the layer something that cannot carry a request.
-pub struct NgtcpConnection<S: TlsSession> {
+pub struct NgtcpConnection<S: Session> {
     detached: DetachedConnection<S>,
     shared: Shared,
     state: State,
     local: Initiator,
 }
 
-impl<S: TlsSession> NgtcpConnection<S> {
+impl<S: Session> NgtcpConnection<S> {
     fn new(detached: DetachedConnection<S>, role: Role) -> Self {
         Self {
             detached,
@@ -247,7 +247,7 @@ impl<S: TlsSession> NgtcpConnection<S> {
     }
 }
 
-impl<S: TlsSession> QuicConnection for NgtcpConnection<S> {
+impl<S: Session> QuicConnection for NgtcpConnection<S> {
     type Error = Error;
 
     /// This transport copies what it is given.
@@ -390,7 +390,7 @@ impl<S: TlsSession> QuicConnection for NgtcpConnection<S> {
     }
 }
 
-impl<S: TlsSession> Drop for NgtcpConnection<S> {
+impl<S: Session> Drop for NgtcpConnection<S> {
     fn drop(&mut self) {
         // The endpoint cannot tell that a connection it does not hold has finished, so
         // saying so is this type's job. Without it the routing entries outlive the
@@ -399,7 +399,7 @@ impl<S: TlsSession> Drop for NgtcpConnection<S> {
     }
 }
 
-impl<S: TlsSession> core::fmt::Debug for NgtcpConnection<S> {
+impl<S: Session> core::fmt::Debug for NgtcpConnection<S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("NgtcpConnection")
             .field("remote", &self.detached.remote)
@@ -420,7 +420,7 @@ fn quic_stream(stream: H3StreamId) -> StreamId {
 /// # Errors
 ///
 /// Fails if the handshake does not complete, or if the endpoint driver is not running.
-pub async fn connect<S: TlsSession>(
+pub async fn connect<S: Session>(
     endpoint: &Endpoint<S>,
     remote: SocketAddr,
     server_name: Option<&str>,
@@ -438,7 +438,7 @@ pub async fn connect<S: TlsSession>(
 /// # Errors
 ///
 /// Fails if the endpoint driver is not running.
-pub async fn accept<S: TlsSession>(endpoint: &Endpoint<S>) -> Result<NgtcpConnection<S>> {
+pub async fn accept<S: Session>(endpoint: &Endpoint<S>) -> Result<NgtcpConnection<S>> {
     let detached = endpoint.accept_detached().await.map_err(Error::endpoint)?;
     Ok(NgtcpConnection::new(detached, Role::Server))
 }

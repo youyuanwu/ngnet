@@ -32,6 +32,14 @@
 //! `rand` receives neither the connection nor `user_data`, and fires during construction
 //! before `user_data` is stored. It reaches its entropy source through
 //! `settings.rand_ctx.native_handle` instead — see [`crate::rand`].
+//!
+//! # Why the slot carries the entropy source as well
+//!
+//! `get_path_challenge_data` *does* receive `user_data`, but what it needs is unpredictable
+//! bytes rather than the application's handlers. It reads them from the slot, which lives as
+//! long as the connection, so path validation cannot depend on whether a bridge happened to be
+//! installed. A connection has deliberately **one** source of randomness: two could diverge,
+//! and only one of them would be the one an application configured.
 
 use core::cell::Cell;
 use core::ffi::c_void;
@@ -49,6 +57,15 @@ use crate::stream::StreamId;
 /// while ngtcp2 holds a raw pointer to it.
 pub(crate) struct BridgeSlot {
     current: Cell<*mut c_void>,
+    /// The connection's entropy source, for the one callback that needs randomness and does
+    /// receive `user_data`.
+    ///
+    /// Here rather than in the [`Bridge`] because it is *always* available, whereas a bridge
+    /// exists only for the duration of one call. `get_path_challenge_data` does fire from the
+    /// write path, where a bridge happens to be installed today — but depending on that would
+    /// make the connection's randomness contingent on an unrelated detail of when bridges are
+    /// armed.
+    rand: Cell<*mut RandCtx>,
 }
 
 impl BridgeSlot {
@@ -56,7 +73,18 @@ impl BridgeSlot {
     pub(crate) fn new() -> Box<Self> {
         Box::new(Self {
             current: Cell::new(core::ptr::null_mut()),
+            rand: Cell::new(core::ptr::null_mut()),
         })
+    }
+
+    /// Points the slot at the connection's entropy source.
+    ///
+    /// # Safety
+    ///
+    /// `rand` must outlive every callback the connection can make, which means outliving
+    /// `ngtcp2_conn_del`.
+    pub(crate) unsafe fn set_rand(&self, rand: *mut RandCtx) {
+        self.rand.set(rand);
     }
 
     /// The pointer to hand to a connection constructor.
@@ -522,6 +550,40 @@ pub(crate) unsafe extern "C" fn extend_max_local_streams_uni_cb(
     };
     if let Some(handler) = bridge.handlers.on_extend_max_local_streams_uni.as_mut() {
         handler(max_streams);
+    }
+    0
+}
+
+/// Supplies the unpredictable bytes a PATH_CHALLENGE frame carries.
+///
+/// The bytes must be unguessable. An off-path attacker who can predict them can answer a
+/// challenge it never received and convince this endpoint that a path it does not control is
+/// valid — so they come from the connection's configured entropy source rather than from
+/// whatever the TLS backend happens to have. That is also why the TLS seam has no random
+/// number generator on it at all.
+pub(crate) unsafe extern "C" fn get_path_challenge_data2_cb(
+    _conn: *mut sys::ngtcp2_conn,
+    data: *mut sys::ngtcp2_path_challenge_data,
+    user_data: *mut c_void,
+) -> core::ffi::c_int {
+    if data.is_null() || user_data.is_null() {
+        return sys::NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    // SAFETY: `user_data` is the boxed slot the connection was constructed with, alive for as
+    // long as the connection.
+    let slot = unsafe { &*user_data.cast::<BridgeSlot>() };
+    let rand = slot.rand.get();
+    if rand.is_null() {
+        return sys::NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    // SAFETY: ngtcp2 provides a writable struct of exactly this size.
+    let out = unsafe { &mut (*data).data };
+    // SAFETY: the pointer is the connection's boxed entropy context, alive for as long as the
+    // connection, and no other reference to it is live inside a callback.
+    let ctx = unsafe { &mut *rand };
+    if ctx.source.fill(out).is_err() {
+        ctx.failed.set(true);
+        return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     }
     0
 }

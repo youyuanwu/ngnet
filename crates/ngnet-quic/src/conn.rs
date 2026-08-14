@@ -39,7 +39,7 @@ use crate::path::PathStorage;
 use crate::rand::EntropySource;
 use crate::retain::Retained;
 use crate::settings::Settings;
-use crate::tls::{Role, TlsSession};
+use crate::tls::{Role, Session};
 use crate::validate;
 
 /// Builder for a [`Conn`].
@@ -57,7 +57,7 @@ pub struct ConnBuilder<S> {
     cid_len: usize,
 }
 
-impl<S: TlsSession> ConnBuilder<S> {
+impl<S: Session> ConnBuilder<S> {
     /// Starts building a connection.
     pub fn new(
         role: Role,
@@ -162,8 +162,14 @@ impl<S: TlsSession> ConnBuilder<S> {
 
         let rand_handle: *mut RandCtx = &mut *rand_ctx;
         settings.rand_ctx.native_handle = rand_handle.cast::<c_void>();
+        // The same source, reachable a second way. `rand` receives only `rand_ctx`;
+        // `get_path_challenge_data` receives only `user_data`. Two routes to one source rather
+        // than two sources, which is the whole point.
+        // SAFETY: both the slot and the context are boxed and owned by the connection, and the
+        // connection is destroyed before either.
+        unsafe { slot.set_rand(rand_handle) };
 
-        let cbs = Self::callbacks(&self.tls, self.role);
+        let cbs = Self::callbacks(self.role);
 
         let mut raw: *mut sys::ngtcp2_conn = core::ptr::null_mut();
         // The `rand` callback fires inside this call, so the entropy source has to be
@@ -224,7 +230,10 @@ impl<S: TlsSession> ConnBuilder<S> {
 
         let mut conn = Conn {
             raw,
-            tls: self.tls,
+            tls: Box::new(crate::tls_bridge::SessionSlot {
+                session: self.tls,
+                exchange: crate::tls_bridge::Exchange::default(),
+            }),
             handlers,
             _allocator: allocator,
             slot,
@@ -243,21 +252,24 @@ impl<S: TlsSession> ConnBuilder<S> {
 
     /// Builds the callback table: the crypto half from the TLS backend, the transport half
     /// here.
-    fn callbacks(tls: &S, role: Role) -> sys::ngtcp2_callbacks {
+    fn callbacks(role: Role) -> sys::ngtcp2_callbacks {
         // SAFETY: a zeroed callbacks struct is the documented starting point; every
         // mandatory entry is filled below or by the backend.
         let mut cbs = unsafe { core::mem::zeroed::<sys::ngtcp2_callbacks>() };
 
-        // The crypto entries are backend-specific and must come from the backend -- see
-        // `crate::tls`. Naming them here would not compile without a TLS feature.
-        // SAFETY: `cbs` is a valid, writable callbacks struct.
-        unsafe { tls.install_callbacks((&raw mut cbs).cast::<c_void>()) };
+        // The crypto half, written once and generically rather than once per backend. Nothing
+        // in it belongs to OpenSSL or to any other stack: it is the same translation for every
+        // implementation of `crate::tls::Session`.
+        crate::tls_bridge::install::<S>(&mut cbs);
 
         // The transport half. The mandatory set is taken from the runtime assert block at
         // `ngtcp2_conn.c:1272-1286`, not from the header prose, whose "added since
         // NGTCP2_CALLBACKS_V*" comments are off by one against the length table in
         // `ngtcp2_callbacks.c`.
         cbs.rand = Some(callbacks::rand_cb);
+        // Not the TLS backend's, deliberately. A connection has one source of randomness,
+        // because two could diverge and only one of them would be the configured one.
+        cbs.get_path_challenge_data2 = Some(callbacks::get_path_challenge_data2_cb);
         cbs.get_new_connection_id = Some(callbacks::get_new_connection_id_cb);
         cbs.remove_connection_id = Some(callbacks::remove_connection_id_cb);
 
@@ -285,9 +297,16 @@ impl<S: TlsSession> ConnBuilder<S> {
 ///
 /// Sans-I/O: it never touches a socket and never reads a clock. Datagrams and timestamps
 /// come from the caller, and datagrams to send go back to the caller.
-pub struct Conn<'h, S: TlsSession> {
+pub struct Conn<'h, S: Session> {
     raw: *mut sys::ngtcp2_conn,
-    tls: S,
+    /// The TLS session, and the crate's record of the transport-parameter exchange, boxed
+    /// because ngtcp2 is given this address.
+    ///
+    /// `ngtcp2_conn_set_tls_native_handle` stores the pointer and every crypto callback
+    /// recovers the session from it. Held inline it would move when this `Conn` is returned
+    /// from its builder, leaving ngtcp2 with the address of a dead frame — the same reason
+    /// `BridgeSlot` is boxed.
+    tls: Box<crate::tls_bridge::SessionSlot<S>>,
     handlers: Handlers<'h>,
     /// Retained by ngtcp2 as `mem`, and dereferenced during `ngtcp2_conn_del`.
     _allocator: Box<Allocator>,
@@ -307,20 +326,36 @@ pub struct Conn<'h, S: TlsSession> {
     retained: Retained,
 }
 
-impl<'h, S: TlsSession> Conn<'h, S> {
+impl<'h, S: Session> Conn<'h, S> {
     /// Installs the TLS handle and the reference the crypto helper reads back.
     fn bind_tls(&mut self) -> Result<()> {
-        let handle = self.tls.native_handle();
-        // SAFETY: `raw` is live and the handle is the one this backend's helper expects --
-        // for OpenSSL the ossl context, not the `SSL`, which is why it is a newtype.
-        unsafe { sys::ngtcp2_conn_set_tls_native_handle(self.raw, handle.as_ptr()) };
+        // The session itself, not a helper context. ngtcp2 treats this as opaque — it stores
+        // the pointer and hands it back, and does nothing else with it
+        // (`ngtcp2_conn.c:14149-14159`, verified) — so the crypto callbacks in
+        // `crate::tls_bridge` recover the session from it and need no reference back to the
+        // connection. That absence is what makes the seam above them safe: there is nothing
+        // for a backend to be given.
+        let handle: *mut crate::tls_bridge::SessionSlot<S> = &raw mut *self.tls;
+        // SAFETY: `raw` is live, and the slot is boxed, so its address outlives the connection
+        // — `Drop` below frees the connection first.
+        unsafe { sys::ngtcp2_conn_set_tls_native_handle(self.raw, handle.cast::<c_void>()) };
 
-        // And the reference back, which the helper's callbacks follow to reach the
-        // connection. `raw` is ngtcp2's own heap allocation and does not move when this
-        // `Conn` is returned from its builder, which is why it is safe to hand over here.
-        // SAFETY: `raw` outlives the TLS session, which is dropped after `ngtcp2_conn_del`
-        // in this type's `Drop`.
-        unsafe { self.tls.bind_connection(self.raw.cast::<c_void>()) };
+        // A **client's** transport parameters, now, because they travel in its very first
+        // message and are settled from the start. A server's are not, and it obtains them
+        // mid-handshake through `crate::tls::Handshaking` — see the trait, which exists
+        // entirely because of that asymmetry.
+        if self.role == Role::Client {
+            // SAFETY: `raw` is live and the session is the one just installed on it.
+            let rv = unsafe {
+                crate::tls_bridge::set_client_local_params(self.raw, &mut self.tls.session)
+            };
+            if rv != 0 {
+                return Err(Error::native(
+                    rv,
+                    "the TLS backend would not take the local transport parameters",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -352,12 +387,12 @@ impl<'h, S: TlsSession> Conn<'h, S> {
 
     /// The application protocol the handshake negotiated, if it has completed.
     pub fn negotiated_alpn(&self) -> Option<Vec<u8>> {
-        self.tls.negotiated_alpn()
+        Session::negotiated_alpn(&self.tls.session)
     }
 
     /// The TLS session driving this connection.
     pub fn tls(&self) -> &S {
-        &self.tls
+        &self.tls.session
     }
 
     /// Every source connection ID this endpoint is currently reachable by.
@@ -468,7 +503,7 @@ impl<'h, S: TlsSession> Conn<'h, S> {
     }
 }
 
-impl<S: TlsSession> Drop for Conn<'_, S> {
+impl<S: Session> Drop for Conn<'_, S> {
     fn drop(&mut self) {
         // Order matters. The connection is destroyed first, while the TLS session is still
         // alive: the helper's callbacks may run during teardown and reach the connection
@@ -492,7 +527,7 @@ impl<S: TlsSession> Drop for Conn<'_, S> {
 // into, exclusively. It is deliberately not `Sync`: the bridge slot is written and read
 // without synchronisation, which is sound only because a `&mut Conn` is required to reach
 // it.
-unsafe impl<S: TlsSession + Send> Send for Conn<'_, S> {}
+unsafe impl<S: Session + Send> Send for Conn<'_, S> {}
 
 // The connection tests need a TLS session to build a connection at all, and the only
 // implementation this crate ships is the OpenSSL one. With that feature off the seam is
@@ -506,7 +541,7 @@ pub(crate) mod test_support {
     use super::*;
     use crate::rand::test_support::CountingEntropy;
     use crate::time::Timestamp;
-    use crate::tls::TlsBackend;
+    use crate::tls::Backend;
     use crate::tls_ossl::{OsslBackend, OsslSession, Verify};
 
     pub(crate) const CERT: &str = include_str!("../tests/data/test-cert.pem");
@@ -542,7 +577,7 @@ pub(crate) mod test_support {
 
     pub(crate) fn client_conn<'h>(handlers: Handlers<'h>) -> Result<Conn<'h, OsslSession>> {
         let backend = client_backend();
-        let session = backend.new_session(Role::Client, None)?;
+        let session = Backend::new_session(&backend, Role::Client, None)?;
         let (local, remote) = addrs();
         ConnBuilder::new(
             Role::Client,
@@ -562,7 +597,7 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use crate::rand::test_support::CountingEntropy;
-    use crate::tls::TlsBackend;
+    use crate::tls::Backend;
     use crate::tls_ossl::OsslBackend;
 
     #[test]
@@ -624,7 +659,7 @@ mod tests {
             .private_key_pem(KEY)
             .build()
             .unwrap();
-        let session = backend.new_session(Role::Server, None).unwrap();
+        let session = Backend::new_session(&backend, Role::Server, None).unwrap();
         let (local, remote) = addrs();
         let result = ConnBuilder::new(
             Role::Server,
@@ -647,7 +682,7 @@ mod tests {
             .private_key_pem(KEY)
             .build()
             .unwrap();
-        let session = backend.new_session(Role::Server, None).unwrap();
+        let session = Backend::new_session(&backend, Role::Server, None).unwrap();
         let (local, remote) = addrs();
 
         // What a server would have taken from the client's first packet.
@@ -680,7 +715,7 @@ mod tests {
             .private_key_pem(KEY)
             .build()
             .unwrap();
-        let session = backend.new_session(Role::Server, None).unwrap();
+        let session = Backend::new_session(&backend, Role::Server, None).unwrap();
         let (local, remote) = addrs();
         let dcid = ConnectionId::new(&[0xaa; 8]).unwrap();
         let result = ConnBuilder::new(

@@ -2,7 +2,7 @@
 
 use ngnet_h3::http::{StreamSource, WriteOutcome as H3WriteOutcome};
 use ngnet_quic::endpoint::DetachedConnection;
-use ngnet_quic::{ErrorKind as QuicErrorKind, StreamId, StreamWrite, TlsSession};
+use ngnet_quic::{ErrorKind as QuicErrorKind, StreamId, StreamWrite, Session};
 
 use crate::connection::{Shared, State};
 use crate::error::{Error, Result};
@@ -13,7 +13,7 @@ use crate::pump::MAX_DATAGRAM;
 /// Each accepted offer does two things at once: it consumes stream bytes *and* produces a
 /// datagram. The abstraction's verdict has no room for the datagram, so it is queued from
 /// inside the closure and the accepted count is reported back.
-pub(crate) fn drain<S: TlsSession, Src: StreamSource>(
+pub(crate) fn drain<S: Session, Src: StreamSource>(
     detached: &mut DetachedConnection<S>,
     shared: &Shared,
     state: &mut State,

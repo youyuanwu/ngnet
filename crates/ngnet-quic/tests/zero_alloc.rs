@@ -14,8 +14,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use ngnet_quic::{
-    ConnBuilder, EntropySource, Handlers, OsslBackend, Result, Role, Settings, Timestamp,
-    TlsBackend, TransportParams, Verify, WriteOutcome,
+    Backend as TlsBackend, ConnBuilder, EntropySource, Handlers, OsslBackend, Result, Role,
+    Settings, Timestamp, TransportParams, Verify, WriteOutcome,
 };
 
 thread_local! {

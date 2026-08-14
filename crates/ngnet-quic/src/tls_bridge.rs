@@ -231,6 +231,28 @@ unsafe fn encode_local_params(conn: *mut sys::ngtcp2_conn) -> Result<Vec<u8>> {
     Ok(large)
 }
 
+/// Hands a **client** the transport parameters it will advertise, before its first flight.
+///
+/// Only a client. A server's are not yet knowable — see [`crate::tls::Handshaking`] — and it
+/// obtains them through the exchange instead.
+///
+/// # Safety
+///
+/// `conn` must be live and `session` must be its session.
+pub(crate) unsafe fn set_client_local_params<S: Session>(
+    conn: *mut sys::ngtcp2_conn,
+    session: &mut S,
+) -> c_int {
+    // SAFETY: the caller guarantees `conn` is live.
+    let Ok(params) = (unsafe { encode_local_params(conn) }) else {
+        return sys::NGTCP2_ERR_CALLBACK_FAILURE;
+    };
+    if session.set_local_transport_params(&params).is_err() {
+        return sys::NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    0
+}
+
 /// Recovers the session a connection was given.
 ///
 /// # Safety

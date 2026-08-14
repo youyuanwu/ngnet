@@ -5,7 +5,7 @@
 //! all of them to be right at once — the callback table, the version constants, the TLS
 //! object graph, the packet paths and the timers.
 
-use ngnet_quic::{ConnectionId, Handlers, Inspection, Role, TlsBackend, TlsSession, inspect};
+use ngnet_quic::{ConnectionId, Handlers, Inspection, Backend as TlsBackend, Role, Session as TlsSession, inspect};
 use ngnet_quic_tests::{
     TEST_ALPN, TEST_SERVER_NAME, TestClock, TestCredentials, client_backend, client_conn, drain,
     pump, server_backend, server_conn,

@@ -463,17 +463,17 @@ fn the_types_a_connection_owns_are_send_because_the_connection_is() {
     assert_send::<ConnectionId>();
 
     // And the connection itself, for a `Send` session.
-    fn conn_is_send<S: TlsSession + Send>() {
+    fn conn_is_send<S: Session + Send>() {
         assert_send::<ngnet_quic::Conn<'static, S>>();
     }
-    let _ = conn_is_send::<DummySession>;
+    let _ = conn_is_send::<DummySafeSession>;
 }
 
 #[test]
 fn the_connection_surface_still_has_the_shape_it_promised() {
     // Named through a generic function rather than instantiated, so this pins the signatures
     // without needing a TLS backend or a live connection.
-    fn uses_conn<S: TlsSession>(conn: &mut ngnet_quic::Conn<'_, S>, cause: &Error) -> Result<()> {
+    fn uses_conn<S: Session>(conn: &mut ngnet_quic::Conn<'_, S>, cause: &Error) -> Result<()> {
         let now = Timestamp::from_nanos(1)?;
         let mut buf = [0u8; 1500];
 
@@ -515,9 +515,9 @@ fn the_connection_surface_still_has_the_shape_it_promised() {
         let _: ngnet_quic::CloseError = conn.close_error();
         Ok(())
     }
-    let _ = uses_conn::<DummySession>;
+    let _ = uses_conn::<DummySafeSession>;
 
-    fn builds<S: TlsSession>(
+    fn builds<S: Session>(
         settings: Settings,
         params: TransportParams,
         entropy: Box<dyn EntropySource + Send>,
@@ -533,7 +533,7 @@ fn the_connection_surface_still_has_the_shape_it_promised() {
             .cid_len(8)
             .build(Handlers::new())
     }
-    let _ = builds::<DummySession>;
+    let _ = builds::<DummySafeSession>;
 }
 
 #[cfg(feature = "tls-ossl")]
