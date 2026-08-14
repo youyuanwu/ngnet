@@ -16,9 +16,9 @@ use ngnet_quic::{
     ApplicationErrorCode, Backend, ConnBuilder, ConnectionId, CryptoError, Direction,
     DirectionalKeys, Directionality, Duration, EntropySource, Error, ErrorKind, ExpiryOutcome,
     HP_MASK_LEN, HP_SAMPLE_LEN, Handlers, Handshaking, HeaderKey, InitialKeys, Initiator,
-    Inspection, Level, NativeCode, NativeTlsHandle, PacketKey, ReadOutcome, Result, Role,
-    RotatedKeys, Session, SessionEvent, Settings, StreamCloseReason, StreamId, StreamWrite,
-    Timestamp, TlsBackend, TlsSession, TransportErrorCode, TransportParams, WriteOutcome,
+    Inspection, Level, NativeCode, PacketKey, ReadOutcome, Result, Role, RotatedKeys, Session,
+    SessionEvent, Settings, StreamCloseReason, StreamId, StreamWrite, Timestamp,
+    TransportErrorCode, TransportParams, WriteOutcome,
 };
 
 #[test]
@@ -310,18 +310,6 @@ fn the_public_surface_still_has_the_shape_it_promised() {
     }
     let _: bool = Role::Server.is_server();
 
-    fn takes_session<S: TlsSession>(s: &S) {
-        let _: NativeTlsHandle = s.native_handle();
-        let _: Option<Vec<u8>> = s.negotiated_alpn();
-        let _: Option<String> = s.failure_reason();
-    }
-    let _ = takes_session::<DummySession>;
-
-    fn takes_backend<B: TlsBackend>(b: &B) -> Result<B::Session> {
-        b.new_session(Role::Client, Some("example.com"))
-    }
-    let _ = takes_backend::<DummyBackend>;
-
     // --- The safe TLS seam ----------------------------------------------------------
     // Named by bound rather than by implementation, because the property being pinned is
     // what an implementor has to supply. Note that nothing here mentions a pointer or a
@@ -416,40 +404,6 @@ fn the_public_surface_still_has_the_shape_it_promised() {
 }
 
 /// A backend that exists only so the generic bounds above have something to name.
-struct DummyBackend;
-
-/// Deliberately `Send`, so the auto-trait assertions above are about `Conn` rather than
-/// about this stand-in.
-struct DummySession;
-
-// SAFETY: never used to build a connection; it exists to pin the trait's shape.
-unsafe impl TlsSession for DummySession {
-    unsafe fn bind_connection(&mut self, _conn: *mut core::ffi::c_void) {}
-    unsafe fn install_callbacks(&self, _callbacks: *mut core::ffi::c_void) {}
-    fn native_handle(&self) -> NativeTlsHandle {
-        // SAFETY: never handed to ngtcp2.
-        unsafe { NativeTlsHandle::new(core::ptr::null_mut()) }
-    }
-    fn negotiated_alpn(&self) -> Option<Vec<u8>> {
-        None
-    }
-}
-
-// SAFETY: as above.
-unsafe impl TlsBackend for DummyBackend {
-    type Session = DummySession;
-    fn new_session(&self, _role: Role, _server_name: Option<&str>) -> Result<Self::Session> {
-        Ok(DummySession)
-    }
-}
-
-/// A `Conn` is `Send`, and it owns its handlers and its entropy source. Both must therefore
-/// be `Send` themselves, or the unsafe impl on `Conn` launders non-`Send` state across a
-/// thread boundary -- an `Rc` captured by a handler, cloned before the connection is moved,
-/// is a data race on a non-atomic refcount reachable from entirely safe code.
-///
-/// The compiler will not catch that: `unsafe impl Send` is precisely the escape hatch that
-/// silences it. So it is asserted here.
 #[test]
 fn the_types_a_connection_owns_are_send_because_the_connection_is() {
     fn assert_send<T: Send>() {}
@@ -570,12 +524,13 @@ fn the_openssl_backend_surface_still_has_the_shape_it_promised() {
     let _ = takes_ossl_session;
 }
 
-/// Stand-ins for the safe seam.
+/// Stand-ins for the seam.
 ///
-/// Worth noticing what is absent: these implement the entire seam and contain no `unsafe`,
-/// no raw pointer and no reference to the raw bindings — unlike `DummySession` above, whose
-/// three `unsafe` blocks are the reason this work exists. The old stand-in needs an
-/// exemption in `invariants.rs` to be allowed to write `unsafe` at all; these need nothing.
+/// Worth noticing what is absent: these implement the **entire** seam — a backend, a session,
+/// both key kinds — and contain no `unsafe`, no raw pointer and no reference to the raw
+/// bindings. The stand-ins they replaced needed three `unsafe` blocks and an exemption in
+/// `invariants.rs` to be allowed to write `unsafe` at all. That difference is the whole of
+/// this work, expressed in the smallest possible implementation.
 struct DummyPacketKey;
 
 impl PacketKey for DummyPacketKey {

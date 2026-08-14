@@ -218,7 +218,11 @@ fn the_allowance_list_is_the_ffi_boundary_and_nothing_else() {
         "retain",
         "settings",
         "stream_io",
-        "tls",
+        // `tls` is deliberately absent, and its absence is the point of this work. The seam
+        // itself -- the traits a backend implements -- now contains no `unsafe`, no raw
+        // pointer and no foreign type, so it needs no grant. It held one for as long as the
+        // seam was two `unsafe` traits handing out an untyped connection handle.
+        //
         // The generic translation between ngtcp2's crypto callbacks and the safe TLS seam.
         //
         // This is the module the safe seam exists to create. The `unsafe` a TLS backend
@@ -508,9 +512,11 @@ fn a_caller_never_needs_unsafe() {
     // The whole point of the crate. Its own tests are the closest thing to a real caller, so
     // if they need `unsafe` to *use* the API, the API is incomplete.
     //
-    // "Use" is the operative word. Implementing the TLS seam is not using the API -- it is
-    // extending it, and that trait is `unsafe` precisely because doing so carries
-    // obligations the compiler cannot check.
+    // Implementing the TLS seam counts as using it. It did not always: the seam was two
+    // `unsafe` traits, and `compat_surface` needed an exemption purely to pin their shape.
+    // That exemption is gone, and its absence is the clearest single statement of what this
+    // work changed -- the file implements a backend, a session and both key kinds, and needs
+    // no `unsafe` to do it.
     //
     // The exemptions are named individually rather than by pattern, so that one becoming
     // unnecessary is noticed rather than silently kept.
@@ -519,10 +525,6 @@ fn a_caller_never_needs_unsafe() {
         "versioned_ffi",
         // This file. A scanner for `unsafe` cannot avoid naming it.
         "invariants",
-        // Implements `TlsBackend` and `TlsSession`, which are `unsafe` traits by design --
-        // writing a TLS backend is exactly the one thing this crate says requires care.
-        // Pinning their shape means implementing them.
-        "compat_surface",
         // Installs a counting `GlobalAlloc`, which is an unsafe trait for reasons that have
         // nothing to do with this crate's API.
         "zero_alloc",

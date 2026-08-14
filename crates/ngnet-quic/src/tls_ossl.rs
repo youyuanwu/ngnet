@@ -1,46 +1,35 @@
 //! The OpenSSL TLS backend.
 //!
-//! Implements [`crate::tls::TlsBackend`] over OpenSSL 3.5's QUIC TLS API, using ngtcp2's
-//! `ngtcp2_crypto_ossl` helper. Enabled by the default-on `tls-ossl` feature.
+//! Implements [`crate::tls::Backend`] and [`crate::tls::Session`] over OpenSSL 3.5's QUIC TLS
+//! API. Enabled by the default-on `tls-ossl` feature.
 //!
-//! # The teardown rule, which is the whole difficulty
+//! # The teardown cycle this used to have, and no longer does
 //!
-//! Three C objects are involved in one connection's TLS: an `SSL`, an
-//! `ngtcp2_crypto_ossl_ctx` that wraps it, and an `ngtcp2_crypto_conn_ref` that OpenSSL
-//! holds as the `SSL`'s application data. They refer to each other in a cycle, and they must
-//! be destroyed in exactly this order:
+//! An earlier version of this backend drove the handshake through ngtcp2's
+//! `ngtcp2_crypto_ossl` helper, which meant three C objects referring to each other in a
+//! cycle: an `SSL`, an `ngtcp2_crypto_ossl_ctx` wrapping it, and an `ngtcp2_crypto_conn_ref`
+//! that OpenSSL held as application data and that pointed back at the `ngtcp2_conn`. They had
+//! to be destroyed in one exact order, and every departure from it was a use-after-free rather
+//! than a leak: `SSL_free` releases outstanding CRYPTO records, which called back into the
+//! helper, which followed the reference to the connection and dereferenced it.
 //!
-//! ```text
-//! SSL_set_app_data(ssl, NULL)  →  SSL_free(ssl)  →  ngtcp2_crypto_ossl_ctx_del(ctx)
-//! ```
+//! None of that exists now. `SSL_set_quic_tls_cbs` takes a callback argument, so this backend
+//! passes its own state directly and OpenSSL holds nothing belonging to ngtcp2. The ordering
+//! problem did not get easier — it stopped existing, which is the difference worth having.
 //!
-//! (`deps/ngtcp2/examples/tls_session_base_ossl.cc:39-48`.)
-//!
-//! Every reason for that ordering is a use-after-free if it is broken. `SSL_free` releases
-//! outstanding CRYPTO records, which calls back into `ossl_crypto_release_rcd`
-//! (`deps/ngtcp2/crypto/ossl/ossl.c:1191`); that reads the app data, calls
-//! `conn_ref->get_conn(conn_ref)`, dereferences the `ngtcp2_conn`, and writes through the
-//! ossl ctx. Clearing the app data first makes it return early — the helper's own comment at
-//! `ossl.c:1196-1200` says that is precisely why the escape hatch exists. And
-//! `ngtcp2_crypto_ossl_ctx_del` frees a `remote_params` buffer OpenSSL may still be
-//! borrowing (`ossl.c:1018-1039`), so it must come last.
-//!
-//! Rust drops struct fields in declaration order, which would be a silent, invisible
-//! dependency on field ordering. So [`OsslSession`] owns all three and implements [`Drop`] by
-//! hand, and the parts are never exposed as independently droppable values.
+//! What is left is ordinary ownership: the engine outlives the `SSL` that reads it, because
+//! `SSL_free` releases records by calling back into the engine, and the helper context outlives
+//! both. [`OsslSession`] implements [`Drop`] by hand to say so, rather than depending on field
+//! order, which would make the reasoning invisible.
 //!
 //! # `ngtcp2_crypto_ossl_init` is process-global
 //!
 //! It prefetches static `EVP_*` objects into globals, with no reference counting
-//! (`ossl.c:49-60`, `:62`, `:82`). The ngtcp2 examples pair it with a per-context
-//! destructor, which means that with two TLS contexts, destroying the second frees objects
-//! the first is still using. This crate calls `init` once behind a [`Once`] and **never**
-//! calls `ngtcp2_crypto_ossl_free`: a bounded one-off leak is the correct trade against
-//! corrupting a live connection.
-
-// `bind_conn_ref` and the `conn_ref` field are wired up by the connection; the drop-order
-// tests below already exercise them.
-#![allow(dead_code)]
+//! (`ossl.c:49-60`, `:62`, `:82`). The ngtcp2 examples pair it with a per-context destructor,
+//! which means that with two TLS contexts, destroying the second frees objects the first is
+//! still using. This crate calls `init` once behind a [`Once`] and **never** calls
+//! `ngtcp2_crypto_ossl_free`: a bounded one-off leak is the correct trade against corrupting a
+//! live connection.
 
 use core::ffi::{CStr, c_char, c_int, c_uchar, c_void};
 use core::ptr;
@@ -51,12 +40,8 @@ use ngnet_quic_sys as sys;
 use crate::error::{Error, ErrorKind, Result};
 use crate::tls::{
     Backend, CryptoError, Direction, DirectionalKeys, HP_MASK_LEN, HP_SAMPLE_LEN, HeaderKey,
-    InitialKeys, Level, NativeTlsHandle, PacketKey, Role, RotatedKeys, Session, SessionEvent,
-    TlsBackend, TlsSession,
+    InitialKeys, Level, PacketKey, Role, RotatedKeys, Session, SessionEvent,
 };
-
-/// `SSL_set_app_data` / `SSL_get_app_data` are macros over ex-data index 0.
-const APP_DATA_INDEX: c_int = 0;
 
 /// The `SSL_ctrl` command behind the `SSL_set_tlsext_host_name` macro.
 const CTRL_SET_TLSEXT_HOSTNAME: c_int = sys::SSL_CTRL_SET_TLSEXT_HOSTNAME as c_int;
@@ -240,11 +225,17 @@ impl Suite {
     }
 
     /// How many bytes protection adds to a payload.
+    ///
+    /// Read from the descriptor only by the dimension tests; the keys themselves carry it.
+    #[cfg(test)]
     fn tag_len(&self) -> usize {
         self.aead.max_overhead
     }
 
     /// How long a secret for this suite's hash is.
+    ///
+    /// Used by the dimension tests; the key schedule derives lengths itself.
+    #[cfg(test)]
     fn hash_len(&self) -> usize {
         // SAFETY: the descriptor names a live algorithm object.
         unsafe { sys::ngtcp2_crypto_md_hashlen(&raw const self.md) }
@@ -1515,21 +1506,6 @@ unsafe extern "C" fn alpn_select_cb(
     sys::SSL_TLSEXT_ERR_ALERT_FATAL as c_int
 }
 
-/// Hands the crypto helper the connection stored in the reference.
-///
-/// The helper calls this from six different callbacks, each having just recovered the
-/// reference from the `SSL`'s application data.
-unsafe extern "C" fn get_conn_cb(
-    conn_ref: *mut sys::ngtcp2_crypto_conn_ref,
-) -> *mut sys::ngtcp2_conn {
-    if conn_ref.is_null() {
-        return ptr::null_mut();
-    }
-    // SAFETY: the reference is the boxed one this session owns, and its `user_data` is the
-    // `ngtcp2_conn` pointer installed by `bind_connection`.
-    unsafe { (*conn_ref).user_data.cast::<sys::ngtcp2_conn>() }
-}
-
 /// An OpenSSL `SSL_CTX`, freed on drop.
 struct SslCtx(*mut sys::SSL_CTX);
 
@@ -1688,55 +1664,20 @@ impl OsslBackend {
 unsafe impl Send for OsslBackend {}
 unsafe impl Sync for OsslBackend {}
 
-// SAFETY: sessions own their own `SSL` and ossl ctx, independent of one another; the
-// backend's `SSL_CTX` is reference-counted by OpenSSL and by `SSL_new`.
-unsafe impl TlsBackend for OsslBackend {
-    type Session = OsslSession;
-
-    fn new_session(&self, role: Role, server_name: Option<&str>) -> Result<Self::Session> {
-        if role != self.role {
-            return Err(Error::invalid_input(
-                "the session role does not match the backend's role",
-            ));
-        }
-        OsslSession::new(self, role, server_name)
-    }
-}
-
-/// Which seam a session is being built for.
-///
-/// Both exist while the connection is moved across; the old one is deleted once nothing
-/// reaches for it. They differ in exactly one thing — whose QUIC-TLS dispatch table is
-/// installed on the `SSL` — and they cannot coexist on one session, because the second
-/// `SSL_set_quic_tls_cbs` replaces the first.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Seam {
-    /// ngtcp2's crypto helper drives the handshake and calls back into the connection.
-    Helper,
-    /// This crate drives the handshake and reports what happened.
-    Safe,
-}
-
 /// One connection's TLS session.
 ///
-/// Owns all three C objects — the `SSL`, the `ngtcp2_crypto_ossl_ctx`, and the boxed
-/// `ngtcp2_crypto_conn_ref` OpenSSL holds as app data — because they must be destroyed in a
-/// specific order and Rust's field-order drop would make that ordering invisible. See the
-/// module documentation.
+/// Owns the `SSL`, the helper context it reads the negotiated suite from, and the engine
+/// OpenSSL calls back into. They must be destroyed in that order, and Rust's field-order drop
+/// would make the ordering invisible, so [`Drop`] is written by hand.
 pub struct OsslSession {
     /// The ossl helper context. **This**, not `ssl`, is what ngtcp2 wants as the native
     /// handle.
     ossl_ctx: *mut sys::ngtcp2_crypto_ossl_ctx,
     ssl: *mut sys::SSL,
-    /// Boxed so its address is stable: OpenSSL holds a pointer to it, and the helper
-    /// dereferences that pointer from six different callbacks.
-    ///
-    /// Used only by the old seam. A session on the safe seam leaves it inert.
-    conn_ref: Box<sys::ngtcp2_crypto_conn_ref>,
     /// A share of the backend's ALPN offer list, keeping it alive for the selection
     /// callback that reads it -- which outlives the backend whenever a session does.
     _alpn_offers: Option<std::sync::Arc<Vec<u8>>>,
-    /// The safe seam's handshake state, or null for a session on the old seam.
+    /// The handshake state OpenSSL's callbacks reach through their argument.
     ///
     /// A raw pointer rather than a `Box` on purpose. OpenSSL holds this same address and
     /// reaches through it from inside `SSL_do_handshake`, `SSL_read` and `SSL_free`. Owning
@@ -1750,15 +1691,6 @@ pub struct OsslSession {
 
 impl OsslSession {
     fn new(backend: &OsslBackend, role: Role, server_name: Option<&str>) -> Result<Self> {
-        Self::with_seam(backend, role, server_name, Seam::Helper)
-    }
-
-    fn with_seam(
-        backend: &OsslBackend,
-        role: Role,
-        server_name: Option<&str>,
-        seam: Seam,
-    ) -> Result<Self> {
         // SAFETY: the backend's context is valid and outlives this call; `SSL_new` takes
         // its own reference on it.
         let ssl = unsafe { sys::SSL_new(backend.ctx.0) };
@@ -1770,10 +1702,6 @@ impl OsslSession {
         let mut session = Self {
             ossl_ctx: ptr::null_mut(),
             ssl,
-            conn_ref: Box::new(sys::ngtcp2_crypto_conn_ref {
-                get_conn: None,
-                user_data: ptr::null_mut(),
-            }),
             _alpn_offers: backend.alpn_offers.clone(),
             engine: ptr::null_mut(),
             verify: backend.verify,
@@ -1788,57 +1716,37 @@ impl OsslSession {
         }
         session.ossl_ctx = ossl_ctx;
 
-        match seam {
-            Seam::Helper => {
-                // SAFETY: `ssl` is valid; this installs the helper's QUIC TLS dispatch.
-                let rc = unsafe {
-                    if role == Role::Server {
-                        sys::ngtcp2_crypto_ossl_configure_server_session(session.ssl)
-                    } else {
-                        sys::ngtcp2_crypto_ossl_configure_client_session(session.ssl)
-                    }
-                };
-                if rc != 0 {
-                    return Err(Error::native(
-                        rc,
-                        "could not configure the QUIC TLS session",
-                    ));
-                }
-            }
-            Seam::Safe => {
-                // The engine is leaked out of its box on purpose: OpenSSL is about to be
-                // given this address, and `Drop` below is what reclaims it, after the
-                // `SSL` that holds it has been freed.
-                let engine = Box::into_raw(Box::new(Engine {
-                    events: std::collections::VecDeque::new(),
-                    inbound: Inbound::default(),
-                    local_params: None,
-                    suite: None,
-                    tx_level: Level::Initial,
-                    version: sys::NGTCP2_PROTO_VER_V1,
-                    ossl_ctx,
-                    conn: no_conn(),
-                    role,
-                    local_params_sent: false,
-                    failure: None,
-                    handshake_completed: false,
-                }));
-                session.engine = engine;
+        // The engine is leaked out of its box on purpose: OpenSSL is about to be
+        // given this address, and `Drop` below is what reclaims it, after the
+        // `SSL` that holds it has been freed.
+        let engine = Box::into_raw(Box::new(Engine {
+            events: std::collections::VecDeque::new(),
+            inbound: Inbound::default(),
+            local_params: None,
+            suite: None,
+            tx_level: Level::Initial,
+            version: sys::NGTCP2_PROTO_VER_V1,
+            ossl_ctx,
+            conn: no_conn(),
+            role,
+            local_params_sent: false,
+            failure: None,
+            handshake_completed: false,
+        }));
+        session.engine = engine;
 
-                // SAFETY: `ssl` is valid, the dispatch table is `static` so it outlives the
-                // `SSL`, and the engine outlives it too because `Drop` frees the `SSL`
-                // first.
-                let rc = unsafe {
-                    sys::SSL_set_quic_tls_cbs(
-                        session.ssl,
-                        QUIC_TLS_DISPATCH.as_ptr(),
-                        engine.cast::<c_void>(),
-                    )
-                };
-                if rc != 1 {
-                    return Err(tls_error("SSL_set_quic_tls_cbs failed"));
-                }
-            }
+        // SAFETY: `ssl` is valid, the dispatch table is `static` so it outlives the
+        // `SSL`, and the engine outlives it too because `Drop` frees the `SSL`
+        // first.
+        let rc = unsafe {
+            sys::SSL_set_quic_tls_cbs(
+                session.ssl,
+                QUIC_TLS_DISPATCH.as_ptr(),
+                engine.cast::<c_void>(),
+            )
+        };
+        if rc != 1 {
+            return Err(tls_error("SSL_set_quic_tls_cbs failed"));
         }
 
         // SAFETY: `ssl` is valid.
@@ -1911,26 +1819,6 @@ impl OsslSession {
         Ok(())
     }
 
-    /// Wires the connection reference OpenSSL hands back to the crypto helper.
-    ///
-    /// # Safety
-    ///
-    /// `get_conn` must return a live `ngtcp2_conn` for as long as this session exists, and
-    /// `user_data` must remain valid for the same period.
-    unsafe fn bind_conn_ref(
-        &mut self,
-        get_conn: sys::ngtcp2_crypto_get_conn,
-        user_data: *mut c_void,
-    ) {
-        self.conn_ref.get_conn = get_conn;
-        self.conn_ref.user_data = user_data;
-        let ptr: *mut sys::ngtcp2_crypto_conn_ref = &mut *self.conn_ref;
-        // SAFETY: `ssl` is valid and `conn_ref` is boxed, so its address is stable for as
-        // long as this session lives -- which, by the `Drop` order below, is longer than
-        // OpenSSL will read it.
-        unsafe { sys::SSL_set_ex_data(self.ssl, APP_DATA_INDEX, ptr.cast::<c_void>()) };
-    }
-
     /// The result of certificate verification, once the handshake has run.
     pub(crate) fn verify_result(&self) -> core::ffi::c_long {
         // SAFETY: `ssl` is valid.
@@ -1942,20 +1830,16 @@ impl Drop for OsslSession {
     fn drop(&mut self) {
         // The order here is the reason this type exists. See the module documentation.
         //
-        // 1. Clear the app data, so the CRYPTO records released during `SSL_free` cannot
-        //    reach a `ngtcp2_conn` that may already be gone. Every ossl dispatch callback
-        //    begins by reading this back and returns early when it is null.
+        // 1. Free the `SSL`. This is what releases any outstanding CRYPTO records, which it
+        //    does by calling back into the engine -- so the engine must still be alive, which
+        //    is why it is freed third rather than first.
         if !self.ssl.is_null() {
-            // SAFETY: `ssl` is valid and null is an accepted ex-data value.
-            unsafe { sys::SSL_set_ex_data(self.ssl, APP_DATA_INDEX, ptr::null_mut()) };
-            // 2. Free the `SSL`, which is what triggers those releases.
             // SAFETY: the pointer came from `SSL_new` and is freed exactly once.
             unsafe { sys::SSL_free(self.ssl) };
             self.ssl = ptr::null_mut();
         }
 
-        // 3. Only now free the helper context, which owns a `remote_params` buffer OpenSSL
-        //    may have been borrowing until the step above completed.
+        // 2. Then the helper context, which the engine read the negotiated suite from.
         if !self.ossl_ctx.is_null() {
             // SAFETY: the pointer came from `ngtcp2_crypto_ossl_ctx_new`, is freed exactly
             // once, and `SSL_free` has already run.
@@ -1963,19 +1847,15 @@ impl Drop for OsslSession {
             self.ossl_ctx = ptr::null_mut();
         }
 
-        // 4. And the engine last of all. It owns the inbound records OpenSSL was reading
-        //    through and the transport parameters it was sending, and `SSL_free` releases
-        //    both by calling back into it -- so freeing it any earlier would be the same
-        //    use-after-free the app-data dance above exists to prevent, arrived at from the
-        //    other direction.
+        // 3. And the engine last of all. It owns the inbound records OpenSSL was reading
+        //    through and the transport parameters it was sending, and step 1 released both by
+        //    calling back into it. Freeing it any earlier is a use-after-free.
         if !self.engine.is_null() {
             // SAFETY: the pointer came from `Box::into_raw`, is reclaimed exactly once, and
             // the `SSL` that held it has been freed.
             drop(unsafe { Box::from_raw(self.engine) });
             self.engine = ptr::null_mut();
         }
-
-        // `conn_ref` is dropped last, by the compiler, after nothing can read it.
     }
 }
 
@@ -1983,84 +1863,6 @@ impl Drop for OsslSession {
 // exclusively. None is shared, and OpenSSL permits an `SSL` to be used from any one thread
 // at a time. It is deliberately not `Sync`.
 unsafe impl Send for OsslSession {}
-
-// SAFETY: `native_handle` returns the ossl helper context, which is what
-// `ngtcp2_conn_set_tls_native_handle` expects for this backend -- see `NativeTlsHandle`.
-// The teardown order required by the helper is enforced by `Drop` above.
-unsafe impl TlsSession for OsslSession {
-    unsafe fn bind_connection(&mut self, conn: *mut c_void) {
-        // `user_data` is the `ngtcp2_conn` pointer itself rather than anything of ours.
-        // That matters: ngtcp2 allocates the connection on the heap and never moves it, so
-        // the pointer stays valid even though the Rust `Conn` wrapper around it is moved
-        // when it is returned from its builder. Pointing at the wrapper would dangle.
-        // SAFETY: the caller guarantees `conn` outlives this session.
-        unsafe { self.bind_conn_ref(Some(get_conn_cb), conn) };
-    }
-
-    fn native_handle(&self) -> NativeTlsHandle {
-        // The ossl ctx, NOT the `SSL`. The parameter is `void *`, so the wrong one would
-        // compile and corrupt memory at run time.
-        // SAFETY: the pointer is live for as long as `self`, and is the one the helper
-        // expects.
-        unsafe { NativeTlsHandle::new(self.ossl_ctx.cast::<c_void>()) }
-    }
-
-    unsafe fn install_callbacks(&self, callbacks: *mut c_void) {
-        // SAFETY: the caller guarantees this points at a valid `ngtcp2_callbacks`.
-        let callbacks = unsafe { &mut *callbacks.cast::<sys::ngtcp2_callbacks>() };
-
-        // The crypto half of the table, supplied by ngtcp2's backend-independent helper.
-        // These are the entries the assert block in `ngtcp2_conn_new` requires.
-        callbacks.recv_crypto_data = Some(sys::ngtcp2_crypto_recv_crypto_data_cb);
-        callbacks.encrypt = Some(sys::ngtcp2_crypto_encrypt_cb);
-        callbacks.decrypt = Some(sys::ngtcp2_crypto_decrypt_cb);
-        callbacks.hp_mask = Some(sys::ngtcp2_crypto_hp_mask_cb);
-        callbacks.update_key = Some(sys::ngtcp2_crypto_update_key_cb);
-        callbacks.delete_crypto_aead_ctx = Some(sys::ngtcp2_crypto_delete_crypto_aead_ctx_cb);
-        callbacks.delete_crypto_cipher_ctx = Some(sys::ngtcp2_crypto_delete_crypto_cipher_ctx_cb);
-        callbacks.get_path_challenge_data = Some(sys::ngtcp2_crypto_get_path_challenge_data_cb);
-        callbacks.version_negotiation = Some(sys::ngtcp2_crypto_version_negotiation_cb);
-
-        if self.role == Role::Server {
-            callbacks.recv_client_initial = Some(sys::ngtcp2_crypto_recv_client_initial_cb);
-        } else {
-            callbacks.client_initial = Some(sys::ngtcp2_crypto_client_initial_cb);
-            callbacks.recv_retry = Some(sys::ngtcp2_crypto_recv_retry_cb);
-        }
-    }
-
-    fn negotiated_alpn(&self) -> Option<Vec<u8>> {
-        let mut data: *const c_uchar = ptr::null();
-        let mut len: core::ffi::c_uint = 0;
-        // SAFETY: `ssl` is valid and both out-parameters are writable.
-        unsafe { sys::SSL_get0_alpn_selected(self.ssl, &mut data, &mut len) };
-        if data.is_null() || len == 0 {
-            return None;
-        }
-        // SAFETY: OpenSSL guarantees the buffer is readable for `len` bytes and owned by
-        // the `SSL`, so copying it out is what keeps the result usable.
-        Some(unsafe { core::slice::from_raw_parts(data, len as usize) }.to_vec())
-    }
-
-    fn failure_reason(&self) -> Option<String> {
-        // Certificate verification first, because it is the failure a caller is most likely
-        // to have caused and the one OpenSSL's generic error queue describes worst.
-        let verdict = self.verify_result();
-        if verdict != sys::X509_V_OK as core::ffi::c_long {
-            // SAFETY: the function accepts any long and returns a static string.
-            let text = unsafe { sys::X509_verify_cert_error_string(verdict) };
-            if !text.is_null() {
-                // SAFETY: the returned string is static and NUL-terminated.
-                let text = unsafe { CStr::from_ptr(text) };
-                return Some(format!(
-                    "certificate verification failed: {}",
-                    text.to_string_lossy()
-                ));
-            }
-        }
-        take_openssl_error()
-    }
-}
 
 impl OsslSession {
     /// Reaches the engine, or fails for a session that was not built for the safe seam.
@@ -2267,17 +2069,43 @@ impl Session for OsslSession {
     }
 
     fn negotiated_alpn(&self) -> Option<Vec<u8>> {
-        TlsSession::negotiated_alpn(self)
+        let mut data: *const c_uchar = ptr::null();
+        let mut len: core::ffi::c_uint = 0;
+        // SAFETY: `ssl` is valid and both out-parameters are writable.
+        unsafe { sys::SSL_get0_alpn_selected(self.ssl, &mut data, &mut len) };
+        if data.is_null() || len == 0 {
+            return None;
+        }
+        // SAFETY: OpenSSL guarantees the buffer is readable for `len` bytes and owned by the
+        // `SSL`, so copying it out is what keeps the result usable.
+        Some(unsafe { core::slice::from_raw_parts(data, len as usize) }.to_vec())
     }
 
     fn failure_reason(&self) -> Option<String> {
+        // What a callback recorded first: it names the actual cause, where OpenSSL's queue
+        // will only say the handshake failed.
         if !self.engine.is_null() {
             // SAFETY: the pointer is live and no callback can be running.
             if let Some(reason) = unsafe { (*self.engine).failure.clone() } {
                 return Some(reason);
             }
         }
-        TlsSession::failure_reason(self)
+        // Then certificate verification, because it is the failure a caller is most likely to
+        // have caused and the one OpenSSL's generic error queue describes worst.
+        let verdict = self.verify_result();
+        if verdict != sys::X509_V_OK as core::ffi::c_long {
+            // SAFETY: the function accepts any long and returns a static string.
+            let text = unsafe { sys::X509_verify_cert_error_string(verdict) };
+            if !text.is_null() {
+                // SAFETY: the returned string is static and NUL-terminated.
+                let text = unsafe { CStr::from_ptr(text) };
+                return Some(format!(
+                    "certificate verification failed: {}",
+                    text.to_string_lossy()
+                ));
+            }
+        }
+        take_openssl_error()
     }
 }
 
@@ -2314,7 +2142,7 @@ impl Backend for OsslBackend {
                 "the session role does not match the backend's role",
             ));
         }
-        OsslSession::with_seam(self, role, server_name, Seam::Safe)
+        OsslSession::new(self, role, server_name)
     }
 }
 
@@ -2811,19 +2639,6 @@ mod tests {
         assert!(session.set_local_transport_params(b"second").is_err());
     }
 
-    #[test]
-    fn a_helper_session_reports_that_it_is_not_on_the_safe_seam() {
-        // The two seams cannot share one session, because the second `SSL_set_quic_tls_cbs`
-        // replaces the first. Asking a helper-backed session for safe-seam behaviour fails
-        // loudly rather than silently doing nothing.
-        let backend = safe_client_backend();
-        let mut session =
-            TlsBackend::new_session(&backend, Role::Client, Some("example.com")).unwrap();
-        assert!(session.set_local_transport_params(b"x").is_err());
-        assert!(session.start_handshake(&mut Recorder::new(b"x")).is_err());
-        assert!(Session::poll_event(&mut session).is_none());
-    }
-
     /// A stand-in connection, for handshakes run with no connection behind them.
     ///
     /// It records what the session did rather than doing it: a fixed blob as this endpoint's
@@ -3255,8 +3070,8 @@ mod tests {
             .alpn("h3")
             .build()
             .unwrap();
-        assert!(TlsBackend::new_session(&backend, Role::Client, None).is_err());
-        assert!(TlsBackend::new_session(&backend, Role::Client, Some("example.com")).is_ok());
+        assert!(Backend::new_session(&backend, Role::Client, None).is_err());
+        assert!(Backend::new_session(&backend, Role::Client, Some("example.com")).is_ok());
     }
 
     #[test]
@@ -3266,21 +3081,31 @@ mod tests {
             .verify(Verify::DangerouslyAcceptAnyCertificate)
             .build()
             .unwrap();
-        assert!(TlsBackend::new_session(&backend, Role::Client, None).is_ok());
+        assert!(Backend::new_session(&backend, Role::Client, None).is_ok());
     }
 
     #[test]
-    fn a_session_reports_the_ossl_context_as_its_native_handle() {
-        // The single easiest catastrophic mistake in this whole crate is handing ngtcp2 the
-        // `SSL *` instead. The parameter is `void *`, so nothing would complain.
+    fn a_session_hands_ngtcp2_nothing_of_its_own() {
+        // What this replaces is worth recording. The old seam made a backend give ngtcp2 an
+        // untyped pointer, and the correct value was the `ngtcp2_crypto_ossl_ctx` rather than
+        // the `SSL` an experienced OpenSSL user would reach for -- a mistake that compiled
+        // cleanly and corrupted memory at run time. There is now nothing to get wrong: the
+        // connection stores a pointer to the *session*, which it owns, and the backend never
+        // sees or supplies it.
         let backend = OsslBackend::builder(Role::Client)
             .alpn("h3")
             .verify(Verify::DangerouslyAcceptAnyCertificate)
             .build()
             .unwrap();
-        let session = TlsBackend::new_session(&backend, Role::Client, None).unwrap();
-        assert_eq!(session.native_handle().as_ptr(), session.ossl_ctx.cast());
-        assert_ne!(session.native_handle().as_ptr(), session.ssl.cast());
+        let session = Backend::new_session(&backend, Role::Client, None).unwrap();
+        // The two C objects still exist and are still distinct; neither is anyone else's
+        // business any more.
+        assert!(!session.ossl_ctx.is_null());
+        assert!(!session.ssl.is_null());
+        assert_ne!(
+            session.ossl_ctx.cast::<c_void>(),
+            session.ssl.cast::<c_void>()
+        );
     }
 
     #[test]
@@ -3289,7 +3114,7 @@ mod tests {
             .alpn("h3")
             .build()
             .unwrap();
-        assert!(TlsBackend::new_session(&backend, Role::Server, None).is_err());
+        assert!(Backend::new_session(&backend, Role::Server, None).is_err());
     }
 
     #[test]
@@ -3301,24 +3126,8 @@ mod tests {
             .build()
             .unwrap();
         for _ in 0..16 {
-            drop(TlsBackend::new_session(&backend, Role::Client, None).unwrap());
+            drop(Backend::new_session(&backend, Role::Client, None).unwrap());
         }
-    }
-
-    #[test]
-    fn a_session_can_be_dropped_after_its_conn_ref_was_bound() {
-        // Binding the conn ref is what puts a pointer into OpenSSL's app data, so this is
-        // the drop path where clearing it first actually matters.
-        let backend = OsslBackend::builder(Role::Client)
-            .alpn("h3")
-            .verify(Verify::DangerouslyAcceptAnyCertificate)
-            .build()
-            .unwrap();
-        let mut session = TlsBackend::new_session(&backend, Role::Client, None).unwrap();
-        // SAFETY: `None` for `get_conn` is never called, and the user data is null, so
-        // nothing is dereferenced. This exercises the ordering, not the callback.
-        unsafe { session.bind_conn_ref(None, ptr::null_mut()) };
-        drop(session);
     }
 
     #[test]
@@ -3331,7 +3140,7 @@ mod tests {
             .verify(Verify::DangerouslyAcceptAnyCertificate)
             .build()
             .unwrap();
-        let session = TlsBackend::new_session(&backend, Role::Client, None).unwrap();
+        let session = Backend::new_session(&backend, Role::Client, None).unwrap();
         drop(backend);
         drop(session);
     }

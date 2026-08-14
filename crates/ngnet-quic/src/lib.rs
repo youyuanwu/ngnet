@@ -83,7 +83,6 @@ mod retain;
 mod settings;
 #[allow(unsafe_code)]
 mod stream_io;
-#[allow(unsafe_code)]
 mod tls;
 // The generic translation between ngtcp2's crypto callbacks and the safe TLS seam. This is
 // where the `unsafe` a TLS backend used to be asked to write now lives, once, instead of
@@ -92,10 +91,10 @@ mod tls;
 mod tls_bridge;
 #[cfg(feature = "tls-ossl")]
 #[allow(unsafe_code)]
-mod token;
+mod tls_ossl;
 #[cfg(feature = "tls-ossl")]
 #[allow(unsafe_code)]
-mod tls_ossl;
+mod token;
 
 mod handlers;
 mod rand;
@@ -131,8 +130,7 @@ pub use stream_io::StreamWrite;
 pub use time::{Duration, Timestamp};
 pub use tls::{
     Backend, CryptoError, Direction, DirectionalKeys, HP_MASK_LEN, HP_SAMPLE_LEN, Handshaking,
-    HeaderKey, InitialKeys, Level, NativeTlsHandle, PacketKey, Role, RotatedKeys, Session,
-    SessionEvent, TlsBackend, TlsSession,
+    HeaderKey, InitialKeys, Level, PacketKey, Role, RotatedKeys, Session, SessionEvent,
 };
 
 #[cfg(feature = "tls-ossl")]
@@ -141,8 +139,7 @@ pub use tls_ossl::{OsslBackend, OsslBackendBuilder, OsslSession, Verify};
 #[cfg(feature = "tls-ossl")]
 pub use token::{
     MIN_RESET_RANDOM, RESET_TOKEN_LEN, TokenSecret, issue_retry_token, reset_token,
-    verify_retry_token, write_retry, write_stateless_reset,
-    write_stateless_reset_smaller_than,
+    verify_retry_token, write_retry, write_stateless_reset, write_stateless_reset_smaller_than,
 };
 
 /// The raw bindings, for capabilities the safe API does not cover yet.
