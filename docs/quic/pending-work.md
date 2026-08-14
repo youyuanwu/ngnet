@@ -172,6 +172,26 @@ system currently carries for free. Worth doing if this crate is ever used somewh
 matters; worth measuring first, since a memcpy of 1200 bytes against an AEAD over the same 1200
 bytes may not show up at all.
 
+## `ngnet-quic-h3-tests::exchange` fails occasionally under load
+
+Observed once in four `cargo test --workspace --all-features` runs, and not reproduced in nine
+attempts afterwards — six of the suite alone, three of the whole workspace. The suite binds real
+sockets on `127.0.0.1:0`, so it is not a port collision; the ephemeral port is chosen by the
+kernel and is unique per test.
+
+Recorded rather than fixed because it is worth being explicit that this is known. A test that
+fails one run in four and passes the next nine trains everyone who sees it to press retry, and
+the first genuine failure it catches will be dismissed the same way.
+
+It predates the safe TLS seam: `tests/ngnet-quic-h3-tests/tests/exchange.rs` was last modified by
+the commit that introduced it, and the seam work changed nothing under
+`tests/ngnet-quic-h3-tests/` at all.
+
+**What would settle it:** run it under contention deliberately — the whole workspace, repeatedly,
+on a loaded machine — with the failure captured rather than summarised, so the failing assertion
+is known. The likely candidates are a timeout that is generous on an idle machine and not on a
+busy one, or a `pump`-style relay bounded by rounds rather than by progress.
+
 ## Mutual TLS is not implemented
 
 `Verify::RequireClientCertificate` exists and returns an error. It is there so that asking
