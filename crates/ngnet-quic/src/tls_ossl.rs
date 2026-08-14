@@ -50,8 +50,9 @@ use ngnet_quic_sys as sys;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::tls::{
-    CryptoError, DirectionalKeys, HP_MASK_LEN, HP_SAMPLE_LEN, HeaderKey, InitialKeys,
-    NativeTlsHandle, PacketKey, Role, TlsBackend, TlsSession,
+    Backend, CryptoError, Direction, DirectionalKeys, HP_MASK_LEN, HP_SAMPLE_LEN, HeaderKey,
+    InitialKeys, Level, NativeTlsHandle, PacketKey, Role, RotatedKeys, Session, SessionEvent,
+    TlsBackend, TlsSession,
 };
 
 /// `SSL_set_app_data` / `SSL_get_app_data` are macros over ex-data index 0.
@@ -653,6 +654,417 @@ fn derive_retry_key(version: u32) -> Result<OsslPacketKey> {
     OsslPacketKey::for_encryption(&Suite::retry(), key)
 }
 
+/// One span of inbound handshake bytes, at an address OpenSSL may hold on to.
+///
+/// The address matters. OpenSSL's record layer takes a pointer from `crypto_recv_rcd` and
+/// keeps reading through it until it calls `crypto_release_rcd` for those bytes — which may
+/// be several calls later, or during `SSL_free`. A `Vec<u8>` that the queue reallocated
+/// underneath it would leave OpenSSL parsing freed memory, and the failure would look like a
+/// corrupt handshake rather than like a lifetime bug.
+///
+/// `Box<[u8]>` is what makes this safe: the queue moves the box, never the bytes.
+struct Record {
+    /// The bytes, at a fixed address for as long as this record exists.
+    data: Box<[u8]>,
+    /// How many bytes have been handed to OpenSSL.
+    read: usize,
+    /// How many bytes OpenSSL has finished with.
+    released: usize,
+}
+
+/// The inbound handshake bytes OpenSSL has not finished with.
+///
+/// Reading and releasing are separate positions rather than one, because OpenSSL is allowed
+/// to read ahead of what it releases: it takes a whole record before it decides how much of
+/// it was a complete message.
+#[derive(Default)]
+struct Inbound {
+    records: std::collections::VecDeque<Record>,
+}
+
+impl Inbound {
+    /// Queues bytes that arrived in a CRYPTO frame.
+    fn push(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        self.records.push_back(Record {
+            data: data.to_vec().into_boxed_slice(),
+            read: 0,
+            released: 0,
+        });
+    }
+
+    /// Hands OpenSSL the next unread span, or nothing.
+    ///
+    /// Returns a raw pointer rather than a slice because that is what crosses the callback
+    /// boundary, and because the borrow it would otherwise imply does not describe the
+    /// truth: OpenSSL holds the pointer after this returns.
+    fn next_span(&mut self) -> (*const u8, usize) {
+        for record in &mut self.records {
+            let unread = record.data.len() - record.read;
+            if unread > 0 {
+                // SAFETY: `read` is within the record, which is boxed and does not move.
+                let ptr = unsafe { record.data.as_ptr().add(record.read) };
+                record.read = record.data.len();
+                return (ptr, unread);
+            }
+        }
+        (ptr::null(), 0)
+    }
+
+    /// Marks bytes as finished with, freeing records once they are wholly consumed.
+    fn release(&mut self, mut released: usize) {
+        while released > 0 {
+            let Some(front) = self.records.front_mut() else {
+                return;
+            };
+            let outstanding = front.data.len() - front.released;
+            let taken = released.min(outstanding);
+            front.released += taken;
+            released -= taken;
+            if front.released == front.data.len() {
+                self.records.pop_front();
+            }
+        }
+    }
+}
+
+/// The state OpenSSL's QUIC-TLS callbacks reach through their `arg` pointer.
+///
+/// # Why `arg` rather than the `SSL`'s application data
+///
+/// `SSL_set_quic_tls_cbs` takes a third argument that it passes to every callback
+/// unmodified. ngtcp2's own helper passes null and recovers its state from the `SSL`'s
+/// application data instead (`ossl.c:1110`, `:1145`, and four more) — because it needs to
+/// reach the `ngtcp2_conn`, which it can only find that way. This backend needs no
+/// connection, so it uses the argument the API already provides. That is what dissolves the
+/// three-object teardown cycle described at the top of this module: nothing OpenSSL holds
+/// points at anything belonging to ngtcp2.
+struct Engine {
+    /// Everything the session has to report, in the order the callbacks produced it.
+    ///
+    /// A queue rather than a set of fields because order is load-bearing and easy to lose:
+    /// OpenSSL can yield a secret, some handshake bytes and the peer's transport parameters
+    /// from inside one `SSL_do_handshake`, and the connection must apply them in that order
+    /// or install a key before the transport parameters its installation depends on.
+    events: std::collections::VecDeque<SessionEvent<OsslPacketKey, OsslHeaderKey>>,
+    /// Inbound handshake bytes OpenSSL has not released.
+    inbound: Inbound,
+    /// The local transport parameters, owned until OpenSSL has sent them.
+    ///
+    /// `SSL_set_quic_tls_transport_params` does not copy: the buffer must stay valid and at
+    /// a fixed address until the extension is written. Keeping it here, in an allocation
+    /// that lives as long as the session, is the whole of the fix.
+    local_params: Option<Vec<u8>>,
+    /// The suite the handshake negotiated, once it has.
+    suite: Option<Suite>,
+    /// The level outbound handshake bytes belong to.
+    ///
+    /// OpenSSL does not say. It yields a write secret for a level and everything it sends
+    /// afterwards belongs to that level, which is exactly what ngtcp2's helper tracks in its
+    /// `tx_level` field (`ossl.c:1131`).
+    tx_level: Level,
+    /// The QUIC version in force, which selects the key schedule's labels.
+    version: u32,
+    /// The helper context, kept only so the negotiated suite can be read from it.
+    ossl_ctx: *mut sys::ngtcp2_crypto_ossl_ctx,
+    /// Why a callback failed, when the failure could not be described by its return value.
+    failure: Option<String>,
+    /// Whether `SSL_do_handshake` has succeeded.
+    ///
+    /// Tracked here rather than asked of OpenSSL because it also gates the transition that
+    /// produces [`SessionEvent::HandshakeComplete`], which must be reported exactly once.
+    handshake_completed: bool,
+}
+
+impl Engine {
+    /// Recovers the engine from the argument OpenSSL passes every callback.
+    ///
+    /// # Safety
+    ///
+    /// `arg` must be the pointer given to `SSL_set_quic_tls_cbs`, still alive, and no other
+    /// reference to the engine may be live. The second condition is what the session's own
+    /// methods are written to preserve: they reach the engine only through this pointer, and
+    /// never hold a borrow across a call into OpenSSL.
+    unsafe fn from_arg<'a>(arg: *mut c_void) -> Option<&'a mut Self> {
+        if arg.is_null() {
+            return None;
+        }
+        // SAFETY: the caller guarantees provenance and exclusivity.
+        Some(unsafe { &mut *arg.cast::<Self>() })
+    }
+
+    /// Derives and queues one direction's keys from a secret OpenSSL yielded.
+    fn yield_keys(&mut self, level: Level, direction: Direction, secret: &[u8]) -> Result<()> {
+        let suite = match level {
+            // The Initial suite is fixed by the specification and needs no negotiation --
+            // and no secret is ever yielded at that level anyway.
+            Level::Initial => Suite::initial(),
+            _ => match self.suite {
+                Some(suite) => suite,
+                None => {
+                    // SAFETY: the context is live for as long as the session, and the
+                    // handshake has reached the point of yielding a secret, so a suite has
+                    // been chosen.
+                    let suite = unsafe { Suite::negotiated(self.ossl_ctx) }?;
+                    self.suite = Some(suite);
+                    suite
+                }
+            },
+        };
+
+        let keys = match direction {
+            Direction::Read => derive_rx_keys(&suite, self.version, secret)?,
+            Direction::Write => derive_keys(&suite, self.version, secret)?,
+        };
+        self.events.push_back(SessionEvent::Keys {
+            level,
+            direction,
+            keys,
+            secret: secret.to_vec(),
+        });
+        Ok(())
+    }
+}
+
+/// Maps OpenSSL's record protection level onto the seam's encryption level.
+fn level_from_ossl(ossl_level: u32) -> Option<Level> {
+    match ossl_level {
+        sys::OSSL_RECORD_PROTECTION_LEVEL_NONE => Some(Level::Initial),
+        sys::OSSL_RECORD_PROTECTION_LEVEL_EARLY => Some(Level::ZeroRtt),
+        sys::OSSL_RECORD_PROTECTION_LEVEL_HANDSHAKE => Some(Level::Handshake),
+        sys::OSSL_RECORD_PROTECTION_LEVEL_APPLICATION => Some(Level::OneRtt),
+        // ngtcp2's helper asserts and aborts here (`ossl.c:1051-1053`), which in a release
+        // build is an abort with no assertion. Failing the handshake is strictly better.
+        _ => None,
+    }
+}
+
+/// Queues handshake bytes OpenSSL wants sent.
+unsafe extern "C" fn ossl_crypto_send(
+    _ssl: *mut sys::SSL,
+    buf: *const c_uchar,
+    buflen: usize,
+    consumed: *mut usize,
+    arg: *mut c_void,
+) -> c_int {
+    // SAFETY: `arg` is the engine pointer, and OpenSSL is single-threaded within one `SSL`.
+    let Some(engine) = (unsafe { Engine::from_arg(arg) }) else {
+        return 1;
+    };
+    // SAFETY: OpenSSL guarantees `buf` is readable for `buflen` for the duration of the
+    // call, which is why the bytes are copied out rather than referenced.
+    let data = unsafe { core::slice::from_raw_parts(buf, buflen) }.to_vec();
+    let level = engine.tx_level;
+    engine
+        .events
+        .push_back(SessionEvent::Handshake { level, data });
+    // Reporting fewer than offered would make OpenSSL retry the remainder, and the queue
+    // above has no back pressure, so all of it is always taken.
+    // SAFETY: OpenSSL provides a writable out-parameter.
+    unsafe { *consumed = buflen };
+    1
+}
+
+/// Hands OpenSSL the next span of inbound handshake bytes.
+unsafe extern "C" fn ossl_crypto_recv_rcd(
+    _ssl: *mut sys::SSL,
+    buf: *mut *const c_uchar,
+    bytes_read: *mut usize,
+    arg: *mut c_void,
+) -> c_int {
+    // SAFETY: as above.
+    let Some(engine) = (unsafe { Engine::from_arg(arg) }) else {
+        // SAFETY: OpenSSL provides writable out-parameters.
+        unsafe {
+            *buf = ptr::null();
+            *bytes_read = 0;
+        }
+        return 1;
+    };
+    let (ptr, len) = engine.inbound.next_span();
+    // SAFETY: OpenSSL provides writable out-parameters. The pointer stays valid until the
+    // matching release, because the record it points into is boxed and is only dropped by
+    // `Inbound::release`.
+    unsafe {
+        *buf = ptr;
+        *bytes_read = len;
+    }
+    1
+}
+
+/// Frees inbound handshake bytes OpenSSL has finished with.
+unsafe extern "C" fn ossl_crypto_release_rcd(
+    _ssl: *mut sys::SSL,
+    released: usize,
+    arg: *mut c_void,
+) -> c_int {
+    // SAFETY: as above.
+    let Some(engine) = (unsafe { Engine::from_arg(arg) }) else {
+        return 1;
+    };
+    engine.inbound.release(released);
+    1
+}
+
+/// Derives the keys for a secret OpenSSL produced.
+unsafe extern "C" fn ossl_yield_secret(
+    _ssl: *mut sys::SSL,
+    ossl_level: u32,
+    direction: c_int,
+    secret: *const c_uchar,
+    secretlen: usize,
+    arg: *mut c_void,
+) -> c_int {
+    // SAFETY: as above.
+    let Some(engine) = (unsafe { Engine::from_arg(arg) }) else {
+        return 1;
+    };
+    let Some(level) = level_from_ossl(ossl_level) else {
+        engine.failure = Some("OpenSSL yielded a secret at an unknown level".to_owned());
+        return 0;
+    };
+    // OpenSSL's convention: non-zero means the write direction.
+    let direction = if direction == 0 {
+        Direction::Read
+    } else {
+        Direction::Write
+    };
+    // SAFETY: OpenSSL guarantees the secret is readable for `secretlen` for this call.
+    let secret = unsafe { core::slice::from_raw_parts(secret, secretlen) };
+
+    if let Err(error) = engine.yield_keys(level, direction, secret) {
+        engine.failure = Some(format!("could not derive keys: {error}"));
+        return 0;
+    }
+    // Set only after the keys are queued, so a failed derivation cannot leave the level
+    // advanced with no key to go with it.
+    if direction == Direction::Write {
+        engine.tx_level = level;
+    }
+    1
+}
+
+/// Reports the peer's transport parameters, exactly as they arrived.
+unsafe extern "C" fn ossl_got_transport_params(
+    _ssl: *mut sys::SSL,
+    params: *const c_uchar,
+    paramslen: usize,
+    arg: *mut c_void,
+) -> c_int {
+    // SAFETY: as above.
+    let Some(engine) = (unsafe { Engine::from_arg(arg) }) else {
+        return 1;
+    };
+    // SAFETY: OpenSSL guarantees the buffer is readable for this call, so it is copied.
+    let params = unsafe { core::slice::from_raw_parts(params, paramslen) }.to_vec();
+    engine
+        .events
+        .push_back(SessionEvent::PeerTransportParams(params));
+    1
+}
+
+/// Reports a TLS alert the peer must be told about.
+unsafe extern "C" fn ossl_alert(_ssl: *mut sys::SSL, alert_code: u8, arg: *mut c_void) -> c_int {
+    // SAFETY: as above.
+    let Some(engine) = (unsafe { Engine::from_arg(arg) }) else {
+        return 1;
+    };
+    engine.events.push_back(SessionEvent::Alert(alert_code));
+    1
+}
+
+/// The dispatch table OpenSSL's QUIC record layer calls into.
+///
+/// A `static` rather than a value built per session: OpenSSL reads the table for as long as
+/// the `SSL` lives, and the per-session state travels in the argument instead. Building it
+/// on the stack would dangle the moment the constructor returned.
+static QUIC_TLS_DISPATCH: [sys::OSSL_DISPATCH; 7] = [
+    sys::OSSL_DISPATCH {
+        function_id: sys::OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_SEND as c_int,
+        // SAFETY of every cast below: `OSSL_DISPATCH` erases each function's type, which is
+        // how OpenSSL's dispatch tables work. The identifier beside it is what says how it
+        // will be called back, so the identifier and the signature must agree -- they are
+        // checked against `ossl.c:1248-1274`, which registers the same six.
+        function: Some(unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(
+                    *mut sys::SSL,
+                    *const c_uchar,
+                    usize,
+                    *mut usize,
+                    *mut c_void,
+                ) -> c_int,
+                unsafe extern "C" fn(),
+            >(ossl_crypto_send)
+        }),
+    },
+    sys::OSSL_DISPATCH {
+        function_id: sys::OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RECV_RCD as c_int,
+        function: Some(unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(
+                    *mut sys::SSL,
+                    *mut *const c_uchar,
+                    *mut usize,
+                    *mut c_void,
+                ) -> c_int,
+                unsafe extern "C" fn(),
+            >(ossl_crypto_recv_rcd)
+        }),
+    },
+    sys::OSSL_DISPATCH {
+        function_id: sys::OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RELEASE_RCD as c_int,
+        function: Some(unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(*mut sys::SSL, usize, *mut c_void) -> c_int,
+                unsafe extern "C" fn(),
+            >(ossl_crypto_release_rcd)
+        }),
+    },
+    sys::OSSL_DISPATCH {
+        function_id: sys::OSSL_FUNC_SSL_QUIC_TLS_YIELD_SECRET as c_int,
+        function: Some(unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(
+                    *mut sys::SSL,
+                    u32,
+                    c_int,
+                    *const c_uchar,
+                    usize,
+                    *mut c_void,
+                ) -> c_int,
+                unsafe extern "C" fn(),
+            >(ossl_yield_secret)
+        }),
+    },
+    sys::OSSL_DISPATCH {
+        function_id: sys::OSSL_FUNC_SSL_QUIC_TLS_GOT_TRANSPORT_PARAMS as c_int,
+        function: Some(unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(*mut sys::SSL, *const c_uchar, usize, *mut c_void) -> c_int,
+                unsafe extern "C" fn(),
+            >(ossl_got_transport_params)
+        }),
+    },
+    sys::OSSL_DISPATCH {
+        function_id: sys::OSSL_FUNC_SSL_QUIC_TLS_ALERT as c_int,
+        function: Some(unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(*mut sys::SSL, u8, *mut c_void) -> c_int,
+                unsafe extern "C" fn(),
+            >(ossl_alert)
+        }),
+    },
+    // `OSSL_DISPATCH_END`: a zero identifier with no function. OpenSSL walks until it finds
+    // this, so omitting it would walk off the end of the array.
+    sys::OSSL_DISPATCH {
+        function_id: 0,
+        function: None,
+    },
+];
+
 /// How a peer's certificate should be checked.
 ///
 /// # What this means per role
@@ -832,11 +1244,14 @@ impl OsslBackendBuilder {
         if self.role == Role::Server {
             // The selection callback reads the offer list through the callback argument,
             // which must stay at a fixed address for as long as any session made from this
-            // context can run. Owning it here -- rather than leaking it, as an earlier
-            // version did -- means it is freed when the backend is, and the field order
-            // below ensures `SSL_CTX_free` runs first.
-            let offers = Box::new(alpn_wire.clone());
-            let ptr: *const Vec<u8> = &*offers;
+            // context can run -- which is **not** the same as as long as the backend lives.
+            // `SSL_new` takes a reference on the context, so a session outlives a dropped
+            // backend, and with it the callback that reads this. Reference counting the
+            // offers, and having every session hold one, is what makes the two lifetimes
+            // agree; owning it in the backend alone was a use-after-free reachable from
+            // entirely safe code, found by dropping a server backend before its session.
+            let offers = std::sync::Arc::new(alpn_wire.clone());
+            let ptr: *const Vec<u8> = std::sync::Arc::as_ptr(&offers);
             // SAFETY: `ctx` is valid, and `offers` is owned by the backend being returned,
             // so the pointer stays valid for the context's whole life.
             unsafe {
@@ -854,7 +1269,7 @@ impl OsslBackendBuilder {
             alpn_wire,
             role: self.role,
             verify: self.verify,
-            _alpn_offers: alpn_offers,
+            alpn_offers,
         })
     }
 }
@@ -1102,11 +1517,15 @@ pub struct OsslBackend {
     verify: Verify,
     /// The server's ALPN offer list, at a fixed address for the selection callback.
     ///
-    /// `Box<Vec<u8>>` rather than `Vec<u8>` deliberately, despite what the lint suggests:
-    /// the callback recovers a `*const Vec<u8>` and dereferences it, so the `Vec` *struct*
-    /// must not move. It would, when this backend is returned by value. Boxing pins it.
+    /// Indirected rather than held inline, despite what the lint suggests: the callback
+    /// recovers a `*const Vec<u8>` and dereferences it, so the `Vec` *struct* must not move
+    /// -- and it would, when this backend is returned by value.
+    ///
+    /// Reference counted rather than merely boxed because a session made from this backend
+    /// keeps the `SSL_CTX` alive after the backend itself is dropped, and the callback goes
+    /// with the context. Every session therefore holds a count.
     #[allow(clippy::box_collection)]
-    _alpn_offers: Option<Box<Vec<u8>>>,
+    alpn_offers: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl OsslBackend {
@@ -1136,6 +1555,20 @@ unsafe impl TlsBackend for OsslBackend {
     }
 }
 
+/// Which seam a session is being built for.
+///
+/// Both exist while the connection is moved across; the old one is deleted once nothing
+/// reaches for it. They differ in exactly one thing — whose QUIC-TLS dispatch table is
+/// installed on the `SSL` — and they cannot coexist on one session, because the second
+/// `SSL_set_quic_tls_cbs` replaces the first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Seam {
+    /// ngtcp2's crypto helper drives the handshake and calls back into the connection.
+    Helper,
+    /// This crate drives the handshake and reports what happened.
+    Safe,
+}
+
 /// One connection's TLS session.
 ///
 /// Owns all three C objects — the `SSL`, the `ngtcp2_crypto_ossl_ctx`, and the boxed
@@ -1149,13 +1582,35 @@ pub struct OsslSession {
     ssl: *mut sys::SSL,
     /// Boxed so its address is stable: OpenSSL holds a pointer to it, and the helper
     /// dereferences that pointer from six different callbacks.
+    ///
+    /// Used only by the old seam. A session on the safe seam leaves it inert.
     conn_ref: Box<sys::ngtcp2_crypto_conn_ref>,
+    /// A share of the backend's ALPN offer list, keeping it alive for the selection
+    /// callback that reads it -- which outlives the backend whenever a session does.
+    _alpn_offers: Option<std::sync::Arc<Vec<u8>>>,
+    /// The safe seam's handshake state, or null for a session on the old seam.
+    ///
+    /// A raw pointer rather than a `Box` on purpose. OpenSSL holds this same address and
+    /// reaches through it from inside `SSL_do_handshake`, `SSL_read` and `SSL_free`. Owning
+    /// it as a `Box` would mean this struct held a reference that a callback could alias, so
+    /// every access — here and in the callbacks — goes through the pointer, and no borrow
+    /// is ever held across a call into OpenSSL.
+    engine: *mut Engine,
     verify: Verify,
     role: Role,
 }
 
 impl OsslSession {
     fn new(backend: &OsslBackend, role: Role, server_name: Option<&str>) -> Result<Self> {
+        Self::with_seam(backend, role, server_name, Seam::Helper)
+    }
+
+    fn with_seam(
+        backend: &OsslBackend,
+        role: Role,
+        server_name: Option<&str>,
+        seam: Seam,
+    ) -> Result<Self> {
         // SAFETY: the backend's context is valid and outlives this call; `SSL_new` takes
         // its own reference on it.
         let ssl = unsafe { sys::SSL_new(backend.ctx.0) };
@@ -1171,6 +1626,8 @@ impl OsslSession {
                 get_conn: None,
                 user_data: ptr::null_mut(),
             }),
+            _alpn_offers: backend.alpn_offers.clone(),
+            engine: ptr::null_mut(),
             verify: backend.verify,
             role,
         };
@@ -1183,19 +1640,54 @@ impl OsslSession {
         }
         session.ossl_ctx = ossl_ctx;
 
-        // SAFETY: `ssl` is valid; this installs the QUIC TLS dispatch table.
-        let rc = unsafe {
-            if role == Role::Server {
-                sys::ngtcp2_crypto_ossl_configure_server_session(session.ssl)
-            } else {
-                sys::ngtcp2_crypto_ossl_configure_client_session(session.ssl)
+        match seam {
+            Seam::Helper => {
+                // SAFETY: `ssl` is valid; this installs the helper's QUIC TLS dispatch.
+                let rc = unsafe {
+                    if role == Role::Server {
+                        sys::ngtcp2_crypto_ossl_configure_server_session(session.ssl)
+                    } else {
+                        sys::ngtcp2_crypto_ossl_configure_client_session(session.ssl)
+                    }
+                };
+                if rc != 0 {
+                    return Err(Error::native(
+                        rc,
+                        "could not configure the QUIC TLS session",
+                    ));
+                }
             }
-        };
-        if rc != 0 {
-            return Err(Error::native(
-                rc,
-                "could not configure the QUIC TLS session",
-            ));
+            Seam::Safe => {
+                // The engine is leaked out of its box on purpose: OpenSSL is about to be
+                // given this address, and `Drop` below is what reclaims it, after the
+                // `SSL` that holds it has been freed.
+                let engine = Box::into_raw(Box::new(Engine {
+                    events: std::collections::VecDeque::new(),
+                    inbound: Inbound::default(),
+                    local_params: None,
+                    suite: None,
+                    tx_level: Level::Initial,
+                    version: sys::NGTCP2_PROTO_VER_V1,
+                    ossl_ctx,
+                    failure: None,
+                    handshake_completed: false,
+                }));
+                session.engine = engine;
+
+                // SAFETY: `ssl` is valid, the dispatch table is `static` so it outlives the
+                // `SSL`, and the engine outlives it too because `Drop` frees the `SSL`
+                // first.
+                let rc = unsafe {
+                    sys::SSL_set_quic_tls_cbs(
+                        session.ssl,
+                        QUIC_TLS_DISPATCH.as_ptr(),
+                        engine.cast::<c_void>(),
+                    )
+                };
+                if rc != 1 {
+                    return Err(tls_error("SSL_set_quic_tls_cbs failed"));
+                }
+            }
         }
 
         // SAFETY: `ssl` is valid.
@@ -1320,6 +1812,18 @@ impl Drop for OsslSession {
             self.ossl_ctx = ptr::null_mut();
         }
 
+        // 4. And the engine last of all. It owns the inbound records OpenSSL was reading
+        //    through and the transport parameters it was sending, and `SSL_free` releases
+        //    both by calling back into it -- so freeing it any earlier would be the same
+        //    use-after-free the app-data dance above exists to prevent, arrived at from the
+        //    other direction.
+        if !self.engine.is_null() {
+            // SAFETY: the pointer came from `Box::into_raw`, is reclaimed exactly once, and
+            // the `SSL` that held it has been freed.
+            drop(unsafe { Box::from_raw(self.engine) });
+            self.engine = ptr::null_mut();
+        }
+
         // `conn_ref` is dropped last, by the compiler, after nothing can read it.
     }
 }
@@ -1404,6 +1908,240 @@ unsafe impl TlsSession for OsslSession {
             }
         }
         take_openssl_error()
+    }
+}
+
+impl OsslSession {
+    /// Reaches the engine, or fails for a session that was not built for the safe seam.
+    ///
+    /// Returns a raw pointer rather than a reference so that callers must open their own
+    /// short unsafe block for each access. That is deliberate friction: a reference handed
+    /// out here could be held across a call into OpenSSL, where a callback would form a
+    /// second one to the same object.
+    fn engine_ptr(&self) -> Result<*mut Engine> {
+        if self.engine.is_null() {
+            return Err(Error::backend("this session is not on the safe TLS seam"));
+        }
+        Ok(self.engine)
+    }
+
+    /// Runs OpenSSL as far as it will go, queuing whatever it produces on the way.
+    ///
+    /// # What "as far as it will go" means
+    ///
+    /// `SSL_do_handshake` reports `WANT_READ` or `WANT_WRITE` when it needs more input.
+    /// Neither is an error here: QUIC delivers handshake bytes a flight at a time, so
+    /// "not yet" is the normal answer to most calls.
+    ///
+    /// The `SSL_read` afterwards is not optional and not about application data — QUIC
+    /// carries none through TLS. It is what makes OpenSSL process **post-handshake**
+    /// messages: session tickets, and the `NewSessionTicket` a server sends after the
+    /// handshake completes. ngtcp2's helper does the same, for the same reason
+    /// (`ossl.c:993`), and omitting it produces a connection that completes and then
+    /// quietly ignores everything the peer says at the TLS layer.
+    fn drive(&mut self) -> Result<()> {
+        let engine = self.engine_ptr()?;
+        let ssl = self.ssl;
+
+        // SAFETY: reading a plain field through the pointer; no borrow is held across the
+        // OpenSSL calls below, which is what keeps the callbacks' `&mut` exclusive.
+        let completed = unsafe { (*engine).handshake_completed };
+
+        if !completed {
+            // SAFETY: `ssl` is valid. This re-enters this module through the dispatch
+            // table, which reaches the engine through the argument rather than through
+            // anything borrowed here.
+            let rv = unsafe { sys::SSL_do_handshake(ssl) };
+            if rv <= 0 {
+                // SAFETY: `ssl` is valid.
+                let err = unsafe { sys::SSL_get_error(ssl, rv) } as u32;
+                return match err {
+                    sys::SSL_ERROR_WANT_READ | sys::SSL_ERROR_WANT_WRITE => Ok(()),
+                    _ => Err(self.handshake_error("SSL_do_handshake failed")),
+                };
+            }
+            // SAFETY: as above; nothing else holds a reference.
+            unsafe {
+                (*engine).handshake_completed = true;
+                (*engine).events.push_back(SessionEvent::HandshakeComplete);
+            }
+        }
+
+        // SAFETY: `ssl` is valid. A null buffer of length zero asks OpenSSL to process
+        // whatever has arrived without returning any of it.
+        let rv = unsafe { sys::SSL_read(ssl, ptr::null_mut(), 0) };
+        if rv != 1 {
+            // SAFETY: `ssl` is valid.
+            let err = unsafe { sys::SSL_get_error(ssl, rv) } as u32;
+            return match err {
+                sys::SSL_ERROR_WANT_READ | sys::SSL_ERROR_WANT_WRITE => Ok(()),
+                _ => Err(self.handshake_error("SSL_read failed")),
+            };
+        }
+        Ok(())
+    }
+
+    /// Builds the error for a failed handshake.
+    ///
+    /// The reason a callback recorded is deliberately **left** in place rather than consumed
+    /// here: [`Error`] carries a `&'static str`, so a reason discovered at run time cannot
+    /// travel inside one. It reaches the caller through
+    /// [`Session::failure_reason`] instead, which is the same route certificate
+    /// verification failures already take.
+    fn handshake_error(&self, context: &'static str) -> Error {
+        tls_error(context)
+    }
+}
+
+impl Session for OsslSession {
+    type PacketKey = OsslPacketKey;
+    type HeaderKey = OsslHeaderKey;
+
+    fn initial_keys(
+        &mut self,
+        version: u32,
+        dcid: &[u8],
+    ) -> Result<InitialKeys<Self::PacketKey, Self::HeaderKey>> {
+        let engine = self.engine_ptr()?;
+        // Every later derivation uses this version's labels. ngtcp2 calls this again after a
+        // Retry and again if a version is negotiated, so the last call is authoritative --
+        // which is exactly the sequence ngtcp2 itself follows.
+        // SAFETY: the pointer is live and no callback can be running.
+        unsafe { (*engine).version = version };
+        derive_initial_keys(self.role, version, dcid)
+    }
+
+    fn retry_key(&mut self, version: u32) -> Result<Self::PacketKey> {
+        derive_retry_key(version)
+    }
+
+    fn set_local_transport_params(&mut self, params: &[u8]) -> Result<()> {
+        let engine = self.engine_ptr()?;
+        // SAFETY: the pointer is live and no callback can be running.
+        let stored = unsafe {
+            if (*engine).local_params.is_some() {
+                return Err(Error::backend(
+                    "the local transport parameters were already set",
+                ));
+            }
+            (*engine).local_params = Some(params.to_vec());
+            let stored = (*engine).local_params.as_ref().expect("just set");
+            (stored.as_ptr(), stored.len())
+        };
+
+        // OpenSSL does **not** copy: it keeps the pointer until it writes the extension.
+        // The buffer it is given lives in the engine, which outlives the `SSL`.
+        // SAFETY: `ssl` is valid and the buffer stays at this address until the session is
+        // dropped, which happens after `SSL_free`.
+        let rc = unsafe { sys::SSL_set_quic_tls_transport_params(self.ssl, stored.0, stored.1) };
+        if rc != 1 {
+            return Err(tls_error("SSL_set_quic_tls_transport_params failed"));
+        }
+        Ok(())
+    }
+
+    fn start_handshake(&mut self) -> Result<()> {
+        self.drive()
+    }
+
+    fn read_handshake(&mut self, _level: Level, data: &[u8]) -> Result<()> {
+        let engine = self.engine_ptr()?;
+        // The level is not passed on. OpenSSL's record layer infers it from the keys it has
+        // installed, and ngtcp2 already refuses handshake data at a level whose keys are not
+        // in place -- so a second, independent notion of the level here could only disagree
+        // with those two.
+        // SAFETY: the pointer is live and no callback can be running.
+        unsafe { (*engine).inbound.push(data) };
+        self.drive()
+    }
+
+    fn poll_event(&mut self) -> Option<SessionEvent<Self::PacketKey, Self::HeaderKey>> {
+        if self.engine.is_null() {
+            return None;
+        }
+        // SAFETY: the pointer is live and no callback can be running.
+        unsafe { (*self.engine).events.pop_front() }
+    }
+
+    fn rotate_keys(
+        &mut self,
+        rx_secret: &[u8],
+        tx_secret: &[u8],
+    ) -> Result<RotatedKeys<Self::PacketKey>> {
+        let engine = self.engine_ptr()?;
+        // SAFETY: the pointer is live and no callback can be running.
+        let (suite, version) = unsafe { ((*engine).suite, (*engine).version) };
+        let suite = suite.ok_or_else(|| {
+            Error::backend("the keys cannot be rotated before a cipher suite is negotiated")
+        })?;
+
+        let next_rx = update_traffic_secret(&suite, version, rx_secret)?;
+        let next_tx = update_traffic_secret(&suite, version, tx_secret)?;
+
+        // Header protection keys are not rotated by a key update, so only the payload keys
+        // are derived here -- which is why the returned type has no place to put them.
+        let rx = derive_rx_keys(&suite, version, &next_rx)?;
+        let tx = derive_keys(&suite, version, &next_tx)?;
+
+        Ok(RotatedKeys {
+            rx_packet: rx.packet,
+            rx_iv: rx.iv,
+            rx_secret: next_rx,
+            tx_packet: tx.packet,
+            tx_iv: tx.iv,
+            tx_secret: next_tx,
+        })
+    }
+
+    fn negotiated_alpn(&self) -> Option<Vec<u8>> {
+        TlsSession::negotiated_alpn(self)
+    }
+
+    fn failure_reason(&self) -> Option<String> {
+        if !self.engine.is_null() {
+            // SAFETY: the pointer is live and no callback can be running.
+            if let Some(reason) = unsafe { (*self.engine).failure.clone() } {
+                return Some(reason);
+            }
+        }
+        TlsSession::failure_reason(self)
+    }
+}
+
+/// Advances a traffic secret to the next generation.
+///
+/// One `hkdf_expand_label` with the `quic ku` label — or `quicv2 ku` for version 2, which
+/// the helper selects from the version rather than this crate choosing it (`shared.c`'s
+/// `ngtcp2_crypto_update_traffic_secret`).
+fn update_traffic_secret(suite: &Suite, version: u32, secret: &[u8]) -> Result<Vec<u8>> {
+    let mut next = vec![0u8; secret.len()];
+    // SAFETY: the destination is the same length as the source, which is what the helper
+    // writes, and the digest descriptor is live.
+    let rv = unsafe {
+        sys::ngtcp2_crypto_update_traffic_secret(
+            next.as_mut_ptr(),
+            version,
+            &raw const suite.md,
+            secret.as_ptr(),
+            secret.len(),
+        )
+    };
+    if rv != 0 {
+        return Err(Error::backend("could not update the traffic secret"));
+    }
+    Ok(next)
+}
+
+impl Backend for OsslBackend {
+    type Session = OsslSession;
+
+    fn new_session(&self, role: Role, server_name: Option<&str>) -> Result<Self::Session> {
+        if role != self.role {
+            return Err(Error::invalid_input(
+                "the session role does not match the backend's role",
+            ));
+        }
+        OsslSession::with_seam(self, role, server_name, Seam::Safe)
     }
 }
 
@@ -1773,6 +2511,414 @@ mod tests {
     }
 
     #[test]
+    fn two_sessions_complete_a_handshake_without_a_connection() {
+        // The claim that matters for this phase: the backend drives a real TLS 1.3
+        // handshake, at every level, entirely through the safe seam -- no `ngtcp2_conn`
+        // exists here at all. If the seam were missing anything the handshake needs, this
+        // could not complete.
+        let mut client = Handshake::new(Role::Client);
+        let mut server = Handshake::new(Role::Server);
+
+        client
+            .session
+            .set_local_transport_params(b"client")
+            .unwrap();
+        server
+            .session
+            .set_local_transport_params(b"server")
+            .unwrap();
+        client.session.start_handshake().unwrap();
+        client.drain();
+
+        for _ in 0..8 {
+            let flight = core::mem::take(&mut client.outbound);
+            for (level, data) in flight {
+                server.session.read_handshake(level, &data).unwrap();
+                server.drain();
+            }
+            let flight = core::mem::take(&mut server.outbound);
+            for (level, data) in flight {
+                client.session.read_handshake(level, &data).unwrap();
+                client.drain();
+            }
+            if client.completed && server.completed {
+                break;
+            }
+        }
+
+        assert!(client.completed, "the client handshake did not complete");
+        assert!(server.completed, "the server handshake did not complete");
+
+        // Each side received the other's transport parameters, exactly as given.
+        assert_eq!(client.peer_params.as_deref(), Some(&b"server"[..]));
+        assert_eq!(server.peer_params.as_deref(), Some(&b"client"[..]));
+
+        // And ALPN was negotiated, which only happens if the extension actually travelled.
+        assert_eq!(
+            Session::negotiated_alpn(&client.session).as_deref(),
+            Some(&b"h3"[..])
+        );
+    }
+
+    #[test]
+    fn the_two_sides_agree_on_every_level_of_keys() {
+        // Not merely "it completed": what each side encrypts with at each level is what the
+        // other decrypts with. A handshake can complete with a key schedule that is wrong in
+        // a way only the peer would notice, which is the failure this rules out.
+        let (client, server) = completed_handshake();
+
+        for level in [Level::Handshake, Level::OneRtt] {
+            let (tx, tx_iv) = client.key(level, Direction::Write).expect("client tx");
+            let (rx, rx_iv) = server.key(level, Direction::Read).expect("server rx");
+            assert_eq!(tx_iv, rx_iv, "the {level:?} initialisation vectors differ");
+
+            let plaintext = b"a payload at this level";
+            let mut buf = vec![0u8; plaintext.len() + tx.tag_len()];
+            buf[..plaintext.len()].copy_from_slice(plaintext);
+            tx.seal(&mut buf, plaintext.len(), tx_iv, b"aad").unwrap();
+            let len = buf.len();
+            let recovered = rx.open(&mut buf, len, rx_iv, b"aad").unwrap();
+            assert_eq!(&buf[..recovered], &plaintext[..]);
+        }
+    }
+
+    #[test]
+    fn the_negotiated_suite_carries_real_usage_limits() {
+        // Left at zero -- which is what they are until `ctx_tls` fills them -- the first
+        // failed decryption closes the connection and every packet forces a key update.
+        // Neither shows up in a loopback test, which is why this is asserted directly.
+        let (client, _) = completed_handshake();
+        let (key, _) = client.key(Level::OneRtt, Direction::Write).expect("key");
+        assert!(key.confidentiality_limit() > 0);
+        assert!(key.integrity_limit() > 0);
+    }
+
+    #[test]
+    fn the_application_keys_rotate_and_still_agree() {
+        // Post-handshake key update. Both sides advance from the secrets they hold, and the
+        // new keys must still match each other -- a rotation that produced two different
+        // generations would break the connection long after it appeared to work.
+        let (mut client, mut server) = completed_handshake();
+
+        let client_rx = client.secret(Level::OneRtt, Direction::Read).to_vec();
+        let client_tx = client.secret(Level::OneRtt, Direction::Write).to_vec();
+        let server_rx = server.secret(Level::OneRtt, Direction::Read).to_vec();
+        let server_tx = server.secret(Level::OneRtt, Direction::Write).to_vec();
+
+        let client_next = client.session.rotate_keys(&client_rx, &client_tx).unwrap();
+        let server_next = server.session.rotate_keys(&server_rx, &server_tx).unwrap();
+
+        assert_eq!(client_next.tx_iv, server_next.rx_iv);
+        assert_ne!(client_next.tx_secret, client_tx);
+
+        let plaintext = b"after the key update";
+        let mut buf = vec![0u8; plaintext.len() + client_next.tx_packet.tag_len()];
+        buf[..plaintext.len()].copy_from_slice(plaintext);
+        client_next
+            .tx_packet
+            .seal(&mut buf, plaintext.len(), &client_next.tx_iv, b"aad")
+            .unwrap();
+        let len = buf.len();
+        let recovered = server_next
+            .rx_packet
+            .open(&mut buf, len, &server_next.rx_iv, b"aad")
+            .unwrap();
+        assert_eq!(&buf[..recovered], &plaintext[..]);
+    }
+
+    #[test]
+    fn a_session_that_never_handshook_can_be_dropped() {
+        // The engine is reachable from OpenSSL from the moment it is installed, so its
+        // teardown has to be sound before anything has used it.
+        let backend = safe_client_backend();
+        let session = Backend::new_session(&backend, Role::Client, Some("example.com")).unwrap();
+        drop(session);
+    }
+
+    #[test]
+    fn the_local_transport_parameters_can_only_be_set_once() {
+        // OpenSSL keeps the pointer it is given until it writes the extension. Replacing the
+        // buffer would leave it reading a freed one, so a second call is refused rather than
+        // quietly reallocating.
+        let backend = safe_client_backend();
+        let mut session =
+            Backend::new_session(&backend, Role::Client, Some("example.com")).unwrap();
+        session.set_local_transport_params(b"first").unwrap();
+        assert!(session.set_local_transport_params(b"second").is_err());
+    }
+
+    #[test]
+    fn a_helper_session_reports_that_it_is_not_on_the_safe_seam() {
+        // The two seams cannot share one session, because the second `SSL_set_quic_tls_cbs`
+        // replaces the first. Asking a helper-backed session for safe-seam behaviour fails
+        // loudly rather than silently doing nothing.
+        let backend = safe_client_backend();
+        let mut session =
+            TlsBackend::new_session(&backend, Role::Client, Some("example.com")).unwrap();
+        assert!(session.set_local_transport_params(b"x").is_err());
+        assert!(session.start_handshake().is_err());
+        assert!(Session::poll_event(&mut session).is_none());
+    }
+
+    /// A backend a safe-seam client session can be made from.
+    fn safe_client_backend() -> OsslBackend {
+        OsslBackend::builder(Role::Client)
+            .alpn("h3")
+            .verify(Verify::DangerouslyAcceptAnyCertificate)
+            .build()
+            .unwrap()
+    }
+
+    /// One key the seam reported, with everything it was reported alongside.
+    struct ReportedKeys {
+        level: Level,
+        direction: Direction,
+        keys: DirectionalKeys<OsslPacketKey, OsslHeaderKey>,
+        secret: Vec<u8>,
+    }
+
+    /// One side of a handshake, plus everything the seam reported to it.
+    struct Handshake {
+        session: OsslSession,
+        outbound: Vec<(Level, Vec<u8>)>,
+        /// Every level anything was ever sent at, which `outbound` loses as it is drained.
+        sent: Vec<Level>,
+        keys: Vec<ReportedKeys>,
+        peer_params: Option<Vec<u8>>,
+        completed: bool,
+    }
+
+    impl Handshake {
+        fn new(role: Role) -> Self {
+            let backend = match role {
+                Role::Client => safe_client_backend(),
+                Role::Server => OsslBackend::builder(Role::Server)
+                    .alpn("h3")
+                    .certificate_chain_pem(crate::conn::test_support::CERT)
+                    .private_key_pem(crate::conn::test_support::KEY)
+                    .build()
+                    .unwrap(),
+            };
+            let server_name = (role == Role::Client).then_some("example.com");
+            let session = Backend::new_session(&backend, role, server_name).unwrap();
+            Self {
+                session,
+                outbound: Vec::new(),
+                sent: Vec::new(),
+                keys: Vec::new(),
+                peer_params: None,
+                completed: false,
+            }
+        }
+
+        /// Drains everything the session has to report, recording it in order.
+        fn drain(&mut self) {
+            while let Some(event) = self.session.poll_event() {
+                match event {
+                    SessionEvent::Handshake { level, data } => {
+                        self.sent.push(level);
+                        self.outbound.push((level, data));
+                    }
+                    SessionEvent::Keys {
+                        level,
+                        direction,
+                        keys,
+                        secret,
+                    } => self.keys.push(ReportedKeys {
+                        level,
+                        direction,
+                        keys,
+                        secret,
+                    }),
+                    SessionEvent::PeerTransportParams(params) => self.peer_params = Some(params),
+                    SessionEvent::HandshakeComplete => self.completed = true,
+                    SessionEvent::Alert(code) => panic!("unexpected TLS alert {code}"),
+                }
+            }
+        }
+
+        fn key(&self, level: Level, direction: Direction) -> Option<(&OsslPacketKey, &[u8])> {
+            self.keys
+                .iter()
+                .find(|k| k.level == level && k.direction == direction)
+                .map(|k| (&k.keys.packet, k.keys.iv.as_slice()))
+        }
+
+        fn secret(&self, level: Level, direction: Direction) -> &[u8] {
+            self.keys
+                .iter()
+                .find(|k| k.level == level && k.direction == direction)
+                .map(|k| k.secret.as_slice())
+                .expect("no secret at that level")
+        }
+    }
+
+    /// Runs a handshake to completion and hands back both sides.
+    fn completed_handshake() -> (Handshake, Handshake) {
+        let mut client = Handshake::new(Role::Client);
+        let mut server = Handshake::new(Role::Server);
+        client
+            .session
+            .set_local_transport_params(b"client")
+            .unwrap();
+        server
+            .session
+            .set_local_transport_params(b"server")
+            .unwrap();
+        client.session.start_handshake().unwrap();
+        client.drain();
+
+        for _ in 0..8 {
+            for (level, data) in core::mem::take(&mut client.outbound) {
+                server.session.read_handshake(level, &data).unwrap();
+                server.drain();
+            }
+            for (level, data) in core::mem::take(&mut server.outbound) {
+                client.session.read_handshake(level, &data).unwrap();
+                client.drain();
+            }
+            if client.completed && server.completed {
+                break;
+            }
+        }
+        assert!(client.completed && server.completed, "handshake stalled");
+        (client, server)
+    }
+
+    #[test]
+    fn a_server_backend_can_be_dropped_before_its_sessions() {
+        // A regression test for a use-after-free that was reachable from entirely safe code.
+        // `SSL_new` takes a reference on the context, so a session outlives a dropped
+        // backend -- and on a *server* the context carries an ALPN selection callback whose
+        // argument pointed into the backend. Running a handshake is what makes the callback
+        // actually fire; merely creating and dropping the session did not, which is why the
+        // existing client-side test never caught it.
+        let backend = OsslBackend::builder(Role::Server)
+            .alpn("h3")
+            .certificate_chain_pem(crate::conn::test_support::CERT)
+            .private_key_pem(crate::conn::test_support::KEY)
+            .build()
+            .unwrap();
+        let mut server = Backend::new_session(&backend, Role::Server, None).unwrap();
+        drop(backend);
+
+        let mut client = Handshake::new(Role::Client);
+        Session::set_local_transport_params(&mut server, b"server").unwrap();
+        client
+            .session
+            .set_local_transport_params(b"client")
+            .unwrap();
+        client.session.start_handshake().unwrap();
+        client.drain();
+
+        for (level, data) in core::mem::take(&mut client.outbound) {
+            server.read_handshake(level, &data).unwrap();
+        }
+        // Reaching here at all is the assertion: selecting ALPN dereferences the offer list.
+        assert!(server.poll_event().is_some());
+    }
+
+    #[test]
+    fn post_handshake_messages_are_processed() {
+        // The `SSL_read` in `drive` is what makes OpenSSL process messages that arrive
+        // *after* the handshake completes -- the session tickets a server sends. Omitting it
+        // leaves a connection that looks perfectly complete and is quietly deaf at the TLS
+        // layer, which no "did the handshake finish" assertion would notice.
+        //
+        // What does notice is the record queue. OpenSSL releases inbound bytes only once it
+        // has consumed them, so a client that never processes the tickets never releases
+        // them. Deleting the `SSL_read` leaves two records outstanding here instead of none,
+        // which is how this test was checked rather than assumed.
+        let (client, server) = completed_handshake();
+
+        assert!(
+            server.sent.contains(&Level::OneRtt),
+            "the server sent nothing at the application level after the handshake completed"
+        );
+        // SAFETY: the engine is live for as long as the session, and no callback is running.
+        let outstanding = unsafe { (*client.session.engine).inbound.records.len() };
+        assert_eq!(
+            outstanding, 0,
+            "the client did not process what arrived after the handshake"
+        );
+    }
+
+    #[test]
+    fn an_inbound_record_survives_until_it_is_wholly_released() {
+        // OpenSSL keeps the pointer `recv_rcd` handed it until the matching `release_rcd`,
+        // which may be several calls later. Freeing the record when it was merely *read*
+        // would leave OpenSSL parsing freed memory -- and it would look like a corrupt
+        // handshake rather than a lifetime bug, which is exactly why this is pinned by
+        // address rather than by "it did not crash".
+        let mut inbound = Inbound::default();
+        inbound.push(b"first record");
+        inbound.push(b"second");
+
+        let (first, first_len) = inbound.next_span();
+        assert_eq!(first_len, 12);
+        let (second, second_len) = inbound.next_span();
+        assert_eq!(second_len, 6);
+
+        // Read to exhaustion, released not at all: both must still be where they were.
+        assert_eq!(inbound.next_span(), (ptr::null(), 0));
+        assert_eq!(inbound.records.len(), 2);
+        assert_eq!(inbound.records[0].data.as_ptr(), first);
+        assert_eq!(inbound.records[1].data.as_ptr(), second);
+
+        // A partial release keeps the record alive; the address must not move.
+        inbound.release(5);
+        assert_eq!(inbound.records.len(), 2);
+        assert_eq!(inbound.records[0].data.as_ptr(), first);
+
+        // Only the whole of it frees it, and the one behind it is untouched.
+        inbound.release(7);
+        assert_eq!(inbound.records.len(), 1);
+        assert_eq!(inbound.records[0].data.as_ptr(), second);
+
+        inbound.release(6);
+        assert!(inbound.records.is_empty());
+        // Releasing more than was ever queued is not a panic: OpenSSL counts bytes, and a
+        // saturating answer is better than an arithmetic one on a hostile connection.
+        inbound.release(100);
+    }
+
+    #[test]
+    fn the_local_transport_parameters_are_owned_rather_than_borrowed() {
+        // `SSL_set_quic_tls_transport_params` does **not** copy: OpenSSL keeps the pointer
+        // until it writes the extension, which is one whole flight later. Handing it the
+        // caller's slice would mean whatever the caller did to that buffer in between is
+        // what the peer receives.
+        //
+        // So the caller's buffer is overwritten in place -- same allocation, different
+        // contents, no freed memory and therefore no undefined behaviour to muddy the
+        // result. If the engine did not own a copy, the server below would receive the
+        // overwritten bytes. It receives the original ones.
+        let mut client = Handshake::new(Role::Client);
+        let mut server = Handshake::new(Role::Server);
+
+        let mut params = b"the original parameters".to_vec();
+        client.session.set_local_transport_params(&params).unwrap();
+        params.fill(0xff);
+
+        server
+            .session
+            .set_local_transport_params(b"server")
+            .unwrap();
+        client.session.start_handshake().unwrap();
+        client.drain();
+        for (level, data) in core::mem::take(&mut client.outbound) {
+            server.session.read_handshake(level, &data).unwrap();
+            server.drain();
+        }
+
+        assert_eq!(
+            server.peer_params.as_deref(),
+            Some(&b"the original parameters"[..]),
+            "the peer received what the caller's buffer became, not what it was"
+        );
+    }
+
+    #[test]
     fn alpn_encodes_with_length_prefixes() {
         let encoded = encode_alpn(&[b"h3".to_vec(), b"hq".to_vec()]).unwrap();
         assert_eq!(encoded, vec![2, b'h', b'3', 2, b'h', b'q']);
@@ -1821,12 +2967,8 @@ mod tests {
             .alpn("h3")
             .build()
             .unwrap();
-        assert!(backend.new_session(Role::Client, None).is_err());
-        assert!(
-            backend
-                .new_session(Role::Client, Some("example.com"))
-                .is_ok()
-        );
+        assert!(TlsBackend::new_session(&backend, Role::Client, None).is_err());
+        assert!(TlsBackend::new_session(&backend, Role::Client, Some("example.com")).is_ok());
     }
 
     #[test]
@@ -1836,7 +2978,7 @@ mod tests {
             .verify(Verify::DangerouslyAcceptAnyCertificate)
             .build()
             .unwrap();
-        assert!(backend.new_session(Role::Client, None).is_ok());
+        assert!(TlsBackend::new_session(&backend, Role::Client, None).is_ok());
     }
 
     #[test]
@@ -1848,7 +2990,7 @@ mod tests {
             .verify(Verify::DangerouslyAcceptAnyCertificate)
             .build()
             .unwrap();
-        let session = backend.new_session(Role::Client, None).unwrap();
+        let session = TlsBackend::new_session(&backend, Role::Client, None).unwrap();
         assert_eq!(session.native_handle().as_ptr(), session.ossl_ctx.cast());
         assert_ne!(session.native_handle().as_ptr(), session.ssl.cast());
     }
@@ -1859,7 +3001,7 @@ mod tests {
             .alpn("h3")
             .build()
             .unwrap();
-        assert!(backend.new_session(Role::Server, None).is_err());
+        assert!(TlsBackend::new_session(&backend, Role::Server, None).is_err());
     }
 
     #[test]
@@ -1871,7 +3013,7 @@ mod tests {
             .build()
             .unwrap();
         for _ in 0..16 {
-            drop(backend.new_session(Role::Client, None).unwrap());
+            drop(TlsBackend::new_session(&backend, Role::Client, None).unwrap());
         }
     }
 
@@ -1884,7 +3026,7 @@ mod tests {
             .verify(Verify::DangerouslyAcceptAnyCertificate)
             .build()
             .unwrap();
-        let mut session = backend.new_session(Role::Client, None).unwrap();
+        let mut session = TlsBackend::new_session(&backend, Role::Client, None).unwrap();
         // SAFETY: `None` for `get_conn` is never called, and the user data is null, so
         // nothing is dereferenced. This exercises the ordering, not the callback.
         unsafe { session.bind_conn_ref(None, ptr::null_mut()) };
@@ -1901,7 +3043,7 @@ mod tests {
             .verify(Verify::DangerouslyAcceptAnyCertificate)
             .build()
             .unwrap();
-        let session = backend.new_session(Role::Client, None).unwrap();
+        let session = TlsBackend::new_session(&backend, Role::Client, None).unwrap();
         drop(backend);
         drop(session);
     }

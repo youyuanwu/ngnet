@@ -16,9 +16,9 @@ use ngnet_quic::{
     ApplicationErrorCode, Backend, ConnBuilder, ConnectionId, CryptoError, Direction,
     DirectionalKeys, Directionality, Duration, EntropySource, Error, ErrorKind, ExpiryOutcome,
     HP_MASK_LEN, HP_SAMPLE_LEN, Handlers, HeaderKey, InitialKeys, Initiator, Inspection, Level,
-    NativeCode, NativeTlsHandle, PacketKey, ReadOutcome, Result, Role, Session, SessionEvent,
-    Settings, StreamCloseReason, StreamId, StreamWrite, Timestamp, TlsBackend, TlsSession,
-    TransportErrorCode, TransportParams, WriteOutcome,
+    NativeCode, NativeTlsHandle, PacketKey, ReadOutcome, Result, Role, RotatedKeys, Session,
+    SessionEvent, Settings, StreamCloseReason, StreamId, StreamWrite, Timestamp, TlsBackend,
+    TlsSession, TransportErrorCode, TransportParams, WriteOutcome,
 };
 
 #[test]
@@ -360,7 +360,7 @@ fn the_public_surface_still_has_the_shape_it_promised() {
         let _: Result<()> = s.start_handshake();
         let _: Result<()> = s.read_handshake(Level::Initial, &[]);
         let _: Option<SessionEvent<S::PacketKey, S::HeaderKey>> = s.poll_event();
-        let _: Result<InitialKeys<S::PacketKey, S::HeaderKey>> = s.rotate_keys(&[], &[]);
+        let _: Result<RotatedKeys<S::PacketKey>> = s.rotate_keys(&[], &[]);
         let _: Option<Vec<u8>> = s.negotiated_alpn();
         let _: Option<String> = s.failure_reason();
     }
@@ -559,7 +559,9 @@ fn the_openssl_backend_surface_still_has_the_shape_it_promised() {
     let _ = on_verify;
 
     fn takes_ossl_session(s: &OsslSession) -> Option<Vec<u8>> {
-        s.negotiated_alpn()
+        // Named through the trait: the type now implements both seams, and the safe one is
+        // what a caller should be reaching for.
+        Session::negotiated_alpn(s)
     }
     let _ = takes_ossl_session;
 }
@@ -652,7 +654,7 @@ impl Session for DummySafeSession {
         &mut self,
         _rx_secret: &[u8],
         _tx_secret: &[u8],
-    ) -> Result<InitialKeys<Self::PacketKey, Self::HeaderKey>> {
+    ) -> Result<RotatedKeys<Self::PacketKey>> {
         Err(Error::backend("stand-in"))
     }
 

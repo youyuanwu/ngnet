@@ -667,30 +667,25 @@ unsafe extern "C" fn update_key<S: Session>(
     };
 
     // A key update rotates payload protection only; header protection keys stay as they
-    // were, which is why nothing here touches them.
+    // were, which is why the returned type has no place for them.
     // SAFETY: ngtcp2 provides buffers of `secretlen` and of the IV length it expects.
     unsafe {
-        core::ptr::copy_nonoverlapping(next.rx.iv.as_ptr(), rx_iv, next.rx.iv.len());
-        core::ptr::copy_nonoverlapping(next.tx.iv.as_ptr(), tx_iv, next.tx.iv.len());
-        *rx_aead_ctx = box_packet_key(next.rx.packet);
-        *tx_aead_ctx = box_packet_key(next.tx.packet);
+        core::ptr::copy_nonoverlapping(next.rx_iv.as_ptr(), rx_iv, next.rx_iv.len());
+        core::ptr::copy_nonoverlapping(next.tx_iv.as_ptr(), tx_iv, next.tx_iv.len());
+        *rx_aead_ctx = box_packet_key(next.rx_packet);
+        *tx_aead_ctx = box_packet_key(next.tx_packet);
     }
 
     // The new secrets are what the *next* rotation starts from, so they have to be handed
-    // back rather than kept.
-    match session.poll_event() {
-        Some(SessionEvent::Keys { secret: rx, .. }) => {
-            // SAFETY: the buffer is `secretlen` long.
-            unsafe { core::ptr::copy_nonoverlapping(rx.as_ptr(), rx_secret, secretlen) };
-        }
-        _ => return sys::NGTCP2_ERR_CALLBACK_FAILURE,
+    // back rather than kept. ngtcp2 sizes both buffers at `secretlen`, so a secret of any
+    // other length would write past them.
+    if next.rx_secret.len() != secretlen || next.tx_secret.len() != secretlen {
+        return sys::NGTCP2_ERR_CALLBACK_FAILURE;
     }
-    match session.poll_event() {
-        Some(SessionEvent::Keys { secret: tx, .. }) => {
-            // SAFETY: the buffer is `secretlen` long.
-            unsafe { core::ptr::copy_nonoverlapping(tx.as_ptr(), tx_secret, secretlen) };
-        }
-        _ => return sys::NGTCP2_ERR_CALLBACK_FAILURE,
+    // SAFETY: both buffers are `secretlen` long, as just checked.
+    unsafe {
+        core::ptr::copy_nonoverlapping(next.rx_secret.as_ptr(), rx_secret, secretlen);
+        core::ptr::copy_nonoverlapping(next.tx_secret.as_ptr(), tx_secret, secretlen);
     }
     0
 }

@@ -333,6 +333,33 @@ pub struct InitialKeys<P, H> {
     pub tx: DirectionalKeys<P, H>,
 }
 
+/// The next generation of application keys, produced by a key update.
+///
+/// A separate type from [`InitialKeys`], and deliberately narrower, because a key update is
+/// a narrower operation than deriving a level's keys: it rotates payload protection only.
+/// Header protection keys are **not** rotated (`shared.c:1049-1063` passes a null header key
+/// to the derivation), so offering a place to put them would invite a backend to derive keys
+/// that are then silently discarded.
+///
+/// The new traffic secrets are returned alongside the keys because ngtcp2 keeps them and
+/// hands them back as the input to the *next* rotation. A backend that returns keys without
+/// secrets has produced a connection that can rotate exactly once.
+#[derive(Debug)]
+pub struct RotatedKeys<P> {
+    /// The new key for decrypting the peer.
+    pub rx_packet: P,
+    /// Its initialisation vector.
+    pub rx_iv: Vec<u8>,
+    /// The secret the generation after next is derived from.
+    pub rx_secret: Vec<u8>,
+    /// The new key for encrypting to the peer.
+    pub tx_packet: P,
+    /// Its initialisation vector.
+    pub tx_iv: Vec<u8>,
+    /// The secret the generation after next is derived from.
+    pub tx_secret: Vec<u8>,
+}
+
 /// Everything a session tells the connection about, in the order it happened.
 ///
 /// A single ordered stream rather than a set of accessors, because order is load-bearing and
@@ -431,13 +458,14 @@ pub trait Session: Send + 'static {
 
     /// Rotates the application keys, given the secrets currently in use.
     ///
-    /// Returns the next generation for both directions. Only the session can do this: it
-    /// alone knows which hash the negotiated cipher suite uses.
+    /// Returns the next generation for both directions, with the secrets the generation
+    /// after that will be derived from. Only the session can do this: it alone knows which
+    /// hash the negotiated cipher suite uses.
     fn rotate_keys(
         &mut self,
         rx_secret: &[u8],
         tx_secret: &[u8],
-    ) -> Result<InitialKeys<Self::PacketKey, Self::HeaderKey>>;
+    ) -> Result<RotatedKeys<Self::PacketKey>>;
 
     /// The application protocol the handshake agreed on, once it has one.
     fn negotiated_alpn(&self) -> Option<Vec<u8>>;

@@ -131,8 +131,8 @@ pub use stream_io::StreamWrite;
 pub use time::{Duration, Timestamp};
 pub use tls::{
     Backend, CryptoError, Direction, DirectionalKeys, HP_MASK_LEN, HP_SAMPLE_LEN, HeaderKey,
-    InitialKeys, Level, NativeTlsHandle, PacketKey, Role, Session, SessionEvent, TlsBackend,
-    TlsSession,
+    InitialKeys, Level, NativeTlsHandle, PacketKey, Role, RotatedKeys, Session, SessionEvent,
+    TlsBackend, TlsSession,
 };
 
 #[cfg(feature = "tls-ossl")]
