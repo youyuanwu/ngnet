@@ -14,6 +14,7 @@
 mod support;
 
 use std::future::IntoFuture;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::Extension;
@@ -206,17 +207,59 @@ async fn a_failure_reports_a_peer_address_that_is_not_a_socket_address() {
     let _ = within("the server to drain", server).await;
 }
 
-/// SC-020: a listener whose source has gone away does not yield and does not block shutdown.
+/// The pacing period this crate applies to a systemic accept failure.
 ///
-/// The channel is closed immediately, so the acceptor fails on every call with a
-/// non-transient error and the retry wrapper paces it. A server that treated a listener's
-/// permanent failure as a reason to spin, or that could not be stopped while a listener was
-/// mid-backoff, would show up here.
+/// Crate-private in the source, so it is written out here. The test below only needs it to be
+/// long enough that a stop signal sent well inside it is unambiguously *inside* it.
+const BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How far into the backoff the stop signal is sent, leaving 800ms of it still to run.
+const INTO_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The longest a *correct* stop may take, chosen to sit between the two outcomes.
+///
+/// Interrupting the backoff costs approximately nothing; waiting out what is left of it costs
+/// about 800ms. Anything under 400ms cannot be the second. Asserting merely `< BACKOFF` would
+/// not separate them at all -- 800ms is under a second -- which is the kind of threshold that
+/// looks like a bound and is not one.
+const PROMPTLY: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// A listener that can never accept, and paces its retries the way the docs tell it to.
+///
+/// **Bounded in the strongest possible way: it never yields a connection at all**, so the
+/// server's uncapped accept loop has nothing to spawn no matter how long it runs.
+///
+/// It sleeps rather than parking, which is the whole point of it. A listener that parks is
+/// trivially interruptible; a listener asleep inside a one-second backoff is the case where a
+/// server that awaited the sleep in an arm *body*, or that ranked accept ahead of stop, would
+/// make its caller wait the second out.
+struct AlwaysFailing(Arc<AtomicUsize>);
+
+impl Listener for AlwaysFailing {
+    type Io = TokioIo<DuplexStream>;
+    type Addr = PipeId;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(BACKOFF).await;
+        }
+    }
+}
+
+/// SC-019, SC-020: a listener that cannot accept neither spins nor blocks shutdown.
+///
+/// Two properties, one setup. The listener fails systemically forever and paces itself by a
+/// full second, so a server that treated permanent failure as a reason to spin would show a
+/// large attempt count; and the stop signal is sent 200ms in, while the listener is
+/// **certainly** inside that sleep rather than parked at an await that happens to be
+/// cancellable. The attempt count is asserted rather than assumed, because "the listener was
+/// mid-backoff when the stop arrived" is precisely the premise that made the earlier version
+/// of this test vacuous -- it used a listener that never slept at all.
 #[tokio::test]
-async fn a_listener_whose_source_is_gone_neither_yields_nor_blocks_shutdown() {
-    let (clients, incoming) = mpsc::channel::<DuplexStream>(1);
-    drop(clients);
-    let listener = DuplexAcceptor { incoming, next: 0 };
+async fn a_listener_that_cannot_accept_neither_spins_nor_blocks_shutdown() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let listener = AlwaysFailing(Arc::clone(&attempts));
 
     let (stop, stopped) = oneshot::channel();
     let server = tokio::spawn(
@@ -227,10 +270,19 @@ async fn a_listener_whose_source_is_gone_neither_yields_nor_blocks_shutdown() {
             .into_future(),
     );
 
-    // Long enough that the listener is certainly inside a backoff sleep when the stop
-    // arrives -- which is SC-019: the stop is honoured without waiting the backoff out.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Long enough to be well inside the first backoff, short enough to be nowhere near its
+    // end. One attempt made, and the listener asleep for the remaining ~800ms.
+    tokio::time::sleep(INTO_BACKOFF).await;
 
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "SC-020: a listener failing systemically must be paced, not spun on -- and this test \
+         is only about SC-019 at all if exactly one attempt has been made, because that is \
+         what puts the listener asleep rather than between sleeps when the stop arrives"
+    );
+
+    let sent = std::time::Instant::now();
     let _ = stop.send(());
     within(
         "a server on a dead listener to stop promptly rather than waiting out its backoff",
@@ -238,6 +290,22 @@ async fn a_listener_whose_source_is_gone_neither_yields_nor_blocks_shutdown() {
     )
     .await
     .expect("the server task to finish");
+
+    assert!(
+        sent.elapsed() < PROMPTLY,
+        "SC-019: the stop must interrupt the listener's backoff rather than wait it out, but \
+         stopping took {:?} against a {BACKOFF:?} backoff entered {INTO_BACKOFF:?} earlier -- \
+         so about 800ms of it was still to run, and this is what waiting it out looks like. \
+         A server that awaited the sleep in a select! arm *body*, or that did not drop the \
+         accept future on stop, lands here",
+        sent.elapsed()
+    );
+
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "the listener should not have been asked again after the stop signal"
+    );
 }
 
 /// SC-012, SC-018: the shipped Unix listener serves, exposes its address type, and drains.
