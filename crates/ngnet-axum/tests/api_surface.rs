@@ -9,7 +9,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 
 use axum::Router;
-use ngnet_axum::{Config, Connection, EngineResult, TokioIo, serve_connection};
+use ngnet_axum::{Config, Connection, EngineResult, TokioIo, serve, serve_connection};
 use tokio::net::TcpStream;
 
 /// `serve_connection`'s return type can be written down by a caller (Rust API guideline
@@ -33,4 +33,44 @@ fn the_connection_type_is_nameable(
 #[test]
 fn the_public_types_compose_from_this_crate_alone() {
     // The assertion is the signature above; reaching here means it compiled.
+}
+
+/// SC-017: the same property holds for a transport that is not a TCP stream.
+///
+/// The signature above would compile even if the crate had stayed TCP-shaped, since a
+/// `TcpStream` is what it always took. This one uses an in-memory pipe and an address type
+/// that is not a socket address, so it compiles only while `serve_connection` is genuinely
+/// generic over both -- and, as above, using only `ngnet_axum` paths.
+#[allow(dead_code)]
+fn the_connection_type_is_nameable_for_a_non_socket_transport(
+    pipe: tokio::io::DuplexStream,
+    router: Router,
+    peer: String,
+    config: Config,
+) -> EngineResult<Connection<impl Future<Output = EngineResult<()>>>> {
+    serve_connection(TokioIo::new(pipe), router, peer, config)
+}
+
+/// A third-party listener is writable using only this crate's public API.
+///
+/// `transports.rs` proves this behaviourally; this pins it as a compile-time property, so
+/// that a change which made `FallibleListener` unimplementable from outside would fail here
+/// even if the behavioural test were deleted.
+#[allow(dead_code)]
+fn a_listener_is_implementable_from_outside() {
+    struct Outside;
+
+    impl ngnet_axum::FallibleListener for Outside {
+        type Io = TokioIo<tokio::io::DuplexStream>;
+        type Addr = String;
+
+        async fn accept(&mut self) -> std::io::Result<(Self::Io, Self::Addr)> {
+            std::future::pending().await
+        }
+    }
+
+    // And that wrapping it yields something `serve` accepts.
+    let _ = |listener: ngnet_axum::RetryingListener<Outside>, router: Router| {
+        serve(listener, router)
+    };
 }
