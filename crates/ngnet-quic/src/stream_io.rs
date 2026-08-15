@@ -72,6 +72,29 @@ pub struct OwnedWrite {
     pub unsent: OwnedBytes,
 }
 
+/// One staged chunk, as it is handed to ngtcp2.
+///
+/// The pointer, the length, and whether anything was staged at all are three views of one
+/// fact, so they travel together rather than as separate arguments that could drift apart.
+/// Nothing staged is a legitimate call — a write may carry only a `fin` — and is described
+/// to ngtcp2 as a null vector of length zero.
+struct StagedVec {
+    base: *const u8,
+    len: usize,
+    staged: bool,
+}
+
+impl StagedVec {
+    fn new(staged: Option<(*const u8, usize)>) -> Self {
+        let (base, len) = staged.unwrap_or((core::ptr::null(), 0));
+        Self {
+            base,
+            len,
+            staged: staged.is_some(),
+        }
+    }
+}
+
 impl<S: Session> Conn<'_, S> {
     /// Opens a bidirectional stream.
     ///
@@ -185,9 +208,8 @@ impl<S: Session> Conn<'_, S> {
         // copy is staged first and *that* is what ngtcp2 is given a pointer to. Several
         // ranges become one staged chunk, which is why a single vector suffices below.
         let staged = self.retained_mut().stage_many(stream, ranges);
-        let (base, len) = staged.unwrap_or((core::ptr::null(), 0));
 
-        self.submit_one_vec(dest, stream, base, len, staged.is_some(), flags, now)
+        self.submit_one_vec(dest, stream, StagedVec::new(staged), flags, now)
     }
 
     /// Writes a buffer whose ownership the caller hands over, retaining it without a copy.
@@ -234,9 +256,8 @@ impl<S: Session> Conn<'_, S> {
         // and *that* is what ngtcp2 is given a pointer into, so the address survives the call
         // even if the caller drops the original the instant it returns.
         let staged = self.retained_mut().stage_owned(stream, data.clone());
-        let (base, len) = staged.unwrap_or((core::ptr::null(), 0));
 
-        let outcome = self.submit_one_vec(dest, stream, base, len, staged.is_some(), flags, now)?;
+        let outcome = self.submit_one_vec(dest, stream, StagedVec::new(staged), flags, now)?;
 
         // Split off what ngtcp2 took. The prefix is already retained above; the suffix shares
         // the same allocation and is handed back for the caller to offer again. On anything
@@ -254,20 +275,17 @@ impl<S: Session> Conn<'_, S> {
 
     /// Issues one already-staged stream write to ngtcp2 and reports what it did.
     ///
-    /// Shared by the borrowing and owning write paths, which differ only in how the bytes at
-    /// `base` were retained. `base`/`len` describe the single vector handed over, `staged`
-    /// says whether a chunk was pushed (so its accepted length can be committed), and the
-    /// outcome is mapped exactly as each caller documents.
+    /// Shared by the borrowing and owning write paths, which differ only in how the bytes in
+    /// `chunk` were retained, and the outcome is mapped exactly as each caller documents.
     fn submit_one_vec(
         &mut self,
         dest: &mut [u8],
         stream: StreamId,
-        base: *const u8,
-        len: usize,
-        staged: bool,
+        chunk: StagedVec,
         flags: u32,
         now: Timestamp,
     ) -> Result<StreamWrite> {
+        let StagedVec { base, len, staged } = chunk;
         let path = self.path_mut().as_raw_mut();
         let mut accepted: sys::ngtcp2_ssize = 0;
         let written = self.with_bridge(|raw| {

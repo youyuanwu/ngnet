@@ -1754,17 +1754,20 @@ mod driver_pass {
         builder.build().expect("an endpoint")
     }
 
+    /// Two established client connections to one server, over a single socket pair.
+    ///
+    /// The server connections are in acceptance order, which is not necessarily the order the
+    /// clients were dialled in.
+    struct TwoConnections {
+        drivers: Vec<Pin<Box<Driver>>>,
+        clients: (Connection, Connection),
+        servers: (Connection, Connection),
+        clock: TestClock,
+    }
+
     /// Drives two client connections to one server to establishment over a single socket
-    /// pair. Returns the drivers, the two client connections, the two server connections in
-    /// acceptance order (not necessarily paired with the client order), and the clock.
-    fn establish_two(
-        cx: &mut Context<'_>,
-    ) -> (
-        Vec<Pin<Box<Driver>>>,
-        (Connection, Connection),
-        (Connection, Connection),
-        TestClock,
-    ) {
+    /// pair.
+    fn establish_two(cx: &mut Context<'_>) -> TwoConnections {
         let (caddr, saddr) = (
             "127.0.0.1:4455".parse().unwrap(),
             "127.0.0.1:4456".parse().unwrap(),
@@ -1821,7 +1824,12 @@ mod driver_pass {
                 && sb.is_established(),
             "the harness did not establish both connections"
         );
-        (drivers, (ca, cb), (sa, sb), clock)
+        TwoConnections {
+            drivers,
+            clients: (ca, cb),
+            servers: (sa, sb),
+            clock,
+        }
     }
 
     #[test]
@@ -1836,7 +1844,12 @@ mod driver_pass {
         // paper over it -- which is why this does not rely on the transfer recovering.
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
-        let (mut drivers, (mut ca, mut cb), (mut sa, mut sb), clock) = establish_two(&mut cx);
+        let TwoConnections {
+            mut drivers,
+            clients: (mut ca, mut cb),
+            servers: (mut sa, mut sb),
+            clock,
+        } = establish_two(&mut cx);
 
         let open_uni =
             |c: &mut Connection, drivers: &mut [Pin<Box<Driver>>], cx: &mut Context<'_>| {
@@ -1945,7 +1958,12 @@ mod driver_pass {
         // close, which a retransmitted close could otherwise repair.
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
-        let (mut drivers, (ca, mut cb), (_sa, _sb), clock) = establish_two(&mut cx);
+        let TwoConnections {
+            mut drivers,
+            clients: (ca, mut cb),
+            servers: (_sa, _sb),
+            clock,
+        } = establish_two(&mut cx);
 
         // The second connection carries a stream: the work that reuses the send buffer.
         let sid_b = {
