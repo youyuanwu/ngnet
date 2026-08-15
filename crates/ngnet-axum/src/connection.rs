@@ -20,12 +20,10 @@
 //! [`serve_shared_with`]: ngnet_h2::http::serve_shared_with
 
 use std::future::Future;
-use std::net::SocketAddr;
 
 use axum::Router;
-use ngnet_h2::http::transport::TokioIo;
+use ngnet_h2::http::transport::Transport;
 use ngnet_h2::http::{Config, Connection, IncomingBody, Result, serve_shared_with};
-use tokio::net::TcpStream;
 use tower_service::Service;
 
 use crate::peer::PeerAddr;
@@ -36,26 +34,45 @@ use crate::peer::PeerAddr;
 /// connection, and the handlers run inside it rather than on tasks of their own. It resolves
 /// when the peer goes away or the connection fails.
 ///
-/// `peer` is required rather than optional. Every accepted TCP connection has one, and
-/// making it an `Option` here would invent a hole in what handlers can rely on rather than
-/// reflect one in the stack underneath.
+/// `peer` is required rather than optional. Every accepted connection has one, and making
+/// it an `Option` here would invent a hole in what handlers can rely on rather than reflect
+/// one in the stack underneath.
+///
+/// The transport is taken by value and is any [`Transport`], not a socket: a TCP stream
+/// wrapped in [`TokioIo`] is one, and so is a Unix-domain stream, an in-memory pipe, or a
+/// TLS session. The caller does the wrapping, because only the caller knows what it has.
+///
+/// `A` is bounded by exactly what inserting a value into [`http::Extensions`] requires, and
+/// no more. In particular it does not need [`Debug`](std::fmt::Debug) here; that is needed
+/// where an address reaches an [`Error`](crate::Error)'s formatting, not where it reaches a
+/// request.
+///
+/// This function does not require [`ServableTransport`](crate::ServableTransport), because a
+/// caller driving one connection themselves polls it in place rather than spawning it, and
+/// so needs no proof that it is [`Send`].
 ///
 /// # Errors
 ///
 /// Fails if the HTTP/2 session cannot be created. This happens before the connection
 /// exists, so there is no future to report it -- failures after this point are reported by
 /// awaiting the returned connection.
-pub fn serve_connection(
-    stream: TcpStream,
+///
+/// [`TokioIo`]: ngnet_h2::http::transport::TokioIo
+pub fn serve_connection<T, A>(
+    transport: T,
     router: Router,
-    peer: SocketAddr,
+    peer: A,
     config: Config,
-) -> Result<Connection<impl Future<Output = Result<()>>>> {
+) -> Result<Connection<impl Future<Output = Result<()>>>>
+where
+    T: Transport,
+    A: Clone + Send + Sync + 'static,
+{
     serve_shared_with(
-        TokioIo::new(stream),
+        transport,
         move |mut request: http::Request<IncomingBody>| {
             // Handlers see the peer here rather than through `ConnectInfo`; see `PeerAddr`.
-            request.extensions_mut().insert(PeerAddr(peer));
+            request.extensions_mut().insert(PeerAddr(peer.clone()));
 
             // Cloning a `Router` bumps an `Arc` rather than rebuilding the routing table,
             // which is what makes calling it per request affordable. The clone is needed

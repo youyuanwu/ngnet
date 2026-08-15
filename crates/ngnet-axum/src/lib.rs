@@ -122,11 +122,13 @@ mod connection;
 mod error;
 mod peer;
 mod server;
+mod transport;
 
 pub use connection::serve_connection;
 pub use error::{Error, ErrorKind};
 pub use peer::PeerAddr;
 pub use server::{Serve, serve};
+pub use transport::{ServableTransport, require_spawnable};
 
 /// The HTTP/2 configuration applied to each connection, re-exported from `ngnet-h2`.
 ///
@@ -151,3 +153,16 @@ pub use ngnet_h2::http::Config;
 /// [`Error`] of its own, which is the one reported to [`Serve::on_error`]; the two are
 /// different types and silently sharing a name would be worse than the rename.
 pub use ngnet_h2::http::{Connection, Error as EngineError, Result as EngineResult};
+
+/// Wraps a tokio byte stream so it can be used as a transport, re-exported from `ngnet-h2`.
+///
+/// [`serve_connection`] takes a transport rather than a socket, and listener
+/// implementations produce one. For anything built on tokio -- a TCP stream, a Unix-domain
+/// stream, an in-memory pipe, a TLS session over any of them -- this is the wrapper that
+/// turns it into one, and [`ServableTransport`] is implemented for every `TokioIo` over such
+/// a stream.
+///
+/// Re-exported for the same reason [`Connection`] is: without it a caller could be *required*
+/// to wrap a stream while being unable to name the wrapper without depending on a crate they
+/// otherwise need not.
+pub use ngnet_h2::http::transport::TokioIo;

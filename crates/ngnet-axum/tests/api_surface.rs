@@ -9,7 +9,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 
 use axum::Router;
-use ngnet_axum::{Config, Connection, EngineResult, serve_connection};
+use ngnet_axum::{Config, Connection, EngineResult, TokioIo, serve_connection};
 use tokio::net::TcpStream;
 
 /// `serve_connection`'s return type can be written down by a caller (Rust API guideline
@@ -27,7 +27,7 @@ fn the_connection_type_is_nameable(
     peer: SocketAddr,
     config: Config,
 ) -> EngineResult<Connection<impl Future<Output = EngineResult<()>>>> {
-    serve_connection(stream, router, peer, config)
+    serve_connection(TokioIo::new(stream), router, peer, config)
 }
 
 #[test]

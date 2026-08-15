@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use axum::Router;
+use ngnet_h2::http::transport::TokioIo;
 use ngnet_h2::http::{Config, Drain};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{Id, JoinSet};
@@ -268,7 +269,7 @@ async fn run(server: Serve) {
                     // creating the HTTP/2 session is fallible. Such a failure can never
                     // arrive through the JoinSet, so it is reported on the spot; it is the
                     // easy path to miss, since it looks like the infallible half of setup.
-                    match serve_connection(stream, router.clone(), peer, config) {
+                    match serve_connection(TokioIo::new(stream), router.clone(), peer, config) {
                         Ok(connection) => {
                             // Taken before the connection is spawned, because afterwards
                             // the connection has been moved into the task and there is
