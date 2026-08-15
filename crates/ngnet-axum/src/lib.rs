@@ -158,7 +158,7 @@ mod server;
 mod transport;
 
 pub use connection::serve_connection;
-pub use error::Error;
+pub use error::{Error, HandlerPanic};
 pub use listener::{FallibleListener, Listener, RetryingListener, TcpListener};
 #[cfg(unix)]
 pub use listener::UnixListener;

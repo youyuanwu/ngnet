@@ -103,6 +103,68 @@ impl<A: fmt::Debug> StdError for Error<A> {
     }
 }
 
+/// The source of an [`Error`] reporting that a request handler panicked.
+///
+/// A panic in a handler unwinds out of the connection that was serving it. The server
+/// catches it, ends that one connection, and reports it here; the accept loop and every
+/// other connection are unaffected.
+///
+/// # Why this is a named type rather than a message
+///
+/// It is what [`Error::source`] downcasts to, and that is the point of it. "My handler
+/// panicked" and "the peer misbehaved" call for different responses -- the first is a bug to
+/// page someone about, the second is Tuesday -- and telling them apart by string-matching on
+/// a rendered message is exactly the failure this crate's [`Error`] exists to avoid:
+///
+/// ```
+/// # use std::error::Error as _;
+/// # fn triage(error: &ngnet_axum::Error) -> bool {
+/// error.source().is_some_and(|source| source.is::<ngnet_axum::HandlerPanic>())
+/// # }
+/// ```
+///
+/// [`Display`](fmt::Display) renders the panic's own message, so the log line a caller
+/// already has keeps saying what went wrong.
+#[derive(Debug)]
+pub struct HandlerPanic {
+    message: String,
+}
+
+impl HandlerPanic {
+    /// Recovers the panic message from the payload [`catch_unwind`](std::panic::catch_unwind)
+    /// produced.
+    ///
+    /// A payload is `&'static str` for `panic!("literal")` and `String` for a formatted one.
+    /// Both are worth reading, and neither is guaranteed: a payload can be any `Any`, from
+    /// `panic_any`. The fallback says so rather than pretending the panic had no message,
+    /// because a report that silently renders as empty is worse than one that admits it
+    /// could not read the payload.
+    pub(crate) fn new(payload: Box<dyn std::any::Any + Send>) -> Self {
+        let message = match payload.downcast::<&'static str>() {
+            Ok(text) => (*text).to_owned(),
+            Err(payload) => match payload.downcast::<String>() {
+                Ok(text) => *text,
+                Err(_) => "a panic with a non-string payload".to_owned(),
+            },
+        };
+
+        Self { message }
+    }
+
+    /// The panic's own message.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for HandlerPanic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "the request handler panicked: {}", self.message)
+    }
+}
+
+impl StdError for HandlerPanic {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
