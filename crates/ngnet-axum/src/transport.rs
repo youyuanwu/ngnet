@@ -57,13 +57,36 @@ use crate::connection::serve_connection;
 ///
 /// If you have a transport that is not a tokio byte stream, the implementation is two lines:
 ///
-/// ```ignore
+/// ```
+/// # use std::{fmt::Debug, future::Future};
+/// # use axum::Router;
+/// # use ngnet_axum::{Config, Connection, EngineResult, ServableTransport, TokioIo};
+/// # use ngnet_axum::{require_spawnable, serve_connection};
+/// # use ngnet_h2::http::transport::Transport;
+/// # // A transport of your own. This one wraps a tokio duplex pipe so the example compiles;
+/// # // substitute whatever your transport actually is. Only the `ServableTransport` impl
+/// # // below is the part worth reading.
+/// # type Inner = TokioIo<tokio::io::DuplexStream>;
+/// # struct MyTransport(Inner);
+/// # impl Transport for MyTransport {
+/// #     type Reader = <Inner as Transport>::Reader;
+/// #     type Writer = <Inner as Transport>::Writer;
+/// #     fn split(self) -> (Self::Reader, Self::Writer) {
+/// #         self.0.split()
+/// #     }
+/// # }
 /// impl ServableTransport for MyTransport {
-///     fn serve<A>(self, router: Router, peer: A, config: Config)
-///         -> Result<Connection<impl Future<Output = Result<()>> + Send + 'static>>
-///     where Self: Sized, A: Clone + Debug + Send + Sync + 'static
+///     fn serve<A>(
+///         self,
+///         router: Router,
+///         peer: A,
+///         config: Config,
+///     ) -> EngineResult<Connection<impl Future<Output = EngineResult<()>> + Send + 'static>>
+///     where
+///         Self: Sized,
+///         A: Clone + Debug + Send + Sync + 'static,
 ///     {
-///         ngnet_axum::require_spawnable(ngnet_axum::serve_connection(self, router, peer, config))
+///         require_spawnable(serve_connection(self, router, peer, config))
 ///     }
 /// }
 /// ```
