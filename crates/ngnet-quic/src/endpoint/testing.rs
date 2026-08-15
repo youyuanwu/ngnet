@@ -87,6 +87,12 @@ pub struct TestSocket {
     sent: Rc<Cell<usize>>,
     /// Datagrams whose destination matches no peer, kept so a test can inspect them.
     stray: StrayLog,
+    /// When set, a completed send is counted but its bytes are dropped instead of copied
+    /// into the peer's queue. A real socket hands the payload to the kernel and keeps
+    /// nothing; this queue keeps a copy so the peer can read it, and that copy is the
+    /// harness's own allocation, not the driver's. A test measuring the driver's send path
+    /// in isolation turns this on so the count reflects `flush` alone.
+    sink: Rc<Cell<bool>>,
 }
 
 impl TestSocket {
@@ -100,6 +106,14 @@ impl TestSocket {
         self.fault.set(Some(fault));
     }
 
+    /// Drops the bytes of completed sends while still counting them.
+    ///
+    /// See the field: this lets a test measure the driver's send path without the harness's
+    /// own per-datagram delivery copy landing in the count.
+    pub fn set_sink(&self, on: bool) {
+        self.sink.set(on);
+    }
+
     /// Datagrams sent to an address with no peer behind it.
     pub fn stray(&self) -> Vec<(SocketAddr, Vec<u8>)> {
         self.stray.borrow().clone()
@@ -111,6 +125,15 @@ impl TestSocket {
     /// a datagram naming an unsupported version.
     pub fn deliver(&self, source: SocketAddr, datagram: &[u8]) {
         self.inbox.borrow_mut().push(source, datagram.to_vec());
+    }
+
+    /// Removes and returns everything currently waiting to be received.
+    ///
+    /// Lets a test capture the datagrams a peer produced so it can re-deliver them — a
+    /// duplicate 1-RTT packet is processed and then dropped, which is how a receive pass can
+    /// be counted while it does real work but stores nothing.
+    pub fn drain_inbox(&self) -> Vec<(SocketAddr, Vec<u8>)> {
+        self.inbox.borrow_mut().datagrams.drain(..).collect()
     }
 }
 
@@ -159,6 +182,11 @@ impl AsyncUdpSocket for TestSocket {
         }
 
         self.sent.set(self.sent.get() + 1);
+        // Sink mode: counted, but the payload is dropped rather than copied into the peer's
+        // queue, so the harness adds no allocation of its own to a measured send.
+        if self.sink.get() {
+            return Poll::Ready(Ok(Sent::Complete));
+        }
         let mut outbox = self.outbox.borrow_mut();
         // The queue has exactly one peer, so anything addressed elsewhere is a datagram
         // nobody will receive -- recorded rather than dropped, so a test can assert about
@@ -193,6 +221,7 @@ pub fn socket_pair(left: SocketAddr, right: SocketAddr) -> (TestSocket, TestSock
             fault: Rc::new(Cell::new(None)),
             sent: Rc::new(Cell::new(0)),
             stray: Rc::clone(&stray),
+            sink: Rc::new(Cell::new(false)),
         },
         TestSocket {
             address: right,
@@ -201,6 +230,7 @@ pub fn socket_pair(left: SocketAddr, right: SocketAddr) -> (TestSocket, TestSock
             fault: Rc::new(Cell::new(None)),
             sent: Rc::new(Cell::new(0)),
             stray,
+            sink: Rc::new(Cell::new(false)),
         },
     )
 }

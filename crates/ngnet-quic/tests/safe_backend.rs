@@ -38,7 +38,7 @@ use std::collections::VecDeque;
 
 use ngnet_quic::{
     Backend, Conn, ConnBuilder, ConnectionId, CryptoError, Direction, DirectionalKeys,
-    EntropySource, Error, Handlers, Handshaking, HeaderKey, InitialKeys, Level, PacketKey,
+    EntropySource, Error, Handlers, Handshaking, HeaderKey, InitialKeys, Iv, Level, PacketKey,
     ReadOutcome, Result, Role, RotatedKeys, Session, SessionEvent, Settings, Timestamp,
     TransportParams, WriteOutcome,
 };
@@ -120,25 +120,29 @@ impl PacketKey for ToyPacketKey {
 
     fn open(
         &self,
-        buf: &mut [u8],
-        ciphertext_len: usize,
+        dest: &mut [u8],
+        ciphertext: &[u8],
         nonce: &[u8],
         aad: &[u8],
     ) -> std::result::Result<usize, CryptoError> {
+        let ciphertext_len = ciphertext.len();
         let Some(plaintext_len) = ciphertext_len.checked_sub(TAG_LEN) else {
             return Err(CryptoError::Decrypt);
         };
-        if buf.len() < ciphertext_len {
+        if dest.len() < plaintext_len {
             return Err(CryptoError::Fatal);
         }
-        let expected = self.tag(&buf[..plaintext_len], nonce, aad);
-        if buf[plaintext_len..ciphertext_len] != expected {
+        // Authenticated from the ciphertext, and the plaintext written into the destination:
+        // the two are separate buffers, as the seam now requires, so nothing is decrypted in
+        // place and nothing is copied first.
+        let expected = self.tag(&ciphertext[..plaintext_len], nonce, aad);
+        if ciphertext[plaintext_len..ciphertext_len] != expected {
             // A forged or reordered packet. Not a failure of the backend, and it must not end
             // the connection.
             return Err(CryptoError::Decrypt);
         }
-        for (i, b) in buf[..plaintext_len].iter_mut().enumerate() {
-            *b ^= self.stream(nonce, i);
+        for (i, b) in dest[..plaintext_len].iter_mut().enumerate() {
+            *b = ciphertext[i] ^ self.stream(nonce, i);
         }
         Ok(plaintext_len)
     }
@@ -194,7 +198,8 @@ fn keys_for(dcid: &[u8], level: u8, direction: u8) -> DirectionalKeys<ToyPacketK
         },
         // Twelve bytes, the length a real AEAD's nonce has. ngtcp2 builds each packet's nonce
         // from this and the packet number, so the two sides must agree on it exactly.
-        iv: (0..12u8).map(|i| key ^ i).collect(),
+        iv: Iv::new(&(0..12u8).map(|i| key ^ i).collect::<Vec<u8>>())
+            .expect("twelve bytes is a length ngtcp2 accepts"),
     }
 }
 
@@ -299,8 +304,8 @@ impl ToySession {
         let mut rx = keys_for(&self.dcid, tag, rx_side);
         let mut tx = keys_for(&self.dcid, tag, tx_side);
         if let Some(len) = self.bad_iv_len {
-            rx.iv = vec![0; len];
-            tx.iv = vec![0; len];
+            rx.iv = Iv::new(&vec![0; len])?;
+            tx.iv = Iv::new(&vec![0; len])?;
         }
         conn.install_keys(level, Direction::Read, rx, &secret)?;
         conn.install_keys(level, Direction::Write, tx, &secret)?;
@@ -347,8 +352,8 @@ impl Session for ToySession {
         let mut rx = keys_for(dcid, tag, rx_side);
         let mut tx = keys_for(dcid, tag, tx_side);
         if let Some(len) = self.bad_iv_len {
-            rx.iv = vec![0; len];
-            tx.iv = vec![0; len];
+            rx.iv = Iv::new(&vec![0; len])?;
+            tx.iv = Iv::new(&vec![0; len])?;
         }
         Ok(InitialKeys { rx, tx })
     }
@@ -689,7 +694,7 @@ fn a_backend_that_forbids_unsafe_completes_a_connection_in_both_roles() {
 }
 
 #[test]
-fn the_toy_protection_is_invertible_in_place_and_rejects_forgery() {
+fn the_toy_protection_is_invertible_and_rejects_forgery() {
     // The two properties ngtcp2 depends on, checked directly rather than inferred from a
     // handshake that happened to work.
     let keys = keys_for(&[1, 2, 3], level_tag(Level::OneRtt), FROM_CLIENT);
@@ -708,25 +713,29 @@ fn the_toy_protection_is_invertible_in_place_and_rejects_forgery() {
         "nothing was protected"
     );
 
-    // Same buffer in and out, which is the shape the seam requires.
-    let len = buf.len();
+    // Ciphertext in, plaintext out into a distinct buffer, which is the shape the seam now
+    // requires: ngtcp2's core always decrypts a packet into a buffer separate from the
+    // packet it received.
+    let mut plain = vec![0u8; plaintext.len()];
     let recovered = keys
         .packet
-        .open(&mut buf, len, nonce, aad)
+        .open(&mut plain, &buf, nonce, aad)
         .expect("opening");
-    assert_eq!(&buf[..recovered], &plaintext[..]);
+    assert_eq!(&plain[..recovered], &plaintext[..]);
 
     // A forged packet is an ordinary event, not a failed backend.
-    let mut forged = vec![0u8; plaintext.len() + TAG_LEN];
+    let forged = vec![0u8; plaintext.len() + TAG_LEN];
+    let mut out = vec![0u8; plaintext.len()];
     assert_eq!(
-        keys.packet.open(&mut forged, len, nonce, aad).unwrap_err(),
+        keys.packet.open(&mut out, &forged, nonce, aad).unwrap_err(),
         CryptoError::Decrypt
     );
 
     // And a packet too short to hold a tag, which is what a truncating attacker sends.
-    let mut short = vec![0u8; 4];
+    let short = vec![0u8; 4];
+    let mut out = vec![0u8; 4];
     assert_eq!(
-        keys.packet.open(&mut short, 4, nonce, aad).unwrap_err(),
+        keys.packet.open(&mut out, &short, nonce, aad).unwrap_err(),
         CryptoError::Decrypt
     );
 }
@@ -748,12 +757,12 @@ fn the_two_sides_derive_each_others_keys() {
             .packet
             .seal(&mut buf, plaintext.len(), &client_tx.iv, b"h")
             .expect("sealing");
-        let len = buf.len();
+        let mut plain = vec![0u8; plaintext.len()];
         let n = server_rx
             .packet
-            .open(&mut buf, len, &server_rx.iv, b"h")
+            .open(&mut plain, &buf, &server_rx.iv, b"h")
             .expect("opening");
-        assert_eq!(&buf[..n], &plaintext[..]);
+        assert_eq!(&plain[..n], &plaintext[..]);
     }
 }
 
@@ -788,14 +797,17 @@ fn a_connection_reports_the_backends_protocol() {
 
 #[test]
 fn a_backend_that_supplies_an_impossible_vector_is_told_so() {
-    // The one dimension a *safe* backend chooses that the type system does not constrain.
+    // The one dimension a *safe* backend chooses, now narrowed to a length the seam checks.
     //
-    // `DirectionalKeys::iv` is an ordinary `Vec<u8>`. ngtcp2 builds each packet's nonce in a
-    // 64-byte stack buffer guarded only by `assert(sizeof(nonce) >= ckm->iv.len)`
-    // (`ngtcp2_conn.c:5920-5926`, with a `TODO` above it saying exactly that), and derives it
-    // by subtracting eight from that length under `assert(ivlen >= sizeof(n))`
-    // (`ngtcp2_crypto.c:100-112`). Release builds contain neither assertion, so those bounds
-    // are the crate's to keep — the same reason `crate::validate` exists at all.
+    // `DirectionalKeys::iv` is an [`Iv`], a fixed-capacity value whose `new` refuses a length
+    // outside the range ngtcp2 accepts -- so a backend cannot even *hold* an over-capacity
+    // vector, and a shorter or slightly-longer one is rejected the moment it is constructed.
+    // ngtcp2 builds each packet's nonce in a 64-byte stack buffer guarded only by
+    // `assert(sizeof(nonce) >= ckm->iv.len)` (`ngtcp2_conn.c:5920-5926`, with a `TODO` above
+    // it saying exactly that), and derives it by subtracting eight from that length under
+    // `assert(ivlen >= sizeof(n))` (`ngtcp2_crypto.c:100-112`). Release builds contain neither
+    // assertion, so those bounds are the crate's to keep -- the same reason `crate::validate`
+    // exists at all.
     //
     // What is asserted here is what the crate guarantees: the backend is told its vector is
     // unusable, and the connection does not go on to complete a handshake with it. Whether a

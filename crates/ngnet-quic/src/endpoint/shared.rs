@@ -308,6 +308,11 @@ impl ConnectionShared {
         !self.lock().outbound.is_empty()
     }
 
+    /// How many datagrams are waiting to be sent for this connection.
+    pub(crate) fn outbound_len(&self) -> usize {
+        self.lock().outbound.len()
+    }
+
     /// Takes the next datagram this connection wants sent.
     pub(crate) fn take_outbound(&self) -> Option<Vec<u8>> {
         self.lock().outbound.pop_front()

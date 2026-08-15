@@ -40,7 +40,7 @@ use ngnet_quic_sys as sys;
 use crate::error::{Error, ErrorKind, Result};
 use crate::tls::{
     Backend, CryptoError, Direction, DirectionalKeys, HP_MASK_LEN, HP_SAMPLE_LEN, HeaderKey,
-    InitialKeys, Level, PacketKey, Role, RotatedKeys, Session, SessionEvent,
+    InitialKeys, Iv, Level, PacketKey, Role, RotatedKeys, Session, SessionEvent,
 };
 
 /// The `SSL_ctrl` command behind the `SSL_set_tlsext_host_name` macro.
@@ -369,29 +369,30 @@ impl PacketKey for OsslPacketKey {
 
     fn open(
         &self,
-        buf: &mut [u8],
-        ciphertext_len: usize,
+        dest: &mut [u8],
+        ciphertext: &[u8],
         nonce: &[u8],
         aad: &[u8],
     ) -> core::result::Result<usize, CryptoError> {
+        let ciphertext_len = ciphertext.len();
         // A packet too short to hold a tag is a malformed packet, not a broken backend: it
         // is exactly what a truncating attacker would send.
         let Some(plaintext_len) = ciphertext_len.checked_sub(self.tag_len()) else {
             return Err(CryptoError::Decrypt);
         };
-        if buf.len() < ciphertext_len || nonce.len() < self.aead_nonce_len() {
+        if dest.len() < plaintext_len || nonce.len() < self.aead_nonce_len() {
             return Err(CryptoError::Fatal);
         }
-        let dest = buf.as_mut_ptr();
-        // SAFETY: as in `seal`, with `dest` and the ciphertext the same buffer
-        // (`ngtcp2.h:2846`); it holds at least `ciphertext_len` bytes and the context is
-        // initialised for decryption.
+        // SAFETY: as in `seal`, but with `dest` and the ciphertext given as the two distinct
+        // buffers they are -- ngtcp2's core never aliases them (see the decrypt region in
+        // `tls_bridge.rs`). `dest` holds at least the plaintext, the ciphertext its full
+        // length, and the context is initialised for decryption.
         let rv = unsafe {
             sys::ngtcp2_crypto_decrypt(
-                dest,
+                dest.as_mut_ptr(),
                 &raw const self.aead,
                 &raw const self.ctx,
-                dest.cast_const(),
+                ciphertext.as_ptr(),
                 ciphertext_len,
                 nonce.as_ptr(),
                 nonce.len(),
@@ -573,6 +574,7 @@ fn derive_keys_with(
 
     let packet = make(suite, &key)?;
     let header = OsslHeaderKey::new(suite, &hp)?;
+    let iv = Iv::new(&iv)?;
     Ok(DirectionalKeys { packet, header, iv })
 }
 
@@ -2185,10 +2187,11 @@ mod tests {
     }
 
     #[test]
-    fn a_payload_is_protected_and_recovered_in_one_buffer() {
-        // The seam protects in place because ngtcp2's callbacks may pass the same pointer as
-        // both source and destination, and two overlapping slices cannot be formed in safe
-        // Rust. This is that case, exercised deliberately rather than incidentally.
+    fn a_payload_is_protected_and_recovered() {
+        // Sealing works in place -- ngtcp2's encrypt callback may pass one pointer as both
+        // source and destination. Opening now takes its ciphertext and its destination as
+        // separate buffers, matching how ngtcp2's core always decrypts a received packet
+        // into a buffer distinct from the packet itself.
         let suite = Suite::initial();
         let key = vec![0x2a; suite.key_len()];
         let nonce = vec![0x11; suite.iv_len()];
@@ -2203,10 +2206,10 @@ mod tests {
         seal.seal(&mut buf, plaintext.len(), &nonce, aad).unwrap();
         assert_ne!(&buf[..plaintext.len()], &plaintext[..]);
 
-        let protected_len = buf.len();
-        let recovered = open.open(&mut buf, protected_len, &nonce, aad).unwrap();
+        let mut plain = vec![0u8; plaintext.len()];
+        let recovered = open.open(&mut plain, &buf, &nonce, aad).unwrap();
         assert_eq!(recovered, plaintext.len());
-        assert_eq!(&buf[..recovered], &plaintext[..]);
+        assert_eq!(&plain[..recovered], &plaintext[..]);
     }
 
     #[test]
@@ -2218,10 +2221,10 @@ mod tests {
         let nonce = vec![0x11; suite.iv_len()];
         let open = OsslPacketKey::for_decryption(&suite, &key).unwrap();
 
-        let mut buf = vec![0u8; 32];
-        let len = buf.len();
+        let ciphertext = vec![0u8; 32];
+        let mut plain = vec![0u8; ciphertext.len()];
         assert_eq!(
-            open.open(&mut buf, len, &nonce, b"").unwrap_err(),
+            open.open(&mut plain, &ciphertext, &nonce, b"").unwrap_err(),
             CryptoError::Decrypt
         );
     }
@@ -2234,9 +2237,10 @@ mod tests {
         let nonce = vec![0x11; suite.iv_len()];
         let open = OsslPacketKey::for_decryption(&suite, &key).unwrap();
 
-        let mut buf = vec![0u8; 8];
+        let ciphertext = vec![0u8; 8];
+        let mut plain = vec![0u8; ciphertext.len()];
         assert_eq!(
-            open.open(&mut buf, 8, &nonce, b"").unwrap_err(),
+            open.open(&mut plain, &ciphertext, &nonce, b"").unwrap_err(),
             CryptoError::Decrypt
         );
     }
@@ -2297,13 +2301,13 @@ mod tests {
             .packet
             .seal(&mut buf, plaintext.len(), &client.tx.iv, b"header")
             .unwrap();
-        let protected_len = buf.len();
+        let mut plain = vec![0u8; plaintext.len()];
         let len = server
             .rx
             .packet
-            .open(&mut buf, protected_len, &server.rx.iv, b"header")
+            .open(&mut plain, &buf, &server.rx.iv, b"header")
             .unwrap();
-        assert_eq!(&buf[..len], &plaintext[..]);
+        assert_eq!(&plain[..len], &plaintext[..]);
     }
 
     #[test]
@@ -2355,8 +2359,14 @@ mod tests {
         let client = derive_initial_keys(Role::Client, v1, &dcid).unwrap();
         let server = derive_initial_keys(Role::Server, v1, &dcid).unwrap();
 
-        assert_eq!(client.tx.iv, hex("fa044b2f42a3fd3b46fb255c"));
-        assert_eq!(server.tx.iv, hex("0ac1493ca1905853b0bba03e"));
+        assert_eq!(
+            client.tx.iv.as_slice(),
+            hex("fa044b2f42a3fd3b46fb255c").as_slice()
+        );
+        assert_eq!(
+            server.tx.iv.as_slice(),
+            hex("0ac1493ca1905853b0bba03e").as_slice()
+        );
         // The roles agree on which key is whose, which is what actually has to hold.
         assert_eq!(client.rx.iv, server.tx.iv);
         assert_eq!(server.rx.iv, client.tx.iv);
@@ -2426,14 +2436,14 @@ mod tests {
         assert_eq!(buf, expected);
 
         // And the other side recovers it, using the key it derived independently.
-        let protected_len = buf.len();
         let client_nonce = super::tests::nonce(&client.rx.iv, 1);
+        let mut plain = vec![0u8; plaintext.len()];
         let recovered = client
             .rx
             .packet
-            .open(&mut buf, protected_len, &client_nonce, &header)
+            .open(&mut plain, &buf, &client_nonce, &header)
             .unwrap();
-        assert_eq!(&buf[..recovered], plaintext.as_slice());
+        assert_eq!(&plain[..recovered], plaintext.as_slice());
     }
 
     #[test]
@@ -2447,8 +2457,14 @@ mod tests {
         let client = derive_initial_keys(Role::Client, v2, &dcid).unwrap();
         let server = derive_initial_keys(Role::Server, v2, &dcid).unwrap();
 
-        assert_eq!(client.tx.iv, hex("91f73e2351d8fa91660e909f"));
-        assert_eq!(server.tx.iv, hex("dd13c276499c0249d3310652"));
+        assert_eq!(
+            client.tx.iv.as_slice(),
+            hex("91f73e2351d8fa91660e909f").as_slice()
+        );
+        assert_eq!(
+            server.tx.iv.as_slice(),
+            hex("dd13c276499c0249d3310652").as_slice()
+        );
 
         // And they differ from version 1's, which is what makes the assertion above mean
         // something rather than merely pass.
@@ -2569,9 +2585,9 @@ mod tests {
             let mut buf = vec![0u8; plaintext.len() + tx.tag_len()];
             buf[..plaintext.len()].copy_from_slice(plaintext);
             tx.seal(&mut buf, plaintext.len(), tx_iv, b"aad").unwrap();
-            let len = buf.len();
-            let recovered = rx.open(&mut buf, len, rx_iv, b"aad").unwrap();
-            assert_eq!(&buf[..recovered], &plaintext[..]);
+            let mut plain = vec![0u8; plaintext.len()];
+            let recovered = rx.open(&mut plain, &buf, rx_iv, b"aad").unwrap();
+            assert_eq!(&plain[..recovered], &plaintext[..]);
         }
     }
 
@@ -2611,12 +2627,12 @@ mod tests {
             .tx_packet
             .seal(&mut buf, plaintext.len(), &client_next.tx_iv, b"aad")
             .unwrap();
-        let len = buf.len();
+        let mut plain = vec![0u8; plaintext.len()];
         let recovered = server_next
             .rx_packet
-            .open(&mut buf, len, &server_next.rx_iv, b"aad")
+            .open(&mut plain, &buf, &server_next.rx_iv, b"aad")
             .unwrap();
-        assert_eq!(&buf[..recovered], &plaintext[..]);
+        assert_eq!(&plain[..recovered], &plaintext[..]);
     }
 
     #[test]

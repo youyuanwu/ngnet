@@ -147,14 +147,25 @@ pub trait PacketKey: Send + 'static {
         aad: &[u8],
     ) -> core::result::Result<(), CryptoError>;
 
-    /// Unprotects `buf[..ciphertext_len]` in place, returning the plaintext length.
+    /// Unprotects `ciphertext` into `dest`, returning the plaintext length.
+    ///
+    /// On entry `ciphertext` holds the protected payload followed by its authentication tag.
+    /// On success the first `ciphertext.len() - tag_len()` bytes of `dest` hold the
+    /// plaintext, and that length is returned; `dest` must be at least that long.
+    ///
+    /// The destination and the ciphertext are separate, non-overlapping buffers. ngtcp2's
+    /// core always decrypts a received packet into a buffer distinct from the packet itself,
+    /// so this crate's bridge never hands a backend two aliasing pointers — even though the C
+    /// header permits it (`ngtcp2.h:2846`). A backend whose primitive decrypts in place must
+    /// copy `ciphertext` into `dest` itself; this crate's own does not, which is the copy
+    /// this seam exists to avoid.
     ///
     /// Returns [`CryptoError::Decrypt`] when the payload does not authenticate. That is not
     /// a failure of the backend and must not end the connection.
     fn open(
         &self,
-        buf: &mut [u8],
-        ciphertext_len: usize,
+        dest: &mut [u8],
+        ciphertext: &[u8],
         nonce: &[u8],
         aad: &[u8],
     ) -> core::result::Result<usize, CryptoError>;
@@ -192,6 +203,53 @@ pub trait HeaderKey: Send + 'static {
     fn mask(&self, sample: &[u8]) -> core::result::Result<[u8; HP_MASK_LEN], CryptoError>;
 }
 
+/// A level's initialisation vector, held inline.
+///
+/// ngtcp2 accepts a vector between `MIN_IV_LEN` (8) and `MAX_IV_LEN` (64) bytes; both bounds
+/// guard a fixed stack buffer whose overrun release builds do not catch. Storing the bytes in
+/// an array of that maximum makes a longer one impossible to express rather than merely
+/// rejected, so no path through a backend can hand ngtcp2 an over-length vector. Construction
+/// is fallible: a backend that produces one outside the accepted range is refused here, at the
+/// seam, rather than deeper in.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Iv {
+    bytes: [u8; crate::validate::MAX_IV_LEN],
+    len: u8,
+}
+
+impl Iv {
+    /// Copies `bytes` inline, rejecting a length ngtcp2 could not handle.
+    pub fn new(bytes: &[u8]) -> Result<Self> {
+        crate::validate::iv_len(bytes.len())?;
+        let mut inline = [0u8; crate::validate::MAX_IV_LEN];
+        inline[..bytes.len()].copy_from_slice(bytes);
+        Ok(Self {
+            bytes: inline,
+            len: bytes.len() as u8,
+        })
+    }
+
+    /// The vector's bytes, without the inline padding behind them.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
+impl core::ops::Deref for Iv {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl core::fmt::Debug for Iv {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The padding behind the length is not part of the value and is not shown.
+        self.as_slice().fmt(f)
+    }
+}
+
 /// One direction's key material for one encryption level.
 ///
 /// The initialisation vector travels alongside the keys rather than inside them because
@@ -203,7 +261,7 @@ pub struct DirectionalKeys<P, H> {
     /// Masks headers.
     pub header: H,
     /// The initialisation vector the nonce is built from.
-    pub iv: Vec<u8>,
+    pub iv: Iv,
 }
 
 /// Both directions of the keys derived from a connection identifier.
@@ -236,13 +294,13 @@ pub struct RotatedKeys<P> {
     /// The new key for decrypting the peer.
     pub rx_packet: P,
     /// Its initialisation vector.
-    pub rx_iv: Vec<u8>,
+    pub rx_iv: Iv,
     /// The secret the generation after next is derived from.
     pub rx_secret: Vec<u8>,
     /// The new key for encrypting to the peer.
     pub tx_packet: P,
     /// Its initialisation vector.
-    pub tx_iv: Vec<u8>,
+    pub tx_iv: Iv,
     /// The secret the generation after next is derived from.
     pub tx_secret: Vec<u8>,
 }
@@ -284,7 +342,7 @@ pub struct RotatedKeys<P> {
 /// # struct K;
 /// # impl PacketKey for K {
 /// #     fn seal(&self, _: &mut [u8], _: usize, _: &[u8], _: &[u8]) -> core::result::Result<(), CryptoError> { Ok(()) }
-/// #     fn open(&self, _: &mut [u8], n: usize, _: &[u8], _: &[u8]) -> core::result::Result<usize, CryptoError> { Ok(n) }
+/// #     fn open(&self, dest: &mut [u8], ciphertext: &[u8], _: &[u8], _: &[u8]) -> core::result::Result<usize, CryptoError> { dest[..ciphertext.len()].copy_from_slice(ciphertext); Ok(ciphertext.len()) }
 /// #     fn tag_len(&self) -> usize { 16 }
 /// #     fn confidentiality_limit(&self) -> u64 { 1 }
 /// #     fn integrity_limit(&self) -> u64 { 1 }

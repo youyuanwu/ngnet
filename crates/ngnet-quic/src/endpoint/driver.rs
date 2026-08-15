@@ -90,14 +90,22 @@ pub(crate) struct Tracked<S: Session> {
     /// Holding it here rather than dropping it is what stops a would-blocked send from
     /// silently losing a packet.
     pub(crate) pending: Option<Vec<u8>>,
-    /// The connection-close datagram, kept for the closing period.
-    ///
-    /// `write_connection_close` returns nothing once the connection is in its closing
-    /// period, so a close that has to be retransmitted cannot be regenerated — it has to
-    /// have been kept. ngtcp2's own server does the same.
-    pub(crate) close_datagram: Option<Vec<u8>>,
     /// Whether this connection has been reported finished.
     pub(crate) finished: bool,
+}
+
+/// The next datagram a connection wants to send, and where its bytes live.
+///
+/// A datagram the core just produced is written into a buffer the caller lends, so sending
+/// it costs no allocation; only if the socket then refuses it does it have to be copied
+/// somewhere that outlives the buffer. A datagram that is already owned -- a retained
+/// `pending`, or one a detached connection queued -- is forwarded as itself, because it
+/// already lives long enough and copying it would be the very waste this avoids.
+pub(crate) enum Produced {
+    /// Written into the buffer the caller lent to `next_datagram`; its length is here.
+    InBuffer(usize),
+    /// Already owned, and forwarded as itself.
+    Owned(Vec<u8>),
 }
 
 /// Builds the handler set a driven connection uses.
@@ -169,6 +177,20 @@ where
     pub(crate) next_index: u64,
     /// A receive buffer, reused so a pass allocates nothing.
     pub(crate) buffer: Vec<u8>,
+    /// A send buffer, reused so producing a datagram the socket accepts allocates nothing.
+    ///
+    /// The core writes each datagram it produces into here, and it is sent straight from
+    /// this buffer when the socket takes it. Only a datagram the socket refuses -- one that
+    /// has to be retained until a later pass, past the point where this buffer is reused --
+    /// is copied out into an owned buffer of its own. Reused across passes, like `buffer`.
+    pub(crate) send_buffer: Vec<u8>,
+    /// A scratch list of connection indices, reused so iterating the connections while the
+    /// loop body mutates them costs no allocation. `service` and `flush` both need to walk
+    /// the connections without holding a borrow of the map across a body that inserts,
+    /// removes or re-borrows; each takes this with `mem::take`, fills it, and restores it,
+    /// the same discipline `buffer` above uses. They never overlap -- `service` restores it
+    /// before calling `flush` -- so one buffer serves both.
+    pub(crate) index_scratch: Vec<u64>,
     /// Whether this endpoint accepts connections it did not initiate.
     pub(crate) accepts: bool,
     /// Datagrams that belong to no connection -- Retry, Version Negotiation, stateless
@@ -245,7 +267,16 @@ where
         };
         let Some(conn) = tracked.conn.as_mut() else {
             // Detached: the datagram belongs to whoever holds the connection, and reading it
-            // here would be a second reader of state that admits only one.
+            // here would be a second reader of state that admits only one. So it is queued
+            // for that owner to read on a pass of its own.
+            //
+            // This copy is forced, and once the attached path stops copying it is the only
+            // one left on the receive path. `datagram` borrows the endpoint's reusable
+            // receive buffer, whose contents the next `poll_recv` overwrites: the borrow's
+            // lifetime ends when this pass does. The owner may not collect until a later
+            // pass, so the bytes have to outlive the borrow, which means owning them.
+            // Handing the owner a borrow that reached across passes would alias a buffer the
+            // endpoint reuses, so it is not an option -- the copy stays.
             let shared = Arc::clone(&tracked.shared);
             shared.deliver_inbound(datagram.to_vec());
             return;
@@ -397,7 +428,7 @@ where
     }
 
     /// Runs whatever a handle asked for on one connection.
-    pub(crate) fn apply_commands(&mut self, index: u64) {
+    pub(crate) fn apply_commands(&mut self, index: u64, cx: &mut Context<'_>) {
         let Some(tracked) = self.connections.get(&index) else {
             return;
         };
@@ -437,7 +468,7 @@ where
                     }
                 }
                 Command::Write { stream, data, fin } => {
-                    self.write_stream(index, stream, &data, fin);
+                    self.write_stream(index, stream, &data, fin, cx);
                 }
                 Command::Reset(stream, code) => {
                     let _ = conn.reset_stream(stream, code);
@@ -472,9 +503,21 @@ where
     /// until the peer acknowledges it, so offering a whole large payload on every attempt
     /// would recopy the remainder for every datagram produced. One packet's worth per
     /// offer keeps that bounded.
-    pub(crate) fn write_stream(&mut self, index: u64, stream: StreamId, data: &[u8], fin: bool) {
+    pub(crate) fn write_stream(
+        &mut self,
+        index: u64,
+        stream: StreamId,
+        data: &[u8],
+        fin: bool,
+        cx: &mut Context<'_>,
+    ) {
         let now = self.clock.now();
+        // The core writes into the reusable send buffer, taken out for the call the way
+        // `flush` takes it and restored on every path out. A write that produces no datagram
+        // -- blocked, or a packet that filled with control frames -- then allocates nothing.
+        let mut buffer = core::mem::take(&mut self.send_buffer);
         let Some(tracked) = self.connections.get_mut(&index) else {
+            self.send_buffer = buffer;
             return;
         };
 
@@ -487,6 +530,7 @@ where
                 data: data.to_vec(),
                 fin,
             });
+            self.send_buffer = buffer;
             return;
         }
 
@@ -494,6 +538,7 @@ where
         // the copy until the peer acknowledges it, so offering a whole large payload on
         // every attempt would recopy the remainder for every datagram produced.
         let Some(conn) = tracked.conn.as_mut() else {
+            self.send_buffer = buffer;
             return;
         };
         let permitted = conn.max_tx_udp_payload_size().max(1);
@@ -503,23 +548,43 @@ where
         // `STREAM_SHUT_WR`.
         let last = fin && chunk_len == data.len();
 
-        let mut datagram = vec![0u8; MAX_DATAGRAM];
-        let outcome = conn.write_stream(&mut datagram, stream, &data[..chunk_len], last, now);
+        let outcome = conn.write_stream(&mut buffer, stream, &data[..chunk_len], last, now);
 
         match outcome {
             Ok(StreamWrite::Datagram { len, accepted }) => {
-                datagram.truncate(len);
-                tracked.pending = Some(datagram);
+                // The datagram is written into the reusable buffer. Offer it to the socket
+                // *before* the buffer is reused, exactly as `flush` does with a core-produced
+                // datagram: a datagram the socket accepts immediately is sent straight from
+                // the buffer and never copied. Only one the socket refuses is copied into a
+                // buffer of its own as `tracked.pending`, because a later write in the same
+                // pass -- or `flush` reusing the buffer afterwards -- would overwrite it.
+                // That copy is the single allocation this path can owe, and it is paid only
+                // on refusal, not on every produced datagram.
                 let held = conn.retained_bytes() as u64;
-                tracked.shared.set_retained(held);
-                // Whatever was not accepted -- which may be everything, since a packet can
-                // fill with control frames instead -- goes back on the queue.
-                if accepted < data.len() {
-                    tracked.shared.push(Command::Write {
-                        stream,
-                        data: data[accepted..].to_vec(),
-                        fin,
-                    });
+                let remote = tracked.remote;
+                let disposition = self.socket.poll_send(cx, remote, &buffer[..len]);
+                if let Some(tracked) = self.connections.get_mut(&index) {
+                    match disposition {
+                        // Sent. The bytes stay in the reusable buffer to be overwritten by
+                        // the next datagram; nothing is allocated.
+                        Poll::Ready(Ok(Sent::Complete)) => {}
+                        // Refused (`WouldBlock`/`Pending`) or the socket errored: keep the
+                        // datagram so a busy socket does not silently lose it. A socket error
+                        // is resurfaced by `flush` on the next pass when it retries `pending`.
+                        _ => {
+                            tracked.pending = Some(buffer[..len].to_vec());
+                        }
+                    }
+                    tracked.shared.set_retained(held);
+                    // Whatever was not accepted -- which may be everything, since a packet
+                    // can fill with control frames instead -- goes back on the queue.
+                    if accepted < data.len() {
+                        tracked.shared.push(Command::Write {
+                            stream,
+                            data: data[accepted..].to_vec(),
+                            fin,
+                        });
+                    }
                 }
             }
             Ok(StreamWrite::StreamBlocked
@@ -540,6 +605,7 @@ where
                 shared.fail(Error::from(err));
             }
         }
+        self.send_buffer = buffer;
     }
 
     /// Writes a connection close and keeps it for the closing period.
@@ -559,11 +625,6 @@ where
             && len > 0
         {
             datagram.truncate(len);
-            // Kept for the closing period: `write_connection_close` returns nothing once
-            // the connection is closing, so a close that has to be answered again cannot be
-            // regenerated -- it has to have been kept.
-            tracked.close_datagram = Some(datagram.clone());
-
             // The pending slot may already hold a datagram -- one produced earlier in this
             // same command batch, or one the socket refused. Overwriting it would silently
             // drop a packet, which is the exact thing that slot exists to prevent, so the
@@ -586,27 +647,27 @@ where
     }
 
     /// Produces the next datagram a connection wants to send, if any.
-    pub(crate) fn next_datagram(&mut self, index: u64) -> Option<Vec<u8>> {
+    ///
+    /// The core's output goes into `buffer`, which the caller owns and reuses across
+    /// connections and passes; an already-owned datagram is returned as itself. The caller
+    /// sends from whichever this reports and copies out only what the socket refuses.
+    pub(crate) fn next_datagram(&mut self, index: u64, buffer: &mut [u8]) -> Option<Produced> {
         let now = self.clock.now();
         let tracked = self.connections.get_mut(&index)?;
 
         if let Some(pending) = tracked.pending.take() {
-            return Some(pending);
+            return Some(Produced::Owned(pending));
         }
 
         // A detached connection produces its own datagrams; the endpoint only forwards what
         // it has queued.
         if let Some(queued) = tracked.shared.take_outbound() {
-            return Some(queued);
+            return Some(Produced::Owned(queued));
         }
 
         let conn = tracked.conn.as_mut()?;
-        let mut datagram = vec![0u8; MAX_DATAGRAM];
-        match conn.write_pkt(&mut datagram, now) {
-            Ok(WriteOutcome::Datagram { len }) => {
-                datagram.truncate(len);
-                Some(datagram)
-            }
+        match conn.write_pkt(buffer, now) {
+            Ok(WriteOutcome::Datagram { len }) => Some(Produced::InBuffer(len)),
             Ok(WriteOutcome::Blocked | WriteOutcome::Idle) => None,
             Err(err) => {
                 let shared = Arc::clone(&tracked.shared);
@@ -759,7 +820,6 @@ where
                 shared,
                 remote,
                 pending: None,
-                close_datagram: None,
                 finished: false,
             },
         );
@@ -823,7 +883,6 @@ where
                 shared,
                 remote,
                 pending: None,
-                close_datagram: None,
                 finished: false,
             },
         );
@@ -887,31 +946,65 @@ where
             }
         }
 
-        let indices: Vec<u64> = self.connections.keys().copied().collect();
-        for index in indices {
-            while let Some(datagram) = self.next_datagram(index) {
+        let mut indices = core::mem::take(&mut self.index_scratch);
+        indices.clear();
+        indices.extend(self.connections.keys().copied());
+        // The send buffer comes out too, for the same reason the index scratch does: the
+        // core writes each produced datagram into it, and it cannot be borrowed from `self`
+        // across a body that re-borrows `self` to send. Taken here, lent to `next_datagram`,
+        // and put back on every path out -- including the error return -- so it is never
+        // leaked.
+        let mut buffer = core::mem::take(&mut self.send_buffer);
+        // Indexed rather than iterated so the scratch is not borrowed across the body, which
+        // lets the error path below move it back before returning. The body re-borrows
+        // `connections`, so holding a borrow of it here would not compile anyway.
+        for i in 0..indices.len() {
+            let index = indices[i];
+            while let Some(produced) = self.next_datagram(index, &mut buffer) {
                 let Some(tracked) = self.connections.get(&index) else {
                     break;
                 };
                 let remote = tracked.remote;
-                match self.socket.poll_send(cx, remote, &datagram) {
+                let bytes = match &produced {
+                    Produced::InBuffer(len) => &buffer[..*len],
+                    Produced::Owned(datagram) => &datagram[..],
+                };
+                match self.socket.poll_send(cx, remote, bytes) {
+                    // Sent. A datagram written into the reusable buffer is simply left there
+                    // to be overwritten by the next one, so a completed send allocates
+                    // nothing; an owned one is dropped here.
                     Poll::Ready(Ok(Sent::Complete)) => {}
                     Poll::Ready(Ok(Sent::WouldBlock)) | Poll::Pending => {
                         // Not sent. Keeping it is what stops a busy socket from silently
                         // losing packets, which QUIC would recover from slowly enough to
-                        // look like a hang.
+                        // look like a hang. This is the one allocation the send path can
+                        // owe: a datagram still in the reusable buffer must be copied into
+                        // one of its own before the next pass overwrites the buffer. A
+                        // datagram that was already owned is retained as itself, for free.
                         if let Some(tracked) = self.connections.get_mut(&index) {
-                            tracked.pending = Some(datagram);
+                            tracked.pending = Some(match produced {
+                                Produced::InBuffer(len) => buffer[..len].to_vec(),
+                                Produced::Owned(datagram) => datagram,
+                            });
                         }
                         break;
                     }
                     Poll::Ready(Err(err)) => {
+                        // The scratch and the send buffer are restored on this path too, not
+                        // just the normal one: both are reused across passes, so an error
+                        // must not leak either.
+                        indices.clear();
+                        self.index_scratch = indices;
+                        self.send_buffer = buffer;
                         return Err(Error::new(ErrorKind::Socket, "the socket failed")
                             .with_source(SocketError(err.to_string())));
                     }
                 }
             }
         }
+        indices.clear();
+        self.index_scratch = indices;
+        self.send_buffer = buffer;
         Ok(())
     }
 

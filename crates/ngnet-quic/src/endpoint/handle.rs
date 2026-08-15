@@ -238,6 +238,8 @@ where
             routes: HashMap::new(),
             next_index: 0,
             buffer: vec![0u8; MAX_DATAGRAM],
+            send_buffer: vec![0u8; MAX_DATAGRAM],
+            index_scratch: Vec::new(),
             accepts: self.accepts,
             outbox: std::collections::VecDeque::new(),
             #[cfg(feature = "tls-ossl")]
@@ -439,6 +441,16 @@ impl<S: Session> DetachedConnection<S> {
     /// Queues a datagram for the endpoint to send, and wakes it.
     pub fn send(&self, datagram: Vec<u8>) {
         self.shared.queue_outbound(datagram);
+    }
+
+    /// How many datagrams this connection has queued for the endpoint to send.
+    ///
+    /// Not a supported API: an allocation-counting test uses the difference across a send
+    /// pass to learn how many datagrams that pass produced, which is what lets it assert one
+    /// allocation per datagram and nothing besides.
+    #[doc(hidden)]
+    pub fn outbound_len_for_test(&self) -> usize {
+        self.shared.outbound_len()
     }
 
     /// Registers a waker to be woken when a datagram arrives for this connection.
@@ -789,9 +801,16 @@ where
             match outcome {
                 Poll::Ready(Ok(received)) => {
                     progressed = true;
-                    let datagram = buffer[..received.len].to_vec();
+                    // The buffer is a local, not a field, for the duration of the dispatch:
+                    // that is what lets a borrow of it be handed to `&mut self` methods
+                    // without copying first. No dispatch destination retains the borrow --
+                    // `read_pkt` passes it to ngtcp2 only for the call, `accept` stores
+                    // owned state, the detached path copies it into its own queue, and the
+                    // Retry and stateless-reset paths read it only while composing separate
+                    // outgoing buffers -- so the compiler is free to end the borrow here,
+                    // before the buffer goes back to `self.inner`.
+                    self.dispatch(&buffer[..received.len], received.source);
                     self.inner.buffer = buffer;
-                    self.dispatch(&datagram, received.source);
                 }
                 Poll::Ready(Err(err)) => {
                     self.inner.buffer = buffer;
@@ -805,6 +824,82 @@ where
             }
         }
         Ok(progressed)
+    }
+
+    /// Runs one receive pass in isolation, for the allocation-counting tests.
+    ///
+    /// A test that needs to count only the receive half cannot go through `poll`, which
+    /// reads, services and sends in one call. This exposes that half and nothing else.
+    /// Hidden and unsupported, like everything in `endpoint::testing`.
+    #[doc(hidden)]
+    pub fn read_datagrams_for_test(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> core::result::Result<bool, Error> {
+        self.read_datagrams(cx)
+    }
+
+    /// Borrows the socket, for the allocation-counting tests that inject and re-inject
+    /// datagrams. Hidden and unsupported, like everything in `endpoint::testing`.
+    #[doc(hidden)]
+    pub fn socket_for_test(&self) -> &Sock {
+        &self.inner.socket
+    }
+
+    /// Whether any connection is holding a datagram the socket has not yet taken, for the
+    /// allocation-counting tests. A stream datagram the socket accepts is sent straight from
+    /// the reusable buffer and leaves nothing here; only one the socket refuses is copied
+    /// into `pending` and shows up. Hidden and unsupported.
+    #[doc(hidden)]
+    pub fn has_pending_for_test(&self) -> bool {
+        self.inner.has_pending()
+    }
+
+    /// Clones every datagram a connection is currently holding in its `pending` slot, for
+    /// the SC-012 tests. A close datagram waits here as an owned buffer of its own while the
+    /// driver reuses its send buffer for other connections' work, so capturing these bytes
+    /// before and after that work is how a test observes the held datagram keeps its own
+    /// bytes without decrypting it. Hidden and unsupported.
+    #[doc(hidden)]
+    pub fn held_datagrams_for_test(&self) -> Vec<Vec<u8>> {
+        self.inner
+            .connections
+            .values()
+            .filter_map(|t| t.pending.clone())
+            .collect()
+    }
+
+    /// Runs the command and timer half of a pass, without the send half, for the
+    /// allocation-counting tests. Command production offers each stream datagram it produces
+    /// to the socket, so this half completes or refuses a stream send; it does not flush, so a
+    /// datagram a test wants held as `pending` for a later counted flush stays held. It takes
+    /// the task context the send needs. Hidden and unsupported.
+    #[doc(hidden)]
+    pub fn service_commands_for_test(&mut self, cx: &mut Context<'_>) {
+        let indices: Vec<u64> = self.inner.connections.keys().copied().collect();
+        for index in &indices {
+            self.inner.apply_routes(*index);
+            self.inner.apply_commands(*index, cx);
+            self.inner.handle_expiry(*index);
+        }
+    }
+
+    /// Runs the whole command-and-send pass -- exactly what a `poll` does apart from reading
+    /// the socket and re-arming the timer -- for the allocation-counting tests. This is the
+    /// pass that walks the connection list twice, once to service commands and once to flush,
+    /// using the driver's reusable index scratch rather than the two `Vec<u64>`s Phase 2
+    /// removed. Excluding the re-arm keeps the boxed-timer allocation, which has nothing to do
+    /// with walking the list, out of a test that counts the walk. Hidden and unsupported.
+    #[doc(hidden)]
+    pub fn service_for_test(&mut self, cx: &mut Context<'_>) -> core::result::Result<(), Error> {
+        self.service(cx)
+    }
+
+    /// Runs one send pass in isolation, for the allocation-counting tests. This is the half
+    /// Phase 5 made allocate nothing when its datagrams complete. Hidden and unsupported.
+    #[doc(hidden)]
+    pub fn flush_for_test(&mut self, cx: &mut Context<'_>) -> core::result::Result<(), Error> {
+        self.inner.flush(cx)
     }
 
     /// Delivers one datagram to whatever should have it.
@@ -965,15 +1060,21 @@ where
 
     /// Runs commands, services timers and writes.
     fn service(&mut self, cx: &mut Context<'_>) -> core::result::Result<(), Error> {
-        let indices: Vec<u64> = self.inner.connections.keys().copied().collect();
+        let mut indices = core::mem::take(&mut self.inner.index_scratch);
+        indices.clear();
+        indices.extend(self.inner.connections.keys().copied());
         for index in &indices {
             // Routing first: an identifier a connection has just minted must be installed
             // before any datagram announcing it goes out, or the peer may use it before the
             // endpoint knows about it.
             self.inner.apply_routes(*index);
-            self.inner.apply_commands(*index);
+            self.inner.apply_commands(*index, cx);
             self.inner.handle_expiry(*index);
         }
+        // Restored before `flush`, which takes the same scratch. This loop has no early
+        // return, so returning it here is the only path out.
+        indices.clear();
+        self.inner.index_scratch = indices;
         self.inner.flush(cx)?;
         self.inner.evict();
         Ok(())

@@ -13,7 +13,7 @@ rather than because it is unwanted.
 | **Explicit congestion notification** | `ngtcp2_pkt_info` carries an ECN byte and this layer always passes zero. Reading it back needs socket ancillary data, which the `AsyncUdpSocket` seam would have to expose — a real widening of the trait for a signal nothing here acts on yet. |
 | **Datagram batching** | `sendmmsg`, `recvmmsg` and segmentation offload. Throughput work, optional even in ngtcp2's own examples, and invisible until an endpoint is carrying enough traffic for syscall overhead to matter. |
 | **More than one socket per endpoint** | A scaling concern rather than a capability one: nothing in the API would change, and a caller who needs it today can run several endpoints. |
-| **An ownership-taking write** | `Connection::write` copies, because the transport holds what it is given until acknowledgement. A `write_owned(Bytes)` alongside it would let a caller hand over instead — see [Sent stream data is copied](#sent-stream-data-is-copied). |
+| **An ownership-taking write at the endpoint layer** | The async `Connection::write` (`src/endpoint/connection.rs`) copies, because it takes an ordinary `&[u8]` and queues a `Command::Write` holding a `to_vec` of it. The sans-I/O core now has `Conn::write_stream_owned`, which retains an `OwnedBytes` without a copy, but the async layer does not yet forward to it. What would settle it: a `write_owned(OwnedBytes)` on the async `Connection` that hands the buffer to `write_stream_owned` instead of copying it into the command queue. |
 | **Backpressure on the write queue** | A caller may queue writes faster than the connection drains them, and nothing bounds that queue. The transport's own flow control bounds what is *in flight*, not what is waiting. Not reachable by a peer — the queue is driven by the local application — but a `write` that resolved only once the transport had accepted the bytes would be the honest shape. |
 | **A bounded accept backlog** | Connections waiting to be accepted accumulate in an unbounded queue. Address validation bounds it in practice on any endpoint that enables it, since an unvalidated peer never reaches the point of creating one; an endpoint without validation has no such bound. |
 | **NEW_TOKEN for returning clients** | The endpoint validates Retry tokens but never issues the regular tokens that would let a client skip validation on its next connection. `accept.rs` classifies them already. |
@@ -123,54 +123,61 @@ loopback socket does not produce — real loss, reordering, path changes, and pe
 negotiate different transport parameters. The QUIC Interop Runner exists for exactly this and
 running against it would be the next real step.
 
-## Sent stream data is copied
+## Copies and allocations that remain, and why each is forced
 
-ngtcp2 does not copy the stream data it accepts. It keeps the caller's pointer so it can
-retransmit, and requires the bytes stay intact "until `acked_stream_data_offset` indicates
-that they are acknowledged by a remote endpoint or the stream is closed"
-(`ngtcp2.h:5244-5248`).
+The copy/allocation audit removed everything that could be argued away from the source — the
+receive-path copy the safe TLS seam used to make, the per-pass connection-index vectors, the
+attached receive copy, the completing send pass's allocation, the HTTP/3 slice vector and its
+production scratch, and the sent-stream-data copy on the ownership-taking path — and pinned
+each removal with an allocation-counting or structural test. What is left below could not be
+argued away: each is forced by a lifetime the source does not let us shorten. None is a defect.
+A count that dropped to zero on any of these would mean a byte was lost, not saved.
 
-`Conn::write_stream` takes an ordinary `&[u8]` that the caller may reuse the moment the call
-returns, so the crate copies the accepted portion and holds it until the acknowledgement
-arrives. `Conn::retained_bytes` reports how much is held.
+| What remains | Why it is forced, and what would settle it |
+| --- | --- |
+| **The detached receive path copies once** | A datagram for a connection whose owner has *detached* it is copied out of the endpoint's reusable receive buffer (the detached arm of `deliver` in `src/endpoint/driver.rs`) before being queued. The borrow of that buffer cannot outlive the pass — the next `poll_recv` overwrites it — and the owner may not collect until a later pass, so the bytes have to be owned. This is the only copy left on the receive path once the attached path stopped copying. **What would settle it:** draining a detached connection within the same pass that received the datagram, so the borrow never crosses a pass — a different ownership boundary between the endpoint and a detached owner than the queue imposes today. Pinned at exactly one allocation per datagram by `a_receive_pass_to_a_detached_connection_allocates_one_buffer_per_datagram` in `tests/zero_alloc.rs`. |
+| **A retained send datagram is copied once** | The driver writes each datagram into one reusable send buffer and sends straight from it (`flush`, `next_datagram`, `write_stream` in `src/endpoint/driver.rs`), so a datagram the socket accepts is not copied. Only a datagram the socket **refuses** — one held as `tracked.pending` until a later pass — is copied into a buffer of its own, because a later write in the same pass overwrites the shared buffer. **What would settle it:** nothing removes it — a datagram retained past the buffer's reuse must be owned; a per-connection buffer would relocate the allocation, not remove it. Pinned by `a_completing_send_pass_copies_a_datagram_only_when_the_socket_refuses_it` and `a_core_produced_datagram_costs_nothing_to_send_and_one_to_retain`, which assert a datagram the socket accepts is sent without a copy and a refused one costs exactly one. |
+| **The HTTP/3 queue allocates once per datagram** | `ngnet-quic-h3` now produces each datagram directly into the buffer it hands to the detached connection's queue (`transmit.rs`, `pump.rs`, `connection.rs`), so the copy out of a separate production scratch is gone. The one owned allocation that remains is forced because the queue takes ownership (`detached.send`, `handle.rs:439-442`) and may hold the datagram across passes until the socket drains it. **What would settle it:** a queue that borrows rather than owns — not possible while the datagram must outlive the pass that produced it; a shared buffer pool would relocate the allocation, not remove it. Pinned at most one per datagram by `tests/ngnet-quic-h3-tests/tests/zero_alloc.rs`. |
 
-That is one copy of every byte sent. `ngnet-h3` avoids the equivalent copy by making callers
-hand over ownership through its `BodySource`; the same could be done here, and would be
-worth doing if this crate is ever used somewhere the copy matters.
+## The HTTP/3 layer's borrowing write still copies, and `RETAINS_BUFFERS` depends on it
 
-**What would settle it:** an ownership-taking overload — `write_stream_owned(Bytes)` or
-similar — alongside the copying one, so the zero-copy path is available without making the
-ordinary path require a paragraph of documentation to use safely.
+`ngnet-quic-h3`'s connection writes stream data through `Conn::write_stream_vectored`, the
+borrowing path, which copies every accepted byte into the transport's own retention. Because
+that copy exists, the layer's buffers are the layer's own again the instant a write returns,
+and `NgtcpConnection` sets `RETAINS_BUFFERS = false`
+(`crates/ngnet-quic-h3/src/connection.rs`) — release is reported on write, not on
+acknowledgement. That constant is correct **only because** of the copy: were the transport
+holding the layer's bytes until acknowledgement, reporting release on write would free a buffer
+QUIC still points at for retransmission, and reporting it on acknowledgement while the copy
+exists would hold every in-flight byte twice.
 
-## Received packets are copied once more than they need to be
+The crate now has an ownership-taking write — `Conn::write_stream_owned`, taking an
+`OwnedBytes` — that retains without a copy. The HTTP/3 layer does not use it.
 
-The safe TLS seam protects payloads **in place**: `PacketKey::seal` and `PacketKey::open` take
-one `&mut [u8]` and work on it. That shape is forced on the send side. ngtcp2 encrypts in place
-— `cc->encrypt(payload, ..., payload, ...)` (`ngtcp2_ppe.c:142`) passes the same pointer as
-source and destination — and two overlapping slices, one shared and one mutable, cannot be
-formed in safe Rust at all. So the seam takes one buffer, and on the send path the bridge
-detects the aliasing and does nothing extra: sending is genuinely zero-copy, and
-`tests/zero_alloc.rs` pins that it allocates nothing.
+**What would settle it:** routing the layer's body writes through `write_stream_owned`, at
+which point the transport retains the layer's buffers rather than copying them, release must be
+reported on acknowledgement rather than on write, and `RETAINS_BUFFERS` becomes `true`. That is
+a larger change to the layer's buffer accounting than this audit took on, and nothing needs it
+yet.
 
-Receiving is not. ngtcp2 decrypts **out of place**, into a buffer it owns —
-`decrypt_pkt(conn->crypto.decrypt_buf.base, ..., payload, ...)`
-(`ngtcp2_conn.c:6846`, `:9457`) — so source and destination differ. The bridge therefore copies
-the ciphertext into the destination and opens it there, where the crypto helper it replaced
-handed both pointers to `EVP_DecryptUpdate` and read one while writing the other in a single
-pass. That is one extra pass over the payload of every packet received. No allocation, but a
-real memcpy of up to a full datagram.
+## An allocation count cannot see a copy into storage already allocated
 
-The in-place shape was applied uniformly because *encrypt* requires it. Nothing checked whether
-*decrypt* did, and it does not: ngtcp2's core never aliases the two buffers, even though its
-documented contract permits a backend to be handed aliasing pointers (`ngtcp2.h:2846`).
+Every removal in this audit is pinned by a test, but not all by the same kind of test. A
+counting allocator sees an allocation appear or fail to appear; it cannot see a
+`copy_from_slice` into a buffer that was already allocated, because no allocation happens. So
+the copy the safe TLS seam used to make before decrypting — ciphertext moved into an
+already-sized destination — could never have been caught by counting, however carefully the
+region was armed.
 
-**What would settle it:** give `open` separate `&[u8]` and `&mut [u8]` parameters. That is
-expressible in safe Rust precisely because the two never overlap here, and it removes the copy.
-The cost is that the seam then has two shapes rather than one, and a backend implementing `open`
-has to be told that its inputs may not alias — so the documentation has to carry what the type
-system currently carries for free. Worth doing if this crate is ever used somewhere the copy
-matters; worth measuring first, since a memcpy of 1200 bytes against an AEAD over the same 1200
-bytes may not show up at all.
+That is why the decrypt bridge is pinned by a **structural source test** instead:
+`the_decrypt_bridge_copies_nothing` in `tests/invariants.rs` reads a named span of
+`tls_bridge.rs` and fails if a copy construct reappears in it. The two kinds of test are
+complementary: the allocation-counting tests guard allocations, and the structural tests guard
+copies into storage that is already there.
+
+**What would settle it:** nothing changes the limitation — it is inherent to counting
+allocations. Where a copy would not allocate, a structural test over a named region is the
+mechanism, as it is for the decrypt bridge.
 
 ## `ngnet-quic-h3-tests::exchange` fails occasionally under load
 

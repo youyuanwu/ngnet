@@ -12,13 +12,15 @@
 //! an open one is where adding a variant must not break anyone. Which is which is a
 //! deliberate decision, recorded here by how it is matched.
 
+use std::io::IoSlice;
+
 use ngnet_quic::{
     ApplicationErrorCode, Backend, ConnBuilder, ConnectionId, CryptoError, Direction,
     DirectionalKeys, Directionality, Duration, EntropySource, Error, ErrorKind, ExpiryOutcome,
     HP_MASK_LEN, HP_SAMPLE_LEN, Handlers, Handshaking, HeaderKey, InitialKeys, Initiator,
-    Inspection, Level, NativeCode, PacketKey, ReadOutcome, Result, Role, RotatedKeys, Session,
-    SessionEvent, Settings, StreamCloseReason, StreamId, StreamWrite, Timestamp,
-    TransportErrorCode, TransportParams, WriteOutcome,
+    Inspection, Iv, Level, NativeCode, OwnedBytes, OwnedWrite, PacketKey, ReadOutcome, Result,
+    Role, RotatedKeys, Session, SessionEvent, Settings, StreamCloseReason, StreamId, StreamWrite,
+    Timestamp, TransportErrorCode, TransportParams, WriteOutcome,
 };
 
 #[test]
@@ -331,7 +333,7 @@ fn the_public_surface_still_has_the_shape_it_promised() {
 
     fn takes_packet_key<K: PacketKey>(k: &K, buf: &mut [u8]) {
         let _: core::result::Result<(), CryptoError> = k.seal(buf, 0, &[], &[]);
-        let _: core::result::Result<usize, CryptoError> = k.open(buf, 0, &[], &[]);
+        let _: core::result::Result<usize, CryptoError> = k.open(buf, &[], &[], &[]);
         let _: usize = k.tag_len();
         let _: u64 = k.confidentiality_limit();
         let _: u64 = k.integrity_limit();
@@ -392,15 +394,74 @@ fn the_public_surface_still_has_the_shape_it_promised() {
         let _: Result<()> = conn.install_keys(Level::Initial, Direction::Read, keys, &[]);
         let _: Result<()> = conn.submit_handshake(Level::Initial, &[]);
     }
+
+    /// A level's initialisation vector is a fixed-capacity value, not a `Vec<u8>`: a length
+    /// ngtcp2 cannot handle has no representation, and construction is fallible for the rest.
+    /// Read through a `Deref` to the bytes, so the array behind it stays private.
+    fn iv_is_a_fixed_capacity_value<P: PacketKey, H: HeaderKey>(
+        keys: DirectionalKeys<P, H>,
+        rotated: RotatedKeys<P>,
+    ) {
+        let _: Result<Iv> = Iv::new(&[]);
+        let iv: Iv = keys.iv;
+        let _: &[u8] = &iv;
+        let _: &[u8] = iv.as_slice();
+        let _: Iv = rotated.rx_iv;
+        let _: Iv = rotated.tx_iv;
+    }
     let _ = events_are_only_what_can_wait;
 
     let _ = takes_packet_key::<DummyPacketKey>;
     let _ = takes_header_key::<DummyHeaderKey>;
     let _ = takes_safe_session::<DummySafeSession>;
     let _ = connection_offers_exactly_four_operations::<DummyPacketKey, DummyHeaderKey>;
+    let _ = iv_is_a_fixed_capacity_value::<DummyPacketKey, DummyHeaderKey>;
     let _ = takes_safe_backend::<DummySafeBackend>;
     let _ = keys_are_send_and_static::<DummySafeSession>;
     let _ = events_are_only_what_can_wait;
+}
+
+/// The initialisation vector is stored inline, not behind a heap pointer.
+///
+/// The whole point of the type is that a length ngtcp2 cannot handle has nowhere to live, so
+/// the storage is asserted rather than trusted. A `Vec<u8>` is three machine words wide
+/// whatever it holds; the inline value is at least as wide as the bytes it can hold, which is
+/// `validate::MAX_IV_LEN` (64). This assertion holds only for the inline form and would fail
+/// the moment the field went back to a `Vec`.
+#[test]
+fn the_initialisation_vector_is_stored_inline() {
+    assert!(core::mem::size_of::<Iv>() >= 64);
+}
+
+/// The owned-send handle offers exactly the operations promised.
+///
+/// `OwnedBytes` is the buffer a caller hands to [`Conn::write_stream_owned`] to be retained
+/// without a copy. Its surface is pinned here: a wrapping constructor over anything shaped
+/// like bytes, an erasing one over an owner the crate cannot see inside, read access, and the
+/// split that hands back an unaccepted suffix as a view into the same allocation.
+#[test]
+fn the_owned_send_handle_still_has_the_shape_it_promised() {
+    let mut bytes: OwnedBytes = OwnedBytes::new(vec![1u8, 2, 3, 4]);
+    let _: usize = bytes.len();
+    let _: bool = bytes.is_empty();
+    let _: &[u8] = bytes.as_slice();
+    let suffix: OwnedBytes = bytes.split_to(2);
+    let _: OwnedBytes = suffix;
+
+    struct Owned(Vec<u8>);
+    impl AsRef<[u8]> for Owned {
+        fn as_ref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+    // `from_owner` is `unsafe`: the handle it yields backs a raw pointer ngtcp2 keeps, so the
+    // owner must lend a slice of stable address and length. `Owned` wraps an immutable `Vec`
+    // and satisfies that. The surface being pinned here is that it is an `unsafe fn` taking
+    // `impl AsRef<[u8]> + Send + Sync + 'static` and returning `OwnedBytes`.
+    // SAFETY: `Owned` never mutates its buffer, so `as_ref` is address- and length-stable.
+    let _: OwnedBytes = unsafe { OwnedBytes::from_owner(Owned(vec![0u8])) };
+
+    let _: OwnedBytes = bytes.clone();
 }
 
 /// A backend that exists only so the generic bounds above have something to name.
@@ -449,8 +510,17 @@ fn the_connection_surface_still_has_the_shape_it_promised() {
         let stream: StreamId = conn.open_bidi_stream()?;
         let _: StreamId = conn.open_uni_stream()?;
         let _: StreamWrite = conn.write_stream(&mut buf, stream, &[0], true, now)?;
-        let _: StreamWrite =
-            conn.write_stream_vectored(&mut buf, stream, &[&[0][..], &[1][..]], true, now)?;
+        let _: StreamWrite = conn.write_stream_vectored(
+            &mut buf,
+            stream,
+            &[IoSlice::new(&[0]), IoSlice::new(&[1])],
+            true,
+            now,
+        )?;
+        let owned = OwnedBytes::new(vec![0u8]);
+        let handed: OwnedWrite = conn.write_stream_owned(&mut buf, stream, owned, true, now)?;
+        let _: StreamWrite = handed.outcome;
+        let _: OwnedBytes = handed.unsent;
         conn.shutdown_stream(stream, ApplicationErrorCode::new(0))?;
         conn.reset_stream(stream, ApplicationErrorCode::new(0))?;
         conn.stop_sending(stream, ApplicationErrorCode::new(0))?;
@@ -546,8 +616,8 @@ impl PacketKey for DummyPacketKey {
 
     fn open(
         &self,
-        _buf: &mut [u8],
-        _ciphertext_len: usize,
+        _dest: &mut [u8],
+        _ciphertext: &[u8],
         _nonce: &[u8],
         _aad: &[u8],
     ) -> core::result::Result<usize, CryptoError> {

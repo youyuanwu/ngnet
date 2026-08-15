@@ -124,13 +124,14 @@ pub use params::{
     TransportParams,
 };
 pub use rand::EntropySource;
+pub use retain::OwnedBytes;
 pub use settings::{Settings, TokenKind};
 pub use stream::{Directionality, Initiator, StreamId};
-pub use stream_io::StreamWrite;
+pub use stream_io::{OwnedWrite, StreamWrite};
 pub use time::{Duration, Timestamp};
 pub use tls::{
     Backend, CryptoError, Direction, DirectionalKeys, HP_MASK_LEN, HP_SAMPLE_LEN, Handshaking,
-    HeaderKey, InitialKeys, Level, PacketKey, Role, RotatedKeys, Session, SessionEvent,
+    HeaderKey, InitialKeys, Iv, Level, PacketKey, Role, RotatedKeys, Session, SessionEvent,
 };
 
 #[cfg(feature = "tls-ossl")]

@@ -43,9 +43,14 @@ matching anything.
 
 ## Public surface — `crates/ngnet-quic/tests/compat_surface.rs`
 
-Three tests name every public item and use each in a way that pins its shape. Nothing there
+Several tests name every public item and use each in a way that pins its shape. Nothing there
 asserts behaviour: **compiling is the assertion**. Adding public API means extending that
-file.
+file. The copy/allocation audit changed the surface in four places, each reflected here:
+`PacketKey::open` now takes the ciphertext and the destination as separate slices,
+`write_stream_vectored` takes `&[IoSlice]` rather than `&[&[u8]]`, `DirectionalKeys` and
+`RotatedKeys` carry an `Iv` in place of a `Vec<u8>`, and `write_stream_owned` — with its
+`OwnedBytes` argument and `OwnedWrite` result — is new. A caller or backend built against the
+old shapes will not compile against these.
 
 Whether an enumeration is matched exhaustively or with a wildcard is itself a promise, and
 the file records which is which:
@@ -59,16 +64,46 @@ the file records which is which:
 
 ## Allocation — `crates/ngnet-quic/tests/zero_alloc.rs`
 
-`writing_packets_allocates_nothing_in_the_wrapper` installs a counting global allocator and
-arms it around a send loop.
+The suite installs a counting global allocator and arms it around a region, asserting both the
+count and — the point of the earlier work — that the region actually did its work, so a region
+that allocates nothing because it did nothing fails rather than passes.
+`the_counter_would_notice_a_real_allocation` and
+`the_counter_is_disarmed_outside_a_measured_region` guard the guard.
 
-The design reason the property *can* hold is that the caller supplies the datagram buffer, so
-nothing need be allocated per packet. But that is an argument, not a guarantee, and it is
-exactly the kind of property that decays silently: one `to_vec()` added inside the wrapper for
-convenience would never fail a functional test.
+The design reason each property *can* hold is an argument, not a guarantee, and it is exactly
+the kind that decays silently: one `to_vec()` added for convenience would never fail a
+functional test. So each is pinned:
 
-`the_counter_would_notice_a_real_allocation` and `the_counter_is_disarmed_outside_a_measured_region`
-guard the guard.
+- `writing_packets_allocates_nothing_in_the_wrapper` and `asking_for_the_expiry_allocates_nothing`
+  — the original two, now asserting a datagram was produced and the expiry was queried rather
+  than only checking the count.
+- `reading_a_packet_allocates_nothing_and_is_processed` and
+  `establishing_a_connection_bounds_its_allocations` — the read path and the handshake, the two
+  that were previously uncovered. The handshake region is a **bound**, not an attribution: other
+  forced allocations share it, and it asserts both roles reached completion.
+- `a_receive_pass_to_an_attached_connection_does_not_allocate`,
+  `a_driver_pass_over_an_established_connection_does_not_allocate_for_iteration`,
+  `a_receive_pass_to_a_detached_connection_allocates_one_buffer_per_datagram`,
+  `a_completing_send_pass_allocates_nothing` and
+  `a_core_produced_datagram_costs_nothing_to_send_and_one_to_retain` — the driver's passes. The
+  detached and retained cases assert *one* allocation, the forced ones the audit could not
+  remove; the rest assert zero.
+- `datagrams_sharing_the_reused_buffer_keep_their_own_bytes` — the reused send buffer does not
+  leak one connection's datagram into another's, exercised across a second connection and a
+  second pass.
+- `sending_owned_data_allocates_nothing_where_a_borrowed_send_allocates` — the owned write
+  (`write_stream_owned`) against the borrowing one, where the difference in count is the proof;
+  both retain until acknowledged.
+
+`the_initialisation_vector_is_stored_inline` and `the_owned_send_handle_still_has_the_shape_it_promised`
+live in `compat_surface.rs`: the first asserts `Iv` is at least as wide as the bytes it holds,
+so it would fail the moment the field went back to a `Vec`, and the second pins `OwnedBytes`'s
+surface. A counting test cannot see a copy into storage already allocated — that is what the
+structural `the_decrypt_bridge_copies_nothing` above is for.
+
+An equivalent suite pins the HTTP/3 layer: `tests/ngnet-quic-h3-tests/tests/zero_alloc.rs`
+asserts a produce pass allocates one owned buffer per datagram and nothing besides, the one
+allocation forced by the endpoint's queue taking ownership.
 
 ## FFI — `crates/ngnet-quic/tests/versioned_ffi.rs`
 
@@ -98,6 +133,7 @@ tests that pass for the wrong reason:
 | Test | Claim |
 | --- | --- |
 | `the_tls_seam_names_nothing_a_backend_cannot_have` | `src/tls.rs` mentions no raw pointer, no `sys::` path, no `ngtcp2_` name and no `c_void`. The compiler cannot express this: a signature can name a foreign type perfectly safely and still leak the library into an interface whose purpose is to hide it. Read textually, because "does not mention" is a different claim from "does not depend on". The seam's own tests are excluded — they deliberately compare its constants against the bindings, which is why the constants may be restated at all. |
+| `the_decrypt_bridge_copies_nothing` | A named span of `src/tls_bridge.rs` — between the `// region:decrypt-no-copy` markers — contains none of `copy_from_slice`, `copy_nonoverlapping`, `to_vec` or `extend_from_slice`. ngtcp2's core always decrypts a received packet into a buffer distinct from the packet, so the bridge hands `PacketKey::open` its ciphertext and its destination as separate slices and decrypts straight across; a copy reappearing in that span would restore exactly the receive-path copy the audit removed and would fail no functional test. The span is *named*, not the whole file scanned, so an unrelated copy elsewhere in the bridge — the sealing path is allowed its own — does not trip it. No allocation-counting test could catch this, because a copy into an already-sized destination allocates nothing. |
 | `the_safe_backend_proves_the_seam_needs_no_unsafe` | `tests/safe_backend.rs` still says `forbid(unsafe_code)`, not `deny`. A `deny` can be silenced from inside by an allowance; a `forbid` cannot. That difference is the entire evidential value of the file. |
 | `a_backend_that_forbids_unsafe_completes_a_connection_in_both_roles` | A whole TLS backend, in a module that forbids unsafe code and depends on nothing but this crate and `std`, carries two real connections through a handshake and moves application data — as a client **and** as a server. The server half is not decoration: a server is the side whose transport parameters cannot be produced up front, and it is where an earlier design of this seam failed. |
 | the `compile_fail` doctest on `Handshaking` | A backend that stores the borrowed connection instead of using it does not compile. Checked for non-vacuity: the same backend that uses it and lets it go compiles, so the test fails for keeping it and nothing else. |
