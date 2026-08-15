@@ -267,7 +267,9 @@ impl Drop for AbortLive {
 ///
 /// Catching is also strictly more informative than joining was. A `JoinError` said only that
 /// the task panicked; the payload here still carries the panic's own message.
-async fn catch_panics<F: Future>(connection: F) -> Result<F::Output, Box<dyn std::any::Any + Send>> {
+async fn catch_panics<F: Future>(
+    connection: F,
+) -> Result<F::Output, Box<dyn std::any::Any + Send>> {
     let mut connection = pin!(connection);
 
     poll_fn(move |context| {
@@ -310,7 +312,8 @@ where
 
     // Wrapped once, here, rather than in the builder: `Serve` is also a plain value a caller
     // can hold and reconfigure, and it has no business carrying a lock it is not yet using.
-    let observer: Option<SharedObserver<L::Addr>> = observer.map(|observe| Arc::new(Mutex::new(observe)));
+    let observer: Option<SharedObserver<L::Addr>> =
+        observer.map(|observe| Arc::new(Mutex::new(observe)));
 
     let mut next_id: u64 = 0;
 
@@ -500,7 +503,10 @@ mod tests {
 
         report(
             &observer,
-            Error::connection(peer, std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+            Error::connection(
+                peer,
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+            ),
         );
 
         let seen = seen.lock().expect("a lock");
@@ -622,8 +628,7 @@ mod tests {
         // Waiting merely for the registry to be empty would assert nothing at all: it is
         // empty before the first connection arrives, so the assertion would pass instantly
         // and pass just as happily with deregistration deleted. It did, when first written.
-        let all_accepted =
-            until(|| entered.load(std::sync::atomic::Ordering::SeqCst) >= 4).await;
+        let all_accepted = until(|| entered.load(std::sync::atomic::Ordering::SeqCst) >= 4).await;
         assert!(all_accepted, "the listener was not drained of its budget");
 
         let empty = until(|| watched.lock().expect("a lock").is_empty()).await;
@@ -670,7 +675,10 @@ mod tests {
 
         report(
             &observer,
-            Error::connection(peer, std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+            Error::connection(
+                peer,
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+            ),
         );
     }
 }

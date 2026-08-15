@@ -22,7 +22,7 @@ use axum::{Router, http::Request};
 use http_body_util::{BodyExt, Empty};
 use hyper::client::conn::http2 as hyper_client;
 use hyper_util::rt::{TokioExecutor, TokioIo as HyperIo};
-use ngnet_axum::{FallibleListener, PeerAddr, RetryingListener, serve};
+use ngnet_axum::{Listener, PeerAddr, serve};
 use ngnet_h2::http::transport::TokioIo;
 use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio::sync::{mpsc, oneshot};
@@ -32,9 +32,15 @@ use support::{LIMIT, within};
 /// How a third-party listener is written, using only this crate's public API.
 ///
 /// It hands out in-memory pipes rather than sockets, so nothing here touches the network.
-/// Note what is absent: no retry, no error classification, no timing, no yielding. Those
-/// come from wrapping it in [`RetryingListener`], which is the whole point of shipping that
-/// type -- the safe path is meant to be the short one.
+/// This is the whole of what a third-party listener has to write: one method, a loop, and
+/// nothing held outside the future. There is no retry policy because a channel receiver
+/// cannot fail transiently; a listener over a real socket would add one, as the shipped ones
+/// do.
+///
+/// **It is bounded on purpose.** Once no further client can arrive it parks forever rather
+/// than returning. An `accept` that is unconditionally ready drives this crate's uncapped
+/// accept loop as fast as the CPU allows, allocating a connection task per pass; that is not
+/// a slow test, it is an out-of-memory.
 struct DuplexAcceptor {
     incoming: mpsc::Receiver<DuplexStream>,
     next: u64,
@@ -48,16 +54,20 @@ struct DuplexAcceptor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PipeId(String);
 
-impl FallibleListener for DuplexAcceptor {
+impl Listener for DuplexAcceptor {
     type Io = TokioIo<DuplexStream>;
     type Addr = PipeId;
 
-    async fn accept(&mut self) -> std::io::Result<(Self::Io, Self::Addr)> {
-        let stream = self.incoming.recv().await.ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotConnected, "no more clients")
-        })?;
-        self.next += 1;
-        Ok((TokioIo::new(stream), PipeId(format!("pipe-{}", self.next))))
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        match self.incoming.recv().await {
+            Some(stream) => {
+                self.next += 1;
+                (TokioIo::new(stream), PipeId(format!("pipe-{}", self.next)))
+            }
+            // Every sender is gone, so no client can ever arrive. Park, rather than
+            // returning something the accept loop would immediately ask again for.
+            None => std::future::pending().await,
+        }
     }
 }
 
@@ -68,7 +78,7 @@ impl FallibleListener for DuplexAcceptor {
 #[tokio::test]
 async fn a_third_party_in_memory_listener_serves_requests() {
     let (clients, incoming) = mpsc::channel(4);
-    let listener = RetryingListener::new(DuplexAcceptor { incoming, next: 0 });
+    let listener = DuplexAcceptor { incoming, next: 0 };
 
     let router = Router::new().route(
         "/whoami",
@@ -85,11 +95,15 @@ async fn a_third_party_in_memory_listener_serves_requests() {
     );
 
     let (server_side, client_side) = tokio::io::duplex(64 * 1024);
-    clients.send(server_side).await.expect("the listener to be up");
-
-    let (mut sender, connection) = hyper_client::handshake(TokioExecutor::new(), HyperIo::new(client_side))
+    clients
+        .send(server_side)
         .await
-        .expect("an HTTP/2 handshake over an in-memory pipe");
+        .expect("the listener to be up");
+
+    let (mut sender, connection) =
+        hyper_client::handshake(TokioExecutor::new(), HyperIo::new(client_side))
+            .await
+            .expect("an HTTP/2 handshake over an in-memory pipe");
     tokio::spawn(connection);
 
     let response = within(
@@ -108,7 +122,12 @@ async fn a_third_party_in_memory_listener_serves_requests() {
     .await
     .expect("a response");
 
-    let body = response.into_body().collect().await.expect("a body").to_bytes();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("a body")
+        .to_bytes();
 
     // SC-012's in-memory counterpart: the handler read a peer address of the listener's own
     // type out of the request extensions, with no socket anywhere in the path.
@@ -131,7 +150,7 @@ async fn a_third_party_in_memory_listener_serves_requests() {
 #[tokio::test]
 async fn a_failure_reports_a_peer_address_that_is_not_a_socket_address() {
     let (clients, incoming) = mpsc::channel(4);
-    let listener = RetryingListener::new(DuplexAcceptor { incoming, next: 0 });
+    let listener = DuplexAcceptor { incoming, next: 0 };
 
     let errors: Arc<Mutex<Vec<PipeId>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&errors);
@@ -147,7 +166,10 @@ async fn a_failure_reports_a_peer_address_that_is_not_a_socket_address() {
     );
 
     let (server_side, mut client_side) = tokio::io::duplex(64 * 1024);
-    clients.send(server_side).await.expect("the listener to be up");
+    clients
+        .send(server_side)
+        .await
+        .expect("the listener to be up");
 
     // Garbage where the HTTP/2 connection preface should be. The session fails after the
     // connection has been accepted and spawned, which is the path that has to carry the
@@ -194,7 +216,7 @@ async fn a_failure_reports_a_peer_address_that_is_not_a_socket_address() {
 async fn a_listener_whose_source_is_gone_neither_yields_nor_blocks_shutdown() {
     let (clients, incoming) = mpsc::channel::<DuplexStream>(1);
     drop(clients);
-    let listener = RetryingListener::new(DuplexAcceptor { incoming, next: 0 });
+    let listener = DuplexAcceptor { incoming, next: 0 };
 
     let (stop, stopped) = oneshot::channel();
     let server = tokio::spawn(
@@ -265,7 +287,9 @@ async fn the_unix_listener_serves_and_drains() {
             .into_future(),
     );
 
-    let client_side = UnixStream::connect(&path).await.expect("a connected client");
+    let client_side = UnixStream::connect(&path)
+        .await
+        .expect("a connected client");
     let (mut sender, connection) =
         hyper_client::handshake(TokioExecutor::new(), HyperIo::new(client_side))
             .await
@@ -284,7 +308,12 @@ async fn the_unix_listener_serves_and_drains() {
     .await
     .expect("a response");
 
-    let body = response.into_body().collect().await.expect("a body").to_bytes();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("a body")
+        .to_bytes();
     assert_eq!(&body[..], b"unix");
 
     assert!(

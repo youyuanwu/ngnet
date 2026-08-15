@@ -19,7 +19,7 @@ implementation rather than the shape the crate is built around.
 - **tokio only.** This one needs restating now that transports are pluggable, because the
   two are easy to conflate. Any transport can be served — a socket, an in-memory pipe, a TLS
   session — but the *runtime* cannot change. The accept loop is built on `tokio::select!`,
-  `tokio::time` and `JoinSet`, and `JoinSet::spawn` requires `Send + 'static`. `ngnet-h2`'s
+  `tokio::time` and `tokio::spawn`, and `tokio::spawn` requires `Send + 'static`. `ngnet-h2`'s
   `completion` transport is thread-per-core over compio and its types are not `Send`, so it
   remains out of reach regardless of what listener is supplied. Serving it would need a
   different accept loop, not a different listener. Pluggable transports did not bring this
@@ -116,55 +116,108 @@ classify and pace. That removed `ErrorKind` — with only connection failures le
 an enum with one variant was ceremony — and with it the `Option` on `Error::peer`, since
 every remaining failure has a peer by construction.
 
-## The backoff, and why it is an instant
+## The backoff, and the design correction that simplified it
 
-This is the hardest-won piece of reasoning in the crate, and moving retry into listeners
-made it *more* important rather than less, because it now has to be got right by people who
-did not write the accept loop.
+This was the hardest-won piece of reasoning in the crate, and it turned out to be reasoning
+about a self-inflicted problem. It is kept here rather than deleted, because the mistake is
+more instructive than the fix.
 
 The backoff lives inside the accept future rather than in the `select!` arm that follows it.
 An `await` in an arm body runs to completion before the loop arbitrates again, so a backoff
-placed there would stop the server observing its stop signal or reaping finished connections
-for the whole second. `axum::serve` puts its own sleep in the same place for the same reason.
-This was caught in review, not in testing: the wrong version passed every test.
+placed there would stop the server observing its stop signal for the whole second.
+`axum::serve` puts its own sleep in the same place for the same reason. This was caught in
+review, not in testing: the wrong version passed every test. That part still stands.
 
-That placement then created a second, subtler bug, and the fix for it is why the backoff is
-stored as an *instant* rather than a duration. A branch future that loses the race is dropped
-and rebuilt on the next pass, so a relative `sleep(one second)` starts again from zero every
-time another arm wins — and on a busy server the other arm, a finished connection, wins
-constantly. Measured against this loop's shape, one connection completing every 100 ms
-stopped a one-second backoff from *ever* elapsing: zero retries in three seconds, against
-four for the same loop sleeping to an absolute deadline. The listener would have stopped
-being retried for exactly as long as the server stayed busy.
+What no longer stands is everything that followed from it. The loop used to have a *third*
+arm, harvesting finished connection tasks out of a `JoinSet` so that per-connection outcomes
+could be reported to `on_error`. A `select!` branch future that loses the race is dropped and
+rebuilt on the next pass, and that third arm won constantly on a busy server — so a relative
+`sleep(one second)` inside `accept` restarted from zero every time any connection ended.
+Measured against that loop's shape, one connection completing every 100 ms stopped a
+one-second backoff from *ever* elapsing: zero retries in three seconds.
 
-Two further traps were found by review of the generic design, neither of them obvious:
+The response at the time was to build machinery to survive it: a second public trait
+returning `io::Result`, and a wrapper holding the backoff as an absolute `Instant` in the
+*listener's* state, where the future being dropped could not reach it. It worked, and it was
+well tested. It was also two public traits that `axum` has no counterpart for, and a contract
+hazard imposed on every third-party listener that axum's implementors do not face.
 
-- **Clearing the deadline before the sleep completes** is as bad as a relative sleep, and
-  looks more correct. `if let Some(deadline) = self.backoff.take()` loses the deadline
-  whenever the future is dropped mid-sleep, degenerating to a spin: measured at 34 attempts
-  in 3.4 seconds against the 3 that correct pacing gives. The deadline is therefore *read*
-  and cleared only after the sleep returns.
-- **Awaiting a handshake inside `accept`** is unsafe here in a way it is not in axum. A TLS
-  listener written the obvious way would have its handshake cancelled part-way through on
-  every harvest, dropping the connection underneath it. axum does not have this problem
-  because its main accept loop never drops the accept future. The advice is to return the
-  un-negotiated transport and let the handshake happen on first use.
+Then `axum`'s own source was read properly (`axum/src/serve/mod.rs:284-294`, 0.8.9). axum
+also `select!`s on `accept()` — but with **two** arms, and the non-accept arm `break`s. Its
+accept future is dropped at most once in a server's life, at shutdown. A relative sleep
+inside axum's `TcpListener::accept` is entirely safe, and always was.
 
-`RetryingListener` exists so that none of this has to be rediscovered. A listener supplies
-one fallible accept operation and wraps it; classification, pacing and cooperative yielding
-come with the wrapper. Both shipped listeners are built that way, and so is the double the
-tests drive. The trait's own documentation states the hazard at the point an implementor
-reads it, because `Listener` is deliberately left unsealed — axum's is open, and a crate
-whose selling point is axum-parity should not be more restrictive — which means a
-third-party listener can still bypass the safe path. That residual risk is accepted and
-documented rather than designed away.
+So the hazard was never a property of the `Listener` abstraction. It was a property of *our
+third arm*, which existed only because `on_error` reports per-connection outcomes and the
+loop was the thing observing them. The causal chain ran: `on_error` → join the connection
+tasks to see how they ended → a harvest arm in the `select!` → accept future dropped in a hot
+cycle → relative sleep never elapses → backoff must live outside the future → two extra
+public traits.
 
-The other thing the loop does deliberately is rank its branches. The stop signal is
-`biased` ahead of everything else, because `select!` chooses at *random* among ready
-branches: with a stop signal already fired and a client already queued, an unranked loop
-would admit that client about half the time, and then immediately drain it, having
-served it nothing. Accepting and harvesting, by contrast, arbitrate unbiased against each other on
-purpose — ranking those two would starve whichever came second under sustained load.
+The correction removes the cause rather than compensating for it. Each connection task now
+reports its own outcome through a shared observer, so the loop has nothing to harvest and
+reduces to axum's shape:
+
+```rust
+loop {
+    tokio::select! {
+        biased;
+        () = &mut stop => break,
+        (io, peer) = listener.accept() => { /* spawn */ }
+    }
+}
+```
+
+`FallibleListener` and `RetryingListener` are deleted. Both shipped listeners implement
+`Listener` directly, retrying in an ordinary loop with an ordinary `sleep`. The classification
+and pacing policy survives as one crate-private `async fn`, shared by the two of them because
+they happen to want the same policy — not because the contract demands it.
+
+Task-side reporting is also *better* on timeliness, which is worth stating because the
+harvest arm was partly justified by it. A connection that fails while the server sits idle
+used to wait for the loop to be polled again; it is now reported the moment it fails. A test
+pins that.
+
+### What remains true
+
+- **The accept future is still dropped once, at shutdown.** The stop arm breaks the loop, and
+  whatever accept was in flight goes with it. An implementation holding a half-finished TLS
+  handshake in local state still loses it *then* — the peer sees the negotiation abandoned
+  rather than refused. That is a much smaller claim than the old one, and the trait
+  documentation now makes exactly it rather than the reassuring version or the alarming one.
+- **The cooperative yield stays**, and is now more load-bearing rather than less. A listener
+  failing transiently in a tight loop never returns `Pending`; under the old three-arm loop
+  the harvest arm would still eventually get a turn, but the only other arm now is the stop
+  signal, so a spinning listener is a server that cannot be shut down. This is a deliberate
+  deviation from axum, which does not yield here.
+
+### What replaced the harvest, and what nearly went with it
+
+Three things the harvest arm was silently doing had to be re-provided:
+
+- **Panic reporting.** A handler panic unwound out of the connection task and was observed as
+  a `JoinError`. A task that reports its own outcome cannot report that it died. Each
+  connection future is therefore run inside a hand-rolled `catch_unwind` — `pin!` plus
+  `poll_fn` plus `AssertUnwindSafe`, no `unsafe`, and the panic payload preserved into a
+  public `HandlerPanic`. A `std::thread::panicking()` drop guard was considered first and
+  rejected in review: it is thread-global, and on a multi-thread runtime a task that merely
+  *ends* on a thread where some other task is unwinding would be misreported.
+- **Ending live connections when the server future is dropped.** The crate documents that
+  dropping the server "ends every connection at once", and that was delivered only as a side
+  effect of `JoinSet::drop` aborting its tasks. `tokio::spawn`'s `JoinHandle` *detaches* on
+  drop, so replacing the `JoinSet` with a refcount barrier alone would have lost the
+  behaviour silently. A registry of live connections holds each `AbortHandle`, and a drop
+  guard on it aborts what is still registered.
+- **Reaping.** The harvest arm was also the sole reaper of the per-connection bookkeeping.
+  Removing it without a replacement is an unbounded leak, so each task removes its own
+  registry entry as it finishes. There is exactly one deregistration mechanism, deliberately:
+  an earlier draft had two, and the redundancy made the leak test vacuous — with a second
+  mechanism to fall back on, deleting the first changed nothing observable.
+
+The stop signal is `biased` ahead of accept, because `select!` chooses at *random* among
+ready branches: with a stop signal already fired and a client already queued, an unranked
+loop would admit that client about half the time, and then immediately drain it, having
+served it nothing. With the harvest arm gone there is nothing else to rank.
 
 ## Peer addresses, and the feature that would undo the crate
 
@@ -193,17 +246,18 @@ since a client from this workspace could only show `ngnet-h2` agreeing with itse
 
 ## Connections are spawned; handlers are not
 
-Each accepted connection becomes a task in a `JoinSet`. Handlers are not spawned — they run
-inside their connection's future, concurrently with each other but on one task. That is
-`ngnet-h2`'s design, and it has two consequences a user must know, both stated on the crate
+Each accepted connection becomes its own `tokio::spawn`ed task. Handlers are not spawned —
+they run inside their connection's future, concurrently with each other but on one task. That
+is `ngnet-h2`'s design, and it has two consequences a user must know, both stated on the crate
 front page: a handler that blocks the thread stalls its whole connection, and a handler that
 panics fails its whole connection rather than one request.
 
-Peer addresses are kept in a map keyed by `tokio::task::Id` rather than returned from the
-task, because a panicked task returns nothing — a `JoinError` carries no value of ours. So
-the two harvest arms take the id from different places: the success arm from the value, the
-failure arm from `JoinError::id()`. Without the map, the failure that most needs attributing
-would be the one that could not be attributed.
+The task owns its peer address and reports its own outcome, which is why there is no map from
+task id to peer any more. There used to be one, keyed by `tokio::task::Id`, because a panicked
+task returns nothing and the `JoinError` the harvest arm saw carried no value of ours — so the
+failure that most needed attributing was the one that could not be attributed without it. The
+task holds its own peer now and cannot lose it, and a panic is caught inside the task rather
+than observed from outside, so it reports with a peer like any other failure.
 
 **The number of simultaneously accepted connections is not capped.** There is no semaphore
 and no limit; the loop accepts what arrives. A caller who needs a bound has to impose it,

@@ -91,10 +91,14 @@ impl TestServer {
 
     /// Waits until the server has reported at least `count` failures, or fails.
     ///
-    /// Polling rather than sleeping a fixed interval: the report happens on the accept
-    /// loop's task and there is no synchronisation point a test can wait on, so the choice
-    /// is between polling with a bound and guessing a duration. Polling turns a slow machine
-    /// into a slower test rather than a flaky one.
+    /// Polling rather than sleeping a fixed interval: the report happens on the connection's
+    /// own task, so a test that has just seen a connection close still has no synchronisation
+    /// point to wait on, and the choice is between polling with a bound and guessing a
+    /// duration. Polling turns a slow machine into a slower test rather than a flaky one.
+    ///
+    /// The wait is short in practice. Reporting used to be the accept loop's job, which meant
+    /// a failure could sit unreported until the loop happened to be polled again; it now
+    /// happens the instant the connection ends.
     pub async fn await_reports(&self, count: usize) {
         within(&format!("{count} reported failure(s)"), async {
             while self.reported() < count {

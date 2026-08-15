@@ -36,9 +36,9 @@
 //! they did.
 
 use std::error::Error as StdError;
+use std::fmt;
 #[cfg(test)]
 use std::io;
-use std::fmt;
 use std::net::SocketAddr;
 
 use crate::peer::PeerAddr;
@@ -55,10 +55,7 @@ pub struct Error<A = SocketAddr> {
 
 impl<A> Error<A> {
     /// A failure on an established connection, naming the peer it was with.
-    pub(crate) fn connection(
-        peer: A,
-        source: impl Into<Box<dyn StdError + Send + Sync>>,
-    ) -> Self {
+    pub(crate) fn connection(peer: A, source: impl Into<Box<dyn StdError + Send + Sync>>) -> Self {
         Self {
             peer: PeerAddr(peer),
             source: source.into(),

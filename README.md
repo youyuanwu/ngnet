@@ -78,8 +78,8 @@ reasons.
 
 ```rust,no_run
 let router = axum::Router::new().route("/hello", axum::routing::get(|| async { "world" }));
-let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
-ngnet_axum::serve(listener, router).await;
+let tcp = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
+ngnet_axum::serve(ngnet_axum::TcpListener::new(tcp), router).await;
 ```
 
 ## Building

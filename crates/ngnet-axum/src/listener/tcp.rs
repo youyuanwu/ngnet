@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use ngnet_h2::http::transport::TokioIo;
 use tokio::net::TcpStream;
 
-use super::{FallibleListener, Listener, RetryingListener};
+use super::{Listener, pace_after};
 
 /// Accepts TCP connections for [`serve`](crate::serve).
 ///
@@ -26,20 +26,24 @@ use super::{FallibleListener, Listener, RetryingListener};
 ///
 /// # Why this is a wrapper rather than an impl on `tokio::net::TcpListener`
 ///
-/// axum implements its listener trait directly on the tokio type, and this crate could not.
-/// A backoff deadline has to survive the accept future being dropped -- see
-/// [`Listener::accept`] for why it is dropped at all -- which means it has to live in the
-/// listener. A bare [`tokio::net::TcpListener`] has nowhere to keep one.
+/// It once had to be, because retry state had to outlive the accept future. It no longer
+/// does, and the wrapper stays for two smaller reasons that are nonetheless the real ones.
 ///
-/// The cost is one visible line at the call site, which is the intended trade: the change is
-/// one a reader can see, and it stops TCP from being the case the API is shaped around.
+/// It disables Nagle on every accepted socket, and it offers [`local_addr`](Self::local_addr).
+/// Both are TCP's business rather than the accept loop's, and neither has anywhere to live on
+/// a bare [`tokio::net::TcpListener`].
+///
+/// And it keeps TCP from being privileged. An impl on the tokio type would make bare TCP the
+/// one transport that needs no wrapping at the call site, which is precisely the shape this
+/// crate exists not to have: TCP is one implementation of [`Listener`] among several. The
+/// cost is one visible line, and a reader can see what it does.
 #[derive(Debug)]
-pub struct TcpListener(RetryingListener<TcpAcceptor>);
+pub struct TcpListener(tokio::net::TcpListener);
 
 impl TcpListener {
     /// Wraps a bound [`tokio::net::TcpListener`].
     pub const fn new(listener: tokio::net::TcpListener) -> Self {
-        Self(RetryingListener::new(TcpAcceptor(listener)))
+        Self(listener)
     }
 
     /// Returns the local address the underlying socket is bound to.
@@ -52,7 +56,7 @@ impl TcpListener {
     ///
     /// Whatever the underlying socket reports.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.0.get_ref().0.local_addr()
+        self.0.local_addr()
     }
 }
 
@@ -60,40 +64,25 @@ impl Listener for TcpListener {
     type Io = TokioIo<TcpStream>;
     type Addr = SocketAddr;
 
-    fn accept(&mut self) -> impl Future<Output = (Self::Io, Self::Addr)> + Send {
-        self.0.accept()
-    }
-}
+    /// Accepts, retrying internally, in the shape the trait documentation recommends.
+    ///
+    /// An ordinary loop holding an ordinary sleep. Nothing survives outside this future,
+    /// because nothing has to: the server drops it at shutdown and not before.
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.0.accept().await {
+                Ok((stream, peer)) => {
+                    // Nagle would otherwise hold back the small writes that HTTP/2 control
+                    // frames are made of, waiting for data that is not coming. This lives
+                    // here rather than in the accept loop because it is a property of TCP,
+                    // and the loop no longer knows what a socket is.
+                    let _ = stream.set_nodelay(true);
 
-/// Pins that the TCP listener gets its retry policy by holding the shared wrapper.
-///
-/// There is no behavioural test that can tell the difference between this and an equivalent
-/// retry loop written out again here, because no test can make a real socket's `accept` fail
-/// on demand. So the guard is structural: this stops compiling if the composition is
-/// replaced, which is the mutation worth catching.
-const _: fn(TcpListener) -> RetryingListener<TcpAcceptor> = |listener| listener.0;
-
-/// The fallible half: accept once, or say why not.
-///
-/// Retry, classification and pacing are [`RetryingListener`]'s, which is why they are absent
-/// here.
-#[derive(Debug)]
-struct TcpAcceptor(tokio::net::TcpListener);
-
-impl FallibleListener for TcpAcceptor {
-    type Io = TokioIo<TcpStream>;
-    type Addr = SocketAddr;
-
-    async fn accept(&mut self) -> io::Result<(Self::Io, Self::Addr)> {
-        let (stream, peer) = self.0.accept().await?;
-
-        // Nagle would otherwise hold back the small writes that HTTP/2 control frames are
-        // made of, waiting for data that is not coming. This lives here rather than in the
-        // accept loop because it is a property of TCP, and the loop no longer knows what a
-        // socket is.
-        let _ = stream.set_nodelay(true);
-
-        Ok((TokioIo::new(stream), peer))
+                    return (TokioIo::new(stream), peer);
+                }
+                Err(error) => pace_after(&error).await,
+            }
+        }
     }
 }
 
@@ -106,15 +95,15 @@ mod tests {
     /// Read back off the socket the listener hands over rather than asserting that a call
     /// was made, because the point of this test is that moving `set_nodelay` out of the
     /// accept loop and into the TCP listener did not quietly lose it. A test double could
-    /// not have caught that -- only the shipped acceptor can.
+    /// not have caught that -- only the shipped listener can.
     #[tokio::test]
     async fn accepted_sockets_have_nagle_disabled() {
         let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = bound.local_addr().unwrap();
-        let mut acceptor = TcpAcceptor(bound);
+        let mut listener = TcpListener::new(bound);
 
         let client = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
-        let (accepted, _peer) = acceptor.accept().await.unwrap();
+        let (accepted, _peer) = listener.accept().await;
         let _client = client.await.unwrap();
 
         assert!(

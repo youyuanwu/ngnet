@@ -102,7 +102,7 @@
 //! transport it likes -- a socket, an in-memory pipe, a TLS session, something that is not a
 //! byte stream at all -- and the crate does not care. What it does care about is the
 //! *runtime*: the accept loop is built on `tokio::select!`, `tokio::time` and
-//! [`JoinSet`](tokio::task::JoinSet), and `JoinSet::spawn` requires `Send + 'static`. So a
+//! [`tokio::spawn`], which requires `Send + 'static`. So a
 //! thread-per-core runtime whose types are not `Send`, which is the case `ngnet-h2`'s
 //! `completion` transport exists to serve, remains out of reach here. Pluggable transports
 //! did not change that and were never going to. Serving such a transport would need a
@@ -136,11 +136,15 @@
 //! | [`UnixListener`] | Unix domain socket (`#[cfg(unix)]`) | [`tokio::net::unix::SocketAddr`] |
 //!
 //! To serve something else -- TLS, an in-memory pipe, a test double -- implement
-//! [`FallibleListener`] and wrap it in [`RetryingListener`]. That is one method returning
-//! `io::Result`, and it is strongly preferred to implementing [`Listener`] directly: this
-//! crate's accept loop drops and rebuilds the accept future, so a listener that paces its
-//! own retries with a relative sleep will never retry at all. [`Listener::accept`] documents
-//! the hazard in full.
+//! [`Listener`]. One method, no wrapping, and the same shape axum's implementors write:
+//! retry internally in an ordinary loop, and pace the retries with an ordinary sleep.
+//!
+//! This crate once asked for more than that, and third-party code written against the older
+//! contract will need a small edit. The accept loop used to arbitrate accepting against
+//! harvesting finished connections, so the accept future was dropped and rebuilt whenever
+//! any connection ended and a relative sleep inside it never elapsed. Two extra traits
+//! existed to make that survivable. The loop has two arms now -- stop, and accept -- and
+//! both traits are gone. [`Listener::accept`] documents what remains true.
 //!
 //! [`Router`]: axum::Router
 //! [`IncomingBody`]: ngnet_h2::http::IncomingBody
@@ -159,9 +163,9 @@ mod transport;
 
 pub use connection::serve_connection;
 pub use error::{Error, HandlerPanic};
-pub use listener::{FallibleListener, Listener, RetryingListener, TcpListener};
 #[cfg(unix)]
 pub use listener::UnixListener;
+pub use listener::{Listener, TcpListener};
 pub use peer::PeerAddr;
 pub use server::{Serve, serve};
 pub use transport::{ServableTransport, require_spawnable};

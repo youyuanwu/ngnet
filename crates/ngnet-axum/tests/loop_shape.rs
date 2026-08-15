@@ -85,10 +85,7 @@ async fn until(mut condition: impl FnMut() -> bool) -> bool {
 }
 
 /// Collects reported failures.
-fn collector() -> (
-    impl FnMut(Error) + Send + 'static,
-    Arc<Mutex<Vec<String>>>,
-) {
+fn collector() -> (impl FnMut(Error) + Send + 'static, Arc<Mutex<Vec<String>>>) {
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&seen);
     (
@@ -446,9 +443,10 @@ async fn the_bounded_listener_serves_a_real_request() {
     let server = tokio::spawn(serve(listener, router).into_future());
 
     let client = incoming.recv().await.expect("a connection");
-    let (mut sender, connection) = hyper_client::handshake(TokioExecutor::new(), HyperIo::new(client))
-        .await
-        .expect("a handshake");
+    let (mut sender, connection) =
+        hyper_client::handshake(TokioExecutor::new(), HyperIo::new(client))
+            .await
+            .expect("a handshake");
     tokio::spawn(connection);
 
     let response = sender
@@ -461,7 +459,12 @@ async fn the_bounded_listener_serves_a_real_request() {
         .await
         .expect("a response");
 
-    let body = response.into_body().collect().await.expect("a body").to_bytes();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("a body")
+        .to_bytes();
     assert_eq!(&body[..], b"fine");
 
     server.abort();

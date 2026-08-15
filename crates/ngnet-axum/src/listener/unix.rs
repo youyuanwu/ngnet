@@ -6,7 +6,7 @@ use ngnet_h2::http::transport::TokioIo;
 use tokio::net::UnixStream;
 use tokio::net::unix::SocketAddr;
 
-use super::{FallibleListener, Listener, RetryingListener};
+use super::{Listener, pace_after};
 
 /// Accepts Unix-domain-socket connections for [`serve`](crate::serve).
 ///
@@ -38,12 +38,12 @@ use super::{FallibleListener, Listener, RetryingListener};
 /// `AddrInUse` against a leftover file even when nothing is listening on it.
 #[derive(Debug)]
 #[cfg_attr(docsrs, doc(cfg(unix)))]
-pub struct UnixListener(RetryingListener<UnixAcceptor>);
+pub struct UnixListener(tokio::net::UnixListener);
 
 impl UnixListener {
     /// Wraps a bound [`tokio::net::UnixListener`].
     pub const fn new(listener: tokio::net::UnixListener) -> Self {
-        Self(RetryingListener::new(UnixAcceptor(listener)))
+        Self(listener)
     }
 
     /// Returns the local address the underlying socket is bound to.
@@ -55,7 +55,7 @@ impl UnixListener {
     ///
     /// Whatever the underlying socket reports.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.0.get_ref().0.local_addr()
+        self.0.local_addr()
     }
 }
 
@@ -63,27 +63,16 @@ impl Listener for UnixListener {
     type Io = TokioIo<UnixStream>;
     type Addr = SocketAddr;
 
-    fn accept(&mut self) -> impl Future<Output = (Self::Io, Self::Addr)> + Send {
-        self.0.accept()
-    }
-}
-
-/// Pins the composition, as in the TCP listener. See the note there.
-const _: fn(UnixListener) -> RetryingListener<UnixAcceptor> = |listener| listener.0;
-
-/// The fallible half: accept once, or say why not.
-///
-/// There is no `set_nodelay` analogue -- Nagle is a TCP algorithm, and this is the point of
-/// having moved that call out of the accept loop.
-#[derive(Debug)]
-struct UnixAcceptor(tokio::net::UnixListener);
-
-impl FallibleListener for UnixAcceptor {
-    type Io = TokioIo<UnixStream>;
-    type Addr = SocketAddr;
-
-    async fn accept(&mut self) -> io::Result<(Self::Io, Self::Addr)> {
-        let (stream, peer) = self.0.accept().await?;
-        Ok((TokioIo::new(stream), peer))
+    /// Accepts, retrying internally, sharing the TCP listener's pacing policy.
+    ///
+    /// There is no `set_nodelay` analogue -- Nagle is a TCP algorithm, and this is the point
+    /// of having moved that call out of the accept loop.
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.0.accept().await {
+                Ok((stream, peer)) => return (TokioIo::new(stream), peer),
+                Err(error) => pace_after(&error).await,
+            }
+        }
     }
 }
