@@ -130,6 +130,29 @@ fn is_transient(error: &io::Error) -> bool {
     )
 }
 
+/// Accepts from `source`, retrying until it succeeds.
+///
+/// The retry loop the [`Listener`] contract asks every implementation to write, written once
+/// because both shipped listeners want the same one. It is deliberately *not* public: the
+/// contract is that an implementor retries, not that they retry like this, and a public
+/// wrapper here is exactly the thing this crate used to have and no longer needs.
+///
+/// `source` is a closure rather than a `&mut self` method so that both a `TcpListener` and a
+/// `UnixListener` -- which share no trait -- can pass their own accept, and so that a test can
+/// pass one that fails on demand. No real socket can be made to fail on demand, which is why
+/// this is the only place the retry loop is testable at all.
+async fn accept_retrying<T, F>(mut source: impl FnMut() -> F) -> T
+where
+    F: Future<Output = io::Result<T>>,
+{
+    loop {
+        match source().await {
+            Ok(accepted) => return accepted,
+            Err(error) => pace_after(&error).await,
+        }
+    }
+}
+
 /// Reacts to an accept failure, and returns when it is worth trying again.
 ///
 /// The whole of this crate's accept-retry policy, in one place so that the two shipped

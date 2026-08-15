@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use ngnet_h2::http::transport::TokioIo;
 use tokio::net::TcpStream;
 
-use super::{Listener, pace_after};
+use super::{Listener, accept_retrying};
 
 /// Accepts TCP connections for [`serve`](crate::serve).
 ///
@@ -69,20 +69,15 @@ impl Listener for TcpListener {
     /// An ordinary loop holding an ordinary sleep. Nothing survives outside this future,
     /// because nothing has to: the server drops it at shutdown and not before.
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            match self.0.accept().await {
-                Ok((stream, peer)) => {
-                    // Nagle would otherwise hold back the small writes that HTTP/2 control
-                    // frames are made of, waiting for data that is not coming. This lives
-                    // here rather than in the accept loop because it is a property of TCP,
-                    // and the loop no longer knows what a socket is.
-                    let _ = stream.set_nodelay(true);
+        let (stream, peer) = accept_retrying(|| self.0.accept()).await;
 
-                    return (TokioIo::new(stream), peer);
-                }
-                Err(error) => pace_after(&error).await,
-            }
-        }
+        // Nagle would otherwise hold back the small writes that HTTP/2 control frames are
+        // made of, waiting for data that is not coming. This lives here rather than in the
+        // accept loop because it is a property of TCP, and the loop no longer knows what a
+        // socket is.
+        let _ = stream.set_nodelay(true);
+
+        (TokioIo::new(stream), peer)
     }
 }
 

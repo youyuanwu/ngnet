@@ -6,7 +6,7 @@ use ngnet_h2::http::transport::TokioIo;
 use tokio::net::UnixStream;
 use tokio::net::unix::SocketAddr;
 
-use super::{Listener, pace_after};
+use super::{Listener, accept_retrying};
 
 /// Accepts Unix-domain-socket connections for [`serve`](crate::serve).
 ///
@@ -68,11 +68,7 @@ impl Listener for UnixListener {
     /// There is no `set_nodelay` analogue -- Nagle is a TCP algorithm, and this is the point
     /// of having moved that call out of the accept loop.
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            match self.0.accept().await {
-                Ok((stream, peer)) => return (TokioIo::new(stream), peer),
-                Err(error) => pace_after(&error).await,
-            }
-        }
+        let (stream, peer) = accept_retrying(|| self.0.accept()).await;
+        (TokioIo::new(stream), peer)
     }
 }

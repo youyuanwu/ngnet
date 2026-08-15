@@ -143,3 +143,105 @@ async fn a_transient_failure_yields_before_retrying() {
          server can never see its own shutdown signal"
     );
 }
+
+/// A source of accept results, scripted by the test and counting the asking.
+///
+/// It stands in for a socket, because no real socket can be made to fail on demand -- which
+/// is the whole reason the retry loop was extracted into a function taking a closure instead
+/// of being written out inside each shipped listener.
+struct Scripted {
+    /// Returned in order; the last is repeated once exhausted.
+    script: Vec<io::ErrorKind>,
+    calls: usize,
+    /// Panic rather than return once this many calls have been made, if set.
+    cap: Option<usize>,
+}
+
+impl Scripted {
+    /// Fails with each kind in turn, then succeeds.
+    fn failing(script: &[io::ErrorKind]) -> Self {
+        Self {
+            script: script.to_vec(),
+            calls: 0,
+            cap: None,
+        }
+    }
+
+    /// Fails forever, and panics if asked more than `cap` times.
+    fn capped(kind: io::ErrorKind, cap: usize) -> Self {
+        Self {
+            script: vec![kind],
+            calls: 0,
+            cap: Some(cap),
+        }
+    }
+
+    fn next(&mut self) -> io::Result<usize> {
+        let seen = self.calls;
+        self.calls += 1;
+
+        if let Some(cap) = self.cap {
+            assert!(
+                seen < cap,
+                "the retry loop asked the underlying accept {} times within a single poll, \
+                 where at most {cap} was correct: it is not pacing itself and would spin",
+                seen + 1
+            );
+        }
+
+        match self.script.get(seen) {
+            Some(kind) => Err(io::Error::from(*kind)),
+            None => Ok(seen),
+        }
+    }
+}
+
+/// SC-005. The retry loop retries until it succeeds, and hands back the success.
+///
+/// Virtual time, so the two systemic failures cost two seconds of clock and no real time.
+/// This is the property the shipped listeners get by calling the helper: an accept that
+/// fails is not an accept that stops.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_failing_source_is_retried_until_it_succeeds() {
+    let mut source = Scripted::failing(&[
+        io::ErrorKind::ConnectionAborted,
+        io::ErrorKind::PermissionDenied,
+        io::ErrorKind::PermissionDenied,
+    ]);
+
+    let started = tokio::time::Instant::now();
+    let accepted = accept_retrying(|| std::future::ready(source.next())).await;
+
+    assert_eq!(
+        accepted, 3,
+        "the retry loop must return the first success, not a failure and not a later one"
+    );
+    assert_eq!(
+        started.elapsed(),
+        ACCEPT_BACKOFF * 2,
+        "one transient failure costs nothing and two systemic ones cost a period each: a \
+         loop that paced the transient one, or failed to pace a systemic one, lands elsewhere"
+    );
+}
+
+/// SC-005a. The retry loop does not spin within a single poll.
+///
+/// Asserted by hand rather than by timing: a spinning loop starves the timer that would time
+/// it out, so a timed test hangs rather than failing. The source panics on its second call,
+/// which puts the failure inside the poll this test drives.
+#[tokio::test(flavor = "current_thread")]
+async fn a_source_that_always_fails_is_not_spun_on() {
+    let mut source = Scripted::capped(io::ErrorKind::PermissionDenied, 1);
+
+    let polled = poll_once(accept_retrying(|| std::future::ready(source.next())));
+
+    assert!(
+        polled.is_pending(),
+        "a listener that cannot accept must yield to the server's loop rather than \
+         monopolising the poll"
+    );
+    assert_eq!(
+        source.calls, 1,
+        "one systemic failure should be paced and then waited out, not tried again at once"
+    );
+}
