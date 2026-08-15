@@ -51,7 +51,7 @@ async fn main() -> Fallible {
     // is told the last request its connection will answer, in-flight requests are finished,
     // and each connection closes after its last stream. There is no deadline on that, so a
     // deployment whose handlers can take arbitrarily long wants a timeout around this.
-    ngnet_axum::serve(listener, router)
+    ngnet_axum::serve(ngnet_axum::TcpListener::new(listener), router)
         .on_error(|error| eprintln!("connection failed: {error}"))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

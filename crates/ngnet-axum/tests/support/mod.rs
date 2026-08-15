@@ -67,7 +67,7 @@ impl TestServer {
         let (stop, stopped) = oneshot::channel();
 
         let task = tokio::spawn(
-            serve(listener, router)
+            serve(ngnet_axum::TcpListener::new(listener), router)
                 .config(config)
                 .on_error(move |error| sink.lock().expect("a lock").push(error))
                 .with_graceful_shutdown(async {

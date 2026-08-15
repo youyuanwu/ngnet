@@ -10,7 +10,7 @@
 //!
 //! // The server future resolves to `()`, not a `Result`: a per-connection failure is
 //! // delivered to `Serve::on_error` rather than ending the server. Nothing here fails.
-//! ngnet_axum::serve(listener, router).await;
+//! ngnet_axum::serve(ngnet_axum::TcpListener::new(listener), router).await;
 //! # Ok(())
 //! # }
 //! ```
@@ -126,7 +126,7 @@ mod server;
 mod transport;
 
 pub use connection::serve_connection;
-pub use error::{Error, ErrorKind};
+pub use error::Error;
 pub use listener::{FallibleListener, Listener, RetryingListener, TcpListener};
 #[cfg(unix)]
 pub use listener::UnixListener;

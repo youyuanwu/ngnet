@@ -17,7 +17,6 @@ use std::net::SocketAddr;
 
 use axum::Router;
 use axum::routing::get;
-use ngnet_axum::ErrorKind;
 use support::{Client, TestServer, get as get_request, text, within};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -45,10 +44,12 @@ async fn an_http1_speaker_fails_only_its_own_connection() {
     server.await_reports(1).await;
     server.with_errors(|errors| {
         assert_eq!(errors.len(), 1, "expected exactly one failure");
-        assert_eq!(errors[0].kind(), ErrorKind::Connection);
+        // The peer is the client's ephemeral address, not the server's, so the assertion
+        // is on what is knowable: it is a real loopback address rather than a placeholder.
         assert!(
-            errors[0].peer().is_some(),
-            "a connection failure should name its peer"
+            SocketAddr::from(errors[0].peer_addr()).ip().is_loopback(),
+            "a connection failure should name its peer, got {:?}",
+            errors[0].peer()
         );
     });
 
@@ -104,10 +105,9 @@ async fn a_panicking_handler_does_not_stop_the_server() {
 
     server.await_reports(1).await;
     server.with_errors(|errors| {
-        assert_eq!(errors[0].kind(), ErrorKind::Connection);
         assert_eq!(
-            errors[0].peer_addr().map(SocketAddr::from),
-            Some(doomed_peer),
+            SocketAddr::from(errors[0].peer_addr()),
+            doomed_peer,
             "the failure named the wrong peer"
         );
     });
@@ -237,16 +237,16 @@ async fn every_reported_failure_names_its_own_peer() {
     }
 
     server.await_reports(3).await;
-    let reported: Vec<Option<SocketAddr>> = server.with_errors(|errors| {
+    let reported: Vec<SocketAddr> = server.with_errors(|errors| {
         errors
             .iter()
-            .map(|error| error.peer_addr().map(SocketAddr::from))
+            .map(|error| SocketAddr::from(error.peer_addr()))
             .collect()
     });
 
     for address in &addresses {
         assert!(
-            reported.contains(&Some(*address)),
+            reported.contains(address),
             "no failure was reported for {address}, only {reported:?}"
         );
     }

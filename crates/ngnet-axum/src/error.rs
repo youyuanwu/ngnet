@@ -3,10 +3,18 @@
 //! A server that has started serving has nobody left to return a `Result` to: the accept
 //! loop outlives every individual failure and is expected to keep going. So failures are
 //! *reported* rather than returned, and the thing they are reported through needs to answer
-//! two questions a caller acts on differently. Did the listener fail, or did one connection
-//! fail? And if a connection failed, which peer was it?
+//! the question a caller acts on: which peer was this with?
 //!
-//! Both are carried here rather than flattened into a message, for the same reason
+//! # There is only one kind of failure left to report
+//!
+//! There used to be two, and a `kind` accessor to tell them apart: accepting could fail, or
+//! a connection could. Accepting can no longer be reported here at all, because a
+//! [`Listener`](crate::Listener) handles its own acceptance failures -- that is what it
+//! means for `accept` to yield a connection rather than a `Result`. Every error that reaches
+//! this type is now a connection error, so a `kind` that could only ever return one value
+//! was removed rather than kept as ceremony.
+//!
+//! The address is carried here rather than flattened into a message, for the same reason
 //! `ngnet-h2`'s own [`Error`](ngnet_h2::http::Error) carries a kind: a caller that has to
 //! string-match to find out which peer misbehaved has been given a log line, not an error.
 //!
@@ -35,80 +43,38 @@ use std::net::SocketAddr;
 
 use crate::peer::PeerAddr;
 
-/// The category of a server failure.
-///
-/// Marked non-exhaustive: new categories are additive, and matching on this must always
-/// carry a wildcard arm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ErrorKind {
-    /// Accepting a connection failed. No peer is known, because none was obtained.
-    ///
-    /// The server does not stop for this. Most causes are transient — a client that
-    /// vanished between the kernel queueing it and the loop reaching it — but a process out
-    /// of file descriptors reports it on every attempt, so the loop throttles rather than
-    /// spinning.
-    Accept,
-    /// One connection failed. Every stream on it failed with it; the server carries on.
-    ///
-    /// This is also how a handler panic arrives: panics unwind out of the connection
-    /// future, so isolation is per connection rather than per request.
-    Connection,
-}
-
-impl ErrorKind {
-    const fn describe(self) -> &'static str {
-        match self {
-            Self::Accept => "accept",
-            Self::Connection => "connection",
-        }
-    }
-}
-
 /// A failure reported by a running server.
 ///
 /// `A` is the peer address type the [`Listener`](crate::Listener) produces, defaulting to
 /// [`SocketAddr`].
 #[derive(Debug)]
 pub struct Error<A = SocketAddr> {
-    kind: ErrorKind,
-    peer: Option<PeerAddr<A>>,
+    peer: PeerAddr<A>,
     source: Box<dyn StdError + Send + Sync>,
 }
 
 impl<A> Error<A> {
-    /// A failure accepting a connection. No peer exists to name.
-    pub(crate) fn accept(source: impl Into<Box<dyn StdError + Send + Sync>>) -> Self {
-        Self {
-            kind: ErrorKind::Accept,
-            peer: None,
-            source: source.into(),
-        }
-    }
-
     /// A failure on an established connection, naming the peer it was with.
     pub(crate) fn connection(
         peer: A,
         source: impl Into<Box<dyn StdError + Send + Sync>>,
     ) -> Self {
         Self {
-            kind: ErrorKind::Connection,
-            peer: Some(PeerAddr(peer)),
+            peer: PeerAddr(peer),
             source: source.into(),
         }
     }
 
-    /// Which kind of failure this is.
-    pub const fn kind(&self) -> ErrorKind {
-        self.kind
-    }
-
-    /// The peer this failure was with, for failures that had one.
+    /// The peer this failure was with.
+    ///
+    /// Not optional: every failure that reaches this type is a connection failure, and a
+    /// connection has a peer by construction. It was optional when accepting could also be
+    /// reported here, which a [`Listener`](crate::Listener) now handles itself.
     ///
     /// Borrowed rather than returned by value, because a listener's address type need not be
     /// [`Copy`] — a Unix-domain address is not.
-    pub const fn peer(&self) -> Option<&PeerAddr<A>> {
-        self.peer.as_ref()
+    pub const fn peer(&self) -> &PeerAddr<A> {
+        &self.peer
     }
 }
 
@@ -116,7 +82,7 @@ impl<A: Copy> Error<A> {
     /// The peer this failure was with, by value, when the address type is [`Copy`].
     ///
     /// Convenience for the common [`SocketAddr`] case, where borrowing is pure ceremony.
-    pub const fn peer_addr(&self) -> Option<PeerAddr<A>> {
+    pub const fn peer_addr(&self) -> PeerAddr<A> {
         self.peer
     }
 }
@@ -126,12 +92,8 @@ impl<A: fmt::Debug> fmt::Display for Error<A> {
         // Formatted with `Debug` rather than `Display`: a Unix-domain address does not
         // implement `Display` at all, so requiring it here would bar the listener this
         // crate ships from ever reporting an error.
-        match &self.peer {
-            Some(PeerAddr(peer)) => {
-                write!(formatter, "{} error with {peer:?}", self.kind.describe())
-            }
-            None => write!(formatter, "{} error", self.kind.describe()),
-        }
+        let PeerAddr(peer) = &self.peer;
+        write!(formatter, "connection error with {peer:?}")
     }
 }
 
@@ -164,8 +126,8 @@ mod tests {
         );
 
         assert_eq!(
-            error.peer().map(|PeerAddr(addr)| addr.clone()),
-            Some(AwkwardAddr("/tmp/ngnet.sock".to_owned())),
+            error.peer().0,
+            AwkwardAddr("/tmp/ngnet.sock".to_owned()),
             "the peer address must be recoverable as an address, not just as a message: a \
              caller shedding a misbehaving client cannot parse one back out of a string"
         );
@@ -176,12 +138,13 @@ mod tests {
         );
     }
 
-    /// The accept variant still names no peer.
+    /// A connection failure renders its peer.
     #[test]
-    fn an_accept_failure_names_no_peer() {
-        let error = Error::<SocketAddr>::accept(io::Error::other("out of descriptors"));
+    fn a_connection_failure_names_its_peer() {
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let error = Error::connection(peer, io::Error::other("reset"));
 
-        assert!(error.peer().is_none());
-        assert_eq!(error.to_string(), "accept error");
+        assert_eq!(error.peer_addr(), PeerAddr(peer));
+        assert_eq!(error.to_string(), "connection error with 127.0.0.1:8080");
     }
 }
