@@ -17,9 +17,16 @@ repository.workspace = true
 # exists *to* depend on axum, and keeping that dependency out of `ngnet-h2` is precisely why
 # the integration is a separate crate rather than a feature of it.
 [dependencies]
-# The `tokio` feature supplies the `TokioIo` transport adapter this crate wraps every
-# accepted socket in. No other transport is enabled: `completion` would need a second
-# integration whose only difference is the runtime, which would test nothing new about axum.
+# The `tokio` feature supplies the `TokioIo` transport adapter. Listeners are now pluggable,
+# so this is no longer the only transport a *user* can serve -- any tokio byte stream works,
+# and so does anything else implementing `ServableTransport`.
+#
+# `completion` is still not enabled, and pluggable transports did not bring it closer. The
+# obstacle was never the transport bound: it is the accept loop, which is built on
+# `tokio::select!`, `tokio::time` and `JoinSet`, and whose `JoinSet::spawn` requires
+# `Send + 'static`. A thread-per-core runtime whose types are not `Send` cannot be served by
+# that loop no matter what listener is handed to it. Enabling `completion` here would need a
+# different accept loop, not a different feature flag.
 ngnet-h2 = { workspace = true, features = ["tokio"] }
 axum.workspace = true
 http.workspace = true

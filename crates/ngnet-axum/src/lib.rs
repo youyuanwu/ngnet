@@ -80,8 +80,12 @@
 //! because only the caller knows what its own handlers are allowed to take and what should
 //! happen to a request that overruns -- wrap the server future in a timeout if you need one.
 //!
-//! **Peer addresses arrive as an extension, not `ConnectInfo`.** Handlers read
-//! [`PeerAddr`] from the request extensions. axum's `ConnectInfo` extractor is gated behind
+//! **Peer addresses arrive as an extension, not `ConnectInfo`, and their type follows the
+//! transport.** Handlers read [`PeerAddr`] from the request extensions. Over TCP that is
+//! `PeerAddr<SocketAddr>`, which is what `PeerAddr` means when written without a parameter,
+//! so nothing changes for a TCP server. Over another transport it is whatever that
+//! [`Listener`] produces -- `PeerAddr<tokio::net::unix::SocketAddr>` for the Unix listener,
+//! which is frequently unnamed because a client that has not bound a path has no address. axum's `ConnectInfo` extractor is gated behind
 //! axum's `tokio` feature, which depends on `hyper-util` -- so supporting it would drag
 //! hyper back into the dependency graph this crate exists to avoid. CI checks that it has
 //! not returned.
@@ -91,14 +95,26 @@
 //! It serves h2c -- cleartext HTTP/2 with prior knowledge -- and nothing else. There is no
 //! TLS, no ALPN, no HTTP/1.1 and no upgrade dance, because `ngnet-h2` is a cleartext h2
 //! implementation. A peer that is not speaking HTTP/2 is an error, not a fallback. It is
-//! server-side only, and tokio-only.
+//! server-side only.
+//!
+//! It is **tokio-only**, and that is worth being precise about now that the transport is
+//! pluggable, because the two are easy to confuse. A [`Listener`] may hand over any
+//! transport it likes -- a socket, an in-memory pipe, a TLS session, something that is not a
+//! byte stream at all -- and the crate does not care. What it does care about is the
+//! *runtime*: the accept loop is built on `tokio::select!`, `tokio::time` and
+//! [`JoinSet`](tokio::task::JoinSet), and `JoinSet::spawn` requires `Send + 'static`. So a
+//! thread-per-core runtime whose types are not `Send`, which is the case `ngnet-h2`'s
+//! `completion` transport exists to serve, remains out of reach here. Pluggable transports
+//! did not change that and were never going to. Serving such a transport would need a
+//! different accept loop, not a different listener.
 //!
 //! **The number of simultaneously accepted connections is not capped.** The accept loop
 //! accepts whatever arrives; a server under load will keep accepting until it runs out of
 //! file descriptors or memory. That is stated plainly because it is a property a caller has
-//! to plan around: a bound belongs in front of this crate -- a semaphore, a listener that
-//! stops accepting, or something upstream -- and there is nothing here that will impose one
-//! for you. [`Config::max_concurrent_streams`] bounds streams *within* a connection, which
+//! to plan around: a bound belongs in front of this crate -- a semaphore, something
+//! upstream, or a [`Listener`] that stops accepting, which is now a practical option rather
+//! than a hypothetical one since a listener can be written by anybody -- and there is
+//! nothing here that will impose one for you. [`Config::max_concurrent_streams`] bounds streams *within* a connection, which
 //! is a different limit and not a substitute.
 //!
 //! # A trap worth knowing about
@@ -109,6 +125,22 @@
 //! the server to stop, and then waits out its timeout. The server is behaving correctly --
 //! it owes that peer the rest of a body -- and the client is the one that has not finished.
 //! Read response bodies to completion, or drop them.
+//!
+//! # Transports
+//!
+//! [`serve`] takes any [`Listener`]. TCP is one implementation and not a privileged one:
+//!
+//! | Listener | Transport | Peer address |
+//! | --- | --- | --- |
+//! | [`TcpListener`] | TCP | [`std::net::SocketAddr`] |
+//! | [`UnixListener`] | Unix domain socket (`#[cfg(unix)]`) | [`tokio::net::unix::SocketAddr`] |
+//!
+//! To serve something else -- TLS, an in-memory pipe, a test double -- implement
+//! [`FallibleListener`] and wrap it in [`RetryingListener`]. That is one method returning
+//! `io::Result`, and it is strongly preferred to implementing [`Listener`] directly: this
+//! crate's accept loop drops and rebuilds the accept future, so a listener that paces its
+//! own retries with a relative sleep will never retry at all. [`Listener::accept`] documents
+//! the hazard in full.
 //!
 //! [`Router`]: axum::Router
 //! [`IncomingBody`]: ngnet_h2::http::IncomingBody

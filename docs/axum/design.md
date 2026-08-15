@@ -7,16 +7,23 @@ and turned out to be wrong.
 ## What the crate is
 
 An axum `Router`, served over `ngnet-h2` instead of hyper. Server-side, h2c only, tokio
-only. Every one of those is a boundary rather than a stage on a roadmap:
+only. Every one of those is a boundary rather than a stage on a roadmap. Note that the
+transport is *not* among them: the server is generic over a `Listener`, and TCP is one
+implementation rather than the shape the crate is built around.
 
 - **Server only.** There is no client surface. `ngnet-h2` has a client, but axum's `Router`
   is a server-side abstraction and there is nothing to integrate on the other side.
 - **h2c only.** `ngnet-h2` is cleartext HTTP/2. There is no TLS, so there is no ALPN, so
   there is no protocol negotiation and no HTTP/1.1 upgrade. A peer that is not speaking
   HTTP/2 is a connection error, not a fallback.
-- **tokio only.** `ngnet-h2` also has a `completion` transport built on compio. A second
-  integration for it would differ only in which runtime spawns the accept loop, and would
-  test nothing about axum that this one does not.
+- **tokio only.** This one needs restating now that transports are pluggable, because the
+  two are easy to conflate. Any transport can be served — a socket, an in-memory pipe, a TLS
+  session — but the *runtime* cannot change. The accept loop is built on `tokio::select!`,
+  `tokio::time` and `JoinSet`, and `JoinSet::spawn` requires `Send + 'static`. `ngnet-h2`'s
+  `completion` transport is thread-per-core over compio and its types are not `Send`, so it
+  remains out of reach regardless of what listener is supplied. Serving it would need a
+  different accept loop, not a different listener. Pluggable transports did not bring this
+  closer and were never going to.
 
 ## The integration point is tower, not hyper
 
@@ -101,27 +108,56 @@ The alternative — resolving to `Result` — reads better and is wrong, because
 choice between ending the server on the first bad connection and inventing somewhere to put
 the errors it survives. A server that stops because one peer spoke HTTP/1.1 is useless, and
 this crate must survive that case: it is not an edge case but the ordinary behaviour of port
-scanners and misconfigured clients. Accept errors are treated the same way, with one
-addition — a transient accept failure such as `EMFILE` backs off before retrying, because
-retrying immediately turns a temporary shortage into a spin.
+scanners and misconfigured clients.
 
-The backoff lives *inside* the accept branch's future rather than in the `select!` arm that
-follows it. An `await` in an arm body runs to completion before the loop arbitrates again,
-so a backoff placed there would stop the server observing its stop signal or reaping
-finished connections for the whole second. `axum::serve` puts its own sleep in the same
-place for the same reason. This was caught in review, not in testing, which is worth
-recording: the wrong version passed every test.
+Accept errors are no longer reported here at all. `Listener::accept` yields a connection or
+does not return, following `axum::serve`, so acceptance failure is the listener's to
+classify and pace. That removed `ErrorKind` — with only connection failures left to report,
+an enum with one variant was ceremony — and with it the `Option` on `Error::peer`, since
+every remaining failure has a peer by construction.
 
-Moving the sleep into the branch future then created a second, subtler bug, and the fix for
-it is why the backoff is stored as an *instant* rather than a duration. A branch future that
-loses the race is dropped and rebuilt on the next pass, so a relative `sleep(one second)`
-starts again from zero every time another arm wins — and on a busy server the other arm, a
-finished connection, wins constantly. Measured against this loop's shape, one connection
-completing every 100 ms stopped a one-second backoff from *ever* elapsing: zero retries in
-five seconds, against roughly forty for the same loop sleeping to an absolute deadline. The
-listener would have stopped being retried for exactly as long as the server stayed busy.
-`sleep_until` is immune because a rebuilt future recomputes the time remaining to the same
-instant, inheriting the progress already made.
+## The backoff, and why it is an instant
+
+This is the hardest-won piece of reasoning in the crate, and moving retry into listeners
+made it *more* important rather than less, because it now has to be got right by people who
+did not write the accept loop.
+
+The backoff lives inside the accept future rather than in the `select!` arm that follows it.
+An `await` in an arm body runs to completion before the loop arbitrates again, so a backoff
+placed there would stop the server observing its stop signal or reaping finished connections
+for the whole second. `axum::serve` puts its own sleep in the same place for the same reason.
+This was caught in review, not in testing: the wrong version passed every test.
+
+That placement then created a second, subtler bug, and the fix for it is why the backoff is
+stored as an *instant* rather than a duration. A branch future that loses the race is dropped
+and rebuilt on the next pass, so a relative `sleep(one second)` starts again from zero every
+time another arm wins — and on a busy server the other arm, a finished connection, wins
+constantly. Measured against this loop's shape, one connection completing every 100 ms
+stopped a one-second backoff from *ever* elapsing: zero retries in three seconds, against
+four for the same loop sleeping to an absolute deadline. The listener would have stopped
+being retried for exactly as long as the server stayed busy.
+
+Two further traps were found by review of the generic design, neither of them obvious:
+
+- **Clearing the deadline before the sleep completes** is as bad as a relative sleep, and
+  looks more correct. `if let Some(deadline) = self.backoff.take()` loses the deadline
+  whenever the future is dropped mid-sleep, degenerating to a spin: measured at 34 attempts
+  in 3.4 seconds against the 3 that correct pacing gives. The deadline is therefore *read*
+  and cleared only after the sleep returns.
+- **Awaiting a handshake inside `accept`** is unsafe here in a way it is not in axum. A TLS
+  listener written the obvious way would have its handshake cancelled part-way through on
+  every harvest, dropping the connection underneath it. axum does not have this problem
+  because its main accept loop never drops the accept future. The advice is to return the
+  un-negotiated transport and let the handshake happen on first use.
+
+`RetryingListener` exists so that none of this has to be rediscovered. A listener supplies
+one fallible accept operation and wraps it; classification, pacing and cooperative yielding
+come with the wrapper. Both shipped listeners are built that way, and so is the double the
+tests drive. The trait's own documentation states the hazard at the point an implementor
+reads it, because `Listener` is deliberately left unsealed — axum's is open, and a crate
+whose selling point is axum-parity should not be more restrictive — which means a
+third-party listener can still bypass the safe path. That residual risk is accepted and
+documented rather than designed away.
 
 The other thing the loop does deliberately is rank its branches. The stop signal is
 `biased` ahead of everything else, because `select!` chooses at *random* among ready
@@ -132,7 +168,18 @@ purpose — ranking those two would starve whichever came second under sustained
 
 ## Peer addresses, and the feature that would undo the crate
 
-Handlers read `PeerAddr` from the request extensions. The idiomatic axum answer is
+Handlers read `PeerAddr` from the request extensions. Its address type follows the listener:
+`PeerAddr<SocketAddr>` over TCP, which is what `PeerAddr` means written bare, so nothing
+changed for existing handlers; `PeerAddr<tokio::net::unix::SocketAddr>` over the Unix
+listener. The parameter is defaulted precisely so that the common case reads as it did.
+
+The address had to become generic rather than widen to some union type, and the Unix
+listener is why: a client that has not bound a path is unnamed, and there is no `SocketAddr`
+that could honestly have been manufactured for it. `Error` carries the same parameter rather
+than erasing the address to a string. Erasure would have been cheaper at every signature —
+it propagates into `Serve::on_error`'s callback type — but it serves only the caller who
+logs the peer, and destroys the case for carrying an address at all: a caller shedding a
+client or feeding a rate limiter needs it back as an address. The idiomatic axum answer is
 `ConnectInfo<SocketAddr>`, and it is deliberately not supported: `ConnectInfo` is gated
 behind axum's `tokio` feature, which depends on `hyper-util`. Enabling it to gain one
 extractor would reinstate hyper in the dependency graph — the single thing the crate exists

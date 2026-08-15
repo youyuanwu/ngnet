@@ -125,7 +125,9 @@ integration rather than a family: no `-sys` crate, no state machine, no layering
 it wires two existing things together. That is possible because a `Router` is a
 `tower::Service` over `http` types and the HTTP engine beneath it is separable; hyper's only
 contribution to axum is turning bytes into requests, and this crate gives that job to
-`ngnet-h2`. Server-side, h2c and tokio only, and unpublished for now.
+`ngnet-h2`. Server-side, h2c and tokio only, and unpublished for now. The transport is not
+among those limits: the server is generic over a `Listener`, with TCP and Unix-domain
+implementations shipped and third-party ones supported.
 
 Within a family's own documents, "the crate" means that family's wrapper: `ngnet-h2` under
 [`h2/`](h2/), `ngnet-h3` under [`h3/`](h3/), `ngnet-quic` under [`quic/`](quic/). The same
