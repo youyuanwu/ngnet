@@ -120,12 +120,14 @@
 
 mod connection;
 mod error;
+mod listener;
 mod peer;
 mod server;
 mod transport;
 
 pub use connection::serve_connection;
 pub use error::{Error, ErrorKind};
+pub use listener::{FallibleListener, Listener, RetryingListener};
 pub use peer::PeerAddr;
 pub use server::{Serve, serve};
 pub use transport::{ServableTransport, require_spawnable};
