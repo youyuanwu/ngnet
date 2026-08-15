@@ -109,6 +109,17 @@ async fn a_panicking_handler_does_not_stop_the_server() {
 
     server.await_reports(1).await;
     server.with_errors(|errors| {
+        // SC-033b's other half: a panic is reported *once*. The old design could in
+        // principle have reported twice -- the connection erroring and then the task
+        // unwinding -- and `catch_panics` collapsing both into one outcome is what stops it.
+        // Asserting only `errors[0]` would pass against a double report.
+        assert_eq!(
+            errors.len(),
+            1,
+            "a single panicking handler must produce exactly one report, but {} were made",
+            errors.len()
+        );
+
         assert_eq!(
             SocketAddr::from(errors[0].peer_addr()),
             doomed_peer,

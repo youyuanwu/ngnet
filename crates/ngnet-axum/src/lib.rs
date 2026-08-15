@@ -144,7 +144,9 @@
 //! harvesting finished connections, so the accept future was dropped and rebuilt whenever
 //! any connection ended and a relative sleep inside it never elapsed. Two extra traits
 //! existed to make that survivable. The loop has two arms now -- stop, and accept -- and
-//! both traits are gone. [`Listener::accept`] documents what remains true.
+//! both traits are gone. [`Listener::accept`] documents what remains true -- the accept
+//! future is still dropped when the server stops, whether that is a graceful shutdown signal
+//! or the server future being dropped outright.
 //!
 //! [`Router`]: axum::Router
 //! [`IncomingBody`]: ngnet_h2::http::IncomingBody

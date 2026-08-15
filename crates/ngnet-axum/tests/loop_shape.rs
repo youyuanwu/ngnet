@@ -156,7 +156,7 @@ async fn the_accept_future_is_built_once_per_connection_and_once_more() {
     server.abort();
 }
 
-/// SC-031: a relative sleep inside `accept` elapses.
+/// SC-031: a relative sleep inside `accept` survives a connection finishing under it.
 ///
 /// This is the property the change exists to restore, and the reason `FallibleListener` and
 /// `RetryingListener` could be deleted. Under the three-arm loop an implementor had to hold
@@ -165,17 +165,42 @@ async fn the_accept_future_is_built_once_per_connection_and_once_more() {
 /// sleep, await it -- it now works, which is what `axum`'s own listeners have always been
 /// able to assume.
 ///
-/// The listener is bounded: it sleeps once, yields one connection, and is then permanently
-/// pending. Virtual time makes bounding *more* important rather than less -- with the clock
-/// auto-advancing there is no wall-clock delay to slow an unbounded listener down.
+/// # The premise this test has to establish, and once did not
+///
+/// An earlier version of this test slept on the *first* accept, with nothing yet connected,
+/// and both reviewers caught it: it would have passed on the three-arm loop too. That loop's
+/// harvest arm was guarded -- `join_next_with_id(), if !connections.is_empty()` -- so with no
+/// live connection it was disabled, the old `select!` parked on its two remaining arms, and
+/// the sleep was never rebuilt. The test proved that a sleep elapses when nothing is
+/// happening, which was never in doubt.
+///
+/// The starvation needed a connection to *finish* while the sleep was pending. That is what
+/// fired the harvest arm, completed the `select!`, re-entered the loop, and rebuilt the accept
+/// future with its sleep back at zero. So this listener yields a connection first, and the
+/// test kills it while the second accept is mid-sleep.
+///
+/// # Why the oracle is an entry count rather than a duration
+///
+/// Counting is order-independent, and duration is not. Under the correct loop `accept` is
+/// entered exactly three times: once yielding the first connection, once sleeping and
+/// yielding the second, once parking. Under a loop that rebuilds the accept future when a
+/// connection finishes, the entry that is live when the first connection dies is rebuilt --
+/// whichever entry that happens to be -- so the count is at least four. No assumption about
+/// *when* the connection dies is needed, which is what makes this robust on a paused clock
+/// where the runtime, not the test, decides when to advance.
+///
+/// The listener is bounded: two connections, then permanently pending. Virtual time makes
+/// bounding *more* important rather than less -- with the clock auto-advancing there is no
+/// wall-clock delay to slow an unbounded listener down.
 #[tokio::test(start_paused = true)]
-async fn a_relative_sleep_inside_accept_now_elapses() {
+async fn a_relative_sleep_inside_accept_survives_a_connection_finishing_under_it() {
     struct Sleeper {
+        /// Incremented on entry into `accept`, which is the oracle.
+        entered: Arc<AtomicUsize>,
         yielded: Arc<AtomicUsize>,
-        /// Raised just before the sleep is awaited, so the test advances the clock only
-        /// once there is a timer to advance past. Advancing first would prove nothing.
+        /// Raised just before the sleep is awaited, so the test kills the first connection
+        /// only once there is genuinely a sleep for it to interrupt.
         armed: Arc<AtomicUsize>,
-        done: bool,
     }
 
     impl Listener for Sleeper {
@@ -183,17 +208,24 @@ async fn a_relative_sleep_inside_accept_now_elapses() {
         type Addr = std::net::SocketAddr;
 
         async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-            if self.done {
-                std::future::pending::<()>().await;
+            let entry = self.entered.fetch_add(1, Ordering::SeqCst);
+
+            match entry {
+                // The first connection, handed over at once. It exists only to be killed
+                // during the sleep below.
+                0 => {}
+                // The whole point: a plain relative sleep, held across an await inside
+                // `accept`, with no deadline kept anywhere outside this future. If the
+                // future is rebuilt while this is pending, the sleep starts again from zero.
+                1 => {
+                    let sleep = tokio::time::sleep(std::time::Duration::from_secs(1));
+                    self.armed.fetch_add(1, Ordering::SeqCst);
+                    sleep.await;
+                }
+                // Bounded: no third connection, ever.
+                _ => std::future::pending::<()>().await,
             }
 
-            // The whole point: a plain relative sleep, held across an await inside `accept`,
-            // with no deadline kept anywhere outside this future.
-            let sleep = tokio::time::sleep(std::time::Duration::from_secs(1));
-            self.armed.fetch_add(1, Ordering::SeqCst);
-            sleep.await;
-
-            self.done = true;
             self.yielded.fetch_add(1, Ordering::SeqCst);
 
             let (server_side, client_side) = tokio::io::duplex(1024);
@@ -206,34 +238,75 @@ async fn a_relative_sleep_inside_accept_now_elapses() {
         }
     }
 
+    let entered = Arc::new(AtomicUsize::new(0));
     let yielded = Arc::new(AtomicUsize::new(0));
     let armed = Arc::new(AtomicUsize::new(0));
     let listener = Sleeper {
+        entered: Arc::clone(&entered),
         yielded: Arc::clone(&yielded),
         armed: Arc::clone(&armed),
-        done: false,
     };
 
-    let server = tokio::spawn(serve(listener, Router::new()).into_future());
+    let reported = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&reported);
 
-    // Wait for the sleep to exist before moving the clock past it.
+    let server = tokio::spawn(
+        serve(listener, Router::new())
+            .on_error(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })
+            .into_future(),
+    );
+
+    // The first connection is out and the second accept is now inside its sleep.
     assert!(
         until(|| armed.load(Ordering::SeqCst) == 1).await,
-        "the listener was never polled"
+        "the listener never reached its sleep"
     );
-
-    // The sleep has not elapsed yet, and nothing has yet been accepted.
     assert_eq!(
         yielded.load(Ordering::SeqCst),
-        0,
-        "the listener yielded before its backoff had elapsed"
+        1,
+        "exactly one connection should be out: the sleep must not have elapsed yet"
     );
 
+    // The first connection's client end was dropped as it was handed over, so its task fails
+    // and finishes while the sleep above is still pending. Under the three-arm loop that is
+    // the harvest, and the harvest is what rebuilt the accept future.
+    assert!(
+        until(|| reported.load(Ordering::SeqCst) >= 1).await,
+        "the first connection never finished, so the sleep was never put under any pressure \
+         and this test would prove nothing"
+    );
+
+    // Only now move the clock. `until` spins on `yield_now`, which keeps the runtime busy, so
+    // a paused clock never auto-advances on its own -- the advance has to be explicit, and it
+    // has to come *after* the first connection has died, or the sleep would elapse before the
+    // pressure this test exists to apply had been applied.
+    //
+    // Two seconds against a one-second sleep, deliberately generous: a loop that restarted the
+    // sleep when the connection died would still elapse the restarted one and still hand over
+    // the second connection. The assertion that discriminates is the entry count below, not
+    // this one.
     tokio::time::advance(std::time::Duration::from_secs(2)).await;
 
+    // The sleep elapses and hands over the second connection.
     assert!(
-        until(|| yielded.load(Ordering::SeqCst) == 1).await,
+        until(|| yielded.load(Ordering::SeqCst) == 2).await,
         "the sleep never elapsed, so the accept future is still being dropped and restarted"
+    );
+
+    // Settle: the listener is now parked in its third and final entry.
+    assert!(
+        until(|| entered.load(Ordering::SeqCst) >= 3).await,
+        "the listener was never asked for a third connection"
+    );
+
+    assert_eq!(
+        entered.load(Ordering::SeqCst),
+        3,
+        "the accept future was rebuilt. Two connections and a park is three entries into \
+         `accept`; more means a connection finishing rebuilt the future underneath the sleep, \
+         which is precisely the starvation this change removed"
     );
 
     server.abort();

@@ -9,7 +9,7 @@
 //! `Send`, so requiring it would have excluded the very runtime the abstraction exists to
 //! admit. The cost lands here. Auto traits do not leak out of an opaque return type in
 //! generic code, so a function generic over `T: Transport` cannot prove that the connection
-//! it builds is `Send` -- and [`JoinSet::spawn`], which is how this crate runs connections
+//! it builds is `Send` -- and [`tokio::spawn`], which is how this crate runs connections
 //! concurrently, requires exactly that.
 //!
 //! So a bound of `Transport` alone is not enough to spawn, and no amount of adding
@@ -21,8 +21,6 @@
 //! operation is implemented *at a concrete transport type*, which is the only place the
 //! compiler can see through the opacity and check `Send` for itself. The crate ships a
 //! blanket implementation covering every tokio byte stream, so in practice nobody writes it.
-//!
-//! [`JoinSet::spawn`]: tokio::task::JoinSet::spawn
 
 use std::fmt::Debug;
 use std::future::Future;

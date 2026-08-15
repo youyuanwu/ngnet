@@ -23,7 +23,7 @@ repository.workspace = true
 #
 # `completion` is still not enabled, and pluggable transports did not bring it closer. The
 # obstacle was never the transport bound: it is the accept loop, which is built on
-# `tokio::select!`, `tokio::time` and `JoinSet`, and whose `JoinSet::spawn` requires
+# `tokio::select!`, `tokio::time` and `tokio::spawn`, and `tokio::spawn` requires
 # `Send + 'static`. A thread-per-core runtime whose types are not `Send` cannot be served by
 # that loop no matter what listener is handed to it. Enabling `completion` here would need a
 # different accept loop, not a different feature flag.

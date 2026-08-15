@@ -65,6 +65,11 @@ const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 /// fires the loop breaks -- dropping whatever accept future was in flight. It is dropped at
 /// most once in a server's life, and never again while the server is accepting.
 ///
+/// The other way it ends is that the server future is itself dropped or aborted, which drops
+/// the accept future with it. That is not a third case so much as the same one arriving
+/// without notice, and it is not avoidable by any listener: if the server is gone, so is the
+/// thing that was calling this method.
+///
 /// That is enough to matter for one kind of implementation. **Work in progress inside this
 /// method is lost if the server is shut down while it is in progress**, and a half-completed
 /// TLS handshake is the case to think about: the connection it was negotiating goes with it,

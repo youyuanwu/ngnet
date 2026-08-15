@@ -173,9 +173,9 @@ async fn a_failure_reports_a_peer_address_that_is_not_a_socket_address() {
         .expect("the listener to be up");
 
     // Garbage where the HTTP/2 connection preface should be. The session fails after the
-    // connection has been accepted and spawned, which is the path that has to carry the
-    // peer address back out through the JoinSet -- the interesting one, and the one where
-    // a generic address could have been dropped on the floor.
+    // connection has been accepted and spawned, which is the path where the connection task
+    // has to report a failure against its own peer address -- the interesting one, and the
+    // one where a generic address could have been dropped on the floor.
     client_side
         .write_all(b"not an HTTP/2 preface at all\r\n\r\n")
         .await
