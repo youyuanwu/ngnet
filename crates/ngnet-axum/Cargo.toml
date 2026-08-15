@@ -48,9 +48,15 @@ http-body.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
-# `signal`, for the worked example's Ctrl-C stop signal, and only for that. Declared here
-# rather than added to the workspace's own tokio feature list because the library needs
-# nothing from it: putting it in `[dependencies]` would enable a feature for every
-# downstream user in order to serve one example. Cargo merges the two sets when building
-# examples and tests, which is exactly the scope wanted.
-tokio = { workspace = true, features = ["signal"] }
+# `signal`, for the worked example's Ctrl-C stop signal; `test-util`, for the paused clock
+# the accept-backoff tests run on. Both are declared here rather than added to the
+# workspace's own tokio feature list because the library needs neither: putting them in
+# `[dependencies]` would enable features for every downstream user in order to serve one
+# example and one test. Cargo merges the two sets when building examples and tests, which is
+# exactly the scope wanted.
+#
+# `test-util` earns its place by making a one-second backoff cost nothing. A listener's retry
+# pacing is measured in seconds, and a suite that waited them out in real time would either
+# be slow or be tempted into the shortcut that is genuinely dangerous here -- an accept that
+# is always ready, which this crate's uncapped accept loop turns into an unbounded allocator.
+tokio = { workspace = true, features = ["signal", "test-util"] }

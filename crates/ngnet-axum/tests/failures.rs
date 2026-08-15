@@ -13,10 +13,12 @@
 
 mod support;
 
+use std::error::Error as _;
 use std::net::SocketAddr;
 
 use axum::Router;
 use axum::routing::get;
+use ngnet_axum::HandlerPanic;
 use support::{Client, TestServer, get as get_request, text, within};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -79,9 +81,11 @@ async fn always_panics() -> &'static str {
 
 /// A panicking handler costs its connection, and the server keeps serving others (SC-009).
 ///
-/// The panic is raised in the handler future, where it unwinds out of the driver, fails the
-/// connection, and reaches the task boundary as a `JoinError`. See the module note: it must
-/// not be moved into a body.
+/// The panic is raised in the handler future, where it unwinds out of the driver and fails
+/// the connection. It used to be observed by the accept loop joining the task and finding a
+/// `JoinError`; the loop no longer joins anything, so the connection task catches its own
+/// panic instead and reports it with the message intact. See the module note: it must not be
+/// moved into a body.
 #[tokio::test]
 async fn a_panicking_handler_does_not_stop_the_server() {
     let router = Router::new()
@@ -109,6 +113,18 @@ async fn a_panicking_handler_does_not_stop_the_server() {
             SocketAddr::from(errors[0].peer_addr()),
             doomed_peer,
             "the failure named the wrong peer"
+        );
+
+        // SC-033a: the report says a handler panicked, and says what it panicked with.
+        // Asserting only that *something* was reported would pass for a connection reset,
+        // which is the opposite diagnosis.
+        let source = errors[0].source().expect("a source");
+        let panic = source
+            .downcast_ref::<HandlerPanic>()
+            .expect("the failure should be reported as a handler panic");
+        assert!(
+            panic.message().contains("deliberate: exercising SC-009"),
+            "the panic's own message was lost, got {panic}"
         );
     });
 

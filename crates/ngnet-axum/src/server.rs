@@ -285,6 +285,21 @@ where
     L: Listener,
     L::Addr: Clone + Debug + Send + Sync + 'static,
 {
+    run_with(server, Arc::new(Mutex::new(HashMap::new()))).await;
+}
+
+/// [`run`], with the registry passed in so a test can look at it.
+///
+/// Whether a finished connection leaves its entry behind is not observable from outside:
+/// shutdown waits on the refcount barrier, which is independent of the registry, and
+/// [`Drain::drain`] is idempotent, so a registry that never removed anything would still
+/// shut down cleanly while growing one entry per connection ever accepted. The only way to
+/// test for that leak is to look, so this seam exists to be looked through.
+async fn run_with<L>(server: Serve<L>, registry: Registry)
+where
+    L: Listener,
+    L::Addr: Clone + Debug + Send + Sync + 'static,
+{
     let Serve {
         mut listener,
         router,
@@ -297,7 +312,6 @@ where
     // can hold and reconfigure, and it has no business carrying a lock it is not yet using.
     let observer: Option<SharedObserver<L::Addr>> = observer.map(|observe| Arc::new(Mutex::new(observe)));
 
-    let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
     let mut next_id: u64 = 0;
 
     // The barrier shutdown waits on. Every connection task holds a receiver for exactly as
@@ -519,6 +533,132 @@ mod tests {
             rendered.contains("Undebuggable"),
             "the listener's type should be named, got {rendered}"
         );
+    }
+
+    /// A listener that hands out a fixed number of in-memory pipes and then stops.
+    ///
+    /// **Bounded by construction, and that is not a stylistic choice.** This crate's accept
+    /// loop puts no cap on simultaneous connections, so a listener whose `accept` is always
+    /// ready is an unbounded allocator: every poll spawns another connection task carrying
+    /// another HTTP/2 session, as fast as the CPU allows. One written that way took this
+    /// machine down. After `budget` connections this one is permanently pending, which is
+    /// what a real listener with nothing to accept does anyway.
+    struct Bounded {
+        budget: usize,
+        /// Kept alive so the connections do not end before the test has looked at them.
+        held: Vec<tokio::io::DuplexStream>,
+        hold: bool,
+        /// Incremented on entry, *before* the budget check, so it counts the permanently
+        /// pending accept too. That is the count the tests synchronise on.
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Listener for Bounded {
+        type Io = ngnet_h2::http::transport::TokioIo<tokio::io::DuplexStream>;
+        type Addr = SocketAddr;
+
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            self.entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            if self.budget == 0 {
+                std::future::pending::<()>().await;
+            }
+            self.budget -= 1;
+
+            let (server_side, client_side) = tokio::io::duplex(64);
+            if self.hold {
+                self.held.push(client_side);
+            } else {
+                // Dropped at once, so the connection fails its handshake and ends
+                // promptly -- which is all this test needs of it.
+                drop(client_side);
+            }
+
+            (
+                ngnet_h2::http::transport::TokioIo::new(server_side),
+                "127.0.0.1:5555".parse().expect("an address"),
+            )
+        }
+    }
+
+    /// Spins until `condition` holds, or gives up. Bounded, and yields rather than sleeps.
+    async fn until(mut condition: impl FnMut() -> bool) -> bool {
+        for _ in 0..10_000 {
+            if condition() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        false
+    }
+
+    /// SC-034: a finished connection leaves nothing behind in the drain registry.
+    ///
+    /// The registry replaced a `JoinSet` whose entries tokio reclaims only when joined, and
+    /// the two-arm loop cannot join. So each task removes its own entry, and if it did not,
+    /// the map would grow by one per connection for the life of the server -- invisibly,
+    /// because nothing else observes it. Hence the white-box assertion: there is no
+    /// behavioural symptom to assert on instead.
+    #[tokio::test]
+    async fn a_finished_connection_is_removed_from_the_registry() {
+        let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+        let watched = Arc::clone(&registry);
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let listener = Bounded {
+            budget: 3,
+            held: Vec::new(),
+            hold: false,
+            entered: Arc::clone(&entered),
+        };
+
+        let server = tokio::spawn(run_with(serve(listener, Router::new()), registry));
+
+        // Synchronise on the loop having entered the *fourth* accept, which is the one that
+        // never returns. Only then is every one of the three connections known to have been
+        // registered -- registration happens before the loop goes round again.
+        //
+        // Waiting merely for the registry to be empty would assert nothing at all: it is
+        // empty before the first connection arrives, so the assertion would pass instantly
+        // and pass just as happily with deregistration deleted. It did, when first written.
+        let all_accepted =
+            until(|| entered.load(std::sync::atomic::Ordering::SeqCst) >= 4).await;
+        assert!(all_accepted, "the listener was not drained of its budget");
+
+        let empty = until(|| watched.lock().expect("a lock").is_empty()).await;
+
+        assert!(
+            empty,
+            "the registry still holds {} finished connections",
+            watched.lock().expect("a lock").len()
+        );
+
+        server.abort();
+    }
+
+    /// The other half of SC-034: a connection that is still running *is* registered.
+    ///
+    /// Without this, a registry that removed entries the instant it made them would pass
+    /// the emptiness assertion above while making shutdown drain nothing at all.
+    #[tokio::test]
+    async fn a_live_connection_is_present_in_the_registry() {
+        let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+        let watched = Arc::clone(&registry);
+
+        let listener = Bounded {
+            budget: 1,
+            held: Vec::new(),
+            hold: true,
+            entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+
+        let server = tokio::spawn(run_with(serve(listener, Router::new()), registry));
+
+        let present = until(|| watched.lock().expect("a lock").len() == 1).await;
+        assert!(present, "the live connection was not registered");
+
+        server.abort();
     }
 
     /// The documented default. Silence is a choice, so it is pinned like any other
