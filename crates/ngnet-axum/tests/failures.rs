@@ -106,7 +106,7 @@ async fn a_panicking_handler_does_not_stop_the_server() {
     server.with_errors(|errors| {
         assert_eq!(errors[0].kind(), ErrorKind::Connection);
         assert_eq!(
-            errors[0].peer().map(SocketAddr::from),
+            errors[0].peer_addr().map(SocketAddr::from),
             Some(doomed_peer),
             "the failure named the wrong peer"
         );
@@ -240,7 +240,7 @@ async fn every_reported_failure_names_its_own_peer() {
     let reported: Vec<Option<SocketAddr>> = server.with_errors(|errors| {
         errors
             .iter()
-            .map(|error| error.peer().map(SocketAddr::from))
+            .map(|error| error.peer_addr().map(SocketAddr::from))
             .collect()
     });
 
