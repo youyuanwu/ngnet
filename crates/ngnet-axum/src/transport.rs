@@ -36,7 +36,7 @@ use crate::connection::serve_connection;
 
 /// A [`Transport`] whose connections this crate can spawn onto a task.
 ///
-/// A listener's connection type is bounded by this rather than by `Transport`
+/// A [`Listener`](crate::Listener)'s connection type is bounded by this rather than by `Transport`
 /// alone, and rather than by `AsyncRead + AsyncWrite`. The transport bound is the point: a
 /// TCP stream is one implementation of a transport here, not a privileged case.
 ///

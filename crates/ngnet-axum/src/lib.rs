@@ -127,7 +127,9 @@ mod transport;
 
 pub use connection::serve_connection;
 pub use error::{Error, ErrorKind};
-pub use listener::{FallibleListener, Listener, RetryingListener};
+pub use listener::{FallibleListener, Listener, RetryingListener, TcpListener};
+#[cfg(unix)]
+pub use listener::UnixListener;
 pub use peer::PeerAddr;
 pub use server::{Serve, serve};
 pub use transport::{ServableTransport, require_spawnable};
@@ -158,7 +160,7 @@ pub use ngnet_h2::http::{Connection, Error as EngineError, Result as EngineResul
 
 /// Wraps a tokio byte stream so it can be used as a transport, re-exported from `ngnet-h2`.
 ///
-/// [`serve_connection`] takes a transport rather than a socket, and listener
+/// [`serve_connection`] takes a transport rather than a socket, and [`Listener`]
 /// implementations produce one. For anything built on tokio -- a TCP stream, a Unix-domain
 /// stream, an in-memory pipe, a TLS session over any of them -- this is the wrapper that
 /// turns it into one, and [`ServableTransport`] is implemented for every `TokioIo` over such

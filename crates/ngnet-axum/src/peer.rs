@@ -23,8 +23,8 @@ use std::net::SocketAddr;
 ///
 /// # Addresses that are not socket addresses
 ///
-/// The address type is a parameter because a listener chooses it, and not every
-/// transport names its peers with a [`SocketAddr`]: a Unix-domain listener uses
+/// The address type is a parameter because a [`Listener`](crate::Listener) chooses it, and
+/// not every transport names its peers with a [`SocketAddr`]: a Unix-domain listener uses
 /// [`tokio::net::unix::SocketAddr`], and an in-memory transport may have no address worth
 /// the name at all. The parameter defaults to [`SocketAddr`], so `PeerAddr` written without
 /// one still means what it always did.

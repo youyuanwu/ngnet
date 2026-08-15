@@ -8,6 +8,17 @@
 //! the reason is the shape of this crate's accept loop rather than any difference of taste.
 //! [`Listener::accept`] documents it, [`FallibleListener`] is the easier path that avoids
 //! it, and [`RetryingListener`] is the thing that actually gets it right.
+//!
+//! Two implementations ship: [`TcpListener`] and, on Unix, [`UnixListener`]. Both are built
+//! by wrapping a [`FallibleListener`], which is the shape third-party listeners should copy.
+
+mod tcp;
+#[cfg(unix)]
+mod unix;
+
+pub use tcp::TcpListener;
+#[cfg(unix)]
+pub use unix::UnixListener;
 
 use std::fmt::Debug;
 use std::future::Future;
