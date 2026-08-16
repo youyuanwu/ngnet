@@ -49,13 +49,33 @@ family here — and, unlike QUIC, it mandates no transport security and provides
 
 | Document | What it covers |
 | --- | --- |
-| [`qmux/design.md`](qmux/design.md) | What the protocol is and is not, why the native build breaks with every other `-sys` crate and compiles C directly, the two places where the obvious safe API would have admitted a use-after-free, and the four upstream behaviours the wrapper compensates for rather than passes through. |
-| [`qmux/pending-work.md`](qmux/pending-work.md) | Gaps in the vendored library, what this increment deliberately omits, and the two design decisions left open. |
-| [`qmux/invariants.md`](qmux/invariants.md) | The properties the QMux suite pins, including three enforced by the compiler rather than at run time. |
+| [`qmux/design.md`](qmux/design.md) | What the protocol is and is not, why the native build breaks with every other `-sys` crate and compiles C directly, the two places where the obvious safe API would have admitted a use-after-free, the four upstream behaviours the wrapper compensates for rather than passes through, and the asynchronous layer: why a QMux connection needs no endpoint and no driver, why the seam is poll-shaped, and what the pump's ordering buys. |
+| [`qmux/pending-work.md`](qmux/pending-work.md) | Gaps in the vendored library — now including the four the asynchronous layer had to work around — what the crates deliberately omit, what those gaps cost in copies, and the design decisions left open. |
+| [`qmux/invariants.md`](qmux/invariants.md) | The properties the QMux suite pins, including four enforced by the compiler rather than at run time, and the behavioural claims the asynchronous layer's tests hold. |
 
-The QMux crates are sans-I/O only: there is no endpoint layer, no runtime integration, and no
-application-protocol mapping yet. There are no benchmarks, and nothing has been tested against
-another QMux implementation.
+Behind a default-on `io` feature, `ngnet-qmux` drives a connection over a byte stream the caller
+supplies, with the byte stream and the clock as seams a caller implements and a ready-made pair
+for tokio behind an off-by-default feature. `--no-default-features` returns it to the sans-I/O
+state machine, with one dependency and no asynchrony. There is no endpoint layer and no driver
+task, deliberately: a QMux connection owns one byte stream and shares it with nothing, so there
+is nothing to demultiplex. Establishing that stream — connecting, listening, accepting, and any
+TLS on it — stays with the caller.
+
+There are no benchmarks, and nothing has been tested against another QMux implementation.
+
+## HTTP/3 over QMux — [`qmux-h3/`](qmux-h3/)
+
+`ngnet-qmux-h3` implements `ngnet-h3`'s transport trait over `ngnet-qmux`'s asynchronous layer,
+so HTTP/3 runs over TCP, a unix socket or a TLS session. That is the QMux draft's own stated
+motivation, and this crate is the only place the two families meet.
+
+- [`qmux-h3/design.md`](qmux-h3/design.md) — why the connection is shared rather than owned
+  outright, the pump that keeps the first request from deadlocking, why nothing here may park,
+  and how a close the HTTP/3 driver will never poll again reaches the peer anyway.
+- [`qmux-h3/pending-work.md`](qmux-h3/pending-work.md) — what is missing, starting with the fact
+  that there is nothing to interoperate with.
+- [`qmux-h3/invariants.md`](qmux-h3/invariants.md) — what its suites pin, and what nothing
+  currently enforces.
 
 ## HTTP/3 over QUIC
 
@@ -92,7 +112,7 @@ in a document of its own.
 
 | Document | What it covers |
 | --- | --- |
-| [`ci.md`](ci.md) | Every check CI runs, across all three families and the axum integration, and the ones it deliberately does not. |
+| [`ci.md`](ci.md) | Every check CI runs, across all four families and the axum integration, and the ones it deliberately does not. |
 
 ## Orientation
 

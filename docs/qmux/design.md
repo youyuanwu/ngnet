@@ -2,8 +2,9 @@
 
 Why the QMux crates are shaped the way they are: what the protocol is and is not, why the
 native build breaks with every other `-sys` crate here, the two places where the obvious safe
-API would have been unsound, and the handful of upstream behaviours that a wrapper has to
-compensate for rather than pass through.
+API would have been unsound, the handful of upstream behaviours that a wrapper has to
+compensate for rather than pass through, and — behind a default-on feature — an asynchronous
+layer that drives the state machine over a byte stream the caller supplies.
 
 ## What QMux is
 
@@ -227,17 +228,217 @@ record is finalised and its length returned. It remains a mapped `ErrorKind` bec
 *constructor* returns it on allocation failure — where, incidentally, the header documents
 `DWNX_ERR_NOMEM` and the code returns `NOBUF`.
 
+## The asynchronous layer
+
+Behind the default-on `io` feature, `src/io.rs` and the subtree beneath it drive the state
+machine over one byte stream the caller hands over. `--no-default-features` removes the whole
+of it and leaves the crate as it was: one dependency, no asynchrony, the same public API.
+
+### There is no endpoint, and no driver task
+
+`ngnet-quic` has both, and the reason is its unit of ownership. One UDP socket carries every
+connection an endpoint serves, so *something* has to read that socket and route each datagram
+to the connection it belongs to by connection id — and that something is a task the
+application does not own, sitting between the caller and the connection state.
+
+A QMux connection has none of that problem. It owns one byte stream and shares it with
+nothing: the operating system already did the demultiplexing when it handed out a separate
+accepted socket per peer. There is no routing table to consult, no datagram that might belong
+to a connection nobody has heard of, and therefore no reason for a task to stand in the
+middle. `Connection<S, C>` owns the byte stream outright, and every operation runs on the
+caller's own task when the caller polls it.
+
+That is also why this layer resembles `ngnet-h2` more than `ngnet-quic` in what it *is*, while
+resembling `ngnet-quic` in the shape of its seams. Establishing the byte stream stays with the
+caller — connecting, listening, accepting, and any TLS over it. The crate offers no third
+constructor, and a test asserts it exposes no way to make one.
+
+### Poll-shaped, though the closer analogue is future-shaped
+
+`ngnet-h2` also runs a protocol over a byte stream, and its transport abstraction returns
+futures and splits into a reader half and a writer half. By subject matter it is the nearer
+precedent, and the layer follows `ngnet-quic`'s poll-shaped socket seam instead. Two reasons,
+both about what a connection must do rather than about taste.
+
+**Composition.** The HTTP/3 transport abstraction this work exists to satisfy,
+`ngnet_h3::http::QuicConnection`, is itself poll-shaped: it hands the transport a `Context` and
+expects an answer before the call returns. A future-shaped byte stream underneath it needs an
+adapter holding an in-flight future between calls, and that adapter has to be
+cancellation-correct — dropping a partially completed read loses bytes off a stream that cannot
+resend them.
+
+**One wakeup has to do both jobs.** A connection must drain reads *and* produce writes in a
+single pass. It has to ask "are there bytes right now?", carry on when the answer is no, and go
+on to flush what the state machine produced. `Poll` says exactly that; awaiting a read does
+not. An awaited read parks the whole connection until bytes arrive, with the records already
+queued for the peer sitting unwritten behind it — and for a peer that is waiting for precisely
+those records before it says anything, that is a deadlock rather than a latency cost.
+
+The layering settles it in any case: one protocol family in this workspace may not depend on
+another, so `ngnet-h2`'s abstraction is unreachable from here whatever its merits.
+
+Neither seam carries a `Send` bound. Thread-per-core runtimes build their I/O on `Rc`, and
+requiring `Send` would exclude them to nobody's benefit; auto traits propagate instead, so a
+connection over a `Send` byte stream is `Send` without anything saying so. The one bound is on
+`AsyncByteStream::Error`, which must convert into a sendable, shareable boxed error — a
+constraint on the *failure type* only, and there because the HTTP/3 abstraction demands it of
+any transport. Discovering that mismatch in the join crate, after callers had implemented the
+trait, is what stating it up front avoids.
+
+There is no `sleep_until` beside `Clock::now`, because there is nothing to arm one from: dwnx
+validates and advertises `max_idle_timeout` and then never acts on it, and has no timer or
+expiry API of any kind. A clock that could wait would imply an enforcement this stack does not
+perform.
+
+### Flush, then produce, then read
+
+The pump's order is the whole design, and the obvious alternative — produce everything the
+state machine owes, then write it out — is wrong twice over.
+
+A record is produced only into an *empty* outbound buffer. So the previous record has
+necessarily reached the byte stream in full before the next one exists, and at most one record
+is ever outstanding. That bounds what a slow peer can make this side hold to a single record —
+16382 bytes — rather than to however much the caller has queued behind it. Producing first
+would bound outbound memory by the backlog instead, which is the first thing wrong with it. The
+second is that records would then have to be interleaved correctly on the way out, and a record
+interleaved with the tail of its predecessor is not a record the peer can parse. Having only
+one record's worth of bytes in flight also makes a partial accept impossible to get wrong:
+there is exactly one place to resume from.
+
+Reading comes last, and the order *within* the read matters as much. The bytes go to the framer
+first and to `Conn::read` second, and only then is the outcome acted on. dwnx reports
+`PeerClosed` after consuming the close record, possibly with more bytes still to come in the
+same chunk, so feeding the framer first is what leaves the close record already latched when
+that report arrives. Feeding the state machine first would work too — but by accident, and only
+until someone reorders two lines that look independent.
+
+Construction schedules the local transport parameters unprompted, which is the write-side half
+of the first-flight problem and the easier one to miss. Stream capacity arrives *only* in the
+peer's announcement, so a connection where both ends read diligently and neither speaks hangs
+with no error at all. For the same reason `Config` supplies working limits rather than
+inheriting the state machine's: `TransportParams::new` is all zeros by faithful reproduction of
+dwnx, and a connection built from those could open nothing.
+
+A push error ends the connection and is never retried. `RecordWriter::push` failing drops the
+writer mid-record; `Drop` finalises so dwnx is not left writing through a retained pointer, but
+the produced bytes are discarded — and if that record had already packed stream data, dwnx has
+*already advanced the stream's send offset*. Retrying would send the next chunk at an offset
+the peer can never reconcile, which presents as a stream that stalls rather than as an error.
+The one exemption is narrow and conditional: a stream the state machine no longer has is
+refused before the record is begun, so nothing was packed and nothing was lost, and that is
+reported as a closed stream rather than as a failure.
+
+### The layer frames records itself
+
+dwnx already parses records, and doing it again looks like duplicated work. The alternative —
+ask the state machine where it stands — was tried and rejected, because there is nothing to
+ask. `dwnx_conn_read` answers `0` for "that was fine, feed me more" whether it stopped between
+records or halfway through a length prefix, the record reader's state has no accessor, and the
+reader itself is private.
+
+Two questions the layer must answer therefore have no answer from below. **Did the byte stream
+end cleanly?** A peer that stops between records has said everything it meant to; a peer that
+stops partway through one has lost bytes it does not know about. Reporting the second as the
+first is the failure mode with no symptom. **What did the peer's close say?** dwnx parses
+CONNECTION_CLOSE into a private struct with no accessor and returns `DWNX_ERR_DRAINING` with
+nothing attached, so the kind, code, frame type and reason are unreachable. Recovering them
+means holding the record's own bytes and decoding them here — and encoding them here too, since
+dwnx serialises no close at all.
+
+Retention is a permanent **latch**, not a sliding window, and the difference is the point. A
+window holding the most recent complete record loses closes: `Conn::read` reports the close only
+after consuming its record, and a single read may carry more bytes after it, so the window would
+begin the next record and evict the close in exactly the case where the peer said something
+worth hearing. A close is terminal, so latching costs one record and loses nothing. The bound is
+one record in progress plus one latched close — under 32 KiB, whatever the peer does, since dwnx
+overwrites any configured maximum with 16382.
+
+The decoder scans frames rather than assuming the close is first, because
+`dwnx_record_reader_reset` returns to the frame-type state while bytes remain in the record: a
+close may legally follow other frames. And the test that matters feeds an encoded close to a
+real connection and expects `PeerClosed`, since round-tripping through our own decoder would
+prove only that we agree with ourselves.
+
+### Two write forms, because there are two callers
+
+`poll_write_stream` parks when flow-control credit is exhausted and resumes when the peer
+extends the window. That is what a direct user of this layer wants, and it is what makes a
+blocked write a wait rather than a failure or a truncation.
+
+`try_write_stream` never parks. It reports `StreamWrite::Accepted(n)`, `Blocked` or `Closed` and
+returns. It exists because the HTTP/3 transport abstraction offers its outbound bytes through a
+*synchronous* closure — handed a stream, some slices, and a verdict to return — with no
+`Context` anywhere in reach. A layer that could only park would have nothing legal to do inside
+it, and discovering that at the join would have meant changing this API after the fact.
+
+Both split a payload across records and across available credit rather than truncating, and both
+report what they took even when they then refuse: a count dropped because the verdict was a
+refusal has the caller offer those bytes a second time, and the peer receives them twice.
+`StreamWrite` is the layer's own type. The sans-I/O `Push` describes the state of a record being
+*built* and invites another push, which is a conversation only the code inside the pump is in a
+position to have; exposing it would put dwnx's record-building protocol into the signature of
+every layer above.
+
+### Waiting, and reading no further ahead than the caller
+
+Three things here cannot proceed on demand: an open the peer's stream limit forbids, a write
+with no credit, and a read the caller has made no room for. Each parks against the event that
+ends it. The alternative — waking one's own waker and returning `Pending` — compiles, passes a
+functional suite, and burns a core; it is a busy loop wearing waiting's clothes, and the tests
+that keep it out count wakeups rather than checking eventual answers.
+
+The connection-level window is the awkward one, because dwnx has no MAX_DATA callback: it
+applies the frame to the send window and tells nobody. So the connection samples
+`max_data_left` across each `Conn::read` and wakes a parked writer when it moves. Waking on any
+inbound bytes would have been simpler and would have spun a blocked writer once per arriving
+record for as long as the peer kept talking.
+
+Read-ahead is bounded by bytes **delivered to the caller and not yet credited back**, not by
+queue depth. Depth is the natural meter and the wrong one: a caller that drains events into a
+`Vec` of its own without crediting them empties the queue while holding exactly as much memory,
+and the bound would read zero. Only connection-level credit moves the figure. The HTTP/3 layer
+above reports every consumed byte twice — once naming a stream, once naming the connection —
+so counting both would credit two bytes for every one delivered, the bound would never bind,
+and read-ahead would be limited by nothing at all.
+
+An idle connection therefore arms nothing: no outbound bytes means no write offered, one read
+registers the byte stream's own waker, and there is no timer here to fire in the meantime.
+
+### One runtime, named only when asked
+
+`src/io/tokio.rs`, behind the off-by-default `tokio` feature, is the only place this crate names
+a runtime. `TokioStream` wraps anything implementing tokio's `AsyncRead + AsyncWrite` rather
+than a socket type, which keeps TCP, unix sockets and TLS sessions over either in reach without
+this crate acquiring a TLS seam or naming a transport it has no business naming. The stream is
+held pinned in a box: an `S: Unpin` bound would have propagated to every signature mentioning a
+connection, and hand-rolled pin projection would have meant `unsafe` in a subtree that has none.
+
+The clock reads tokio's own `Instant` rather than the standard library's, so that a test which
+pauses time sees timestamps agreeing with it — and because the structural suite forbids
+`std::time` in this subtree.
+
+The loopback tests run the same exchange bodies and the same assertions as the in-memory ones;
+only the socket setup differs. Two implementations sharing one test body is the evidence that
+the seam is not shaped around either. Two similar bodies would not be.
+
 ## Module layout
 
-`ngnet-quic` has thirty-five modules; `ngnet-qmux` has eleven, and the difference is almost
-entirely protocol rather than ambition. There is no `cid`, `path`, `packet`, `rand`, `token`,
-`tls`, `tls_bridge` or `tls_ossl`, because QMux has no connection IDs, paths, packets,
-entropy, tokens or cryptography. There is no `retain`, because dwnx copies stream data into
-the record and never retransmits, so there is nothing to keep alive on the caller's behalf —
-the single largest simplification relative to the QUIC wrapper. There is no `endpoint` subtree,
-because this increment is sans-I/O only.
+`ngnet-quic` has thirty-five modules; `ngnet-qmux` has eleven core ones plus the layer, and the
+difference is almost entirely protocol rather than ambition. There is no `cid`, `path`,
+`packet`, `rand`, `token`, `tls`, `tls_bridge` or `tls_ossl`, because QMux has no connection
+IDs, paths, packets, entropy, tokens or cryptography. There is no `retain`, because dwnx copies
+stream data into the record and never retransmits, so there is nothing to keep alive on the
+caller's behalf — the single largest simplification relative to the QUIC wrapper. Where the
+QUIC wrapper has an `endpoint` subtree this one has `io`, and it is smaller for the reason
+above: there is no socket to share, so there is no endpoint, no accept loop and no driver.
 
 What remains maps one-to-one onto the C API: `conn` for lifecycle and the read path,
 `callbacks` and `handlers` for the event bridge, `write` and `stream_io` for the outbound and
 stream operations, and `error`, `params`, `settings`, `stream`, `time` and `ccerr` for the
-value types.
+value types. The layer adds `io/conn` for ownership and the pump, `io/stream` and `io/clock`
+for the seams, `io/framing` and `io/close` for the two jobs dwnx cannot do, `io/event`,
+`io/scheduling`, `io/error`, `io/testing` and — behind its feature — `io/tokio`.
+
+Module files are flat here as everywhere in this crate: `io.rs` with submodules in `io/`, never
+`io/mod.rs`. The rule is not cosmetic. The structural test that reads `lib.rs`'s `unsafe`
+allowance list derives a module's name from its file stem, and a `mod.rs` would break it.
