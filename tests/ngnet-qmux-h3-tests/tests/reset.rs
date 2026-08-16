@@ -15,12 +15,26 @@ use tokio::time::timeout;
 
 /// The backlog the response offers before it fails.
 ///
-/// The reset discards whatever the transport had not yet written, so the failure is only
-/// *mid-body* while there is a backlog to discard. A body small enough to fit in the windows
-/// would be delivered whole and the stream would end cleanly before the reset was sent.
+/// The reset only discards something while there is something to discard, and that is what
+/// makes the failure land *mid-body*. Sixteen mebibytes against a one-mebibyte connection
+/// window cannot all be in flight, so a backlog exists for as long as the caller has not
+/// drained it.
+///
+/// That last clause is the whole reason [`SETTLE`] exists below. An earlier version of this
+/// test read the body immediately and passed only in debug builds: a release build drained
+/// all sixteen mebibytes inside the fifty milliseconds the body waits before failing, leaving
+/// no backlog and therefore no mid-body reset. The test was timing-dependent in the unsafe
+/// direction — it needed the transport to be *slower* than the producer.
 const CHUNK: usize = 256 * 1024;
 const CHUNKS: usize = 64;
 const OFFERED: usize = CHUNK * CHUNKS;
+
+/// How long the caller waits before reading, so the reset provably precedes the read.
+///
+/// Comfortably longer than the body's own pause. The dependence is now in the safe direction:
+/// the test needs the failure to happen *before* the caller drains, and making that margin
+/// larger makes the test more reliable rather than less.
+const SETTLE: core::time::Duration = core::time::Duration::from_millis(500);
 
 /// Reads a body until it ends or fails, reporting how much arrived first.
 async fn read_until_failure(
@@ -65,6 +79,12 @@ async fn a_peer_reset_mid_body_fails_only_its_own_request() {
                 .expect("the broken request must not hang")
                 .expect("its headers arrive before its body fails");
             assert_eq!(response.status(), 200);
+
+            // Deliberately not read yet. The response body is offered faster than the
+            // connection window allows, so a backlog builds; leaving it there until the
+            // handler's body has failed is what makes this a reset with something to discard
+            // rather than a reset after a complete delivery.
+            tokio::time::sleep(SETTLE).await;
 
             let (read, failure) = timeout(LIMIT, read_until_failure(response.into_body()))
                 .await

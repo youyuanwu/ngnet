@@ -499,3 +499,55 @@ fn writing_to_a_stream_that_is_gone_is_reported_rather_than_fatal() {
         "and the exchange that finished was the client's first stream"
     );
 }
+
+/// A reset issued immediately before an ending still reaches the peer.
+///
+/// The failure this guards against is silent and was found the hard way. A stream shutdown
+/// queues its frame *inside the state machine*, not in the outbound buffer, and only a
+/// production pass turns it into a record. An ending that flushed what was already buffered
+/// and then shut the byte stream down would carry everything except the frame that explains
+/// why the exchange stopped -- and the peer would see a stream that simply went quiet.
+///
+/// Nothing is pumped between the shutdown and the ending here, which is the point: `poll_finish`
+/// has to produce, not merely flush.
+#[test]
+fn a_reset_issued_just_before_an_ending_still_reaches_the_peer() {
+    let (mut client, mut server) = connected_pair(Config::new());
+    const CODE: u64 = 0x9abc;
+
+    let client_side = async {
+        let stream = open_bidi(&mut client).await.expect("opening a stream");
+        write_all(&mut client, stream, b"partial", false)
+            .await
+            .expect("writing");
+        client
+            .shutdown_stream(stream, Shutdown::Write, CODE)
+            .expect("shutting down the write side");
+
+        // Straight to the ending, with no pump in between.
+        core::future::poll_fn(|cx| client.poll_finish(cx))
+            .await
+            .expect("finishing");
+        stream
+    };
+
+    let server_side = async {
+        loop {
+            if let Event::StreamReset {
+                stream_id,
+                app_error_code,
+                ..
+            } = next_event(&mut server).await.expect("an event")
+            {
+                return (stream_id, app_error_code);
+            }
+        }
+    };
+
+    let (stream, (observed, code)) = run_pair(client_side, server_side);
+    assert_eq!(
+        stream, observed,
+        "the reset named the stream even though it was produced during the ending"
+    );
+    assert_eq!(code, CODE, "and it carried the application's reason");
+}

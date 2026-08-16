@@ -440,13 +440,11 @@ fn finishing_without_a_close_shuts_the_write_side_down() {
     let mut conn =
         Connection::client(near, TestClock::new(), Config::new()).expect("constructing a client");
 
-    // Pumping first, exactly as the HTTP/3 join's tail does. `poll_finish` flushes and shuts
-    // down but does not produce, symmetrically with `poll_close`: both are endings, and
-    // neither invents new records to send. So the announcement has to be produced here for
-    // there to be anything for the flush to prove it carried.
-    let pumped = poll_once(|cx| conn.poll_pump(cx));
-    assert!(matches!(pumped, Poll::Ready(Ok(()))), "pumping: {pumped:?}");
-
+    // Nothing has been pumped, deliberately. An ending has to *produce* what the state
+    // machine has queued and not merely flush what is already in the buffer: a reset or a
+    // stop-sending issued just before the end lives inside the state machine until a
+    // production pass turns it into a record, and an ending that skipped that would drop
+    // exactly the frames explaining why it is ending.
     let finished = poll_once(|cx| conn.poll_finish(cx));
     assert!(
         matches!(finished, Poll::Ready(Ok(()))),

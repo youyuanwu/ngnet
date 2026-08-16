@@ -84,6 +84,29 @@ too high delays the events the driver has to attend to.
 
 **What would settle it:** a benchmark showing which end of that trade actually costs anything.
 
+## A response body that fails after delivering everything ends cleanly
+
+Not this crate's behaviour, and not fixable here, but found through it and worth recording
+where the next person to write a reset test will look.
+
+When a handler's response body returns an error, `ngnet-h3` ends it with
+`BodyOutcome::Eof` and separately records `Ending::Failed`
+(`crates/ngnet-h3/src/http/body/outgoing.rs:112-116`). The `Eof` finishes the stream, and the
+driver then resets it (`crates/ngnet-h3/src/http/server.rs:361-365`). Those are two signals
+about one stream, and which the peer acts on depends on whether anything was still queued
+behind the FIN.
+
+With a backlog, the reset discards it and the caller sees a failed body, which is right. With
+no backlog -- a body small enough to fit the windows, or a peer that has already drained it --
+the FIN has already been delivered, the caller sees a complete body, and the reset arrives for
+a stream that is finished. The response was truncated and the caller is not told.
+
+`tests/ngnet-qmux-h3-tests/tests/reset.rs` sidesteps this by keeping a backlog deliberately,
+and says so. It is recorded here rather than fixed because the fix belongs in `ngnet-h3`,
+where it would change the QUIC path identically and deserves its own reasoning: the choice is
+between not finishing a failed body at all and accepting that a truncated response can look
+complete.
+
 ## No datagrams, no WebTransport, no priority
 
 Neither `ngnet-h3` nor `ngnet-qmux` exposes unreliable datagrams, so this crate cannot.

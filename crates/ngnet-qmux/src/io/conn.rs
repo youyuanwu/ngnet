@@ -837,7 +837,11 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         }
 
         if self.closing.is_none() {
-            match self.flush(cx) {
+            // Produced, not merely flushed, and before `closing` is set -- which stops
+            // production. A stream this caller reset moments ago has its RESET_STREAM sitting
+            // in the state machine, and a close that flushed without producing would leave
+            // the peer with a stream that simply stopped.
+            match self.drain_pending(cx) {
                 Ok(true) => {}
                 Ok(false) => return Poll::Pending,
                 Err(error) => return Poll::Ready(Err(error)),
@@ -899,7 +903,7 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
             return Poll::Ready(Ok(()));
         }
 
-        match self.flush(cx) {
+        match self.drain_pending(cx) {
             Ok(true) => {}
             Ok(false) => return Poll::Pending,
             Err(error) => return Poll::Ready(Err(error)),
@@ -954,6 +958,19 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
                 return Ok(());
             }
         }
+    }
+
+    /// Produces whatever the state machine has queued and writes it out.
+    ///
+    /// Returns whether everything is now on the byte stream. The ending paths need this and
+    /// cannot use [`Connection::flush`] alone: a reset or a stop-sending issued just before
+    /// the end is *queued inside the state machine*, not in the outbound buffer, and only a
+    /// production pass turns it into a record. Flushing alone writes what is already there
+    /// and silently drops what is not — which loses exactly the frames that explain to the
+    /// peer why the ending is happening.
+    fn drain_pending(&mut self, cx: &mut Context<'_>) -> Result<bool> {
+        self.write_side(cx)?;
+        Ok(self.written >= self.outbound.len())
     }
 
     /// Offers the outbound buffer to the byte stream until it is empty or refuses.
