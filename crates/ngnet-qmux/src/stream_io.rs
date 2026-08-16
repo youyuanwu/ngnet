@@ -8,7 +8,7 @@ use crate::stream::StreamId;
 
 /// The result of asking to open a stream.
 ///
-/// Deliberately not `#[non_exhaustive]`, unlike [`crate::WriteOutcome`]: dwnx's open functions
+/// Deliberately not `#[non_exhaustive]`, unlike [`crate::Push`]: dwnx's open functions
 /// document exactly two non-error results, success and `STREAM_ID_BLOCKED`, and a third would
 /// be a change in the protocol rather than an addition to the API. Callers get to match
 /// exhaustively and be told by the compiler if that ever stops being true.
