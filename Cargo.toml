@@ -10,6 +10,7 @@ members = [
     "crates/ngnet-quic",
     "crates/ngnet-quic-h3",
     "crates/ngnet-qmux-sys",
+    "crates/ngnet-qmux",
     "crates/ngnet-util",
     "tests/ngnet-h2-tests",
     "tests/ngnet-h2-bench",
@@ -82,6 +83,7 @@ ngnet-quic = { path = "crates/ngnet-quic" }
 # different protocol over a different substrate, and a workspace test asserts neither family
 # reaches the other.
 ngnet-qmux-sys = { path = "crates/ngnet-qmux-sys" }
+ngnet-qmux = { path = "crates/ngnet-qmux" }
 # The one crate allowed to depend on both families, and the only place they meet. Keeping
 # the adapter here rather than in either of them is what lets a caller take HTTP/3 without
 # a QUIC implementation, or QUIC without an HTTP/3 state machine; a workspace test asserts

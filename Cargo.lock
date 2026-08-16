@@ -1113,6 +1113,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ngnet-qmux"
+version = "0.1.0"
+dependencies = [
+ "ngnet-qmux-sys",
+]
+
+[[package]]
 name = "ngnet-qmux-sys"
 version = "0.1.0"
 dependencies = [
