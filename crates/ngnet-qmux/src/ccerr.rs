@@ -113,6 +113,28 @@ impl CloseReason {
         &self.reason
     }
 
+    /// Assembles a close reason from fields decoded off the wire.
+    ///
+    /// The wire is the one source these four fields can come from that dwnx's own constructors
+    /// cannot reproduce: they set `frame_type` to zero and offer no way to change it, so a
+    /// transport close naming the frame that provoked it would arrive here with that field
+    /// lost. Crate-private and compiled only with the `io` layer, so the sans-I/O crate's
+    /// public API is what it was.
+    #[cfg(feature = "io")]
+    pub(crate) fn from_parts(
+        kind: CloseKind,
+        error_code: u64,
+        frame_type: u64,
+        reason: Vec<u8>,
+    ) -> Self {
+        Self {
+            kind,
+            error_code,
+            frame_type,
+            reason,
+        }
+    }
+
     /// Copy a `dwnx_ccerr` into an owned Rust value.
     pub(crate) fn from_native(ccerr: &sys::dwnx_ccerr) -> Self {
         let reason = if ccerr.reason.is_null() || ccerr.reasonlen == 0 {
@@ -137,10 +159,7 @@ impl CloseReason {
     }
 
     /// Run one of dwnx's setters and copy the result out.
-    fn build(
-        reason: &[u8],
-        set: impl FnOnce(*mut sys::dwnx_ccerr, *const u8, usize),
-    ) -> Self {
+    fn build(reason: &[u8], set: impl FnOnce(*mut sys::dwnx_ccerr, *const u8, usize)) -> Self {
         let mut ccerr = MaybeUninit::<sys::dwnx_ccerr>::uninit();
         set(ccerr.as_mut_ptr(), reason.as_ptr(), reason.len());
         // SAFETY: every dwnx setter fully initialises the struct.
@@ -178,12 +197,10 @@ mod tests {
     /// transport code; everything else is inferred into the transport space.
     #[test]
     fn idle_close_is_its_own_kind() {
-        let idle =
-            CloseReason::from_native_error(NativeCode::new(sys::DWNX_ERR_IDLE_CLOSE), b"");
+        let idle = CloseReason::from_native_error(NativeCode::new(sys::DWNX_ERR_IDLE_CLOSE), b"");
         assert_eq!(idle.kind(), CloseKind::IdleClose);
 
-        let flow =
-            CloseReason::from_native_error(NativeCode::new(sys::DWNX_ERR_FLOW_CONTROL), b"");
+        let flow = CloseReason::from_native_error(NativeCode::new(sys::DWNX_ERR_FLOW_CONTROL), b"");
         assert_eq!(flow.kind(), CloseKind::Transport);
         assert_eq!(flow.error_code(), u64::from(sys::DWNX_FLOW_CONTROL_ERROR));
     }

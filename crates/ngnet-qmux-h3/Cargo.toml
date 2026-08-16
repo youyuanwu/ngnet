@@ -1,0 +1,32 @@
+[package]
+name = "ngnet-qmux-h3"
+version = "0.1.0"
+description = "HTTP/3 over QMux: an ngnet-h3 transport backed by ngnet-qmux"
+# Cannot be published while either crate it binds is unpublished, and both are withheld
+# while their APIs are still expected to change.
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No feature table, deliberately.
+#
+# `ngnet-h3` and `ngnet-qmux` each gate their async layer behind a feature, because each is
+# usable as a bare state machine without it. This crate is nothing *but* the join between
+# those two async layers: with either one disabled it has no reason to exist and would not
+# compile. A feature that can only ever be on is a lie in a manifest, so there is none.
+#
+# It does depend on both crates' default features, which is where those async layers live.
+# Note that `ngnet-qmux`'s runtime glue is a further feature this crate does *not* enable:
+# the byte stream and the clock arrive as arguments, so nothing here needs to know which
+# runtime produced them.
+[dependencies]
+ngnet-h3.workspace = true
+ngnet-qmux.workspace = true
+bytes.workspace = true
+# Not for a protocol of their own: `http::Request` and `http_body::Body` appear in the bounds
+# `ngnet_h3::http::serve` and `handshake` impose on a handler and a response body, and a
+# wrapper around either cannot state those bounds without naming the types. Both are already
+# `ngnet-h3`'s own dependencies, so nothing new is compiled on their account.
+http.workspace = true
+http-body.workspace = true

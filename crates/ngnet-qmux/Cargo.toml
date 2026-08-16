@@ -11,15 +11,32 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# No features, and the absence is the point.
-#
-# `ngnet-quic` needs `tls-ossl` because a QUIC connection without a TLS backend cannot
-# complete a handshake, and `endpoint`/`tokio` because it grew an I/O layer. QMux has neither
-# problem: the draft delegates confidentiality and integrity to whatever carries the byte
-# stream, so there is no TLS seam to gate, and this crate is sans-I/O by design, so there is
-# no runtime to make optional. A caller supplies the transport.
+# Still no TLS feature, and the absence is the point. `ngnet-quic` needs `tls-ossl` because a
+# QUIC connection without a TLS backend cannot complete a handshake; QMux does not have that
+# problem, because the draft delegates confidentiality and integrity to whatever carries the
+# byte stream. There is no TLS seam here to gate, and there will not be one.
+[features]
+# The `io` layer is the headline API for a caller who wants to run QMux over a byte stream
+# rather than to drive a state machine by hand, so it is on by default, as `endpoint` is in
+# `ngnet-quic` and `http` is in `ngnet-h2` and `ngnet-h3`. Turning it off returns the crate to
+# the sans-I/O state machine it was before the layer existed: exactly one dependency, no
+# asynchrony of its own, and an unchanged public API. That is what `--no-default-features`
+# builds, and what a structural test reads the source and this manifest to confirm.
+default = ["io"]
+io = []
+# A ready-made byte stream and clock for tokio. Off by default, and for a stronger reason than
+# in `ngnet-quic`: the whole argument for the seam is that a caller keeps the choice of
+# runtime, and a QMux byte stream is a TCP socket, a unix socket, a TLS session or a pipe
+# depending on the deployment -- so the crate has no business naming one. Implies `io`, since
+# there is nothing for an implementation to plug into otherwise.
+tokio = ["io", "dep:tokio"]
 
-# Exactly one dependency, as in `ngnet-h2`, `ngnet-h3` and `ngnet-quic`. A test fails the
-# build if that grows.
+# Exactly one *non-optional* dependency, as in `ngnet-h2`, `ngnet-h3` and `ngnet-quic`. A test
+# fails the build if that grows, and requires every optional one to be reachable only through a
+# declared feature.
 [dependencies]
 ngnet-qmux-sys = { workspace = true }
+
+# Optional, and reachable only through the `tokio` feature above -- which is what keeps the
+# non-optional count at one, the claim a structural test enforces.
+tokio = { workspace = true, optional = true }

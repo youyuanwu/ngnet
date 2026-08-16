@@ -1,0 +1,28 @@
+[package]
+name = "ngnet-qmux-h3-tests"
+version = "0.1.0"
+description = "Integration tests driving HTTP/3 over QMux, in memory and over loopback TCP"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# This crate exists so `ngnet-qmux-h3` can be exercised end to end -- over an in-memory byte
+# stream pair and over real loopback TCP -- without the crate itself acquiring a runtime, a
+# body implementation or an HTTP type system. A workspace test asserts what `ngnet-qmux-h3`
+# depends on, and anything beyond that belongs here.
+#
+# `[dependencies]` rather than `[dev-dependencies]` because the harness lives in `src/lib.rs`,
+# and a library target cannot see dev-dependencies.
+[dependencies]
+ngnet-qmux-h3.workspace = true
+# `tokio` for the runtime glue the loopback test needs: a `TokioStream` over a `TcpStream`
+# and a `TokioClock`. The in-memory tests use neither and would compile without it.
+ngnet-qmux = { workspace = true, features = ["tokio"] }
+ngnet-h3.workspace = true
+
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+tokio.workspace = true

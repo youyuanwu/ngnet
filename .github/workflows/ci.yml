@@ -128,7 +128,16 @@ jobs:
       - name: Test (HTTP/3 over ngtcp2, release)
         run: cargo test -p ngnet-quic-h3 -p ngnet-quic-h3-tests --release
 
-      # Thirteen configurations that differ only in a package and its features, so they are one
+      # And the same argument for the other join. libdwnx checks its own invariants with
+      # ninety-odd `assert()` calls, every one of which `NDEBUG` removes from a release
+      # build, so the workspace runs above and this one exercise materially different C. The
+      # Rust side gains something too: the large-body and concurrency tests here move
+      # megabytes through the record layer, and debug builds are slow enough that a
+      # performance regression hides in the noise rather than showing up as a timeout.
+      - name: Test (HTTP/3 over QMux, release)
+        run: cargo test -p ngnet-qmux-h3 -p ngnet-qmux-h3-tests --release
+
+      # Sixteen configurations that differ only in a package and its features, so they are one
       # step iterating a list rather than ten near-identical steps. The list is the whole
       # point of the step: a configuration is added by adding a line, and the reason it
       # exists is written directly above it, where a reader looking at the entry will find
@@ -201,6 +210,24 @@ jobs:
           # not compile. One invocation covers it.
           HTTP/3 over ngtcp2                       | -p ngnet-quic-h3
 
+          # The QMux wrapper's three, and the reason it has three is the same one the h3
+          # family has: its asynchronous layer is behind a default-on `io` feature, so the
+          # sans-I/O configuration compiles code no other entry reaches -- and the crate's
+          # promise is that `--no-default-features` is the state machine as it was before the
+          # layer existed. The all-features entry is the one that resolves the optional tokio
+          # dependency, so it is where an item gated on that feature is actually compiled.
+          QMux wrapper, default features           | -p ngnet-qmux
+          QMux sans-I/O core alone                 | -p ngnet-qmux --no-default-features
+          QMux wrapper, all features               | -p ngnet-qmux --all-features
+
+          # The HTTP/3-over-QMux join, for the same reason its ngtcp2 sibling gets one line:
+          # it is nothing but the join between two async layers, so it has no features to
+          # vary. Its integration crate rides along in the same invocation because that crate
+          # keeps its harness in `src/lib.rs` rather than behind [dev-dependencies], which
+          # makes it an ordinary library that `--all-targets` would otherwise lint only when
+          # something else happened to build it.
+          HTTP/3 over QMux                         | -p ngnet-qmux-h3 -p ngnet-qmux-h3-tests
+
           # `ngnet-axum` has no feature matrix -- axum, tokio and the h2 transport are all
           # unconditional -- so unlike the crates above it needs exactly one invocation
           # rather than one per configuration.
@@ -211,7 +238,7 @@ jobs:
           client policy layer                      | -p ngnet-util
           CONFIGURATIONS
 
-      # Seventeen invocations that differ only in packages and features, collapsed the same
+      # Twenty-four invocations that differ only in packages and features, collapsed the same
       # way as clippy above, and for the same reasons -- including that a `strategy.matrix`
       # would put each on its own runner and rebuild the C libraries for every one.
       #
@@ -276,6 +303,16 @@ jobs:
           QUIC tests                               | -p ngnet-quic-tests
           HTTP/3 over ngtcp2                       | -p ngnet-quic-h3
           HTTP/3-over-ngtcp2 tests                 | -p ngnet-quic-h3-tests
+
+          # The QMux wrapper's own matrix, for the same reason as h3's: its asynchronous
+          # layer sits behind a default-on `io` feature, so a doc link into it breaks the
+          # configuration without it -- which is the exact bug the h2 matrix above was written
+          # for.
+          QMux wrapper, default features           | -p ngnet-qmux
+          QMux sans-I/O core alone                 | -p ngnet-qmux --no-default-features
+          QMux wrapper, all features               | -p ngnet-qmux --all-features
+          HTTP/3 over QMux                         | -p ngnet-qmux-h3
+          HTTP/3-over-QMux tests                   | -p ngnet-qmux-h3-tests
 
           # One invocation each, for the same reason as their clippy entries: no features to
           # vary.

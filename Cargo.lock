@@ -1117,6 +1117,32 @@ name = "ngnet-qmux"
 version = "0.1.0"
 dependencies = [
  "ngnet-qmux-sys",
+ "tokio",
+]
+
+[[package]]
+name = "ngnet-qmux-h3"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body",
+ "ngnet-h3",
+ "ngnet-qmux",
+]
+
+[[package]]
+name = "ngnet-qmux-h3-tests"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "ngnet-h3",
+ "ngnet-qmux",
+ "ngnet-qmux-h3",
+ "tokio",
 ]
 
 [[package]]
