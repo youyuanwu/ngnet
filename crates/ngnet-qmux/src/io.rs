@@ -41,6 +41,15 @@
 //! **No timer.** [`Clock`] reports the time and offers no way to wait for one; see its module
 //! documentation for why an idle timeout is not enforced here.
 //!
+//! # Two things it must do that the state machine cannot
+//!
+//! [`RecordFramer`] counts record boundaries in parallel with dwnx, because dwnx tolerates a
+//! partial record by asking for more input and so cannot say whether a byte stream ended
+//! between records or partway through one. [`encode_close_record`] and [`decode_close_frame`]
+//! are the CONNECTION_CLOSE codec, because dwnx serialises no close at all and parses an
+//! incoming one into a private struct it exposes no accessor for. Neither is duplicated work
+//! chosen for its own sake; each module argues its case where a reader will find it.
+//!
 //! # Why poll-shaped, when the closer precedent is future-shaped
 //!
 //! `ngnet-h2` also runs a protocol over a byte stream, and its transport abstraction is
@@ -84,12 +93,16 @@
 //! the bound.
 
 mod clock;
+mod close;
 mod error;
+mod framing;
 mod stream;
 
 #[doc(hidden)]
 pub mod testing;
 
 pub use clock::Clock;
+pub use close::{decode_close_frame, encode_close_record};
 pub use error::{Error, ErrorKind, Result};
+pub use framing::RecordFramer;
 pub use stream::{AsyncByteStream, Written};
