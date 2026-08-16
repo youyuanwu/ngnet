@@ -220,7 +220,8 @@ fn skip_frame(frame_type: u64, fields: &[u8]) -> Option<usize> {
         FRAME_QX_TRANSPORT_PARAMETERS => {
             let (len, read) = read_varint(fields)?;
             let len = usize::try_from(len).ok()?;
-            (read + len <= fields.len()).then_some(read + len)
+            let end = read.checked_add(len)?;
+            (end <= fields.len()).then_some(end)
         }
         _ if (frame_type & !0x07) == FRAME_STREAM => {
             let (_, read) = read_varint(fields)?;
@@ -237,7 +238,8 @@ fn skip_frame(frame_type: u64, fields: &[u8]) -> Option<usize> {
             let (len, read) = read_varint(&fields[at..])?;
             at += read;
             let len = usize::try_from(len).ok()?;
-            (at + len <= fields.len()).then_some(at + len)
+            let end = at.checked_add(len)?;
+            (end <= fields.len()).then_some(end)
         }
         _ => None,
     }

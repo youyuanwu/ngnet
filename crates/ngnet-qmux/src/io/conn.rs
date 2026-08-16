@@ -877,6 +877,46 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         }
     }
 
+    /// Flushes what is queued and shuts the write side down, without saying why.
+    ///
+    /// The counterpart to [`Connection::poll_close`] for an ending that carries no close: the
+    /// caller failed, or went away, and there is nothing to tell the peer beyond the fact that
+    /// nothing more is coming. The bytes already produced still have to reach it.
+    ///
+    /// Shutting down matters even though dropping a socket produces the same FIN. A byte
+    /// stream that wraps another — a buffered writer, a TLS session — has bytes of its own to
+    /// flush, and dropping it discards them. That is the whole reason
+    /// [`AsyncByteStream::poll_shutdown`](crate::io::AsyncByteStream::poll_shutdown) exists,
+    /// and skipping it works only for the one implementation that needs it least.
+    ///
+    /// Poll until [`Poll::Ready`].
+    ///
+    /// # Errors
+    ///
+    /// Reports a byte-stream failure encountered while flushing or shutting down.
+    pub fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.closing == Some(Closing::Complete) {
+            return Poll::Ready(Ok(()));
+        }
+
+        match self.flush(cx) {
+            Ok(true) => {}
+            Ok(false) => return Poll::Pending,
+            Err(error) => return Poll::Ready(Err(error)),
+        }
+
+        match self.stream.poll_shutdown(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                self.closing = Some(Closing::Complete);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(
+                self.fail_stream(error, "the byte stream failed while shutting down")
+            )),
+        }
+    }
+
     /// Flush, produce, read -- and one more write pass for whatever the read left to say.
     fn pump(&mut self, cx: &mut Context<'_>) -> Result<()> {
         if let Some(terminal) = &self.terminal {

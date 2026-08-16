@@ -257,8 +257,12 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
             // that is already over, and there is nobody left to tell.
             Some(reason) => self.conn.poll_close(cx, reason).is_ready(),
             // No close was asked for -- the driver failed, or was dropped. What it wrote
-            // before that still has to reach the peer.
-            None => self.conn.poll_pump(cx).is_ready(),
+            // before that still has to reach the peer, and then the write side has to be
+            // shut down like any other ending. Pumping alone would be enough for a bare
+            // socket, whose drop produces a FIN anyway, and wrong for every stream that
+            // wraps one: `poll_shutdown` is what flushes a buffered writer or finishes a
+            // part-built TLS record, so without it the bytes just pumped are discarded.
+            None => self.conn.poll_pump(cx).is_ready() && self.conn.poll_finish(cx).is_ready(),
         };
         if done {
             self.finished = true;

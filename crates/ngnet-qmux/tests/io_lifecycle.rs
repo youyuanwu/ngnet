@@ -421,3 +421,51 @@ fn a_backed_up_transport_does_not_lose_a_record() {
         "the announcement arrived whole and unduplicated despite being written one byte per call"
     );
 }
+
+/// Finishing without a close still shuts the write side down.
+///
+/// The counterpart to `poll_close` for an ending that has nothing to say: the caller failed,
+/// or went away, and the peer needs to learn that nothing more is coming.
+///
+/// Flushing alone would look sufficient against a socket, whose drop emits a FIN whatever the
+/// program does. It is not sufficient for the byte streams this seam exists to accept. A
+/// buffered writer or a TLS session holds bytes of its own that only a shutdown flushes, so a
+/// finish that skipped it would discard exactly the bytes it had just been asked to deliver.
+///
+/// The test byte stream has no `Drop`, and reports end of stream only once the writer has
+/// shut down, so the peer reaching an orderly ending is the evidence that it happened.
+#[test]
+fn finishing_without_a_close_shuts_the_write_side_down() {
+    let (near, far) = stream_pair();
+    let mut conn =
+        Connection::client(near, TestClock::new(), Config::new()).expect("constructing a client");
+
+    // Pumping first, exactly as the HTTP/3 join's tail does. `poll_finish` flushes and shuts
+    // down but does not produce, symmetrically with `poll_close`: both are endings, and
+    // neither invents new records to send. So the announcement has to be produced here for
+    // there to be anything for the flush to prove it carried.
+    let pumped = poll_once(|cx| conn.poll_pump(cx));
+    assert!(matches!(pumped, Poll::Ready(Ok(()))), "pumping: {pumped:?}");
+
+    let finished = poll_once(|cx| conn.poll_finish(cx));
+    assert!(
+        matches!(finished, Poll::Ready(Ok(()))),
+        "finishing a connection with nothing outstanding completes at once: {finished:?}"
+    );
+
+    let mut far = far;
+    let mut buffer = [0u8; 512];
+    let mut announced = 0usize;
+    loop {
+        match poll_once(|cx| far.poll_read(cx, &mut buffer)) {
+            Poll::Ready(Ok(0)) => break,
+            Poll::Ready(Ok(read)) => announced += read,
+            other => panic!("the peer should read the announcement and then the end: {other:?}"),
+        }
+    }
+
+    assert!(
+        announced > 0,
+        "finishing flushed nothing, so the transport parameters never left the buffer"
+    );
+}

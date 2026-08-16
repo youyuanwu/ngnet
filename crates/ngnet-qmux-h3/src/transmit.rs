@@ -54,10 +54,22 @@ pub(crate) fn drain<S: AsyncByteStream, C: Clock, Src: StreamSource>(
 
             let mut total: usize = 0;
             let mut refusal: Option<WriteOutcome> = None;
+            // The end-of-stream marker must ride on the last slice that is actually written,
+            // not on the last slice offered. A trailing empty slice would otherwise take the
+            // marker, be refused because a record is already outstanding, and contribute
+            // nothing to `total` -- so the closure would answer `Accepted(offered)` and the
+            // driver would commit the stream as ended while QMux had sent no FIN, leaving the
+            // peer waiting for an end that never comes. nghttp3 does not currently emit
+            // zero-length vectors, but `ngnet-h3` does not rely on that, and the failure is
+            // silent, so the index is computed rather than assumed.
+            let last_written = slices
+                .iter()
+                .rposition(|slice| !slice.is_empty())
+                .unwrap_or(0);
             let count = slices.len().max(1);
 
             for index in 0..count {
-                let last = index + 1 == count;
+                let last = index == last_written;
                 // The end-of-stream marker rides on the final slice and only there. QMux
                 // applies it only when it takes the whole of what it was offered, so a
                 // partial accept cannot end the stream early.
