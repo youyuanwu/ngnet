@@ -94,7 +94,9 @@
 
 mod clock;
 mod close;
+mod conn;
 mod error;
+mod event;
 mod framing;
 mod stream;
 
@@ -103,6 +105,11 @@ pub mod testing;
 
 pub use clock::Clock;
 pub use close::{decode_close_frame, encode_close_record};
+pub use conn::{
+    Config, Connection, DEFAULT_CONNECTION_DATA, DEFAULT_MAX_STREAMS, DEFAULT_STREAM_DATA,
+    StreamWrite,
+};
 pub use error::{Error, ErrorKind, Result};
+pub use event::Event;
 pub use framing::RecordFramer;
 pub use stream::{AsyncByteStream, Written};

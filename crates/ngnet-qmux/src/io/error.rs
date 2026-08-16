@@ -160,10 +160,30 @@ impl Error {
         self
     }
 
+    /// Replaces the description.
+    ///
+    /// The mapping from a state-machine failure keeps that layer's phrasing, which is accurate
+    /// but says nothing about what this layer was doing when it happened. Where the doing is
+    /// the interesting part -- a record that failed to serialise, say -- the connection
+    /// substitutes its own description and keeps the original as the source.
+    pub(crate) const fn with_context(mut self, context: &'static str) -> Self {
+        self.context = context;
+        self
+    }
+
     /// What kind of failure this is.
     #[must_use]
     pub const fn kind(&self) -> ErrorKind {
         self.kind
+    }
+
+    /// The description this error was built with.
+    ///
+    /// Not public: a caller reads the description through [`fmt::Display`], which also renders
+    /// the close reason. This exists so the connection can reproduce a latched ending on every
+    /// later operation without keeping the original error, whose boxed source cannot be cloned.
+    pub(crate) const fn context(&self) -> &'static str {
+        self.context
     }
 
     /// Why the connection closed, when the failure was a close.
