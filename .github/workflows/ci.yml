@@ -305,7 +305,7 @@ jobs:
       # silently as the API moves.
       #
       # Tracking performance over time needs a dedicated machine with a pinned core and
-      # saved baselines. See docs/h2/benchmarks.md.
+      # saved baselines. See docs/h2/benchmarks/running.md.
       - name: Benchmarks compile and run once
         run: cargo bench --workspace -- --test
 
