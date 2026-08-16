@@ -31,6 +31,13 @@ hyper-util.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 
+# The library target carries fixtures, not benchmarks, and libtest would otherwise be handed
+# the Criterion arguments meant for the benches below — `cargo bench -- --save-baseline x`
+# fails on `Unrecognized option` before a single measurement is taken. Excluding the lib from
+# `cargo bench` costs nothing: `cargo test` still builds and tests it.
+[lib]
+bench = false
+
 # `harness = false` on each bench hands the whole `main` to Criterion rather than to
 # libtest, which is what lets Criterion time and report the iterations itself.
 [[bench]]
