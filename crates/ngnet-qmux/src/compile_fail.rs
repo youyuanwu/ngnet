@@ -15,33 +15,59 @@
 /// handlers no way to name the connection: they are owned by it, and every entry point takes
 /// `&mut self`, so the borrow checker rejects the attempt.
 ///
-/// ```compile_fail
-/// use ngnet_qmux::{Conn, Handlers, Role, Timestamp, WriteRequest};
-///
-/// let mut conn = Conn::builder(Role::Client).build().unwrap();
-/// let handlers = Handlers::new().on_stream_open(|_| {
-///     // `conn` is already borrowed by the connection that owns these handlers.
-///     let mut buf = [0u8; 4096];
-///     let _ = conn.write(&mut buf, WriteRequest::control_only(), Timestamp::from_nanos(0));
-///     Ok(())
-/// });
-/// let _ = conn.builder(Role::Client).handlers(handlers);
-/// ```
-///
-/// The same attempt written the other way round -- installing the handlers first, then using
-/// the connection inside one -- fails for the same reason.
+/// Note what the error actually is. A handler installed on a connection cannot name that
+/// connection, because the binding does not exist yet when the handler is written -- the
+/// handlers are an argument to the builder that produces it. That is the property, and
+/// "cannot find value `conn`" is its exact expression, not a technicality standing in for it.
 ///
 /// ```compile_fail
 /// use ngnet_qmux::{Conn, Handlers, Role};
 ///
 /// let mut conn = Conn::builder(Role::Client)
-///     .handlers(Handlers::new().on_stream_open(|_| {
+///     .handlers(Handlers::new().on_stream_open(move |_| {
 ///         let _ = conn.streams_bidi_left();
 ///         Ok(())
 ///     }))
 ///     .build()
 ///     .unwrap();
 /// ```
+///
+/// Nor can one be smuggled in from outside, because a handler that captured a connection would
+/// have to own it, and the connection it is installed on owns the handler.
+///
+/// ```compile_fail
+/// use ngnet_qmux::{Conn, Handlers, Role, Timestamp, WriteRequest};
+///
+/// let mut other = Conn::builder(Role::Client).build().unwrap();
+/// let mut conn = Conn::builder(Role::Client)
+///     .handlers(Handlers::new().on_stream_open(move |_| {
+///         let mut buf = [0u8; 4096];
+///         let _ = other.write(&mut buf, WriteRequest::control_only(), Timestamp::from_nanos(0));
+///         Ok(())
+///     }))
+///     .build()
+///     .unwrap();
+/// // `other` was moved into the handler, so it cannot also be used here.
+/// let _ = other.streams_bidi_left();
+/// ```
+///
+/// A handler is also required to be `Send`, so it cannot smuggle a thread-affine handle into a
+/// connection that is itself `Send`.
+///
+/// ```compile_fail
+/// use ngnet_qmux::{Conn, Handlers, Role};
+/// use std::rc::Rc;
+///
+/// let shared = Rc::new(std::cell::Cell::new(0u32));
+/// let captured = Rc::clone(&shared);
+/// let _ = Conn::builder(Role::Client)
+///     .handlers(Handlers::new().on_stream_open(move |_| {
+///         captured.set(captured.get() + 1);
+///         Ok(())
+///     }))
+///     .build();
+/// ```
+///
 mod handlers_cannot_reach_the_connection {}
 
 /// A connection cannot be shared between threads.

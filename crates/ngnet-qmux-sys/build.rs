@@ -213,10 +213,20 @@ fn configure_probes(build: &mut cc::Build) {
         build.define("WORDS_BIGENDIAN", None);
     }
 
+    // dwnx's byte-order header gates its Windows path on `WIN32`, not `_WIN32`. MSVC and
+    // clang-cl predefine only the underscored spellings, so on a `*-pc-windows-msvc` target
+    // the check fails, the `_byteswap_*` path is skipped, and `dwnx_bswap64` falls through to
+    // a portable fallback calling `ntohl` -- which is neither declared nor linked, since
+    // nothing includes `<winsock2.h>` or links `ws2_32`. The result is a link error naming
+    // symbols no source appears to call. The MinGW target defines `WIN32` itself and is
+    // unaffected; defining it unconditionally for the family is harmless there.
+    if windows {
+        build.define("WIN32", None);
+    }
+
     // Deliberately *not* defined: `HAVE_CONFIG_H`. Every dwnx header guards its `config.h`
     // include with it, so leaving it unset means the generated config autotools would have
     // produced is simply not needed -- the defines above take its place.
-    let _ = windows;
     let _ = apple;
 }
 

@@ -44,6 +44,7 @@
 
 use ngnet_qmux_sys as sys;
 
+use core::cell::Cell;
 use core::ffi::c_void;
 use core::ptr;
 
@@ -74,15 +75,25 @@ pub(crate) struct Scratch {
 }
 
 /// The live borrows a callback needs, valid only for the duration of one entry point.
+///
+/// `Copy` so it can be read out of the [`Cell`] without disturbing it.
+#[derive(Clone, Copy)]
 struct Bridge {
     handlers: *mut Handlers<'static>,
     scratch: *mut Scratch,
 }
 
 /// The stable, boxed cell whose address dwnx holds as `user_data`.
+///
+/// Interior-mutable on purpose, and this is a soundness matter rather than a convenience.
+/// Writing through a `&mut BridgeSlot` held across the C call would leave two live `&mut` to
+/// the same slot -- the guard's, and the one a callback forms from `user_data` -- which is
+/// aliasing Rust forbids, even though the two never overlap in time in any observable way.
+/// With a `Cell` no `&mut` to the slot ever exists, so the question does not arise. This is
+/// the arrangement `ngnet-quic`'s bridge uses, for the same reason.
 #[derive(Default)]
 pub(crate) struct BridgeSlot {
-    bridge: Option<Bridge>,
+    bridge: Cell<Option<Bridge>>,
 }
 
 impl BridgeSlot {
@@ -93,7 +104,7 @@ impl BridgeSlot {
 
 /// Installs a [`Bridge`] for the duration of one entry point.
 pub(crate) struct BridgeGuard<'a> {
-    slot: &'a mut BridgeSlot,
+    slot: &'a BridgeSlot,
 }
 
 impl<'a> BridgeGuard<'a> {
@@ -106,28 +117,29 @@ impl<'a> BridgeGuard<'a> {
     /// borrow ends -- and dwnx never retains `user_data` beyond the call, because it only ever
     /// passes it back to the callbacks it invokes synchronously.
     pub(crate) fn new<'h>(
-        slot: &'a mut BridgeSlot,
+        slot: &'a BridgeSlot,
         handlers: &mut Handlers<'h>,
         scratch: &mut Scratch,
     ) -> Self {
+        let previous = slot.bridge.take();
         debug_assert!(
-            slot.bridge.is_none(),
+            previous.is_none(),
             "a bridge is already installed: an entry point was re-entered, which the API is \
              supposed to make impossible"
         );
 
         let handlers: *mut Handlers<'h> = handlers;
-        slot.bridge = Some(Bridge {
+        slot.bridge.set(Some(Bridge {
             handlers: handlers.cast::<Handlers<'static>>(),
             scratch,
-        });
+        }));
         Self { slot }
     }
 }
 
 impl Drop for BridgeGuard<'_> {
     fn drop(&mut self) {
-        self.slot.bridge = None;
+        self.slot.bridge.set(None);
     }
 }
 
@@ -148,10 +160,10 @@ where
         return 0;
     }
 
-    // SAFETY: the caller guarantees `user_data` is the live boxed slot. The `&mut` is confined
-    // to this function, and dwnx is single-threaded with respect to one connection.
-    let slot = unsafe { &mut *user_data.cast::<BridgeSlot>() };
-    let Some(bridge) = slot.bridge.as_ref() else {
+    // SAFETY: the caller guarantees `user_data` is the live boxed slot. Only a shared
+    // reference is formed, so this cannot alias the guard's own borrow.
+    let slot = unsafe { &*user_data.cast::<BridgeSlot>() };
+    let Some(bridge) = slot.bridge.get() else {
         // No entry point is active. Unreachable through this crate's API; treated as "nobody
         // is listening" rather than as a failure.
         return 0;
@@ -447,11 +459,11 @@ mod tests {
     /// A callback firing with no bridge installed is inert rather than unsound.
     #[test]
     fn dispatch_without_a_bridge_is_a_no_op() {
-        let mut slot = BridgeSlot::new();
-        let slot_ptr: *mut BridgeSlot = &mut slot;
+        let slot = BridgeSlot::new();
+        let slot_ptr: *const BridgeSlot = &slot;
 
         // SAFETY: a live slot with no bridge installed.
-        let rv = unsafe { dispatch(slot_ptr.cast(), |_, _| Ok(())) };
+        let rv = unsafe { dispatch(slot_ptr.cast_mut().cast(), |_, _| Ok(())) };
         assert_eq!(rv, 0);
     }
 
@@ -465,32 +477,32 @@ mod tests {
 
     #[test]
     fn guard_installs_and_clears_the_slot() {
-        let mut slot = BridgeSlot::new();
+        let slot = BridgeSlot::new();
         let mut handlers = Handlers::new();
         let mut scratch = Scratch::default();
 
         {
-            let _guard = BridgeGuard::new(&mut slot, &mut handlers, &mut scratch);
-            assert!(slot_is_installed(&_guard));
+            let guard = BridgeGuard::new(&slot, &mut handlers, &mut scratch);
+            assert!(guard.slot.bridge.get().is_some());
         }
-        assert!(slot.bridge.is_none());
-    }
-
-    fn slot_is_installed(guard: &BridgeGuard<'_>) -> bool {
-        guard.slot.bridge.is_some()
+        assert!(slot.bridge.get().is_none());
     }
 
     /// A handler error becomes the one code C understands, and the message survives in scratch.
     #[test]
     fn handler_errors_are_stashed_and_reported() {
-        let mut slot = BridgeSlot::new();
+        let slot = BridgeSlot::new();
         let mut handlers = Handlers::new();
         let mut scratch = Scratch::default();
-        let slot_ptr: *mut BridgeSlot = &mut slot;
+        let slot_ptr: *const BridgeSlot = &slot;
 
-        let guard = BridgeGuard::new(&mut slot, &mut handlers, &mut scratch);
+        let guard = BridgeGuard::new(&slot, &mut handlers, &mut scratch);
         // SAFETY: a bridge is installed for the lifetime of `guard`.
-        let rv = unsafe { dispatch(slot_ptr.cast(), |_, _| Err(HandlerError::new("nope"))) };
+        let rv = unsafe {
+            dispatch(slot_ptr.cast_mut().cast(), |_, _| {
+                Err(HandlerError::new("nope"))
+            })
+        };
         drop(guard);
 
         assert_eq!(rv, sys::DWNX_ERR_CALLBACK_FAILURE);

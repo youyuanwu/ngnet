@@ -1,7 +1,7 @@
 //! Construction, destruction, and the properties that hold across them.
 
-use std::cell::Cell;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use ngnet_qmux::{Conn, ErrorKind, Handlers, Role, TransportParams};
 
@@ -41,16 +41,16 @@ fn construct_and_drop_many_times() {
 /// C connection but leaked the boxes, or ran them twice, this counter would disagree.
 #[test]
 fn handler_state_is_dropped_exactly_once() {
-    struct Sentinel(Rc<Cell<u32>>);
+    struct Sentinel(Arc<AtomicU32>);
     impl Drop for Sentinel {
         fn drop(&mut self) {
-            self.0.set(self.0.get() + 1);
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 
-    let drops = Rc::new(Cell::new(0));
+    let drops = Arc::new(AtomicU32::new(0));
     {
-        let sentinel = Sentinel(Rc::clone(&drops));
+        let sentinel = Sentinel(Arc::clone(&drops));
         let conn = Conn::builder(Role::Client)
             .transport_params(params())
             .handlers(Handlers::new().on_stream_open(move |_| {
@@ -60,10 +60,18 @@ fn handler_state_is_dropped_exactly_once() {
             }))
             .build()
             .unwrap();
-        assert_eq!(drops.get(), 0, "dropped while the connection was alive");
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "dropped while the connection was alive"
+        );
         drop(conn);
     }
-    assert_eq!(drops.get(), 1, "handler state should drop exactly once");
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "handler state should drop exactly once"
+    );
 }
 
 /// A connection built from dwnx's untouched defaults is legal, if not useful.

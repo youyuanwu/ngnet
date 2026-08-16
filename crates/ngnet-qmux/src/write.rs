@@ -152,12 +152,28 @@ impl<'b> Record<'b> {
 ///
 /// The buffer is borrowed for the lifetime of this value because dwnx retains it across the
 /// whole sequence; see the module documentation.
+///
+/// # Always call [`RecordWriter::finish`]
+///
+/// Dropping a writer mid-record is *safe* — the `Drop` impl closes the record, so dwnx is
+/// never left holding a buffer whose borrow has ended — but it is not free. dwnx advances a
+/// stream's send offset as soon as data is packed, so any bytes already taken are lost, and
+/// the peer will reject the next record on that stream as a gap it can never fill. Use
+/// [`Conn::write`] where possible; it finishes the record for you.
 pub struct RecordWriter<'c, 'h, 'b> {
     conn: &'c mut Conn<'h>,
-    buf: &'b mut [u8],
+    /// `Option` so that `finish` can take the borrow back out and hand the caller a slice of
+    /// it. A plain `&'b mut [u8]` cannot be moved out of a type with a `Drop` impl, and the
+    /// `Drop` impl is what keeps the API sound.
+    buf: Option<&'b mut [u8]>,
     now: Timestamp,
     /// Set once dwnx reports the record finished, so `finish` does not call again.
     len: Option<usize>,
+    /// Whether dwnx has an unfinished record pointing into `buf`.
+    ///
+    /// Set by the first push that dwnx accepts, cleared once the record is finalised. See the
+    /// `Drop` impl for why this has to be tracked rather than inferred.
+    started: bool,
     too_small: bool,
 }
 
@@ -166,9 +182,10 @@ impl<'c, 'h, 'b> RecordWriter<'c, 'h, 'b> {
         let too_small = buf.len() < MIN_USABLE_BUFFER;
         Self {
             conn,
-            buf,
+            buf: Some(buf),
             now,
             len: None,
+            started: false,
             too_small,
         }
     }
@@ -193,8 +210,9 @@ impl<'c, 'h, 'b> RecordWriter<'c, 'h, 'b> {
         };
 
         let mut pdatalen: sys::dwnx_ssize = 0;
-        let buf_ptr = self.buf.as_mut_ptr();
-        let buf_len = self.buf.len();
+        let buf = self.buf.as_mut().expect("buffer is taken only by finish");
+        let buf_ptr = buf.as_mut_ptr();
+        let buf_len = buf.len();
         let data_ptr = request.data.as_ptr();
         let data_len = request.data.len();
         let now = self.now.as_nanos();
@@ -223,6 +241,16 @@ impl<'c, 'h, 'b> RecordWriter<'c, 'h, 'b> {
         // dwnx signals "took no stream data" with -1, which must not become a length.
         let consumed = usize::try_from(pdatalen).ok();
 
+        // Anything but the three per-stream signals means dwnx reached `dwnx_qre_start` and is
+        // now holding `buf`. See the `Drop` impl.
+        if !matches!(
+            rv,
+            _ if rv as i64 == i64::from(sys::DWNX_ERR_STREAM_DATA_BLOCKED)
+                || rv as i64 == i64::from(sys::DWNX_ERR_STREAM_SHUT_WR)
+        ) {
+            self.started = true;
+        }
+
         if rv > 0 {
             let len = usize::try_from(rv).map_err(|_| {
                 Error::validation(
@@ -231,6 +259,7 @@ impl<'c, 'h, 'b> RecordWriter<'c, 'h, 'b> {
                 )
             })?;
             self.len = Some(len);
+            self.started = false;
             return Ok(Push::Complete { consumed });
         }
 
@@ -242,6 +271,7 @@ impl<'c, 'h, 'b> RecordWriter<'c, 'h, 'b> {
             // Nothing to send at all: the record closes empty.
             0 => {
                 self.len = Some(0);
+                self.started = false;
                 Ok(Push::Complete { consumed })
             }
             sys::DWNX_ERR_WRITE_MORE => Ok(Push::Accepted { consumed }),
@@ -271,10 +301,73 @@ impl<'c, 'h, 'b> RecordWriter<'c, 'h, 'b> {
             let _ = self.push(WriteRequest::control_only())?;
         }
 
+        // Taking the buffer out both hands the caller its slice and tells `Drop` there is
+        // nothing left to finalise.
+        let buf = self.buf.take().expect("buffer is taken only once");
+
         Ok(match self.len {
             Some(0) | None => Record::Empty,
-            Some(len) => Record::Bytes(&self.buf[..len]),
+            Some(len) => Record::Bytes(&buf[..len]),
         })
+    }
+}
+
+/// Finalise a record the caller abandoned.
+///
+/// This is not tidiness; without it the safe API admits a write-after-free.
+///
+/// `dwnx_qre_start` stores the caller's buffer in the connection and sets a "started" flag,
+/// and only `dwnx_qre_final` clears it (`dwnx_qre.c`). A later call skips `qre_start` while
+/// that flag is set, so it appends through the *retained* pointer and ignores whatever buffer
+/// it was just given. A `RecordWriter` dropped mid-record therefore leaves the connection
+/// holding a pointer into a buffer whose borrow has ended -- and the next write, with a
+/// different and entirely valid buffer, scribbles into the old one.
+///
+/// Reaching that needs no `unsafe`: pushing once, seeing `Accepted`, and returning early is
+/// enough, and `Push::StreamBlocked` and `Push::StreamClosed` positively invite a caller to
+/// stop pushing. `Conn::write`'s `?` on a failed push is a second route.
+///
+/// So an unfinished record is closed here. A control-only write always reaches
+/// `dwnx_qre_final`, which clears the flag and leaves the connection ready for the next
+/// record. The bytes are discarded, which is correct: nobody asked for them.
+///
+/// This makes abandonment *safe*, not free. Any stream data already packed is lost, because
+/// dwnx advanced the stream's send offset when it took the bytes, and the peer will reject the
+/// next record on that stream as a gap. `RecordWriter`'s own documentation says so, and a test
+/// pins it.
+impl Drop for RecordWriter<'_, '_, '_> {
+    fn drop(&mut self) {
+        let Some(buf) = self.buf.as_mut() else {
+            // `finish` took the buffer, so the record is already closed.
+            return;
+        };
+        if !self.started {
+            return;
+        }
+
+        let mut pdatalen: sys::dwnx_ssize = 0;
+        let buf_ptr = buf.as_mut_ptr();
+        let buf_len = buf.len();
+        let now = self.now.as_nanos();
+
+        self.conn.with_bridge(|raw| {
+            // SAFETY: the same buffer this record was started with, still borrowed by `self`
+            // and so still valid. Passing `-1` as the stream id adds no stream data, which is
+            // what makes this always terminate the record rather than invite another push.
+            unsafe {
+                sys::dwnx_conn_write_stream(
+                    raw,
+                    buf_ptr,
+                    buf_len,
+                    &mut pdatalen,
+                    sys::DWNX_WRITE_STREAM_FLAG_NONE,
+                    -1,
+                    core::ptr::null(),
+                    0,
+                    now,
+                )
+            }
+        });
     }
 }
 

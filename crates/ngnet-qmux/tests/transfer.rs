@@ -6,8 +6,7 @@
 //! in memory is therefore a legitimate deployment of the protocol, and it exercises exactly
 //! the same code a TCP or TLS carrier would.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use ngnet_qmux::{
     Conn, Error, ReadOutcome, Role, StreamId, Timestamp, TransportParams, WriteRequest,
@@ -68,17 +67,17 @@ struct Observed {
     params_seen: bool,
 }
 
-fn build(role: Role, observed: &Rc<RefCell<Observed>>) -> Conn<'static> {
-    let for_data = Rc::clone(observed);
-    let for_open = Rc::clone(observed);
-    let for_params = Rc::clone(observed);
+fn build(role: Role, observed: &Arc<Mutex<Observed>>) -> Conn<'static> {
+    let for_data = Arc::clone(observed);
+    let for_open = Arc::clone(observed);
+    let for_params = Arc::clone(observed);
 
     Conn::builder(role)
         .transport_params(params())
         .handlers(
             ngnet_qmux::Handlers::new()
                 .on_stream_data(move |event| {
-                    for_data.borrow_mut().stream_data.push((
+                    for_data.lock().unwrap().stream_data.push((
                         event.stream_id.get(),
                         event.data.to_vec(),
                         event.fin,
@@ -86,11 +85,11 @@ fn build(role: Role, observed: &Rc<RefCell<Observed>>) -> Conn<'static> {
                     Ok(())
                 })
                 .on_stream_open(move |id| {
-                    for_open.borrow_mut().opened.push(id.get());
+                    for_open.lock().unwrap().opened.push(id.get());
                     Ok(())
                 })
                 .on_transport_params(move |_| {
-                    for_params.borrow_mut().params_seen = true;
+                    for_params.lock().unwrap().params_seen = true;
                     Ok(())
                 }),
         )
@@ -113,8 +112,8 @@ fn feed(conn: &mut Conn<'_>, bytes: &[u8], fragment: bool) -> Result<ReadOutcome
 
 /// The headline test: a stream transfer between two connections, end to end.
 fn transfer(fragment: bool) {
-    let client_seen = Rc::new(RefCell::new(Observed::default()));
-    let server_seen = Rc::new(RefCell::new(Observed::default()));
+    let client_seen = Arc::new(Mutex::new(Observed::default()));
+    let server_seen = Arc::new(Mutex::new(Observed::default()));
 
     let mut client = build(Role::Client, &client_seen);
     let mut server = build(Role::Server, &server_seen);
@@ -128,7 +127,7 @@ fn transfer(fragment: bool) {
     feed(&mut client, &server_hello, fragment).unwrap();
 
     assert!(
-        server_seen.borrow().params_seen,
+        server_seen.lock().unwrap().params_seen,
         "server never saw the client's transport parameters"
     );
     assert!(client.peer_transport_params().is_some());
@@ -149,7 +148,7 @@ fn transfer(fragment: bool) {
     feed(&mut server, &records, fragment).unwrap();
 
     // What arrived must be exactly what was sent, on the same stream.
-    let seen = server_seen.borrow();
+    let seen = server_seen.lock().unwrap();
     let received: Vec<u8> = seen
         .stream_data
         .iter()
@@ -225,8 +224,8 @@ fn a_connection_without_handlers_still_transfers() {
 /// Streams opened by the client carry client-initiated ids, and the server sees them as remote.
 #[test]
 fn stream_ownership_is_visible_from_both_sides() {
-    let client_seen = Rc::new(RefCell::new(Observed::default()));
-    let server_seen = Rc::new(RefCell::new(Observed::default()));
+    let client_seen = Arc::new(Mutex::new(Observed::default()));
+    let server_seen = Arc::new(Mutex::new(Observed::default()));
     let mut client = build(Role::Client, &client_seen);
     let mut server = build(Role::Server, &server_seen);
 

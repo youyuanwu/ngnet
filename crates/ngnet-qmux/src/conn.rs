@@ -262,7 +262,7 @@ impl<'h> Conn<'h> {
         self.scratch.handler_error = None;
 
         let raw = self.raw;
-        let guard = BridgeGuard::new(&mut self.slot, &mut self.handlers, &mut self.scratch);
+        let guard = BridgeGuard::new(&self.slot, &mut self.handlers, &mut self.scratch);
         let result = f(raw);
         drop(guard);
         result

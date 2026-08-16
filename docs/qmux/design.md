@@ -119,6 +119,21 @@ The borrow checker then enforces what the C documentation only implies, and a `c
 doctest pins it. `Conn::write` drives the whole loop internally for the common single-payload
 case, so most callers never see `RecordWriter` at all.
 
+The borrow alone turned out to be insufficient, which a review caught. `dwnx_qre_start` sets a
+"started" flag that only `dwnx_qre_final` clears, and a later call skips `qre_start` while it
+is set — so a `RecordWriter` merely *dropped* mid-record leaves the connection pointing into a
+buffer whose borrow has ended, and the next write appends through the stale pointer while
+reporting a length measured against the old record. Reaching that needs no `unsafe`: pushing
+once, seeing `Accepted`, and returning early is enough, and `StreamBlocked` and `StreamClosed`
+positively invite a caller to stop. `RecordWriter` therefore has a `Drop` that finalises an
+unfinished record with a control-only write, which always reaches `dwnx_qre_final`.
+
+That makes abandonment safe but not free, and the difference is worth stating. dwnx advances a
+stream's send offset the moment it packs data, so bytes taken by an abandoned record are lost
+and the peer rejects the next record on that stream as a gap it can never fill. The rule is
+"always call `finish`", which `Conn::write` does on the caller's behalf; both halves are
+pinned by tests.
+
 This is the one place the design departs from `ngnet-quic`, which collapses ngtcp2's
 equivalent `WRITE_MORE` away entirely. It can afford to: ngtcp2's version requires the caller
 to repeat identical arguments, so exposing it is a footgun with no upside. QMux's does not
@@ -134,7 +149,10 @@ one would overwrite the first's borrows.
 
 `ngnet-quic` handles this by relying on ngtcp2's documented rule that its main entry points
 may not be called from callbacks. dwnx's rule is narrower, covering only the write, so the
-same reasoning does not carry over.
+same reasoning does not carry over. The bridge slot is a `Cell` rather than something reached
+through `&mut`, so that no `&mut` to it ever exists: a guard holding one across the C call, and
+a callback forming a second from `user_data`, would be aliasing Rust forbids even where the two
+never overlap observably.
 
 Rather than police the difference at run time, `ngnet-qmux` removes the capability. The C
 callbacks are handed a `dwnx_conn *`, but the shims do not forward it: handlers receive event
@@ -143,6 +161,11 @@ every entry point takes `&mut self`, the borrow checker also refuses to let a ha
 one from outside. There is nothing to call, so there is nothing to check. Four `compile_fail`
 doctests pin this, and the debug assertion that remains in the bridge is a tripwire against
 future changes rather than the mechanism.
+
+Handlers are also required to be `Send`. `Conn` carries a hand-written `unsafe impl Send`, and
+it owns its handlers — so without the bound a caller could capture an `Rc` in a handler, move
+the connection to another thread and drop it there, racing a non-atomic refcount from entirely
+safe code. `ngnet-quic` takes the same position for the same reason.
 
 The cost is real and worth naming: a handler cannot extend a flow-control window at the moment
 it observes data, or open a stream in response to one closing. It records what it saw, and the

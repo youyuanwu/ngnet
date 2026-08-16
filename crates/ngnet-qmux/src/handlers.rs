@@ -61,19 +61,26 @@ pub type HandlerResult = Result<(), HandlerError>;
 /// A boxed, optional handler taking one event value.
 ///
 /// Every field of [`Handlers`] is one of these; naming the shape once keeps the struct
-/// readable and stops each field restating the same four pieces of syntax.
-type Handler<'h, T> = Option<Box<dyn FnMut(T) -> HandlerResult + 'h>>;
+/// readable and stops each field restating the same pieces of syntax.
+///
+/// The `Send` bound is load-bearing, exactly as it is in `ngnet-quic`. A [`crate::Conn`] is
+/// `Send`, and it owns its handlers -- so without this a caller could capture an `Rc` in a
+/// handler, move the connection to another thread and drop it there, racing a non-atomic
+/// refcount from safe code. The bound is what makes that `unsafe impl Send` honest.
+type Handler<'h, T> = Option<Box<dyn FnMut(T) -> HandlerResult + Send + 'h>>;
 
 /// The same, for the events dwnx reports with two values.
-type Handler2<'h, A, B> = Option<Box<dyn FnMut(A, B) -> HandlerResult + 'h>>;
+type Handler2<'h, A, B> = Option<Box<dyn FnMut(A, B) -> HandlerResult + Send + 'h>>;
 
 /// The same, for the one event reported with three.
-type Handler3<'h, A, B, C> = Option<Box<dyn FnMut(A, B, C) -> HandlerResult + 'h>>;
+type Handler3<'h, A, B, C> = Option<Box<dyn FnMut(A, B, C) -> HandlerResult + Send + 'h>>;
 
 /// The two handlers taking a borrow need their own aliases, because the borrow is higher
 /// ranked -- it lives only for the callback -- and cannot be threaded through a type parameter.
-type RecvTransportParams<'h> = Option<Box<dyn FnMut(&TransportParams) -> HandlerResult + 'h>>;
-type RecvStreamData<'h> = Option<Box<dyn FnMut(StreamDataEvent<'_>) -> HandlerResult + 'h>>;
+type RecvTransportParams<'h> =
+    Option<Box<dyn FnMut(&TransportParams) -> HandlerResult + Send + 'h>>;
+type RecvStreamData<'h> =
+    Option<Box<dyn FnMut(StreamDataEvent<'_>) -> HandlerResult + Send + 'h>>;
 
 /// Stream data received from the peer.
 #[derive(Clone, Copy, Debug)]
@@ -147,7 +154,7 @@ impl<'h> Handlers<'h> {
     #[must_use]
     pub fn on_transport_params(
         mut self,
-        handler: impl FnMut(&TransportParams) -> HandlerResult + 'h,
+        handler: impl FnMut(&TransportParams) -> HandlerResult + Send + 'h,
     ) -> Self {
         self.recv_transport_params = Some(Box::new(handler));
         self
@@ -157,7 +164,7 @@ impl<'h> Handlers<'h> {
     #[must_use]
     pub fn on_stream_data(
         mut self,
-        handler: impl FnMut(StreamDataEvent<'_>) -> HandlerResult + 'h,
+        handler: impl FnMut(StreamDataEvent<'_>) -> HandlerResult + Send + 'h,
     ) -> Self {
         self.recv_stream_data = Some(Box::new(handler));
         self
@@ -168,7 +175,10 @@ impl<'h> Handlers<'h> {
     /// dwnx invokes this only for an explicit open, not for a stream brought into existence
     /// implicitly by data arriving on a higher-numbered one.
     #[must_use]
-    pub fn on_stream_open(mut self, handler: impl FnMut(StreamId) -> HandlerResult + 'h) -> Self {
+    pub fn on_stream_open(
+        mut self,
+        handler: impl FnMut(StreamId) -> HandlerResult + Send + 'h,
+    ) -> Self {
         self.stream_open = Some(Box::new(handler));
         self
     }
@@ -177,7 +187,7 @@ impl<'h> Handlers<'h> {
     #[must_use]
     pub fn on_stream_close(
         mut self,
-        handler: impl FnMut(StreamCloseEvent) -> HandlerResult + 'h,
+        handler: impl FnMut(StreamCloseEvent) -> HandlerResult + Send + 'h,
     ) -> Self {
         self.stream_close = Some(Box::new(handler));
         self
@@ -187,7 +197,7 @@ impl<'h> Handlers<'h> {
     #[must_use]
     pub fn on_stream_reset(
         mut self,
-        handler: impl FnMut(StreamId, u64, u64) -> HandlerResult + 'h,
+        handler: impl FnMut(StreamId, u64, u64) -> HandlerResult + Send + 'h,
     ) -> Self {
         self.stream_reset = Some(Box::new(handler));
         self
@@ -197,7 +207,7 @@ impl<'h> Handlers<'h> {
     #[must_use]
     pub fn on_stream_stop_sending(
         mut self,
-        handler: impl FnMut(StreamId, u64) -> HandlerResult + 'h,
+        handler: impl FnMut(StreamId, u64) -> HandlerResult + Send + 'h,
     ) -> Self {
         self.stream_stop_sending = Some(Box::new(handler));
         self
@@ -207,7 +217,7 @@ impl<'h> Handlers<'h> {
     #[must_use]
     pub fn on_recv_stop_sending(
         mut self,
-        handler: impl FnMut(StreamId, u64) -> HandlerResult + 'h,
+        handler: impl FnMut(StreamId, u64) -> HandlerResult + Send + 'h,
     ) -> Self {
         self.recv_stop_sending = Some(Box::new(handler));
         self
@@ -217,7 +227,7 @@ impl<'h> Handlers<'h> {
     #[must_use]
     pub fn on_extend_max_stream_data(
         mut self,
-        handler: impl FnMut(StreamId, u64) -> HandlerResult + 'h,
+        handler: impl FnMut(StreamId, u64) -> HandlerResult + Send + 'h,
     ) -> Self {
         self.extend_max_stream_data = Some(Box::new(handler));
         self
@@ -231,7 +241,7 @@ impl<'h> Handlers<'h> {
     #[must_use]
     pub fn on_extend_max_streams(
         mut self,
-        handler: impl FnMut(StreamLimitKind, u64) -> HandlerResult + 'h,
+        handler: impl FnMut(StreamLimitKind, u64) -> HandlerResult + Send + 'h,
     ) -> Self {
         self.extend_max_streams = Some(Box::new(handler));
         self

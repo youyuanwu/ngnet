@@ -3,8 +3,7 @@
 //! Everything here needs a live pair of connections, which is why it is not beside the code it
 //! tests.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use ngnet_qmux::{
     Conn, ErrorKind, HandlerError, Handlers, OpenOutcome, Push, ReadOutcome, Record,
@@ -71,10 +70,10 @@ struct Log {
 }
 
 /// A connection with every handler wired to the log.
-fn observed(role: Role, log: &Rc<RefCell<Log>>) -> Conn<'static> {
+fn observed(role: Role, log: &Arc<Mutex<Log>>) -> Conn<'static> {
     macro_rules! l {
         () => {
-            Rc::clone(log)
+            Arc::clone(log)
         };
     }
     let (p, d, o, c, r, ss, rss, esd, es) =
@@ -85,21 +84,21 @@ fn observed(role: Role, log: &Rc<RefCell<Log>>) -> Conn<'static> {
         .handlers(
             Handlers::new()
                 .on_transport_params(move |_| {
-                    p.borrow_mut().params += 1;
+                    p.lock().unwrap().params += 1;
                     Ok(())
                 })
                 .on_stream_data(move |e| {
-                    d.borrow_mut()
+                    d.lock().unwrap()
                         .data
                         .push((e.stream_id.get(), e.data.to_vec(), e.fin));
                     Ok(())
                 })
                 .on_stream_open(move |id| {
-                    o.borrow_mut().opened.push(id.get());
+                    o.lock().unwrap().opened.push(id.get());
                     Ok(())
                 })
                 .on_stream_close(move |e| {
-                    c.borrow_mut().closed.push((
+                    c.lock().unwrap().closed.push((
                         e.stream_id.get(),
                         e.rx_app_error_code,
                         e.tx_app_error_code,
@@ -107,23 +106,23 @@ fn observed(role: Role, log: &Rc<RefCell<Log>>) -> Conn<'static> {
                     Ok(())
                 })
                 .on_stream_reset(move |id, final_size, code| {
-                    r.borrow_mut().reset.push((id.get(), final_size, code));
+                    r.lock().unwrap().reset.push((id.get(), final_size, code));
                     Ok(())
                 })
                 .on_stream_stop_sending(move |id, code| {
-                    ss.borrow_mut().stop_sending.push((id.get(), code));
+                    ss.lock().unwrap().stop_sending.push((id.get(), code));
                     Ok(())
                 })
                 .on_recv_stop_sending(move |id, code| {
-                    rss.borrow_mut().recv_stop_sending.push((id.get(), code));
+                    rss.lock().unwrap().recv_stop_sending.push((id.get(), code));
                     Ok(())
                 })
                 .on_extend_max_stream_data(move |id, max| {
-                    esd.borrow_mut().extend_stream_data.push((id.get(), max));
+                    esd.lock().unwrap().extend_stream_data.push((id.get(), max));
                     Ok(())
                 })
                 .on_extend_max_streams(move |kind, max| {
-                    es.borrow_mut().extend_streams.push((kind, max));
+                    es.lock().unwrap().extend_streams.push((kind, max));
                     Ok(())
                 }),
         )
@@ -144,25 +143,25 @@ fn open(conn: &mut Conn<'_>) -> StreamId {
 /// splitting them would mean rebuilding that sequence per event.
 #[test]
 fn all_protocol_events_are_delivered() {
-    let client_log = Rc::new(RefCell::new(Log::default()));
-    let server_log = Rc::new(RefCell::new(Log::default()));
+    let client_log = Arc::new(Mutex::new(Log::default()));
+    let server_log = Arc::new(Mutex::new(Log::default()));
     let mut client = observed(Role::Client, &client_log);
     let mut server = observed(Role::Server, &server_log);
 
     // recv_transport_params, both directions.
     handshake(&mut client, &mut server);
-    assert_eq!(client_log.borrow().params, 1);
-    assert_eq!(server_log.borrow().params, 1);
+    assert_eq!(client_log.lock().unwrap().params, 1);
+    assert_eq!(server_log.lock().unwrap().params, 1);
 
     // stream_open and recv_stream_data on the server.
     let stream = open(&mut client);
     let (records, _) = drain(&mut client, WriteRequest::stream(stream, b"payload"));
     server.read(&records, now()).unwrap();
 
-    assert!(server_log.borrow().opened.contains(&stream.get()));
+    assert!(server_log.lock().unwrap().opened.contains(&stream.get()));
     assert!(
         server_log
-            .borrow()
+            .lock().unwrap()
             .data
             .iter()
             .any(|(id, d, _)| *id == stream.get() && d == b"payload")
@@ -183,12 +182,12 @@ fn all_protocol_events_are_delivered() {
     client.read(&records, now()).unwrap();
 
     assert!(
-        !client_log.borrow().extend_stream_data.is_empty(),
+        !client_log.lock().unwrap().extend_stream_data.is_empty(),
         "client never saw its stream window extended"
     );
     assert!(
         client_log
-            .borrow()
+            .lock().unwrap()
             .extend_streams
             .iter()
             .any(|(kind, _)| *kind == StreamLimitKind::LocalBidi),
@@ -202,7 +201,7 @@ fn all_protocol_events_are_delivered() {
     let (records, _) = drain(&mut server, WriteRequest::control_only());
     assert!(
         server_log
-            .borrow()
+            .lock().unwrap()
             .stop_sending
             .iter()
             .any(|(id, code)| *id == stream.get() && *code == 7),
@@ -213,7 +212,7 @@ fn all_protocol_events_are_delivered() {
     client.read(&records, now()).unwrap();
     assert!(
         client_log
-            .borrow()
+            .lock().unwrap()
             .recv_stop_sending
             .iter()
             .any(|(id, code)| *id == stream.get() && *code == 7)
@@ -227,7 +226,7 @@ fn all_protocol_events_are_delivered() {
 
     assert!(
         server_log
-            .borrow()
+            .lock().unwrap()
             .reset
             .iter()
             .any(|(id, _, _)| *id == stream.get()),
@@ -241,7 +240,7 @@ fn all_protocol_events_are_delivered() {
     let _ = drain(&mut client, WriteRequest::control_only());
 
     assert!(
-        !server_log.borrow().closed.is_empty(),
+        !server_log.lock().unwrap().closed.is_empty(),
         "the server never saw the stream close"
     );
 }
@@ -418,8 +417,8 @@ fn an_idle_connection_reports_empty() {
 /// Writing to a stream whose write side is closed is a signal, not a failure.
 #[test]
 fn writing_to_a_closed_stream_is_reported() {
-    let client_log = Rc::new(RefCell::new(Log::default()));
-    let server_log = Rc::new(RefCell::new(Log::default()));
+    let client_log = Arc::new(Mutex::new(Log::default()));
+    let server_log = Arc::new(Mutex::new(Log::default()));
     let mut client = observed(Role::Client, &client_log);
     let mut server = observed(Role::Server, &server_log);
     handshake(&mut client, &mut server);
@@ -535,4 +534,97 @@ fn shutting_down_an_unknown_stream_is_a_no_op() {
 fn stream_ids_beyond_the_varint_bound_are_rejected() {
     assert!(StreamId::new(StreamId::MAX + 1).is_err());
     assert!(StreamId::new(-1).is_err());
+}
+
+/// An abandoned record does not leave dwnx holding the dropped buffer.
+///
+/// `dwnx_qre_start` stores the caller's buffer in the connection and only `dwnx_qre_final`
+/// releases it, so a `RecordWriter` dropped mid-record would leave the next write appending
+/// into a buffer whose borrow has ended -- a write-after-free reachable from safe code.
+/// `RecordWriter::drop` finalises the record to prevent that.
+///
+/// The check is that a record written afterwards, into a different buffer, is well formed and
+/// accepted by the peer. Before the fix, dwnx appended through the retained pointer and
+/// returned a length measured against the abandoned record.
+#[test]
+fn abandoning_a_record_does_not_poison_the_next_one() {
+    let client_log = Arc::new(Mutex::new(Log::default()));
+    let server_log = Arc::new(Mutex::new(Log::default()));
+    let mut client = observed(Role::Client, &client_log);
+    let mut server = observed(Role::Server, &server_log);
+    handshake(&mut client, &mut server);
+
+    let stream = open(&mut client);
+
+    {
+        // A heap buffer, so a stale pointer would refer to freed memory rather than to a live
+        // stack frame that happens to survive. Control-only, so nothing is taken from a
+        // stream -- see the test below for why that distinction matters.
+        let mut abandoned = vec![0u8; BUF];
+        let mut record = client.record(&mut abandoned, now());
+        let pushed = record.push(WriteRequest::control_only()).unwrap();
+        assert!(
+            matches!(pushed, Push::Accepted { .. } | Push::Complete { .. }),
+            "unexpected outcome: {pushed:?}"
+        );
+        // Dropped without `finish`, which is the whole point.
+    }
+
+    // A completely different buffer. What the peer receives must arrive intact.
+    let (records, consumed) = drain(&mut client, WriteRequest::stream(stream, b"delivered"));
+    assert_eq!(consumed, 9);
+    server.read(&records, now()).unwrap();
+
+    let seen = server_log.lock().unwrap();
+    let received: Vec<u8> = seen
+        .data
+        .iter()
+        .filter(|(id, _, _)| *id == stream.get())
+        .flat_map(|(_, d, _)| d.clone())
+        .collect();
+    assert_eq!(
+        received, b"delivered",
+        "the record written after an abandoned one did not survive"
+    );
+}
+
+/// Abandoning a record that took stream data loses those bytes, and the stream cannot recover.
+///
+/// Worth pinning as a documented hazard rather than left to be discovered. `RecordWriter::drop`
+/// makes abandonment memory-safe, but it cannot make it free: dwnx advances the stream's send
+/// offset as soon as data is packed, so discarding the record leaves a gap the peer will never
+/// be sent. The peer then rejects the next record for that stream as a protocol violation.
+///
+/// The rule this implies is simply "always call `finish`", which `Conn::write` does for the
+/// caller. This test exists so that a change making abandonment silently lossy-but-tolerated
+/// would be noticed.
+#[test]
+fn abandoning_a_record_that_took_stream_data_desynchronises_the_stream() {
+    let client_log = Arc::new(Mutex::new(Log::default()));
+    let server_log = Arc::new(Mutex::new(Log::default()));
+    let mut client = observed(Role::Client, &client_log);
+    let mut server = observed(Role::Server, &server_log);
+    handshake(&mut client, &mut server);
+
+    let stream = open(&mut client);
+
+    {
+        let mut abandoned = vec![0u8; BUF];
+        let mut record = client.record(&mut abandoned, now());
+        let pushed = record
+            .push(WriteRequest::stream(stream, b"never sent"))
+            .unwrap();
+        assert!(
+            matches!(pushed, Push::Accepted { consumed: Some(10) }),
+            "the data must actually have been taken for this test to mean anything: {pushed:?}"
+        );
+    }
+
+    // Those ten bytes are gone. The next record starts at offset 10, and the peer -- which
+    // never received offsets 0..10 -- rejects it.
+    let (records, _) = drain(&mut client, WriteRequest::stream(stream, b"delivered"));
+    let error = server
+        .read(&records, now())
+        .expect_err("the peer should reject a stream that skipped a range");
+    assert!(!error.leaves_connection_usable());
 }

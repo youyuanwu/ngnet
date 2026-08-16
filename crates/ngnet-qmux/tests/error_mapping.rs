@@ -105,6 +105,19 @@ fn every_header_condition_is_deliberately_classified() {
         );
     }
 
+    // The table's second column has to be asserted, not merely written down. Checking only
+    // that each constant *appears* would prove the mapping is total while saying nothing
+    // about whether it is right, and eighteen of these are not covered by any other test.
+    for (code, expected_kind) in expected {
+        let actual = ngnet_qmux::Error::from_native(*code, "test").kind();
+        assert_eq!(
+            actual,
+            *expected_kind,
+            "dwnx error {code} is classified as {actual:?}, but this test expects \
+             {expected_kind:?}. One of the two is wrong."
+        );
+    }
+
     // And the reverse: nothing in the table has been removed upstream.
     let in_header: BTreeSet<i32> = conditions_from_header()
         .into_iter()
