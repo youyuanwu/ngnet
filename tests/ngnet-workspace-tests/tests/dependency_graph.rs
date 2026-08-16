@@ -313,3 +313,102 @@ fn the_adapter_depends_on_both_families() {
         );
     }
 }
+
+/// The QMux core depends only on its bindings.
+///
+/// The same claim `http3_core_depends_only_on_its_bindings` makes, for the newest pair. It is
+/// stricter here than there, because `ngnet-qmux` has no features at all: there is no TLS
+/// backend to gate and no I/O layer to make optional, so the single dependency holds
+/// unconditionally rather than only under `--no-default-features`.
+#[test]
+fn qmux_core_depends_only_on_its_bindings() {
+    let tree = cargo_tree(&["-p", "ngnet-qmux", "-e", "normal"]);
+    let dependencies: Vec<&str> = tree
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+
+    assert_eq!(
+        dependencies.len(),
+        1,
+        "the QMux core's dependency graph is no longer just its bindings: expected exactly \
+         one dependency, found {}.\n\
+         Inspect it with:\n  cargo tree -p ngnet-qmux -e normal\n\n{tree}",
+        dependencies.len(),
+    );
+
+    assert!(
+        dependency_name(dependencies[0]) == "ngnet-qmux-sys",
+        "the QMux core has exactly one dependency, but it is not its bindings: it is `{}`.\n\
+         Inspect it with:\n  cargo tree -p ngnet-qmux -e normal\n\n{tree}",
+        dependency_name(dependencies[0]),
+    );
+}
+
+/// QMux reaches neither the QUIC family nor the HTTP families, nor any TLS or runtime crate.
+///
+/// The names invite confusion -- QMux comes from the ngtcp2 authors and reuses QUIC's frame
+/// encoding and stream semantics -- but the two share no code here, and should not. QMux runs
+/// over a byte stream the caller supplies; it has no UDP, no packets, and no cryptography of
+/// its own, and the draft explicitly permits carrying it over an unsecured substrate such as a
+/// unix socket. A caller who wants QMux should not be compiling ngtcp2 or OpenSSL to get it.
+#[test]
+fn no_other_protocol_stack_or_tls_reaches_qmux() {
+    for crate_name in ["ngnet-qmux", "ngnet-qmux-sys"] {
+        let tree = cargo_tree(&["-p", crate_name, "-e", "normal"]);
+
+        for forbidden in [
+            "ngnet-quic",
+            "ngnet-quic-sys",
+            "ngnet-quic-h3",
+            "ngnet-h2",
+            "ngnet-h2-sys",
+            "ngnet-h3",
+            "ngnet-h3-sys",
+            "quinn",
+            "rustls",
+            "openssl",
+            "openssl-sys",
+            "tokio",
+            "compio",
+        ] {
+            assert!(
+                !contains_at_word_boundary(&tree, forbidden),
+                "{forbidden} reached {crate_name}'s normal dependency graph.\n\
+                 Find it with:\n  cargo tree -p {crate_name} -e normal -i {forbidden}\n\
+                 QMux is a sans-I/O state machine over a caller-supplied byte stream: it needs \
+                 no other protocol stack, no TLS, and no runtime.\n\n{tree}",
+            );
+        }
+    }
+}
+
+/// Nothing that existed before QMux has picked it up.
+///
+/// The check above keeps QMux from growing into the rest of the workspace; this one keeps the
+/// rest of the workspace from growing into QMux. Both crates are unpublished and expected to
+/// churn with the draft, so anything depending on them inherits that churn.
+#[test]
+fn no_existing_crate_reaches_qmux() {
+    for crate_name in [
+        "ngnet-h2",
+        "ngnet-h3",
+        "ngnet-quic",
+        "ngnet-quic-h3",
+        "ngnet-axum",
+        "ngnet-util",
+    ] {
+        let tree = cargo_tree(&["-p", crate_name, "-e", "normal"]);
+
+        for forbidden in ["ngnet-qmux", "ngnet-qmux-sys"] {
+            assert!(
+                !contains_at_word_boundary(&tree, forbidden),
+                "{forbidden} reached {crate_name}'s normal dependency graph.\n\
+                 Find it with:\n  cargo tree -p {crate_name} -e normal -i {forbidden}\n\
+                 The QMux crates are unpublished and track an unratified draft; nothing \
+                 established should depend on them yet.\n\n{tree}",
+            );
+        }
+    }
+}

@@ -22,6 +22,8 @@ Design notes, the invariants the test suite pins, and the tracked backlog live i
 | [`ngnet-quic-tests`](tests/ngnet-quic-tests) | Not published. Drives `ngnet-quic` through real TLS handshakes and real stream data, in process and over loopback UDP, so the wrapper needs no certificate or runtime dependency of its own. |
 | [`ngnet-quic-h3`](crates/ngnet-quic-h3) | Not published yet, alongside the two crates it binds. HTTP/3 over ngtcp2: implements `ngnet-h3`'s transport trait on an `ngnet-quic` connection, so the two families in this workspace form one stack. The only crate that depends on both — deliberately, and a dependency-graph test enforces it, so a caller wanting either alone pays for neither. |
 | [`ngnet-quic-h3-tests`](tests/ngnet-quic-h3-tests) | Not published. Drives HTTP/3 over ngtcp2 across real loopback UDP, and interoperates against [quinn](https://github.com/quinn-rs/quinn) in both roles. |
+| [`ngnet-qmux`](crates/ngnet-qmux) | Not published yet — QMux is an unratified IETF draft and dwnx is early-stage; see [`docs/qmux/pending-work.md`](docs/qmux/pending-work.md). Safe, sans-I/O API driving a [QMux](https://datatracker.ietf.org/doc/html/draft-ietf-quic-qmux) client or server: QUIC's multiplexed streams carried over any ordered, reliable byte stream the caller owns. No TLS — the protocol mandates none and provides none — and no I/O layer yet. |
+| [`ngnet-qmux-sys`](crates/ngnet-qmux-sys) | Not published yet, alongside `ngnet-qmux`. Raw FFI bindings to [dwnx](https://github.com/ngtcp2/dwnx). The one `-sys` crate here that compiles its C sources directly with `cc` rather than driving CMake, because dwnx ships autotools only; viable because libdwnx depends on nothing at all. |
 | [`ngnet-axum`](crates/ngnet-axum) | Not published yet — the API is new and expected to change; see [`docs/axum/design.md`](docs/axum/design.md). Serves an [axum](https://github.com/tokio-rs/axum) `Router` over `ngnet-h2` instead of hyper. Server-side, h2c and tokio only; transports are pluggable, with TCP and Unix-domain listeners shipped. |
 | [`ngnet-util`](crates/ngnet-util) | Not published yet — the API is new and expected to change; see [`docs/util/design.md`](docs/util/design.md). A pooling HTTP/2 client over `ngnet-h2`: send a request at a URI and the connection is opened, reused, retired and replaced for you. Client-side, h2c and tokio only. |
 | [`ngnet-workspace-tests`](tests/ngnet-workspace-tests) | Not published. Checks that belong to the workspace rather than to any crate in it: what the resolved dependency graph contains, and what the linked binaries pull in. Takes no dependencies of its own — it drives `cargo` and `readelf` and reads the output. |
@@ -242,6 +244,7 @@ This repo vendors three upstream C libraries as git submodules:
 | [`deps/nghttp2`](https://github.com/nghttp2/nghttp2) | `v1.70.0` | HTTP/2, behind `ngnet-h2-sys`. |
 | [`deps/nghttp3`](https://github.com/ngtcp2/nghttp3) | `v1.18.0` | HTTP/3 (RFC 9114) framing and QPACK (RFC 9204), behind `ngnet-h3-sys`. |
 | [`deps/ngtcp2`](https://github.com/ngtcp2/ngtcp2) | `v1.25.0` | QUIC transport (RFC 9000), behind `ngnet-quic-sys`. |
+| [`deps/dwnx`](https://github.com/ngtcp2/dwnx) | *(untagged)* | QMux (draft-ietf-quic-qmux), behind `ngnet-qmux-sys`. Pre-release and never tagged, so this one is pinned to a commit rather than a version. |
 
 `nghttp3` depends on no QUIC transport and on no TLS library — it is a state
 machine over stream bytes — and neither does `ngnet-h3`. Choosing a QUIC
@@ -260,7 +263,7 @@ why CI pins its runner image rather than using `ubuntu-latest`.
 
 ## Minimum submodule checkout
 
-All three libraries declare nested submodules that only their own tests, tooling
+All four libraries declare nested submodules that only their own tests, tooling
 and example applications need, so a `--recursive` checkout fetches a great deal
 this repo never compiles:
 
@@ -269,10 +272,11 @@ this repo never compiles:
 | `nghttp2/third-party/{mruby,neverbleed,urlparse}`, `nghttp2/tests/munit` | No — `nghttpx`, `nghttp`, `h2load` and the upstream test suite only. |
 | `nghttp3/tests/munit` | No — upstream test suite only. |
 | `ngtcp2/tests/munit`, `ngtcp2/third-party/urlparse` | No — upstream test suite, and the example client/server. `urlparse` reads like a library dependency, but its CMake target is guarded on libev and nghttp3 being found, so a lib-only build never reaches it. |
+| `dwnx/third-party/http-parser` | No — the example client/server only. `ngnet-qmux-sys` compiles the 25 files of `lib/` and nothing else. |
 | `nghttp3/lib/sfparse` | **Yes** — the structured-field parser is part of the library, not its tests. `nghttp3` does not compile without it. |
 
-That last row is the trap: "clone non-recursively" is correct for `nghttp2` and
-`ngtcp2`, and quietly wrong for `nghttp3`. The [`justfile`](justfile) encodes the right set, so
+That last row is the trap: "clone non-recursively" is correct for `nghttp2`, `ngtcp2` and
+`dwnx`, and quietly wrong for `nghttp3`. The [`justfile`](justfile) encodes the right set, so
 it does not have to be remembered:
 
 ```sh

@@ -1,0 +1,25 @@
+[package]
+name = "ngnet-qmux"
+version = "0.1.0"
+description = "Safe, sans-I/O Rust bindings to libdwnx for the QMux protocol"
+# QMux is an unratified IETF draft and dwnx is early-stage; see `docs/qmux/pending-work.md`.
+# Publishing would fix a public API that is expected to move with both. Remove this line, and
+# the same line in `ngnet-qmux-sys`, to release the pair together -- a published crate cannot
+# depend on an unpublished one.
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No features, and the absence is the point.
+#
+# `ngnet-quic` needs `tls-ossl` because a QUIC connection without a TLS backend cannot
+# complete a handshake, and `endpoint`/`tokio` because it grew an I/O layer. QMux has neither
+# problem: the draft delegates confidentiality and integrity to whatever carries the byte
+# stream, so there is no TLS seam to gate, and this crate is sans-I/O by design, so there is
+# no runtime to make optional. A caller supplies the transport.
+
+# Exactly one dependency, as in `ngnet-h2`, `ngnet-h3` and `ngnet-quic`. A test fails the
+# build if that grows.
+[dependencies]
+ngnet-qmux-sys = { workspace = true }

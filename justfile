@@ -21,10 +21,13 @@ default:
 #   nghttp2  mruby, neverbleed, urlparse, munit  — nghttpx, nghttp, h2load, upstream tests
 #   nghttp3  tests/munit                         — upstream tests
 #   ngtcp2   tests/munit, third-party/urlparse   — upstream tests, example client/server
+#   dwnx     third-party/http-parser             — example client/server only
 #
 # ngtcp2's `third-party/urlparse` looks like a library dependency from its path, but the
 # target is wrapped in `if(LIBEV_FOUND AND LIBNGHTTP3_FOUND)` and so is only ever compiled
-# for the example applications, which `ENABLE_LIB_ONLY=ON` does not build.
+# for the example applications, which `ENABLE_LIB_ONLY=ON` does not build. dwnx's bundled
+# `http-parser` is the same story: `ngnet-qmux-sys` compiles the 25 files of `lib/` and
+# nothing else, so the parser its examples use never enters the build.
 #
 # The one nested submodule that *is* required is `nghttp3/lib/sfparse`: the structured-field
 # parser is part of the library itself, not of its test suite, and nghttp3 does not compile
@@ -42,7 +45,7 @@ submodules depth="":
     if [ -n "{{ depth }}" ]; then
         args+=(--depth "{{ depth }}")
     fi
-    git submodule update "${args[@]}" deps/nghttp2 deps/nghttp3 deps/ngtcp2
+    git submodule update "${args[@]}" deps/nghttp2 deps/nghttp3 deps/ngtcp2 deps/dwnx
     git -C deps/nghttp3 submodule update "${args[@]}" lib/sfparse
 
 # Report which submodules are present, which are missing, and which have drifted from the

@@ -3,7 +3,7 @@
 Notes that outlive any one change. API documentation lives with the code (`cargo doc`);
 what is here is the reasoning a reader cannot recover from the source.
 
-There are three crate families — HTTP/2, HTTP/3 and QUIC — built the same way and largely
+There are four crate families — HTTP/2, HTTP/3, QUIC and QMux — built the same way and largely
 independent of each other, so each keeps its own notes. Alongside them sit two crates that
 are not families but *layers above* one: `ngnet-axum`, which wires the HTTP/2 family to a
 third-party framework on the server side, and `ngnet-util`, which is the client-side policy
@@ -39,6 +39,23 @@ There are no HTTP/3 benchmarks yet.
 
 There are no QUIC benchmarks, and the crate has not been tested against another QUIC
 implementation.
+
+## QMux — [`qmux/`](qmux/)
+
+QMux is a draft protocol that carries QUIC's stream operations over a single ordered, reliable
+byte stream, so an application written against QUIC's stream API can run over TCP. It comes
+from the ngtcp2 authors and reuses QUIC's frame encoding, but shares no code with the QUIC
+family here — and, unlike QUIC, it mandates no transport security and provides none.
+
+| Document | What it covers |
+| --- | --- |
+| [`qmux/design.md`](qmux/design.md) | What the protocol is and is not, why the native build breaks with every other `-sys` crate and compiles C directly, the two places where the obvious safe API would have admitted a use-after-free, and the four upstream behaviours the wrapper compensates for rather than passes through. |
+| [`qmux/pending-work.md`](qmux/pending-work.md) | Gaps in the vendored library, what this increment deliberately omits, and the two design decisions left open. |
+| [`qmux/invariants.md`](qmux/invariants.md) | The properties the QMux suite pins, including three enforced by the compiler rather than at run time. |
+
+The QMux crates are sans-I/O only: there is no endpoint layer, no runtime integration, and no
+application-protocol mapping yet. There are no benchmarks, and nothing has been tested against
+another QMux implementation.
 
 ## HTTP/3 over QUIC
 
