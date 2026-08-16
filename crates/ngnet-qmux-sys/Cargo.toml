@@ -1,0 +1,35 @@
+[package]
+name = "ngnet-qmux-sys"
+version = "0.1.0"
+description = "Low level FFI bindings to libdwnx, built from the vendored dwnx submodule"
+# Withheld from release alongside `ngnet-qmux`. QMux is an unratified IETF draft and dwnx is
+# early-stage, so the API this crate exposes is expected to move with both.
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Declares that this crate links the native `dwnx` library, so cargo will
+# refuse to link two copies of it into the same binary.
+links = "dwnx"
+build = "build.rs"
+
+[lib]
+# bindgen carries the C doc comments over verbatim, and their C code samples
+# are not valid Rust, so they must not be run as doctests.
+doctest = false
+
+# No features. `ngnet-quic-sys` gates a crypto helper behind one because ngtcp2 ships an
+# OpenSSL-dependent archive alongside the core library; dwnx has no such thing. Its library
+# half depends on nothing at all -- QMux delegates confidentiality and integrity to whatever
+# carries it -- so there is nothing here to make optional.
+
+[build-dependencies]
+# `cc` rather than `cmake`, which every other `-sys` crate in this workspace uses. dwnx ships
+# an autotools build and no CMakeLists.txt, so there is no cmake project to drive. Compiling
+# the sources directly is possible precisely because the library has no external dependencies:
+# 25 C files, no configure-time feature detection that matters (see build.rs), and no linking
+# beyond libc. The alternative -- running autoreconf and configure from a build script -- would
+# make autoconf, automake and libtool prerequisites for every contributor and CI job.
+cc.workspace = true
+bindgen.workspace = true

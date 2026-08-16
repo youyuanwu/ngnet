@@ -9,6 +9,7 @@ members = [
     "crates/ngnet-quic-sys",
     "crates/ngnet-quic",
     "crates/ngnet-quic-h3",
+    "crates/ngnet-qmux-sys",
     "crates/ngnet-util",
     "tests/ngnet-h2-tests",
     "tests/ngnet-h2-bench",
@@ -40,6 +41,10 @@ repository = "https://github.com/youyuanwu/ngnet"
 axum = { version = "0.8", default-features = false }
 bindgen = "0.72"
 bytes = "1"
+# Compiles the vendored dwnx sources for `ngnet-qmux-sys`. That crate is the only one here
+# that needs a C compiler driver rather than `cmake`, because dwnx ships autotools and no
+# CMakeLists.txt; see its build script for why compiling the sources directly is viable.
+cc = "1"
 # `io-uring` and deliberately *not* `polling`: with both, compio compiles a fusion driver
 # that probes the kernel and silently falls back to epoll when io_uring cannot be obtained.
 # A transport that quietly became readiness-based while still calling itself completion-based
@@ -73,6 +78,10 @@ ngnet-h3 = { path = "crates/ngnet-h3" }
 ngnet-h3-sys = { path = "crates/ngnet-h3-sys" }
 ngnet-quic-sys = { path = "crates/ngnet-quic-sys", default-features = false }
 ngnet-quic = { path = "crates/ngnet-quic" }
+# The QMux pair. Unrelated to the QUIC crates above despite the similar name: QMux is a
+# different protocol over a different substrate, and a workspace test asserts neither family
+# reaches the other.
+ngnet-qmux-sys = { path = "crates/ngnet-qmux-sys" }
 # The one crate allowed to depend on both families, and the only place they meet. Keeping
 # the adapter here rather than in either of them is what lets a caller take HTTP/3 without
 # a QUIC implementation, or QUIC without an HTTP/3 state machine; a workspace test asserts
