@@ -7,32 +7,35 @@
 //! collected somewhere a caller will not look.
 
 use std::collections::HashMap;
-use std::future::{Future, IntoFuture, pending};
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::time::Duration;
-use tokio::time::Instant;
+use std::fmt::Debug;
+use std::future::{Future, IntoFuture, pending, poll_fn};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::{Pin, pin};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::Poll;
 
 use axum::Router;
 use ngnet_h2::http::{Config, Drain};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::task::{Id, JoinSet};
+use tokio::task::AbortHandle;
 
-use crate::connection::serve_connection;
-use crate::error::Error;
-
-/// How long to wait before accepting again after a failure that will recur.
-///
-/// A transient accept error is reported and retried at once. A systemic one — the process
-/// being out of file descriptors is the usual case — is true of the *listener* rather than
-/// of one client, so retrying immediately produces an unbounded stream of identical
-/// failures and no progress. Backing off turns that into one report a second, which a
-/// caller can see and act on. The value matches `axum::serve`'s.
-const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
+use crate::error::{Error, HandlerPanic};
+use crate::listener::Listener;
+use crate::transport::ServableTransport;
 
 /// The callback failures are reported through, if the caller installed one.
-type Observer = Box<dyn FnMut(Error) + Send>;
+///
+/// Generic over the address because the listener chooses it; see [`Error`] for why the
+/// address is carried as a type rather than erased to a string.
+type Observer<A> = Box<dyn FnMut(Error<A>) + Send>;
+
+/// The observer once the server is running, shared with every connection task.
+///
+/// Connection tasks report their own outcomes, so the callback has to be reachable from all
+/// of them at once. `Arc<Mutex<_>>` is what makes that possible **without changing
+/// [`Serve::on_error`]'s bound**: `Mutex<T>: Sync` requires only `T: Send`, which the
+/// existing `FnMut(..) + Send + 'static` already gives, and the mutex supplies the interior
+/// mutability an `FnMut` needs. A caller's closure is unaffected.
+type SharedObserver<A> = Arc<Mutex<Observer<A>>>;
 
 /// Serves `router` on every connection `listener` accepts, over cleartext HTTP/2.
 ///
@@ -43,12 +46,16 @@ type Observer = Box<dyn FnMut(Error) + Send>;
 /// ```no_run
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// let router = axum::Router::new();
-/// let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
+/// let tcp = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
 ///
-/// ngnet_axum::serve(listener, router).await;
+/// ngnet_axum::serve(ngnet_axum::TcpListener::new(tcp), router).await;
 /// # Ok(())
 /// # }
 /// ```
+///
+/// Any [`Listener`] will do. TCP is one implementation among several rather than the shape
+/// the server is built around: [`UnixListener`](crate::UnixListener) ships too, and a
+/// third-party listener over TLS or an in-memory pipe is served by the same call.
 ///
 /// Awaiting works directly, but [`tokio::spawn`] takes a [`Future`] rather than an
 /// [`IntoFuture`], so a server that runs on its own task needs an explicit
@@ -57,7 +64,7 @@ type Observer = Box<dyn FnMut(Error) + Send>;
 /// The server accepts an unbounded number of simultaneous connections. There is no cap and
 /// no way to set one; a deployment that needs a bound must impose it in front of the
 /// listener.
-pub fn serve(listener: TcpListener, router: Router) -> Serve {
+pub fn serve<L: Listener>(listener: L, router: Router) -> Serve<L> {
     Serve {
         listener,
         router,
@@ -69,15 +76,15 @@ pub fn serve(listener: TcpListener, router: Router) -> Serve {
 
 /// A configured server, and the future that runs it. Built by [`serve`].
 #[must_use = "a Serve does nothing until awaited"]
-pub struct Serve {
-    listener: TcpListener,
+pub struct Serve<L: Listener> {
+    listener: L,
     router: Router,
     config: Config,
-    observer: Option<Observer>,
+    observer: Option<Observer<L::Addr>>,
     stop: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
-impl Serve {
+impl<L: Listener> Serve<L> {
     /// Sets the HTTP/2 configuration applied to every connection this server accepts.
     ///
     /// Replaces the configuration wholesale rather than merging, so build the [`Config`]
@@ -95,8 +102,30 @@ impl Serve {
     /// to a log the caller never configured is harder to live with than one that says
     /// nothing — but it does mean a server built without this method fails invisibly.
     ///
-    /// The callback runs on the accept loop's own task, so it should not block.
-    pub fn on_error(mut self, observer: impl FnMut(Error) + Send + 'static) -> Self {
+    /// # Where the callback runs, and what that means for it
+    ///
+    /// Almost always on the connection task that failed, not on the accept loop. A
+    /// connection reports its own outcome the moment it has one, so a failure is reported
+    /// when it happens rather than when the loop next gets round to looking. The one
+    /// exception is a failure setting a connection *up*, which happens before any task
+    /// exists and is therefore reported from the accept loop.
+    ///
+    /// Three consequences worth knowing:
+    ///
+    /// - **Invocations are serialised**, so the callback sees one failure at a time and
+    ///   needs no locking of its own. It still should not block: it holds that lock while it
+    ///   runs, and a slow callback delays every other connection trying to report.
+    /// - **Order across connections is unspecified.** Two connections failing at once are
+    ///   reported in whichever order they reach the lock. Failures on a single connection
+    ///   keep their order, there being at most one.
+    /// - **It must not re-enter the server** — awaiting this server's future, or dropping
+    ///   it, from inside the callback is not supported.
+    ///
+    /// A callback that panics while reporting from a connection task does not disable
+    /// reporting for the others. One that panics while reporting a connection *setup*
+    /// failure ends the server, because that one runs on the accept loop; a panic in caller
+    /// code is not something to swallow and carry on from there.
+    pub fn on_error(mut self, observer: impl FnMut(Error<L::Addr>) + Send + 'static) -> Self {
         self.observer = Some(Box::new(observer));
         self
     }
@@ -133,7 +162,11 @@ impl Serve {
     }
 }
 
-impl IntoFuture for Serve {
+impl<L> IntoFuture for Serve<L>
+where
+    L: Listener,
+    L::Addr: Clone + Debug + Send + Sync + 'static,
+{
     type Output = ();
     type IntoFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -142,13 +175,19 @@ impl IntoFuture for Serve {
     }
 }
 
-impl std::fmt::Debug for Serve {
+impl<L: Listener> std::fmt::Debug for Serve<L> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The router, the observer and the stop signal are all opaque; naming the fields
         // without pretending to show them is more use than deriving nothing.
+        //
+        // The listener is shown by type name rather than by value. `Listener` does not
+        // require `Debug` -- axum's does not either -- and adding the bound here would
+        // propagate to every caller that merely wants a `Serve` to be printable, which is a
+        // steep price for one field. The type name is what a reader is actually looking for
+        // when debugging a transport-generic server anyway: which listener is this.
         formatter
             .debug_struct("Serve")
-            .field("listener", &self.listener)
+            .field("listener", &std::any::type_name::<L>())
             .field("config", &self.config)
             .field("observer", &self.observer.is_some())
             .field("stop_signal", &self.stop.is_some())
@@ -158,143 +197,249 @@ impl std::fmt::Debug for Serve {
 
 /// Hands `error` to the observer, if one was installed.
 ///
-/// Trivial, and factored out for two reasons: it is the single point where the
-/// silently-dropped default lives, and it is the only way to test the accept-error
-/// reporting path. `TcpListener::accept` cannot be made to fail on demand, so the accept
-/// arm of that path is proven by calling this directly rather than through a socket.
-fn report(observer: &mut Option<Observer>, error: Error) {
-    if let Some(observe) = observer.as_mut() {
+/// The single point where the silently-dropped default lives, and the only place the
+/// observer is invoked -- which now matters more than it did, because the callers are spread
+/// across every connection task rather than confined to the accept loop.
+///
+/// A poisoned lock is *recovered from* rather than propagated. Poisoning here means one
+/// caller callback panicked while reporting; taking that as a reason to stop reporting on
+/// every other connection would turn one bad report into a silent server. The mutex guards a
+/// callback, not an invariant that a panic could have left half-updated.
+fn report<A>(observer: &Option<SharedObserver<A>>, error: Error<A>) {
+    if let Some(observe) = observer {
+        let mut observe = observe.lock().unwrap_or_else(PoisonError::into_inner);
         observe(error);
     }
 }
 
-/// Accepts one connection, after waiting out any backoff still owed.
+/// What the accept loop keeps for a connection it has spawned.
 ///
-/// The wait belongs *inside* this future rather than in the caller's `select!` arm, which
-/// is not a stylistic preference. An `.await` in an arm body runs to completion before the
-/// loop arbitrates again, so a backoff placed there would stop the stop signal from being
-/// observed and stop finished connections from being reported for its whole duration —
-/// reintroducing, in precisely the situation the loop is under stress, the delayed
-/// reporting the arbitrated loop exists to prevent. `axum::serve` puts its sleep in the
-/// same place for the same reason.
+/// Only what *shutdown* needs, which is why there is no peer address here any more: the task
+/// reports its own outcome and carries its own peer, so nothing has to be looked up by id.
 ///
-/// Living in a `select!` branch has a consequence that makes the *deadline* here
-/// load-bearing rather than incidental. Whenever another arm wins, this future is dropped
-/// and rebuilt on the next pass, so a relative `sleep(backoff)` would start again from
-/// zero every time. On a busy server the other arm — a finished connection — wins often:
-/// measured against this loop's shape, one connection completing every 100ms stopped a
-/// one-second relative backoff from *ever* elapsing, so the listener was never retried at
-/// all while the server stayed busy. Precisely the wrong moment to stop accepting.
+/// The drain handle is here because by the time the loop wants it, the connection itself has
+/// been moved into its task. The abort handle is here because dropping the server future has
+/// to end every connection at once, and a bare [`JoinHandle`](tokio::task::JoinHandle)
+/// *detaches* when dropped where a [`JoinSet`](tokio::task::JoinSet) aborted -- so the
+/// aborting has to be done deliberately now that the set is gone.
+struct Live {
+    drain: Drain,
+    abort: Option<AbortHandle>,
+}
+
+/// The live connections, shared so each task can remove its own entry when it finishes.
+type Registry = Arc<Mutex<HashMap<u64, Live>>>;
+
+/// Ends every still-registered connection when the server future is dropped.
 ///
-/// Sleeping until an absolute `Instant` is immune, because a rebuilt future recomputes the
-/// remaining time to the same instant and so inherits the progress already made.
-async fn accept(
-    listener: &TcpListener,
-    backoff: Option<Instant>,
-) -> io::Result<(TcpStream, SocketAddr)> {
-    if let Some(deadline) = backoff {
-        tokio::time::sleep_until(deadline).await;
+/// [`Serve::with_graceful_shutdown`] documents that dropping this future "ends every
+/// connection at once", and until this guard existed that was delivered only as a side
+/// effect of [`JoinSet`](tokio::task::JoinSet) aborting its tasks on drop. Spawning
+/// individually gives up that side effect silently -- a dropped
+/// [`JoinHandle`](tokio::task::JoinHandle) detaches, leaving the connection running with
+/// nothing left to stop it -- so the guarantee is now made explicitly, by this type,
+/// or not at all.
+struct AbortLive(Registry);
+
+impl Drop for AbortLive {
+    fn drop(&mut self) {
+        let live = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        for connection in live.values() {
+            if let Some(abort) = &connection.abort {
+                abort.abort();
+            }
+        }
     }
-    listener.accept().await
 }
 
-/// Whether an accept failure is about one client rather than about the listener.
+/// Runs `connection` to completion, converting a panic into a value instead of an unwind.
 ///
-/// A client that vanishes between the kernel queueing its connection and the loop reaching
-/// it produces one of these, and the next accept will succeed. Anything else — `EMFILE`
-/// being the case that matters — is a property of the process or the listener and will
-/// recur immediately, so it is backed off instead.
-fn is_transient(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::Interrupted
-    )
+/// A handler panic unwinds out of the connection future. It used to be observed as a
+/// [`JoinError`](tokio::task::JoinError) once the accept loop joined the task, which is no
+/// longer possible: a task that reports its own outcome cannot report that it died. So the
+/// panic is caught here, on the task's own stack, before it can take the task with it.
+///
+/// [`pin!`](std::pin::pin) pins the connection to this function's stack frame, so projecting
+/// through it needs neither `unsafe` -- which this crate denies -- nor a pin-projection
+/// dependency. [`AssertUnwindSafe`] is sound because a caught panic is terminal for this
+/// connection: nothing polls it again, so nothing can observe whatever state the unwind left
+/// behind.
+///
+/// Catching is also strictly more informative than joining was. A `JoinError` said only that
+/// the task panicked; the payload here still carries the panic's own message.
+async fn catch_panics<F: Future>(
+    connection: F,
+) -> Result<F::Output, Box<dyn std::any::Any + Send>> {
+    let mut connection = pin!(connection);
+
+    poll_fn(move |context| {
+        match catch_unwind(AssertUnwindSafe(|| connection.as_mut().poll(context))) {
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(payload) => Poll::Ready(Err(payload)),
+        }
+    })
+    .await
 }
 
-async fn run(server: Serve) {
+async fn run<L>(server: Serve<L>)
+where
+    L: Listener,
+    L::Addr: Clone + Debug + Send + Sync + 'static,
+{
+    run_with(server, Arc::new(Mutex::new(HashMap::new()))).await;
+}
+
+/// [`run`], with the registry passed in so a test can look at it.
+///
+/// Whether a finished connection leaves its entry behind is not observable from outside:
+/// shutdown waits on the refcount barrier, which is independent of the registry, and
+/// [`Drain::drain`] is idempotent, so a registry that never removed anything would still
+/// shut down cleanly while growing one entry per connection ever accepted. The only way to
+/// test for that leak is to look, so this seam exists to be looked through.
+async fn run_with<L>(server: Serve<L>, registry: Registry)
+where
+    L: Listener,
+    L::Addr: Clone + Debug + Send + Sync + 'static,
+{
     let Serve {
-        listener,
+        mut listener,
         router,
         config,
-        mut observer,
+        observer,
         stop,
     } = server;
 
-    let mut connections = JoinSet::new();
-    // A panicked task returns nothing and its `JoinError` carries no payload of ours, so
-    // the peer address cannot ride along with the task's own output — it has to be kept
-    // here and looked up by task id. Bounded by the number of live connections: every
-    // harvest removes its entry.
-    let mut peers: HashMap<Id, Live> = HashMap::new();
+    // Wrapped once, here, rather than in the builder: `Serve` is also a plain value a caller
+    // can hold and reconfigure, and it has no business carrying a lock it is not yet using.
+    let observer: Option<SharedObserver<L::Addr>> =
+        observer.map(|observe| Arc::new(Mutex::new(observe)));
+
+    let mut next_id: u64 = 0;
+
+    // The barrier shutdown waits on. Every connection task holds a receiver for exactly as
+    // long as it runs, so when the last one is gone the sender's `closed()` resolves. This
+    // is axum's arrangement, and it replaces joining a `JoinSet` -- which cannot be done
+    // from a two-arm loop, because joining is the third arm.
+    let (close, close_token) = tokio::sync::watch::channel(());
+
+    // Held for the rest of this function. If the server future is dropped instead of
+    // completing, this is what ends the connections that were still live.
+    let _abort_live = AbortLive(Arc::clone(&registry));
+
     let mut stop = stop.unwrap_or_else(|| Box::pin(pending()));
-    // Owed to the *listener*, not to any connection: set after a failure that will recur,
-    // and waited out at the start of the next accept rather than here. Held as the instant
-    // the retry becomes due rather than as a duration, so that the wait survives this
-    // future being dropped and rebuilt by the loop. See `accept`.
-    let mut backoff: Option<Instant> = None;
 
     loop {
-        // Two levels, and the nesting is the point. The stop signal is given strict
-        // priority via `biased`, because a flat `select!` chooses *at random* among ready
-        // branches: with a stop signal already fired and a client already queued, half the
-        // time the loop would admit that connection and then immediately drain it, having
-        // served nothing. Serving a connection accepted after the stop signal is the
-        // one thing FR-011 forbids.
+        // Two arms, which is the whole shape of this loop and worth stating plainly: the
+        // stop signal, which breaks, and accepting, which continues. `axum::serve` has the
+        // same two and no more.
         //
-        // Below that, accepting and harvesting arbitrate *unbiased* against each other. A
-        // single biased list would have to rank them, and either order starves the other
-        // under sustained load: accept-first leaves finished connections unreported while
-        // clients keep arriving, harvest-first stops accepting while connections keep
-        // ending.
+        // That matters to anyone implementing `Listener`. `select!` drops the futures of
+        // the arms it did not take, so every arm that fires *and continues the loop* forces
+        // the accept future to be built again from scratch. This loop used to have a third
+        // such arm -- harvesting finished connections -- and it fired constantly, which made
+        // a relative sleep inside `accept` useless: the sleep never survived long enough to
+        // elapse. Connection outcomes are now reported by the connections themselves, that
+        // arm is gone, and the accept future is dropped at most once per server: at
+        // shutdown.
+        //
+        // `biased` gives the stop signal strict priority, because a flat `select!` chooses
+        // *at random* among ready branches: with a stop signal already fired and a client
+        // already queued, half the time the loop would admit that connection and then
+        // immediately drain it, having served nothing.
         tokio::select! {
             biased;
 
             () = &mut stop => break,
 
-            () = async {
-                tokio::select! {
-            accepted = accept(&listener, backoff) => match accepted {
-                Ok((stream, peer)) => {
-                    backoff = None;
+            // No error arm: `Listener::accept` yields a connection or does not return,
+            // because acceptance failure is the listener's to classify and pace. That is
+            // axum's shape, and it is now safe here for axum's reason rather than in spite
+            // of a difference -- see `Listener::accept`.
+            (transport, peer) = listener.accept() => {
+                // `serve_connection` can fail *here*, before any task exists, because
+                // creating the HTTP/2 session is fallible. There is no connection task to
+                // report such a failure from, so it is reported on the spot; it is the easy
+                // path to miss, since it looks like the infallible half of setup.
+                //
+                // The peer is cloned rather than moved because it is needed twice: once
+                // inside the connection, for handlers to read, and once by the task, to name
+                // the connection in any failure it reports.
+                match transport.serve(router.clone(), peer.clone(), config) {
+                    Ok(connection) => {
+                        // Taken before the connection is spawned, because afterwards the
+                        // connection has been moved into the task and there is nothing left
+                        // here to ask.
+                        let drain = connection.drain_handle();
 
-                    // Nagle would otherwise hold back the small writes that HTTP/2 control
-                    // frames are made of, waiting for data that is not coming.
-                    let _ = stream.set_nodelay(true);
+                        let id = next_id;
+                        next_id = next_id.wrapping_add(1);
 
-                    // `serve_connection` can fail *here*, before any task exists, because
-                    // creating the HTTP/2 session is fallible. Such a failure can never
-                    // arrive through the JoinSet, so it is reported on the spot; it is the
-                    // easy path to miss, since it looks like the infallible half of setup.
-                    match serve_connection(stream, router.clone(), peer, config) {
-                        Ok(connection) => {
-                            // Taken before the connection is spawned, because afterwards
-                            // the connection has been moved into the task and there is
-                            // nothing left here to ask.
-                            let drain = connection.drain_handle();
-                            let handle = connections.spawn(connection);
-                            peers.insert(handle.id(), Live { peer, drain });
+                        // Registered *before* spawning, not after. `tokio::spawn` can have
+                        // run the task to completion before it returns, and a task that
+                        // finished removes its own entry -- so registering afterwards can
+                        // insert an entry nobody will ever remove, one per connection, for
+                        // the life of the server.
+                        registry
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(id, Live { drain, abort: None });
+
+                        let task_observer = observer.clone();
+                        let task_registry = Arc::clone(&registry);
+                        let task_token = close_token.clone();
+
+                        let handle = tokio::spawn(async move {
+                            // Held, never explicitly dropped. This is what orders the
+                            // barrier after deregistration: the token cannot be released
+                            // before the task body finishes, so `close.closed()` cannot
+                            // resolve while any entry is still registered.
+                            let _token = task_token;
+
+                            let outcome = catch_panics(connection).await;
+
+                            // Deregistered before reporting, so the caller's callback never
+                            // runs with this lock held. This is the *only* place an entry is
+                            // removed: a task reaches this line unless it panicked -- which
+                            // `catch_panics` prevents -- or was aborted, which happens only
+                            // when the server future is dropped and the registry with it.
+                            task_registry
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .remove(&id);
+
+                            match outcome {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => report(&task_observer, Error::connection(peer, error)),
+                                // A panic in a *response body* never reaches here: it is
+                                // pulled from inside an `extern "C"` callback and aborts the
+                                // process instead.
+                                Err(payload) => report(
+                                    &task_observer,
+                                    Error::connection(peer, HandlerPanic::new(payload)),
+                                ),
+                            }
+                        });
+
+                        // Backfilled with `get_mut`, never `insert`: the task may already
+                        // have finished and removed itself, and re-inserting would resurrect
+                        // the entry permanently.
+                        //
+                        // The entry is momentarily `abort: None`, which is safe against
+                        // `AbortLive` only because this future can be dropped solely while
+                        // suspended at the `select!` above, and insert -> spawn -> backfill
+                        // is synchronous. **No `.await` may be introduced between them.**
+                        if let Some(live) = registry
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .get_mut(&id)
+                        {
+                            live.abort = Some(handle.abort_handle());
                         }
-                        Err(error) => report(&mut observer, Error::connection(peer, error)),
                     }
-                }
-                Err(error) => {
-                    backoff = (!is_transient(&error)).then(|| Instant::now() + ACCEPT_BACKOFF);
-                    report(&mut observer, Error::accept(error));
+                    Err(error) => report(&observer, Error::connection(peer, error)),
                 }
             },
-
-            // Harvested here rather than after the loop so that a connection which fails
-            // while the server is still accepting is reported when it fails, instead of
-            // whenever the next client happens to turn up. The guard matters: on an empty
-            // set this is immediately ready with `None`, which would spin.
-            Some(joined) = connections.join_next_with_id(), if !connections.is_empty() => {
-                harvest(&mut observer, &mut peers, joined);
-            }
-                }
-            } => {}
         }
     }
 
@@ -312,131 +457,228 @@ async fn run(server: Serve) {
     // Every live connection, not just the idle ones. A connection in the middle of serving
     // a request is exactly the one whose peer most needs to be told, and telling it does
     // not disturb the request in flight.
-    for live in peers.values() {
-        live.drain.drain();
+    //
+    // Collected out from under the lock before any of them is used, so that nothing else is
+    // held while a connection is touched.
+    let draining: Vec<Drain> = registry
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .values()
+        .map(|live| live.drain.clone())
+        .collect();
+
+    for drain in draining {
+        drain.drain();
     }
 
-    while let Some(joined) = connections.join_next_with_id().await {
-        harvest(&mut observer, &mut peers, joined);
-    }
-}
-
-/// What the accept loop keeps for a connection it has spawned.
-///
-/// The address is here because a panicked task carries no payload of ours and the peer has
-/// to be recoverable by task id. The drain handle is here because by the time the loop
-/// wants it, the connection itself has been moved into its task.
-struct Live {
-    peer: SocketAddr,
-    drain: Drain,
-}
-
-/// Reports one finished connection, and forgets its peer.
-///
-/// The two arms take the task id from different places, which is easy to get wrong: a
-/// successful join returns it alongside the output, while a panicked one carries it on the
-/// [`JoinError`](tokio::task::JoinError). Taking it from the wrong place leaks a map entry
-/// on exactly the path that most needs the address.
-fn harvest(
-    observer: &mut Option<Observer>,
-    peers: &mut HashMap<Id, Live>,
-    joined: Result<(Id, ngnet_h2::http::Result<()>), tokio::task::JoinError>,
-) {
-    match joined {
-        Ok((id, outcome)) => {
-            let peer = peers.remove(&id).map(|live| live.peer);
-            if let (Err(error), Some(peer)) = (outcome, peer) {
-                report(observer, Error::connection(peer, error));
-            }
-        }
-        Err(join_error) => {
-            let peer = peers.remove(&join_error.id()).map(|live| live.peer);
-            // A handler panic unwinds out of the connection future and so out of its task,
-            // which is what makes it observable here at all. A panic in a *response body*
-            // never reaches this point: it is pulled from inside an `extern "C"` callback
-            // and aborts the process instead.
-            if let Some(peer) = peer {
-                report(observer, Error::connection(peer, join_error));
-            }
-        }
-    }
+    // Then wait for them. Releasing this loop's own token first is what lets the count reach
+    // zero at all.
+    drop(close_token);
+    close.closed().await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-
-    use crate::error::ErrorKind;
+    use std::net::SocketAddr;
 
     /// Collects everything reported, so a test can assert on it.
-    fn collector() -> (Option<Observer>, Arc<Mutex<Vec<Error>>>) {
+    fn collector() -> (Option<SharedObserver<SocketAddr>>, Arc<Mutex<Vec<Error>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
-        let observer: Option<Observer> = Some(Box::new(move |error| {
-            sink.lock().expect("a lock").push(error)
-        }));
-        (observer, seen)
+        let observer: Observer<SocketAddr> =
+            Box::new(move |error| sink.lock().expect("a lock").push(error));
+        (Some(Arc::new(Mutex::new(observer))), seen)
     }
 
-    /// SC-018's accept-level half. `TcpListener::accept` cannot be made to fail on demand
-    /// in a test, so the reporting path is driven directly with the error the kernel would
-    /// have produced. The connection-level half is proven over a real socket instead.
+    /// A reported failure reaches the observer with its peer intact.
+    ///
+    /// There is no accept-level counterpart any more, and its absence is the point of this
+    /// change: a listener classifies and paces its own acceptance failures, so none can
+    /// reach an observer.
     #[test]
-    fn an_accept_failure_is_reported_without_a_peer() {
-        let (mut observer, seen) = collector();
-
-        report(
-            &mut observer,
-            Error::accept(io::Error::from(io::ErrorKind::OutOfMemory)),
-        );
-
-        let seen = seen.lock().expect("a lock");
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].kind(), ErrorKind::Accept);
-        assert!(
-            seen[0].peer().is_none(),
-            "an accept failure has no peer to name"
-        );
-    }
-
-    /// The other variant, and the reason `kind` exists: a caller tells "my listener is
-    /// dead" from "one client had a bad time" without matching on a message.
-    #[test]
-    fn a_connection_failure_names_its_peer() {
-        let (mut observer, seen) = collector();
+    fn a_connection_failure_is_reported_with_its_peer() {
+        let (observer, seen) = collector();
         let peer: SocketAddr = "127.0.0.1:5555".parse().expect("an address");
 
         report(
-            &mut observer,
-            Error::connection(peer, io::Error::from(io::ErrorKind::ConnectionReset)),
+            &observer,
+            Error::connection(
+                peer,
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+            ),
         );
 
         let seen = seen.lock().expect("a lock");
         assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].kind(), ErrorKind::Connection);
-        assert_eq!(seen[0].peer().map(|peer| peer.0), Some(peer));
+        assert_eq!(seen[0].peer_addr().0, peer);
+    }
+
+    /// SC-016: a server is debug-formattable even when its listener is not.
+    ///
+    /// `Listener` does not require `Debug`, and this pins that `Serve` did not quietly
+    /// acquire the bound anyway -- the double here deliberately does not implement it. The
+    /// listener's *type* still has to appear, because "which transport is this server on"
+    /// is the question a reader is asking when they print one.
+    #[test]
+    fn a_server_is_debug_formattable_even_when_its_listener_is_not() {
+        struct Undebuggable;
+
+        impl Listener for Undebuggable {
+            type Io = ngnet_h2::http::transport::TokioIo<tokio::io::DuplexStream>;
+            type Addr = SocketAddr;
+
+            async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+                std::future::pending().await
+            }
+        }
+
+        let rendered = format!("{:?}", serve(Undebuggable, Router::new()));
+
+        assert!(
+            rendered.contains("Undebuggable"),
+            "the listener's type should be named, got {rendered}"
+        );
+    }
+
+    /// A listener that hands out a fixed number of in-memory pipes and then stops.
+    ///
+    /// **Bounded by construction, and that is not a stylistic choice.** This crate's accept
+    /// loop puts no cap on simultaneous connections, so a listener whose `accept` is always
+    /// ready is an unbounded allocator: every poll spawns another connection task carrying
+    /// another HTTP/2 session, as fast as the CPU allows. One written that way took this
+    /// machine down. After `budget` connections this one is permanently pending, which is
+    /// what a real listener with nothing to accept does anyway.
+    struct Bounded {
+        budget: usize,
+        /// Kept alive so the connections do not end before the test has looked at them.
+        held: Vec<tokio::io::DuplexStream>,
+        hold: bool,
+        /// Incremented on entry, *before* the budget check, so it counts the permanently
+        /// pending accept too. That is the count the tests synchronise on.
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Listener for Bounded {
+        type Io = ngnet_h2::http::transport::TokioIo<tokio::io::DuplexStream>;
+        type Addr = SocketAddr;
+
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            self.entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            if self.budget == 0 {
+                std::future::pending::<()>().await;
+            }
+            self.budget -= 1;
+
+            let (server_side, client_side) = tokio::io::duplex(64);
+            if self.hold {
+                self.held.push(client_side);
+            } else {
+                // Dropped at once, so the connection fails its handshake and ends
+                // promptly -- which is all this test needs of it.
+                drop(client_side);
+            }
+
+            (
+                ngnet_h2::http::transport::TokioIo::new(server_side),
+                "127.0.0.1:5555".parse().expect("an address"),
+            )
+        }
+    }
+
+    /// Spins until `condition` holds, or gives up. Bounded, and yields rather than sleeps.
+    async fn until(mut condition: impl FnMut() -> bool) -> bool {
+        for _ in 0..10_000 {
+            if condition() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        false
+    }
+
+    /// SC-034: a finished connection leaves nothing behind in the drain registry.
+    ///
+    /// The registry replaced a `JoinSet` whose entries tokio reclaims only when joined, and
+    /// the two-arm loop cannot join. So each task removes its own entry, and if it did not,
+    /// the map would grow by one per connection for the life of the server -- invisibly,
+    /// because nothing else observes it. Hence the white-box assertion: there is no
+    /// behavioural symptom to assert on instead.
+    #[tokio::test]
+    async fn a_finished_connection_is_removed_from_the_registry() {
+        let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+        let watched = Arc::clone(&registry);
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let listener = Bounded {
+            budget: 3,
+            held: Vec::new(),
+            hold: false,
+            entered: Arc::clone(&entered),
+        };
+
+        let server = tokio::spawn(run_with(serve(listener, Router::new()), registry));
+
+        // Synchronise on the loop having entered the *fourth* accept, which is the one that
+        // never returns. Only then is every one of the three connections known to have been
+        // registered -- registration happens before the loop goes round again.
+        //
+        // Waiting merely for the registry to be empty would assert nothing at all: it is
+        // empty before the first connection arrives, so the assertion would pass instantly
+        // and pass just as happily with deregistration deleted. It did, when first written.
+        let all_accepted = until(|| entered.load(std::sync::atomic::Ordering::SeqCst) >= 4).await;
+        assert!(all_accepted, "the listener was not drained of its budget");
+
+        let empty = until(|| watched.lock().expect("a lock").is_empty()).await;
+
+        assert!(
+            empty,
+            "the registry still holds {} finished connections",
+            watched.lock().expect("a lock").len()
+        );
+
+        server.abort();
+    }
+
+    /// The other half of SC-034: a connection that is still running *is* registered.
+    ///
+    /// Without this, a registry that removed entries the instant it made them would pass
+    /// the emptiness assertion above while making shutdown drain nothing at all.
+    #[tokio::test]
+    async fn a_live_connection_is_present_in_the_registry() {
+        let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+        let watched = Arc::clone(&registry);
+
+        let listener = Bounded {
+            budget: 1,
+            held: Vec::new(),
+            hold: true,
+            entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+
+        let server = tokio::spawn(run_with(serve(listener, Router::new()), registry));
+
+        let present = until(|| watched.lock().expect("a lock").len() == 1).await;
+        assert!(present, "the live connection was not registered");
+
+        server.abort();
     }
 
     /// The documented default. Silence is a choice, so it is pinned like any other
     /// behaviour rather than left to be discovered.
     #[test]
     fn without_an_observer_a_failure_is_dropped_rather_than_panicking() {
-        let mut observer: Option<Observer> = None;
+        let observer: Option<SharedObserver<SocketAddr>> = None;
+        let peer: SocketAddr = "127.0.0.1:5555".parse().expect("an address");
 
         report(
-            &mut observer,
-            Error::accept(io::Error::from(io::ErrorKind::OutOfMemory)),
+            &observer,
+            Error::connection(
+                peer,
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+            ),
         );
-    }
-
-    /// The classification that decides whether the loop backs off. `EMFILE` is the case
-    /// that matters: it is true of the process, not of a client, so it recurs at once.
-    #[test]
-    fn only_per_client_accept_failures_are_treated_as_transient() {
-        assert!(is_transient(&io::Error::from(
-            io::ErrorKind::ConnectionAborted
-        )));
-        assert!(!is_transient(&io::Error::from(io::ErrorKind::OutOfMemory)));
     }
 }

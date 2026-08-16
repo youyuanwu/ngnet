@@ -213,7 +213,7 @@ async fn an_already_stopped_server_admits_no_queued_connection() {
 
         let router = Router::new().route("/hello", get(|| async { "world" }));
         let server = tokio::spawn(
-            ngnet_axum::serve(listener, router)
+            ngnet_axum::serve(ngnet_axum::TcpListener::new(listener), router)
                 .with_graceful_shutdown(std::future::ready(()))
                 .into_future(),
         );

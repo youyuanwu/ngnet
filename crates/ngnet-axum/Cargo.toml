@@ -17,9 +17,16 @@ repository.workspace = true
 # exists *to* depend on axum, and keeping that dependency out of `ngnet-h2` is precisely why
 # the integration is a separate crate rather than a feature of it.
 [dependencies]
-# The `tokio` feature supplies the `TokioIo` transport adapter this crate wraps every
-# accepted socket in. No other transport is enabled: `completion` would need a second
-# integration whose only difference is the runtime, which would test nothing new about axum.
+# The `tokio` feature supplies the `TokioIo` transport adapter. Listeners are now pluggable,
+# so this is no longer the only transport a *user* can serve -- any tokio byte stream works,
+# and so does anything else implementing `ServableTransport`.
+#
+# `completion` is still not enabled, and pluggable transports did not bring it closer. The
+# obstacle was never the transport bound: it is the accept loop, which is built on
+# `tokio::select!`, `tokio::time` and `tokio::spawn`, and `tokio::spawn` requires
+# `Send + 'static`. A thread-per-core runtime whose types are not `Send` cannot be served by
+# that loop no matter what listener is handed to it. Enabling `completion` here would need a
+# different accept loop, not a different feature flag.
 ngnet-h2 = { workspace = true, features = ["tokio"] }
 axum.workspace = true
 http.workspace = true
@@ -41,9 +48,15 @@ http-body.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
-# `signal`, for the worked example's Ctrl-C stop signal, and only for that. Declared here
-# rather than added to the workspace's own tokio feature list because the library needs
-# nothing from it: putting it in `[dependencies]` would enable a feature for every
-# downstream user in order to serve one example. Cargo merges the two sets when building
-# examples and tests, which is exactly the scope wanted.
-tokio = { workspace = true, features = ["signal"] }
+# `signal`, for the worked example's Ctrl-C stop signal; `test-util`, for the paused clock
+# the accept-backoff tests run on. Both are declared here rather than added to the
+# workspace's own tokio feature list because the library needs neither: putting them in
+# `[dependencies]` would enable features for every downstream user in order to serve one
+# example and one test. Cargo merges the two sets when building examples and tests, which is
+# exactly the scope wanted.
+#
+# `test-util` earns its place by making a one-second backoff cost nothing. A listener's retry
+# pacing is measured in seconds, and a suite that waited them out in real time would either
+# be slow or be tempted into the shortcut that is genuinely dangerous here -- an accept that
+# is always ready, which this crate's uncapped accept loop turns into an unbounded allocator.
+tokio = { workspace = true, features = ["signal", "test-util"] }

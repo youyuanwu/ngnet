@@ -22,7 +22,7 @@ Design notes, the invariants the test suite pins, and the tracked backlog live i
 | [`ngnet-quic-tests`](tests/ngnet-quic-tests) | Not published. Drives `ngnet-quic` through real TLS handshakes and real stream data, in process and over loopback UDP, so the wrapper needs no certificate or runtime dependency of its own. |
 | [`ngnet-quic-h3`](crates/ngnet-quic-h3) | Not published yet, alongside the two crates it binds. HTTP/3 over ngtcp2: implements `ngnet-h3`'s transport trait on an `ngnet-quic` connection, so the two families in this workspace form one stack. The only crate that depends on both — deliberately, and a dependency-graph test enforces it, so a caller wanting either alone pays for neither. |
 | [`ngnet-quic-h3-tests`](tests/ngnet-quic-h3-tests) | Not published. Drives HTTP/3 over ngtcp2 across real loopback UDP, and interoperates against [quinn](https://github.com/quinn-rs/quinn) in both roles. |
-| [`ngnet-axum`](crates/ngnet-axum) | Not published yet — the API is new and expected to change; see [`docs/axum/design.md`](docs/axum/design.md). Serves an [axum](https://github.com/tokio-rs/axum) `Router` over `ngnet-h2` instead of hyper. Server-side, h2c and tokio only. |
+| [`ngnet-axum`](crates/ngnet-axum) | Not published yet — the API is new and expected to change; see [`docs/axum/design.md`](docs/axum/design.md). Serves an [axum](https://github.com/tokio-rs/axum) `Router` over `ngnet-h2` instead of hyper. Server-side, h2c and tokio only; transports are pluggable, with TCP and Unix-domain listeners shipped. |
 | [`ngnet-util`](crates/ngnet-util) | Not published yet — the API is new and expected to change; see [`docs/util/design.md`](docs/util/design.md). A pooling HTTP/2 client over `ngnet-h2`: send a request at a URI and the connection is opened, reused, retired and replaced for you. Client-side, h2c and tokio only. |
 | [`ngnet-workspace-tests`](tests/ngnet-workspace-tests) | Not published. Checks that belong to the workspace rather than to any crate in it: what the resolved dependency graph contains, and what the linked binaries pull in. Takes no dependencies of its own — it drives `cargo` and `readelf` and reads the output. |
 
@@ -78,8 +78,8 @@ reasons.
 
 ```rust,no_run
 let router = axum::Router::new().route("/hello", axum::routing::get(|| async { "world" }));
-let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
-ngnet_axum::serve(listener, router).await;
+let tcp = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
+ngnet_axum::serve(ngnet_axum::TcpListener::new(tcp), router).await;
 ```
 
 ## Building

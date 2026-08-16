@@ -13,11 +13,12 @@
 
 mod support;
 
+use std::error::Error as _;
 use std::net::SocketAddr;
 
 use axum::Router;
 use axum::routing::get;
-use ngnet_axum::ErrorKind;
+use ngnet_axum::HandlerPanic;
 use support::{Client, TestServer, get as get_request, text, within};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -45,10 +46,12 @@ async fn an_http1_speaker_fails_only_its_own_connection() {
     server.await_reports(1).await;
     server.with_errors(|errors| {
         assert_eq!(errors.len(), 1, "expected exactly one failure");
-        assert_eq!(errors[0].kind(), ErrorKind::Connection);
+        // The peer is the client's ephemeral address, not the server's, so the assertion
+        // is on what is knowable: it is a real loopback address rather than a placeholder.
         assert!(
-            errors[0].peer().is_some(),
-            "a connection failure should name its peer"
+            SocketAddr::from(errors[0].peer_addr()).ip().is_loopback(),
+            "a connection failure should name its peer, got {:?}",
+            errors[0].peer()
         );
     });
 
@@ -78,9 +81,11 @@ async fn always_panics() -> &'static str {
 
 /// A panicking handler costs its connection, and the server keeps serving others (SC-009).
 ///
-/// The panic is raised in the handler future, where it unwinds out of the driver, fails the
-/// connection, and reaches the task boundary as a `JoinError`. See the module note: it must
-/// not be moved into a body.
+/// The panic is raised in the handler future, where it unwinds out of the driver and fails
+/// the connection. It used to be observed by the accept loop joining the task and finding a
+/// `JoinError`; the loop no longer joins anything, so the connection task catches its own
+/// panic instead and reports it with the message intact. See the module note: it must not be
+/// moved into a body.
 #[tokio::test]
 async fn a_panicking_handler_does_not_stop_the_server() {
     let router = Router::new()
@@ -104,11 +109,33 @@ async fn a_panicking_handler_does_not_stop_the_server() {
 
     server.await_reports(1).await;
     server.with_errors(|errors| {
-        assert_eq!(errors[0].kind(), ErrorKind::Connection);
+        // SC-033b's other half: a panic is reported *once*. The old design could in
+        // principle have reported twice -- the connection erroring and then the task
+        // unwinding -- and `catch_panics` collapsing both into one outcome is what stops it.
+        // Asserting only `errors[0]` would pass against a double report.
         assert_eq!(
-            errors[0].peer().map(SocketAddr::from),
-            Some(doomed_peer),
+            errors.len(),
+            1,
+            "a single panicking handler must produce exactly one report, but {} were made",
+            errors.len()
+        );
+
+        assert_eq!(
+            SocketAddr::from(errors[0].peer_addr()),
+            doomed_peer,
             "the failure named the wrong peer"
+        );
+
+        // SC-033a: the report says a handler panicked, and says what it panicked with.
+        // Asserting only that *something* was reported would pass for a connection reset,
+        // which is the opposite diagnosis.
+        let source = errors[0].source().expect("a source");
+        let panic = source
+            .downcast_ref::<HandlerPanic>()
+            .expect("the failure should be reported as a handler panic");
+        assert!(
+            panic.message().contains("deliberate: exercising SC-009"),
+            "the panic's own message was lost, got {panic}"
         );
     });
 
@@ -237,16 +264,16 @@ async fn every_reported_failure_names_its_own_peer() {
     }
 
     server.await_reports(3).await;
-    let reported: Vec<Option<SocketAddr>> = server.with_errors(|errors| {
+    let reported: Vec<SocketAddr> = server.with_errors(|errors| {
         errors
             .iter()
-            .map(|error| error.peer().map(SocketAddr::from))
+            .map(|error| SocketAddr::from(error.peer_addr()))
             .collect()
     });
 
     for address in &addresses {
         assert!(
-            reported.contains(&Some(*address)),
+            reported.contains(address),
             "no failure was reported for {address}, only {reported:?}"
         );
     }
