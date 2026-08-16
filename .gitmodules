@@ -7,3 +7,6 @@
 [submodule "deps/ngtcp2"]
 	path = deps/ngtcp2
 	url = https://github.com/ngtcp2/ngtcp2
+[submodule "deps/dwnx"]
+	path = deps/dwnx
+	url = https://github.com/ngtcp2/dwnx
