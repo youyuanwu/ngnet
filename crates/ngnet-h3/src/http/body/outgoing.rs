@@ -17,6 +17,19 @@
 //! waiting for a transport that is perfectly willing, and treating congestion as a deferral
 //! means waiting for a body that has already spoken. Only the first is handled here; the
 //! second belongs to the driver.
+//!
+//! # Why a failed body defers too
+//!
+//! A body that reports an error is abandoned, and the peer is told so by a reset of that
+//! one stream. Ending the body instead — which is what this adapter used to do — puts an
+//! end-of-stream marker on the wire ahead of that reset, and the two contradict each other:
+//! a peer with nothing queued behind the marker has already been told the message was
+//! complete by the time the reset arrives, so it ignores the reset and believes a truncated
+//! message. Deferring is the only other thing nghttp3's data callback can be told, so it is
+//! how "produce nothing further for this stream, ever" is said here. The obligation that
+//! comes with it is the driver's: a deferred stream that is never resumed and never reset
+//! hangs, so the ending recorded here is read and turned into a reset early in the very
+//! next pass, before the driver can wait for anything.
 
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -40,9 +53,35 @@ pub(crate) enum Ending {
     ///
     /// Deliberately *not* reported to the state machine as a body failure: that signal is
     /// connection-fatal, and one caller's file read going wrong must not take down every
-    /// other exchange sharing the connection. The driver ends the body here and resets this
-    /// stream instead.
+    /// other exchange sharing the connection. The stream produces no end-of-stream marker
+    /// at all; the driver resets it instead, and the reset is the only thing the peer is
+    /// ever told about how this message ended.
     Failed,
+}
+
+/// Whether any of these bodies has recorded an ending no pass has acted on yet.
+///
+/// The driver asks this before it lets itself wait, because a recorded [`Ending::Failed`]
+/// is a reset that has not been queued yet and a stream sitting deferred in the meantime.
+/// A slot whose mutex is poisoned answers *no*: the scan that empties these slots skips a
+/// poisoned one and always will, so calling it outstanding would keep the driver spinning
+/// over work nothing can ever clear. Blocking on the lock rather than trying it is
+/// deliberate too — contention here is another thread recording an ending, not a reason to
+/// report there is nothing to do.
+pub(crate) fn ending_pending(
+    endings: &[(StreamId, Arc<std::sync::Mutex<Option<Ending>>>)],
+) -> bool {
+    endings
+        .iter()
+        .any(|(_, ending)| ending.lock().is_ok_and(|slot| slot.is_some()))
+}
+
+/// How a body stopped being pulled from.
+enum Stopped {
+    /// It ended, and the stream carries an end-of-stream marker for it.
+    Ended,
+    /// It failed, and the stream will be reset rather than ended.
+    Abandoned,
 }
 
 /// A caller's body, wrapped so the state machine can pull from it.
@@ -52,7 +91,8 @@ pub(crate) struct Outgoing<B> {
     waker: Waker,
     /// Set once the body has finished, and read by the driver afterwards.
     ending: Arc<std::sync::Mutex<Option<Ending>>>,
-    finished: bool,
+    /// How this body stopped, once it has, so a later pull answers the same way again.
+    stopped: Option<Stopped>,
 }
 
 impl<B> Outgoing<B>
@@ -70,12 +110,15 @@ where
             body: Box::pin(body),
             waker: Waker::from(Arc::new(BodyWaker { stream, shared })),
             ending,
-            finished: false,
+            stopped: None,
         }
     }
 
     fn finish(&mut self, ending: Ending) {
-        self.finished = true;
+        self.stopped = Some(match ending {
+            Ending::Failed => Stopped::Abandoned,
+            _ => Stopped::Ended,
+        });
         if let Ok(mut slot) = self.ending.lock() {
             *slot = Some(ending);
         }
@@ -88,8 +131,18 @@ where
     B::Error: Into<Box<dyn core::error::Error + Send + Sync>>,
 {
     fn next(&mut self) -> BodyOutcome {
-        if self.finished {
-            return BodyOutcome::Eof(Vec::new());
+        match self.stopped {
+            // The state machine does not consult a source that has signalled an end, so
+            // this arm is only ever reached defensively; answering anything else would
+            // pull a body past its own last frame.
+            Some(Stopped::Ended) => return BodyOutcome::Eof(Vec::new()),
+            // An abandoned body *is* re-pullable, because deferring records no end: a
+            // stray wake from its own waker resumes the stream and brings the state
+            // machine straight back here. Answering `Eof` would put the end-of-stream
+            // marker on the wire that this whole path exists to withhold, so late or not,
+            // the answer is the same one that suspended the stream in the first place.
+            Some(Stopped::Abandoned) => return BodyOutcome::Defer,
+            None => {}
         }
 
         let mut context = Context::from_waker(&self.waker);
@@ -110,10 +163,17 @@ where
                     return BodyOutcome::Eof(pieces);
                 }
                 Poll::Ready(Some(Err(_))) => {
-                    // A caller's body failing must not poison the connection, so the body
-                    // simply ends here and the driver resets this one stream.
+                    // A caller's body failing must not poison the connection, so the
+                    // driver resets this one stream. Until it does, the stream must carry
+                    // no end marker or the peer would be told the message completed and
+                    // would rightly ignore the reset that followed; see the module
+                    // documentation. Deferring is how that is said, and anything gathered
+                    // in this pull goes with the message it can no longer finish — the
+                    // stream is being reset, so bytes on it are bytes the peer must not
+                    // act on.
                     self.finish(Ending::Failed);
-                    return BodyOutcome::Eof(pieces);
+                    drop(pieces);
+                    return BodyOutcome::Defer;
                 }
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                     Ok(mut data) => {

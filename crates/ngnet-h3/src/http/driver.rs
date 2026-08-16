@@ -10,17 +10,22 @@
 //! 2. **Feed received bytes** to the state machine and extend receive credit by what it
 //!    reports. Body payload is *not* credited here; the caller credits it as it reads,
 //!    because only the caller knows when it has finished with the bytes.
-//! 3. **Drain deferred credit.** Credit for a QPACK-blocked stream arrives late and exactly
+//! 3. **Settle finished bodies**, so a body that failed during the last pass's transmit
+//!    becomes a queued reset here, ahead of everything below that can wait. Such a stream
+//!    carries no end-of-stream marker by design, so a pass that stopped short of this —
+//!    on a stream the transport has not opened yet, or at the park — would leave the peer
+//!    holding a message that neither ended nor was abandoned.
+//! 4. **Drain deferred credit.** Credit for a QPACK-blocked stream arrives late and exactly
 //!    once, and a connection that drops it under-credits the peer by degrees until it
 //!    stalls.
-//! 4. **Apply releases**, skipping streams already closed. Closing released that stream's
+//! 5. **Apply releases**, skipping streams already closed. Closing released that stream's
 //!    buffers, so applying a release afterwards would report more acknowledged than was ever
 //!    written.
-//! 5. **Drain transport actions** the state machine asked for.
-//! 6. **Advance the role** — submit queued requests, or poll handlers.
-//! 7. **Transmit**, by handing the backend a source it pulls from.
-//! 8. **Close finished streams**, which is one of only three things that release a buffer.
-//! 9. **Park**, if and only if nothing above could make progress.
+//! 6. **Drain transport actions** the state machine asked for.
+//! 7. **Advance the role** — submit queued requests, or poll handlers.
+//! 8. **Transmit**, by handing the backend a source it pulls from.
+//! 9. **Close finished streams**, which is one of only three things that release a buffer.
+//! 10. **Park**, if and only if nothing above could make progress.
 //!
 //! # The write side is pulled, not pushed
 //!
@@ -80,6 +85,16 @@ pub(crate) trait Role {
 
     /// Submits whatever the role has queued.
     fn advance(&mut self, conn: &mut Conn<Events>, events: &mut Events) -> Result<()>;
+
+    /// Acts on bodies that have finished since the last pass.
+    ///
+    /// Separate from [`advance`](Self::advance), which also does this, because a body that
+    /// failed leaves its stream deferred with no end marker on it and the reset is the
+    /// only thing that will ever tell the peer so. `advance` is too late to be the first
+    /// to notice: the pass can wait for a stream the transport has not opened, or decide
+    /// the connection is finished, before it ever gets there. Run early it is one extra
+    /// scan of a short list; run only late it is a stream that neither ends nor resets.
+    fn settle(&mut self, conn: &mut Conn<Events>) -> Result<()>;
 
     /// A complete header section arrived on a stream.
     fn head(
@@ -698,7 +713,14 @@ where
         let had_events = !events.is_empty();
         driver.apply_events(events, &mut guard.role)?;
 
-        // 3. Credit that arrived late, for streams that were QPACK-blocked.
+        // 3. Bodies that finished during the last pass, read before anything below can
+        // wait on the transport or on the peer. A failed body's stream is suspended with
+        // no end marker on it, and the reset queued here is the only thing that will ever
+        // tell the peer the message was abandoned; it is drained onto the transport a few
+        // lines down, in this same pass.
+        guard.role.settle(&mut driver.conn)?;
+
+        // 4. Credit that arrived late, for streams that were QPACK-blocked.
         let deferred = driver.conn.take_deferred_credit();
         for (stream, bytes) in deferred {
             driver.extend(Some(stream), bytes)?;
@@ -711,7 +733,7 @@ where
             driver.extend(Some(stream), bytes)?;
         }
 
-        // 5. Actions the state machine asked the transport to take.
+        // 6. Actions the state machine asked the transport to take.
         actions.clear();
         shared.take_actions(&mut actions);
         for action in actions.drain(..) {
@@ -731,11 +753,20 @@ where
             }
         }
 
-        // Resets a caller asked for, by dropping a response future or an unread body.
+        // Resets a caller asked for, by dropping a response future or an unread body, and
+        // resets owed by a body that failed.
         resets.clear();
         shared.take_resets(&mut resets);
         for (stream, code) in resets.drain(..) {
             driver.conn.shutdown_stream_read(stream).ok();
+            // Every caller of this queue is abandoning its own send side, and saying so
+            // sets `SHUT_WR` and unschedules the stream, which is what stops nghttp3
+            // offering write turns to a stream that will never produce bytes again — a
+            // failed body's stream is suspended, so it would otherwise be asked
+            // indefinitely. It does not close the stream or release its buffers; only a
+            // stream close does that, and the transport reports none for a reset this end
+            // issued.
+            driver.conn.shutdown_stream_write(stream).ok();
             driver
                 .backend
                 .reset(stream, code)
@@ -766,7 +797,7 @@ where
             }
         }
 
-        // 6. Submit whatever the role has queued.
+        // 7. Submit whatever the role has queued.
         {
             let mut events = core::mem::take(&mut driver.events);
             let result = guard.role.advance(&mut driver.conn, &mut events);
@@ -780,7 +811,7 @@ where
             dispatch(&mut driver, &mut guard.role, observed)?;
         }
 
-        // 7. Transmit.
+        // 8. Transmit.
         let mut blocked = core::mem::take(&mut driver.blocked);
         let failure = {
             let mut offers = Offers {
@@ -808,7 +839,7 @@ where
             dispatch(&mut driver, &mut guard.role, observed)?;
         }
 
-        // 9. Are we finished, and if not, is there anything to do?
+        // 10. Are we finished, and if not, is there anything to do?
         if driver.peer_gone {
             return Ok(());
         }

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use http_body::Body;
 
-use super::body::{Ending, IncomingBody, Outgoing};
+use super::body::{Ending, IncomingBody, Outgoing, ending_pending};
 use super::config::Config;
 use super::connection::Connection;
 use super::driver::{self, Driver, DriverGuard, REQUEST_CANCELLED, Role};
@@ -320,7 +320,10 @@ where
     }
 
     fn busy(&self) -> bool {
-        self.tasks.any_woken()
+        // An ending nobody has read yet is a stream that has stopped producing bytes and
+        // has not been reset. Parking on one would leave the peer waiting on a message
+        // this endpoint has already abandoned, until the peer happened to say something.
+        self.tasks.any_woken() || ending_pending(&self.endings)
     }
 
     fn done(&self) -> bool {
@@ -334,6 +337,10 @@ where
             cancelled.trip();
         }
         self.tasks.abandon_all();
+    }
+
+    fn settle(&mut self, conn: &mut Conn<Events>) -> Result<()> {
+        self.finish_bodies(conn)
     }
 }
 
