@@ -50,6 +50,22 @@
 //! incoming one into a private struct it exposes no accessor for. Neither is duplicated work
 //! chosen for its own sake; each module argues its case where a reader will find it.
 //!
+//! # Waiting, and the cost of getting it wrong
+//!
+//! Three things here have to wait for the peer: an open the peer's stream limit forbids, a
+//! write whose flow-control credit is spent, and a connection with nothing to do. Each parks a
+//! waker and is woken by the event that actually unblocks it -- a raised limit, an extended
+//! window, or bytes arriving on the byte stream. The alternative, waking one's own waker and
+//! returning [`Pending`](core::task::Poll::Pending), compiles and passes a functional test
+//! suite while burning a core; `conn`'s documentation names the events, and
+//! `tests/io_scheduling.rs` counts wakeups to prove none of them is a spin.
+//!
+//! The same reasoning runs the other way for reading. This layer stops pulling from the byte
+//! stream once it is far enough ahead of a caller who is not consuming, where "far enough" is
+//! measured in bytes handed over and not yet credited back -- not in queued events, which a
+//! caller could drain into their own unbounded buffer without ever consuming anything.
+//! [`Config::read_ahead`] sets the part of that figure which applies before any credit exists.
+//!
 //! # Why poll-shaped, when the closer precedent is future-shaped
 //!
 //! `ngnet-h2` also runs a protocol over a byte stream, and its transport abstraction is
@@ -98,6 +114,7 @@ mod conn;
 mod error;
 mod event;
 mod framing;
+mod scheduling;
 mod stream;
 
 #[doc(hidden)]
@@ -106,8 +123,8 @@ pub mod testing;
 pub use clock::Clock;
 pub use close::{decode_close_frame, encode_close_record};
 pub use conn::{
-    Config, Connection, DEFAULT_CONNECTION_DATA, DEFAULT_MAX_STREAMS, DEFAULT_STREAM_DATA,
-    StreamWrite,
+    Config, Connection, DEFAULT_CONNECTION_DATA, DEFAULT_MAX_STREAMS, DEFAULT_READ_AHEAD,
+    DEFAULT_STREAM_DATA, StreamWrite,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use event::Event;

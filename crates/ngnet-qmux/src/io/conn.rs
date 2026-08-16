@@ -48,6 +48,32 @@
 //! an error, and is the most expensive of the failures in this file to diagnose after the
 //! fact.
 //!
+//! # Waiting, and never spinning
+//!
+//! Three things here cannot proceed on demand: an open the peer's stream limit forbids, a
+//! write with no flow-control credit, and a read the caller has not made room for. Each parks
+//! against the event that ends it -- a raised limit, an extended window, credit reported back
+//! -- through [`Signals`], and none of them wakes itself. See that module for what a self-wake
+//! costs and which callback fires which slot.
+//!
+//! [`try_write_stream`](Connection::try_write_stream) is the deliberate exception: it reports
+//! [`StreamWrite::Blocked`] and returns, because the caller it exists for has no [`Context`]
+//! to park with.
+//!
+//! An idle connection therefore arms nothing at all. It has no outbound bytes, so it never
+//! offers the byte stream a write; it polls one read, which registers the byte stream's own
+//! waker and returns pending; and there is no timer here to fire in the meantime. The next
+//! poll happens when the peer says something, and not before.
+//!
+//! # How much this reads ahead of its caller
+//!
+//! [`ReadAhead`] bounds bytes *delivered and not yet credited back*, and the pump stops
+//! reading from the byte stream while that figure is at the bound. Backpressure then flows
+//! where it belongs: bytes pile up in the transport, the peer's own window closes, and the
+//! sender stops. Only [`extend_connection_credit`](Connection::extend_connection_credit)
+//! moves the figure; the scheduling module explains why counting the stream-level extension
+//! as well would make the bound meaningless.
+//!
 //! # How a connection ends
 //!
 //! Every ending is latched the first time it is observed, and every later operation reports
@@ -69,10 +95,11 @@ use crate::io::close::encode_close_record;
 use crate::io::error::{Error, ErrorKind, Result};
 use crate::io::event::{Event, EventQueue};
 use crate::io::framing::RecordFramer;
+use crate::io::scheduling::{ReadAhead, Signals};
 use crate::io::stream::{AsyncByteStream, Written};
 use crate::params::TransportParams;
 use crate::settings::Settings;
-use crate::stream::StreamId;
+use crate::stream::{Directionality, StreamId};
 use crate::stream_io::{OpenOutcome, Shutdown};
 use crate::time::{Duration, Timestamp};
 use crate::write::{Push, WriteRequest};
@@ -89,6 +116,16 @@ pub const DEFAULT_CONNECTION_DATA: u64 = 1024 * 1024;
 
 /// How many streams of each kind the peer may open.
 pub const DEFAULT_MAX_STREAMS: u64 = 100;
+
+/// How many bytes may be delivered to the caller before it must report consuming some.
+///
+/// The same figure as [`DEFAULT_CONNECTION_DATA`], and deliberately: the connection window is
+/// how much the peer may send before this side says anything, so a layer that held less than
+/// that would refuse to read bytes the protocol has already permitted -- stalling a caller
+/// that credits in batches rather than per event, which is a legitimate and common shape. A
+/// larger figure would let the layer hold more than the protocol ever puts in flight, which
+/// buys nothing and costs memory.
+pub const DEFAULT_READ_AHEAD: u64 = DEFAULT_CONNECTION_DATA;
 
 /// The size of the read buffer, and so the most bytes one read may deliver.
 ///
@@ -117,6 +154,7 @@ pub struct Config {
     max_streams_bidi: u64,
     max_streams_uni: u64,
     max_idle_timeout: Duration,
+    read_ahead: u64,
 }
 
 impl Default for Config {
@@ -131,6 +169,7 @@ impl Default for Config {
             // believe in a deadline that nobody is keeping. See [`crate::io::Clock`] for why
             // there is no timer here to keep it with.
             max_idle_timeout: Duration::from_nanos(0),
+            read_ahead: DEFAULT_READ_AHEAD,
         }
     }
 }
@@ -189,6 +228,25 @@ impl Config {
     #[must_use]
     pub const fn max_idle_timeout(mut self, timeout: Duration) -> Self {
         self.max_idle_timeout = timeout;
+        self
+    }
+
+    /// How many bytes may be delivered to the caller before it must report consuming some.
+    ///
+    /// This layer's own bound on what it holds on the caller's behalf, and **not** a
+    /// restatement of the protocol's receive window. It counts bytes handed over by
+    /// [`Connection::poll_next_event`] that
+    /// [`Connection::extend_connection_credit`] has not yet accounted for, so a caller that
+    /// drains events into a buffer of its own without crediting them is stopped at this figure
+    /// however diligently it drains. The number applies before any credit has been extended;
+    /// afterwards each credited byte buys another byte of read-ahead.
+    ///
+    /// Setting it to zero means the layer reads nothing until the caller credits, which is a
+    /// coherent configuration for a caller that wants to pull explicitly, and a deadlock for
+    /// one that expects data to arrive unprompted.
+    #[must_use]
+    pub const fn read_ahead(mut self, bytes: u64) -> Self {
+        self.read_ahead = bytes;
         self
     }
 
@@ -266,6 +324,10 @@ pub struct Connection<S: AsyncByteStream, C: Clock> {
     /// Set at construction -- which is what makes the transport-parameter announcement leave
     /// unprompted -- and again after every read and every operation that queues a frame.
     produce_pending: bool,
+    /// The wakers parked by an operation that cannot proceed yet.
+    signals: Signals,
+    /// How far the layer has read ahead of the caller, and how far it may.
+    read_ahead: ReadAhead,
     closing: Option<Closing>,
     terminal: Option<Terminal>,
 }
@@ -345,12 +407,13 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
 
     fn new(role: Role, stream: S, clock: C, config: Config) -> Result<Self> {
         let events = EventQueue::new();
+        let signals = Signals::new();
         let conn = Conn::builder(role)
             // Starting the connection's clock where the caller's clock is, rather than at
             // zero, so every interval dwnx computes is an interval in the caller's timescale.
             .settings(Settings::new().with_initial_timestamp(clock.now()))
             .transport_params(config.transport_params())
-            .handlers(handlers(&events))
+            .handlers(handlers(&events, &signals))
             .build()?;
 
         Ok(Self {
@@ -369,6 +432,8 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
             // wrong. Scheduling it here means the first pump emits it, whatever the first
             // entry point turns out to be.
             produce_pending: true,
+            signals,
+            read_ahead: ReadAhead::new(config.read_ahead),
             closing: None,
             terminal: None,
         })
@@ -444,12 +509,31 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     pub fn poll_next_event(&mut self, cx: &mut Context<'_>) -> Poll<Result<Event>> {
         let pumped = self.pump(cx);
         if let Some(event) = self.events.pop() {
+            if let Event::StreamData { data, .. } = &event {
+                // Delivery is what read-ahead is measured in: from here the bytes are the
+                // caller's, and the layer will read no further ahead than the caller has
+                // credited back. Counted on the way out rather than when the event was queued,
+                // because an event sitting in the queue is bounded by the protocol's window
+                // and one the caller is holding is bounded by nothing else.
+                self.read_ahead.delivered(data.len() as u64);
+            }
             return Poll::Ready(Ok(event));
         }
         match pumped {
             Ok(()) => Poll::Pending,
             Err(error) => Poll::Ready(Err(error)),
         }
+    }
+
+    /// How many delivered bytes the caller has yet to report consuming.
+    ///
+    /// The layer's own read-ahead figure, bounded by [`Config::read_ahead`] plus everything
+    /// [`Connection::extend_connection_credit`] has accounted for. A caller that watches this
+    /// climb to the bound and stay there is watching backpressure work: the layer has stopped
+    /// reading, and the peer's window is closing behind it.
+    #[must_use]
+    pub const fn read_ahead(&self) -> u64 {
+        self.read_ahead.outstanding()
     }
 
     /// Opens a bidirectional stream.
@@ -486,11 +570,12 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
                 self.produce_pending = true;
                 Poll::Ready(Ok(stream))
             }
-            // Capacity is the peer's to grant, and it grants it in a frame this side has yet
-            // to read. Asking to be polled again is what keeps the request live; the pump at
-            // the top of the next poll is what makes it eventually succeed.
+            // Capacity is the peer's to grant, and it grants it in a MAX_STREAMS frame this
+            // side has yet to read. Parked against the `extend_max_streams` callback, which is
+            // dwnx reporting exactly that frame; waking here instead would spin a whole core
+            // for as long as the peer took to answer.
             Ok(OpenOutcome::Blocked) => {
-                cx.waker().wake_by_ref();
+                self.signals.park_open(cx);
                 Poll::Pending
             }
             Err(error) => Poll::Ready(Err(Error::from(error))),
@@ -551,7 +636,7 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
                         "the stream's write side is closed",
                     )));
                 }
-                Verdict::Blocked => return Self::park(cx, written),
+                Verdict::Blocked => return self.park_write(cx, written),
                 Verdict::Packed => {
                     written += produced.consumed;
                     if written == data.len() {
@@ -561,7 +646,7 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
                     // *connection* window this way rather than as a blocked stream, and
                     // producing again would spin.
                     if produced.consumed == 0 {
-                        return Self::park(cx, written);
+                        return self.park_write(cx, written);
                     }
                 }
             }
@@ -638,6 +723,13 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
 
     /// Reports bytes consumed on a stream, so the peer may send that much more.
     ///
+    /// This moves the *protocol's* per-stream window and nothing else. It does not relieve
+    /// this layer's read-ahead bound: a caller reporting the same bytes to both windows --
+    /// which is what the HTTP/3 layer above does, because stream-level credit does not imply
+    /// connection-level credit -- would otherwise credit each consumed byte twice, and a bound
+    /// that fell twice as fast as it rose would never bind at all. See
+    /// [`Connection::extend_connection_credit`], which is the one that counts.
+    ///
     /// # Errors
     ///
     /// Reports the connection's ending, and anything the state machine refuses -- extending a
@@ -657,6 +749,12 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     /// stream-level credit does not imply connection-level credit, and a caller who extends
     /// only one leaves the other to run out.
     ///
+    /// This is also the call that governs the layer's own read-ahead. Bytes credited here
+    /// cancel bytes delivered by [`Connection::poll_next_event`], and a connection that
+    /// stopped reading because the caller was behind resumes on this call. A caller that
+    /// consumes events and never credits will be read to exactly once and then stopped, which
+    /// is the bound doing its job rather than a fault.
+    ///
     /// # Errors
     ///
     /// Reports the connection's ending.
@@ -665,6 +763,39 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
             return Err(terminal.error());
         }
         self.conn.extend_max_data(bytes);
+        self.read_ahead.credited(bytes);
+        if !self.read_ahead.is_exhausted() {
+            // The pump stopped reading and registered its waker here rather than with the byte
+            // stream, so nothing else will ever fire it: the byte stream has been ready this
+            // whole time and the layer was declining to look.
+            self.signals.wake_read_ahead();
+        }
+        self.produce_pending = true;
+        Ok(())
+    }
+
+    /// Permits the peer to open `count` more streams of one kind.
+    ///
+    /// The counterpart to [`Connection::extend_stream_credit`] for the other resource a peer
+    /// can exhaust. Stream capacity is *not* returned when a stream closes -- neither dwnx nor
+    /// this layer recycles it -- so a connection that never calls this stops accepting new
+    /// streams for good once the configured limit has been reached, which presents as a peer
+    /// whose opens hang rather than as an error at either end.
+    ///
+    /// The MAX_STREAMS frame this queues leaves on the next pump, and the peer's blocked open
+    /// wakes when it arrives.
+    ///
+    /// # Errors
+    ///
+    /// Reports the connection's ending.
+    pub fn extend_stream_limit(&mut self, kind: Directionality, count: usize) -> Result<()> {
+        if let Some(terminal) = &self.terminal {
+            return Err(terminal.error());
+        }
+        match kind {
+            Directionality::Bidirectional => self.conn.extend_max_streams_bidi(count),
+            Directionality::Unidirectional => self.conn.extend_max_streams_uni(count),
+        }
         self.produce_pending = true;
         Ok(())
     }
@@ -784,10 +915,11 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
                 }
                 Poll::Ready(Ok(Written::Accepted(0))) => {
                     // Forbidden by the contract, because zero bytes accepted carries no
-                    // obligation to wake and a caller offered it can only spin. Asking to be
-                    // polled again keeps a non-conforming stream making progress instead of
-                    // stalling silently; the cost lands on the implementation that broke the
-                    // rule.
+                    // obligation to wake and a caller offered it can only spin. This is the
+                    // one wake this layer issues to itself, and it is not a scheduling
+                    // placeholder: it is what an implementation that broke the rule gets
+                    // instead of a connection that stalls in silence, and it is unreachable
+                    // for one that keeps it.
                     cx.waker().wake_by_ref();
                     return Ok(false);
                 }
@@ -804,8 +936,21 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
 
     /// Reads from the byte stream until it has nothing more, feeding the framer and then the
     /// state machine.
+    ///
+    /// Stops early when the caller is behind. That is the whole of the read-ahead bound: an
+    /// unread byte stream is backpressure the peer can feel, and it costs this side nothing to
+    /// hold.
     fn read_side(&mut self, cx: &mut Context<'_>) -> Result<()> {
         loop {
+            if self.read_ahead.is_exhausted() {
+                // No read is issued, so the byte stream registers nothing -- which is why the
+                // waker goes here instead, to be fired by the credit that makes room. A read
+                // issued anyway would deliver bytes the caller has no room for and defeat the
+                // bound; parking without registering anything would strand the connection.
+                self.signals.park_read_ahead(cx);
+                return Ok(());
+            }
+
             let filled = match self.stream.poll_read(cx, &mut self.inbound) {
                 Poll::Pending => return Ok(()),
                 Poll::Ready(Err(error)) => {
@@ -823,7 +968,17 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
             }
 
             let now = self.clock.now();
+            // Sampled across the read because a MAX_DATA frame raises this and raises nothing
+            // else: dwnx applies it to the connection's send window and invokes no callback
+            // (`deps/dwnx/lib/dwnx_conn.c:1045-1056`), so a write parked on an exhausted
+            // connection window has no event to wait for and this comparison is its wakeup.
+            // Waking on any inbound bytes would have done as well, and would have spun a
+            // blocked writer once per record for as long as the peer kept sending.
+            let credit_before = self.conn.max_data_left();
             let outcome = self.conn.read(&self.inbound[..filled], now);
+            if self.conn.max_data_left() > credit_before {
+                self.signals.wake_credit();
+            }
             // Whatever arrived may have queued a response -- a window extension, a ping
             // answer -- and the pump's trailing write pass is what sends it.
             self.produce_pending = true;
@@ -931,15 +1086,18 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         self.fail(Error::new(ErrorKind::ByteStream, context).with_boxed_source(source.into()))
     }
 
-    /// Reports a partial write, or waits.
-    fn park(cx: &mut Context<'_>, written: usize) -> Poll<Result<usize>> {
+    /// Reports a partial write, or waits for the peer to extend a window.
+    ///
+    /// Parked against [`Signals::park_credit`], which the `extend_max_stream_data` callback
+    /// fires for a stream window and [`Connection::read_side`] fires for the connection window
+    /// -- dwnx raises no callback for the latter. A partial write is reported rather than
+    /// waited on, because the bytes that were taken are already the peer's problem and a
+    /// caller told nothing about them would send them twice.
+    fn park_write(&self, cx: &mut Context<'_>, written: usize) -> Poll<Result<usize>> {
         if written > 0 {
             return Poll::Ready(Ok(written));
         }
-        // Credit is the peer's to extend, in a frame this side has yet to read. Asking to be
-        // polled again keeps the write live; the pump at the top of the next poll is what
-        // makes it eventually succeed.
-        cx.waker().wake_by_ref();
+        self.signals.park_credit(cx);
         Poll::Pending
     }
 }
@@ -1020,11 +1178,17 @@ fn pack(
 
 /// The handlers the layer installs on the state machine.
 ///
-/// They capture the event queue and nothing else, which is what satisfies the state machine's
-/// `Send` bound on handlers without imposing one on the caller's byte stream or clock. A
-/// handler cannot reach the connection by design, so each one records and returns; the pump
-/// acts once the entry point that provoked it has returned.
-fn handlers(events: &EventQueue) -> Handlers<'static> {
+/// They capture the event queue and the signal set and nothing else, which is what satisfies
+/// the state machine's `Send` bound on handlers without imposing one on the caller's byte
+/// stream or clock. A handler cannot reach the connection by design, so each one records and
+/// returns; the pump acts once the entry point that provoked it has returned.
+///
+/// Two of them do one thing more: they fire a waker. That is not the connection being reached
+/// into -- a waker is a scheduling primitive, not a connection handle, and the operation it
+/// wakes still runs from a poll like any other. It is how a blocked open and a blocked write
+/// learn that the frame they were waiting for has arrived, rather than by asking again on
+/// every pass.
+fn handlers(events: &EventQueue, signals: &Signals) -> Handlers<'static> {
     let data = events.clone();
     let opened = events.clone();
     let closed = events.clone();
@@ -1033,6 +1197,8 @@ fn handlers(events: &EventQueue) -> Handlers<'static> {
     let stream_credit = events.clone();
     let limits = events.clone();
     let params = events.clone();
+    let credit_signal = signals.clone();
+    let limit_signal = signals.clone();
 
     Handlers::new()
         .on_stream_data(move |event| {
@@ -1076,10 +1242,18 @@ fn handlers(events: &EventQueue) -> Handlers<'static> {
                 stream_id,
                 max_data,
             });
+            // The event a write parked on an exhausted stream window is waiting for. dwnx
+            // raises this both for a MAX_STREAM_DATA frame and for the peer's transport
+            // parameters granting a stream its first window, which is exactly the pair of
+            // occasions on which a blocked write can make progress.
+            credit_signal.wake_credit();
             Ok(())
         })
         .on_extend_max_streams(move |kind, max_streams| {
             limits.push(Event::StreamLimit { kind, max_streams });
+            // The event a blocked open is waiting for, and the only one: stream capacity is
+            // the peer's to grant and it grants it here.
+            limit_signal.wake_open();
             Ok(())
         })
         .on_transport_params(move |received| {
@@ -1096,6 +1270,7 @@ impl<S: AsyncByteStream, C: Clock> core::fmt::Debug for Connection<S, C> {
         f.debug_struct("Connection")
             .field("role", &self.role())
             .field("outbound", &(self.outbound.len() - self.written))
+            .field("read_ahead", &self.read_ahead.outstanding())
             .field("closing", &self.closing)
             .field("terminal", &self.terminal)
             .finish_non_exhaustive()
@@ -1145,6 +1320,17 @@ mod tests {
         assert_eq!(params.initial_max_streams_bidi(), 3);
         assert_eq!(params.initial_max_streams_uni(), 5);
         assert_eq!(params.max_idle_timeout(), Duration::from_nanos(13));
+    }
+
+    /// The read-ahead allowance is the one knob here that never reaches the wire: it governs how
+    /// far this layer will run ahead of its caller, not what the peer is told. Getting it wrong in
+    /// the direction of zero would stall the connection, so it is checked separately from the
+    /// transport parameters.
+    #[test]
+    fn the_read_ahead_allowance_is_a_local_knob_with_a_non_zero_default() {
+        assert_eq!(Config::default().read_ahead, DEFAULT_READ_AHEAD);
+        const { assert!(DEFAULT_READ_AHEAD > 0) };
+        assert_eq!(Config::new().read_ahead(64).read_ahead, 64);
     }
 
     /// The configuration dwnx would abort on, rejected as an ordinary error instead.

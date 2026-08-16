@@ -32,11 +32,11 @@
 
 use std::future::{Future, poll_fn};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use ngnet_qmux::io::testing::{TestByteStream, TestClock, stream_pair};
-use ngnet_qmux::io::{AsyncByteStream, Clock, Config, Connection, Error, Event, Result};
+use ngnet_qmux::io::{AsyncByteStream, Clock, Config, Connection, Error, Event, Result, Written};
 use ngnet_qmux::{CloseReason, Role, StreamId};
 
 /// How many round-robin passes before an exchange is declared broken.
@@ -143,10 +143,7 @@ pub fn connected_pair(
     Connection<TestByteStream, TestClock>,
     Connection<TestByteStream, TestClock>,
 ) {
-    let (client_side, server_side) = stream_pair();
-    let client = Connection::client(client_side, TestClock::new(), config).expect("a client");
-    let server = Connection::server(server_side, TestClock::new(), config).expect("a server");
-    (client, server)
+    connected_pair_with(config, config, |_| {})
 }
 
 /// The same, with the caps a byte-at-a-time exchange needs applied to both halves.
@@ -156,14 +153,70 @@ pub fn connected_pair_one_byte_at_a_time(
     Connection<TestByteStream, TestClock>,
     Connection<TestByteStream, TestClock>,
 ) {
-    let (client_side, server_side) = stream_pair();
-    for side in [&client_side, &server_side] {
+    connected_pair_with(config, config, |side| {
         side.set_read_cap(Some(1));
         side.set_write_cap(Some(1));
-    }
-    let client = Connection::client(client_side, TestClock::new(), config).expect("a client");
-    let server = Connection::server(server_side, TestClock::new(), config).expect("a server");
+    })
+}
+
+/// A pair with the two sides configured differently, and each byte stream prepared first.
+///
+/// Both knobs exist for the same reason: the interesting scheduling cases are asymmetric. A
+/// blocked open needs a peer that permits fewer streams than this side wants, and a byte
+/// stream that refuses its first write has to be told so *before* the connection is built,
+/// because construction schedules the transport-parameter announcement and the connection
+/// keeps the only handle to its stream afterwards.
+pub fn connected_pair_with(
+    client_config: Config,
+    server_config: Config,
+    prepare: impl Fn(&TestByteStream),
+) -> (
+    Connection<TestByteStream, TestClock>,
+    Connection<TestByteStream, TestClock>,
+) {
+    let (client_side, server_side) = stream_pair();
+    prepare(&client_side);
+    prepare(&server_side);
+    let client =
+        Connection::client(client_side, TestClock::new(), client_config).expect("a client");
+    let server =
+        Connection::server(server_side, TestClock::new(), server_config).expect("a server");
     (client, server)
+}
+
+/// A waker that counts how often it was fired.
+///
+/// The instrument the scheduling tests are built on. "This connection is idle" and "this
+/// connection is spinning" look identical from the outside -- both are a poll returning
+/// pending -- and the only thing that tells them apart is whether anything asked to be polled
+/// again. A count of zero across many polls is the assertion; a self-woken connection cannot
+/// produce one.
+#[derive(Default)]
+pub struct WakeCount {
+    wakes: AtomicUsize,
+}
+
+impl WakeCount {
+    /// How many times the waker has been fired.
+    pub fn count(&self) -> usize {
+        self.wakes.load(Ordering::SeqCst)
+    }
+}
+
+impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A waker and the count it feeds.
+pub fn counting_waker() -> (Waker, Arc<WakeCount>) {
+    let count = Arc::new(WakeCount::default());
+    (Waker::from(Arc::clone(&count)), count)
 }
 
 /// One connection with the far end of its byte stream left in the test's hands.
@@ -173,13 +226,41 @@ pub fn connected_pair_one_byte_at_a_time(
 pub fn connection_with_peer_stream(
     role: Role,
 ) -> (Connection<TestByteStream, TestClock>, TestByteStream) {
+    connection_with_peer_stream_configured(role, Config::new())
+}
+
+/// The same, with a configuration the test chooses.
+///
+/// Which matters when the test is about a limit: the parameters a connection announces are the
+/// permissions its peer will have, so a peer that must find itself blocked is built by
+/// configuring the side that grants it.
+pub fn connection_with_peer_stream_configured(
+    role: Role,
+    config: Config,
+) -> (Connection<TestByteStream, TestClock>, TestByteStream) {
     let (near, far) = stream_pair();
     let conn = match role {
-        Role::Client => Connection::client(near, TestClock::new(), Config::new()),
-        Role::Server => Connection::server(near, TestClock::new(), Config::new()),
+        Role::Client => Connection::client(near, TestClock::new(), config),
+        Role::Server => Connection::server(near, TestClock::new(), config),
     }
     .expect("constructing a connection");
     (conn, far)
+}
+
+/// Writes bytes to a connection through the far end of its byte stream.
+///
+/// `TestByteStream::deliver` is the way in while a test still owns the connection's own half;
+/// once the connection has taken it, the peer's half is the only way in. It is also the more
+/// honest one for a scheduling test, because writing wakes the connection exactly as a real
+/// transport would rather than by a side door.
+pub fn peer_writes(far: &mut TestByteStream, bytes: &[u8]) {
+    let mut written = 0usize;
+    while written < bytes.len() {
+        match poll_once(|cx| far.poll_write(cx, &bytes[written..])) {
+            Poll::Ready(Ok(Written::Accepted(taken))) if taken > 0 => written += taken,
+            other => panic!("the peer's byte stream would not take the bytes: {other:?}"),
+        }
+    }
 }
 
 /// Whatever the connection has written so far, read off the far end of the byte stream.
@@ -200,7 +281,12 @@ pub fn drain_written(far: &mut TestByteStream) -> Vec<u8> {
 /// Handwritten bytes would be a second implementation of the encoding, and a test built on
 /// them would pass while the layer and the wire disagreed. These came off a connection.
 pub fn announcement_record(role: Role) -> Vec<u8> {
-    let (mut conn, mut far) = connection_with_peer_stream(role);
+    announcement_record_configured(role, Config::new())
+}
+
+/// The same, for a peer whose advertised limits the test has chosen.
+pub fn announcement_record_configured(role: Role, config: Config) -> Vec<u8> {
+    let (mut conn, mut far) = connection_with_peer_stream_configured(role, config);
     let pumped = poll_once(|cx| conn.poll_pump(cx));
     assert!(
         matches!(pumped, Poll::Ready(Ok(()))),
