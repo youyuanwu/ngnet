@@ -161,3 +161,46 @@ fn quic_wrapper_links_tls_only_when_its_backend_is_enabled() {
             .join("\n"),
     );
 }
+
+/// The QMux crates link no TLS, in any configuration.
+///
+/// Simpler than the QUIC checks above, and simpler for a reason worth stating. `ngnet-quic`
+/// needs a feature matrix because it genuinely links OpenSSL when its backend is on; QMux has
+/// no such feature and no such configuration. The protocol delegates confidentiality and
+/// integrity to whatever carries its byte stream and provides none itself, and libdwnx depends
+/// on nothing at all -- so the absence here is unconditional.
+///
+/// Asked of `readelf` rather than of the manifest for the same reason as the QUIC checks: a
+/// native library arrives through link flags a build script emits, which no manifest or
+/// `cargo tree` inspection can see.
+#[test]
+fn qmux_links_no_tls_in_any_configuration() {
+    if !platform_uses_elf() {
+        eprintln!(
+            "SKIPPED: qmux_links_no_tls_in_any_configuration -- this check reads the ELF \
+             dynamic section, and this platform does not produce ELF executables. It runs on \
+             Linux, which is what CI is."
+        );
+        return;
+    }
+
+    for package in ["ngnet-qmux-sys", "ngnet-qmux"] {
+        for binary in test_executables(&["-p", package]) {
+            let linked: Vec<String> = needed_libraries(&binary)
+                .into_iter()
+                .filter(|library| is_openssl(library))
+                .collect();
+
+            assert!(
+                linked.is_empty(),
+                "{} links OpenSSL ({}).\n\
+                 QMux has no TLS backend and libdwnx has no external dependencies, so nothing \
+                 here should reach a TLS library in any configuration.\n\
+                 Inspect it with:\n  readelf -d {}",
+                binary.display(),
+                linked.join(", "),
+                binary.display(),
+            );
+        }
+    }
+}
