@@ -7,9 +7,9 @@
 //!
 //! # Reading this honestly
 //!
-//! `docs/h2/benchmarks.md` records that grouped A/B designs on this machine are untrustworthy:
-//! unchanged control arms have drifted 5–11% inside a single session. Three things guard
-//! against mistaking that drift for a result.
+//! `docs/h2/benchmarks/controls.md` records that grouped A/B designs are untrustworthy on the
+//! host these results were taken on: unchanged control arms drifted 5–11% inside a single
+//! session. Three things guard against mistaking that drift for a result.
 //!
 //! 1. **The pairs are adjacent.** Within each size, `push` and `shared` for a transport run
 //!    back to back, so the two halves of a comparison sit as close together in time as

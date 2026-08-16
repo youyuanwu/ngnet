@@ -7,7 +7,8 @@
 //! `ngnet-h2-tokio` against `hyper-tokio` isolates the HTTP/2 stack, and `ngnet-h2-compio` against
 //! `hyper-tokio` varies both.
 //!
-//! This is where the write-path asymmetry named in `docs/h2/benchmarks.md` bites hardest: the two
+//! This is where the write-path asymmetry named in `docs/h2/benchmarks/controls.md` bites
+//! hardest: the two
 //! readiness arms buffer or borrow outbound bytes in ways the completion arm structurally
 //! cannot, so a large-body difference is partly write strategy and not purely I/O model or
 //! stack.

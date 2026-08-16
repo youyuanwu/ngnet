@@ -319,7 +319,8 @@ statically at a monomorphic construction point; a crate-private `BodyPlan` trait
 down to submission without changing any public signature. The push-model API is entirely
 unchanged, and the two paths are pinned octet-for-octet against each other. The measured
 payoff — large on the readiness transport, small and honestly *not* meeting the stated bar on
-the completion transport — is in [`benchmarks.md`](benchmarks.md).
+the completion transport — is in
+[`benchmarks/findings/handing-bodies-over.md`](benchmarks/findings/handing-bodies-over.md).
 
 ## The completion transport, and why it compiles no fallback
 
@@ -358,8 +359,9 @@ turned out to be false. The gathering path (mechanism 4 above) reaches both: it 
 multiplexed pass from one write per block to a single `writev` while copying nothing that
 the driver did not already own. Measured on the tokio transport it moved concurrent
 throughput **+109% at N=8 and +143% at N=64**, to parity with compio and slightly ahead of
-hyper, and 1 MiB body throughput up rather than down. See `benchmarks.md` for the
-numbers and the three confounds that bound them.
+hyper, and 1 MiB body throughput up rather than down. See
+`benchmarks/findings/write-path-and-gathering.md` for the numbers and
+`benchmarks/controls.md` for the three confounds that bound them.
 
 ## Decisions that cost a wrong attempt first
 

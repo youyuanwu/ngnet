@@ -82,7 +82,7 @@ test, and no more.
   io_uring. Body uploads improved where a `HEADERS` block could be folded into the first DATA
   frame's `writev` (-15% at 1 KiB, -14% at 64 KiB); at 1 MiB the effect is neutral, which is
   what was wanted there — the goal at large bodies was to avoid the copy a coalescing path
-  would have imposed, not to gain. See `benchmarks.md`.
+  would have imposed, not to gain. See `benchmarks/findings/write-path-and-gathering.md`.
 - **Neither driver write buffer is preallocated.** `gathered` and `out` both start as
   `BytesMut::new()` and grow to their steady-state high-water marks, reallocating a few times
   during warm-up before settling — which is why `http_zero_alloc.rs` measures only the steady
@@ -100,7 +100,8 @@ test, and no more.
   16 KiB DATA frames included, so its bound is the flow-control window the *peer* advertises,
   which a peer may raise. Measure before picking either; 16 KiB is unlikely to be right for
   both. Removing `out`'s per-pass allocation was worth about 4-7% to the completion transport
-  (see `benchmarks.md`), and the residual warm-up cost is what this entry is about.
+  (see `benchmarks/findings/coalescing-buffer-reuse.md`), and the residual warm-up cost is what
+  this entry is about.
 
   Two second-order effects are worth knowing before anyone revisits this, neither a defect.
   `BytesMut::reserve` folds the split offset into the requested capacity before doubling, so a
@@ -154,15 +155,20 @@ test, and no more.
   `mem_send2` call, so a large upload is one write per frame; handing the body over lets a
   whole flow-control window's worth of frames ride in one gathering write. The batch is bounded
   by the 64 KiB initial window, not by `MAX_REGIONS`, which is a guard rail rather than the
-  binding constraint. See `benchmarks.md` for the numbers, the drift controls and the
-  method.
+  binding constraint. See `benchmarks/findings/handing-bodies-over.md` for the numbers, the
+  drift controls and the method.
 
   **What is actually still open:**
 
-  - **The completion result does not clear the drift bar.** −4.07% at 1 MiB is real in sign
-    across every clean replicate, but the untouched `compio-push` control arm moved 34.94% in
-    the same sessions, so by the stated criterion it is **not** a demonstrated win. It needs a
-    quieter machine and a pre-registered replicate count, not more argument.
+  - **The completion result now clears the drift bar, on the second machine to ask.** −4.07% at
+    1 MiB was real in sign across every clean replicate on the legacy host, but the untouched
+    `compio-push` control arm moved 34.94% in the same sessions, so by the stated criterion it
+    was not a demonstrated win. Re-measured on a host that drifts ~1%, over five replicates, it
+    is −4.55% against a 1.92% control spread and negative in every replicate: **MET**. What is
+    still open is smaller and newer — below 64 KiB the completion transport is measurably
+    *slower* with a handed-over body (+1.99% at 1 KiB), which no design note predicted, and the
+    replicate count on the settling run was extended from two to five rather than
+    pre-registered. See `benchmarks/data/xeon-8370c-azure/03-shared-body.md`.
   - **The opt-in is per connection, not per body.** A caller who wants to hand over some bodies
     and generate others on one connection cannot; they get the shared path for all of them, and
     a source that genuinely generates bytes gains nothing from it. Making this per-body would
@@ -299,8 +305,10 @@ These are not gaps. They are decisions, recorded so they are not mistaken for ov
 
   The case where coalescing is expected to win is **emulated** gathering at high region counts,
   where the emulating loop degenerates toward one syscall per region. That case is **identified
-  structurally and has never been measured on this machine.** No number in this repository
-  belongs to it. In particular the 68.3 Kelem/s that appears in `benchmarks.md` is the removed
+  structurally and has never been measured on any machine on record.** No number in this
+  repository
+  belongs to it. In particular the 68.3 Kelem/s recorded in
+  `benchmarks/data/legacy-dev-host/02-gathering-path.md` is the removed
   *per-block* drain, not emulated gathering, and citing it here would be the same conflation
   this document corrected once already. Emulated gathering accumulates in the driver first, so
   small blocks collapse into one region before the emulating loop sees them.
