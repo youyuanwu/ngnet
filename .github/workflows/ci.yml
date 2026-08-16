@@ -128,6 +128,15 @@ jobs:
       - name: Test (HTTP/3 over ngtcp2, release)
         run: cargo test -p ngnet-quic-h3 -p ngnet-quic-h3-tests --release
 
+      # And the same argument for the other join. libdwnx checks its own invariants with
+      # ninety-odd `assert()` calls, every one of which `NDEBUG` removes from a release
+      # build, so the workspace runs above and this one exercise materially different C. The
+      # Rust side gains something too: the large-body and concurrency tests here move
+      # megabytes through the record layer, and debug builds are slow enough that a
+      # performance regression hides in the noise rather than showing up as a timeout.
+      - name: Test (HTTP/3 over QMux, release)
+        run: cargo test -p ngnet-qmux-h3 -p ngnet-qmux-h3-tests --release
+
       # Sixteen configurations that differ only in a package and its features, so they are one
       # step iterating a list rather than ten near-identical steps. The list is the whole
       # point of the step: a configuration is added by adding a line, and the reason it
@@ -211,6 +220,14 @@ jobs:
           QMux sans-I/O core alone                 | -p ngnet-qmux --no-default-features
           QMux wrapper, all features               | -p ngnet-qmux --all-features
 
+          # The HTTP/3-over-QMux join, for the same reason its ngtcp2 sibling gets one line:
+          # it is nothing but the join between two async layers, so it has no features to
+          # vary. Its integration crate rides along in the same invocation because that crate
+          # keeps its harness in `src/lib.rs` rather than behind [dev-dependencies], which
+          # makes it an ordinary library that `--all-targets` would otherwise lint only when
+          # something else happened to build it.
+          HTTP/3 over QMux                         | -p ngnet-qmux-h3 -p ngnet-qmux-h3-tests
+
           # `ngnet-axum` has no feature matrix -- axum, tokio and the h2 transport are all
           # unconditional -- so unlike the crates above it needs exactly one invocation
           # rather than one per configuration.
@@ -221,7 +238,7 @@ jobs:
           client policy layer                      | -p ngnet-util
           CONFIGURATIONS
 
-      # Twenty-two invocations that differ only in packages and features, collapsed the same
+      # Twenty-four invocations that differ only in packages and features, collapsed the same
       # way as clippy above, and for the same reasons -- including that a `strategy.matrix`
       # would put each on its own runner and rebuild the C libraries for every one.
       #
@@ -294,6 +311,8 @@ jobs:
           QMux wrapper, default features           | -p ngnet-qmux
           QMux sans-I/O core alone                 | -p ngnet-qmux --no-default-features
           QMux wrapper, all features               | -p ngnet-qmux --all-features
+          HTTP/3 over QMux                         | -p ngnet-qmux-h3
+          HTTP/3-over-QMux tests                   | -p ngnet-qmux-h3-tests
 
           # One invocation each, for the same reason as their clippy entries: no features to
           # vary.

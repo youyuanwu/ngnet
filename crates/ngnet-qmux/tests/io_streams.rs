@@ -351,3 +351,151 @@ fn each_endpoint_reports_its_own_role() {
         "the first stream belongs to the client, which is what makes the roles asymmetric"
     );
 }
+
+/// A record that takes part of a payload and then runs out of window still reports the count.
+///
+/// The two facts a write returns -- how much was taken, and why no more was -- can both be
+/// true at once, because one record can pack some of the payload and only then find the
+/// window exhausted. Those bytes are in the record and the record goes to the peer, so a
+/// caller told only "blocked" offers them a second time and the stream carries them twice.
+/// The peer then reads a duplicated fragment inside a frame it was told the length of, which
+/// is a protocol failure some distance from its cause.
+///
+/// The window is deliberately not a multiple of the offer size, so the boundary falls partway
+/// through a write rather than neatly between two.
+#[test]
+fn a_partly_taken_write_reports_what_it_took_even_when_it_then_blocks() {
+    const WINDOW: u64 = 3_000;
+    const OFFER: usize = 700;
+    let config = Config::new()
+        .initial_max_stream_data(WINDOW)
+        .initial_max_data(WINDOW);
+    let (mut client, mut server) = connected_pair(config);
+
+    let payload = vec![0x5au8; 8_192];
+
+    let (sent, received) = run_pair(
+        async {
+            let stream = open_bidi(&mut client).await.expect("opening a stream");
+            let mut sent = 0usize;
+            loop {
+                let end = (sent + OFFER).min(payload.len());
+                match client
+                    .try_write_stream(stream, &payload[sent..end], false)
+                    .expect("a write outcome")
+                {
+                    StreamWrite::Accepted(taken) => sent += taken,
+                    StreamWrite::Blocked | StreamWrite::Closed => break,
+                }
+                flush(&mut client).await.expect("flushing");
+            }
+            flush(&mut client).await.expect("flushing");
+            sent
+        },
+        async {
+            let mut received = 0usize;
+            // Exactly the window's worth arrives and then nothing does, so the read stops
+            // when the count reaches it rather than on an end this test never sends.
+            while (received as u64) < WINDOW {
+                if let Event::StreamData { data, .. } =
+                    next_event(&mut server).await.expect("an event")
+                {
+                    received += data.len();
+                }
+            }
+            received
+        },
+    );
+
+    assert_eq!(
+        sent as u64, WINDOW,
+        "every byte the window allowed must be reported as accepted; a count dropped because \
+         the same record also reported a block is a byte the caller will send again"
+    );
+    assert_eq!(
+        received as u64, WINDOW,
+        "and the peer must receive exactly those bytes, which is what a resend would break"
+    );
+}
+
+/// Writing to a stream that no longer exists is a closed stream, not a dead connection.
+///
+/// A caller above this layer holds a queue of bytes per stream, and a stream can finish --
+/// or be torn down by either end -- while that queue still has something in it. The offer
+/// that follows names a stream the state machine has already forgotten and disposed of.
+/// Treating that as a failed record would kill a connection carrying every other exchange
+/// every time one exchange ended with bytes still queued behind it.
+///
+/// Both ends finish the stream here, which is what makes it *gone* rather than half-closed:
+/// a stream with either half still open is still a stream the write path finds, and it
+/// answers with a shut write side instead.
+#[test]
+fn writing_to_a_stream_that_is_gone_is_reported_rather_than_fatal() {
+    let (mut client, mut server) = connected_pair(Config::new());
+
+    let (outcome, answered) = run_pair(
+        async {
+            let stream = open_bidi(&mut client).await.expect("opening a stream");
+            write_all(&mut client, stream, b"a question", true)
+                .await
+                .expect("writing");
+            flush(&mut client).await.expect("flushing");
+
+            // Reading the server's end-of-stream is what completes the stream, and a
+            // completed stream is one the state machine disposes of.
+            loop {
+                if let Event::StreamData { fin, .. } =
+                    next_event(&mut client).await.expect("an event")
+                    && fin
+                {
+                    break;
+                }
+            }
+
+            let outcome = client
+                .try_write_stream(stream, b"an afterthought", true)
+                .expect("a write to a departed stream is an outcome, not an error");
+
+            // The connection has to still work, which a fatal ending would not allow.
+            let another = open_bidi(&mut client)
+                .await
+                .expect("opening another stream");
+            write_all(&mut client, another, b"still here", true)
+                .await
+                .expect("writing on a fresh stream");
+            flush(&mut client).await.expect("flushing");
+            outcome
+        },
+        async {
+            let mut answered = None;
+            loop {
+                match next_event(&mut server).await.expect("an event") {
+                    Event::StreamData { stream_id, fin, .. } if fin && answered.is_none() => {
+                        write_all(&mut server, stream_id, b"an answer", true)
+                            .await
+                            .expect("answering");
+                        flush(&mut server).await.expect("flushing");
+                        answered = Some(stream_id);
+                    }
+                    Event::StreamData {
+                        data, fin: true, ..
+                    } if data == b"still here" => {
+                        return answered.expect("the first stream was answered");
+                    }
+                    _ => {}
+                }
+            }
+        },
+    );
+
+    assert_eq!(
+        outcome,
+        StreamWrite::Closed,
+        "a stream the state machine no longer has takes no more bytes, and says so"
+    );
+    assert_eq!(
+        answered.get(),
+        0,
+        "and the exchange that finished was the client's first stream"
+    );
+}

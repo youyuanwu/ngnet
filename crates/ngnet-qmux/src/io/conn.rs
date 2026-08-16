@@ -629,16 +629,23 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
                 Ok(Some(produced)) => produced,
             };
 
+            // Counted before the verdict is read, and for every verdict. A record that took
+            // part of the payload and *then* ran out of window reports both the count and the
+            // refusal, and the bytes it took are already on their way to the peer: dropping
+            // the count because the verdict was a refusal would have the caller offer them a
+            // second time and the stream would carry them twice.
+            written += produced.consumed;
+
             match produced.verdict {
-                Verdict::Closed => {
+                Verdict::Closed if written == 0 => {
                     return Poll::Ready(Err(Error::new(
                         ErrorKind::Internal,
                         "the stream's write side is closed",
                     )));
                 }
+                Verdict::Closed => return Poll::Ready(Ok(written)),
                 Verdict::Blocked => return self.park_write(cx, written),
                 Verdict::Packed => {
-                    written += produced.consumed;
                     if written == data.len() {
                         return Poll::Ready(Ok(written));
                     }
@@ -687,11 +694,18 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         }
 
         let produced = self.produce(WriteRequest::stream(stream, data).with_fin(fin))?;
+        // The count outranks the verdict. A record can take part of the payload and only then
+        // find the window exhausted, and those bytes leave on the next pump whatever the
+        // verdict says; answering `Blocked` and losing the count would have the caller offer
+        // them again and the peer would receive them twice.
+        if produced.consumed > 0 {
+            return Ok(StreamWrite::Accepted(produced.consumed));
+        }
         Ok(match produced.verdict {
             Verdict::Closed => StreamWrite::Closed,
             Verdict::Blocked => StreamWrite::Blocked,
-            Verdict::Packed if produced.consumed == 0 && !data.is_empty() => StreamWrite::Blocked,
-            Verdict::Packed => StreamWrite::Accepted(produced.consumed),
+            Verdict::Packed if !data.is_empty() => StreamWrite::Blocked,
+            Verdict::Packed => StreamWrite::Accepted(0),
         })
     }
 
@@ -1121,6 +1135,19 @@ enum OpenKind {
 /// finalises the record so dwnx stops writing through the buffer -- and discards the bytes,
 /// having already advanced the send offset of any stream whose data went in. The caller must
 /// fail the connection rather than try again.
+///
+/// One class of failure is exempt, and the exemption is load-bearing. A push naming a stream
+/// the state machine no longer has -- because it was reset, by either end, since the caller
+/// last looked -- is refused before the record is begun, so nothing has been packed and
+/// nothing has been lost. It is reported as a closed stream, which is what it is. Treating it
+/// as fatal instead kills a working connection every time a caller offers bytes for a stream
+/// that was reset while those bytes were queued, which is the ordinary shape of a cancelled
+/// exchange rather than an edge case: the caller above holds a backlog, the reset discards
+/// it, and the next offer names a stream that is gone.
+///
+/// The exemption is conditional on nothing having been consumed yet. Once part of the
+/// payload is in the record, a refusal is no longer the simple "this stream cannot take
+/// bytes" it appears to be, and the caller has an accepted count to be told about instead.
 fn pack(
     conn: &mut Conn<'static>,
     scratch: &mut [u8],
@@ -1139,7 +1166,15 @@ fn pack(
             data: remaining,
             fin: request.fin,
         };
-        match writer.push(step)? {
+        let pushed = match writer.push(step) {
+            Ok(pushed) => pushed,
+            Err(error) if consumed == 0 && error.kind() == crate::ErrorKind::Stream => {
+                verdict = Verdict::Closed;
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        match pushed {
             Push::Accepted { consumed: taken } => {
                 let taken = taken.unwrap_or(0);
                 consumed += taken;

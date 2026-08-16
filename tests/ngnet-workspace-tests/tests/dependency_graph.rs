@@ -250,22 +250,31 @@ fn no_hyper_reaches_the_client_policy_layer() {
     );
 }
 
-/// The HTTP/3 wrapper does not reach a QUIC implementation.
+/// The HTTP/3 wrapper does not reach a transport implementation.
 ///
 /// `ngnet-h3` is a state machine over nghttp3 and nothing else. It defines a transport
 /// abstraction and takes whatever implements it, which is what lets a caller run HTTP/3 over
-/// quinn, over this workspace's own QUIC stack, or over something not written yet.
+/// quinn, over this workspace's own QUIC stack, over QMux, or over something not written yet.
 ///
-/// The workspace now contains a crate that implements that abstraction over `ngnet-quic`. The
-/// risk this check exists for is that the adapter, or something it drags in, ends up in
-/// `ngnet-h3`'s own graph — at which point a caller who wanted HTTP/3 and a different
-/// transport is compiling ngtcp2 and OpenSSL for nothing, and the abstraction has quietly
-/// stopped being one.
+/// The workspace now contains two crates implementing that abstraction: one over `ngnet-quic`
+/// and one over `ngnet-qmux`. That is precisely when this check starts to matter. With a
+/// single adapter a stray dependency would be a mild waste; with two, `ngnet-h3` depending on
+/// either one would force every caller of the other to compile a transport they will never
+/// instantiate — ngtcp2 and OpenSSL for the QMux user, ngtcp2-less QMux bindings for the QUIC
+/// user — and the abstraction would have quietly stopped being one.
 #[test]
 fn the_http3_wrapper_reaches_no_quic_implementation() {
     let tree = cargo_tree(&["-p", "ngnet-h3", "-e", "normal"]);
 
-    for forbidden in ["ngnet-quic", "ngnet-quic-sys", "ngnet-quic-h3", "quinn"] {
+    for forbidden in [
+        "ngnet-quic",
+        "ngnet-quic-sys",
+        "ngnet-quic-h3",
+        "ngnet-qmux",
+        "ngnet-qmux-sys",
+        "ngnet-qmux-h3",
+        "quinn",
+    ] {
         assert!(
             !contains_at_word_boundary(&tree, forbidden),
             "{forbidden} reached ngnet-h3's normal dependency graph.\n\
@@ -310,6 +319,42 @@ fn the_adapter_depends_on_both_families() {
              Check with:\n  cargo tree -p ngnet-quic-h3 -e normal\n\
              This crate exists to join the two families; without both there is nothing to \
              join.\n\n{tree}",
+        );
+    }
+}
+
+/// The QMux join is the second, and only other, place the two families meet.
+///
+/// `ngnet-qmux-h3` is the permitted exception to every negative check in this file that names
+/// a QMux crate and an HTTP/3 crate together: it exists to implement `ngnet-h3`'s transport
+/// trait over `ngnet-qmux`'s connection, so it must reach both, and a check that forbade the
+/// combination outright would forbid the crate.
+///
+/// Stating the positive separately is what keeps the exception honest. The alternative — just
+/// leaving `ngnet-qmux-h3` off the forbidden lists — would be satisfied equally well by a
+/// crate that had lost one of its two halves, or by no crate at all. This asserts the join is
+/// still a join.
+#[test]
+fn the_qmux_adapter_depends_on_both_families() {
+    let tree = cargo_tree(&["-p", "ngnet-qmux-h3", "-e", "normal"]);
+
+    for required in ["ngnet-h3", "ngnet-qmux"] {
+        assert!(
+            contains_at_word_boundary(&tree, required),
+            "{required} is missing from ngnet-qmux-h3's normal dependency graph.\n\
+             Check with:\n  cargo tree -p ngnet-qmux-h3 -e normal\n\
+             This crate exists to join HTTP/3 to QMux; without both there is nothing to \
+             join.\n\n{tree}",
+        );
+    }
+
+    for forbidden in ["ngnet-quic", "ngnet-quic-sys", "quinn", "openssl-sys"] {
+        assert!(
+            !contains_at_word_boundary(&tree, forbidden),
+            "{forbidden} reached ngnet-qmux-h3's normal dependency graph.\n\
+             Find it with:\n  cargo tree -p ngnet-qmux-h3 -e normal -i {forbidden}\n\
+             Joining HTTP/3 to QMux needs no QUIC implementation and no TLS: QMux runs over a \
+             byte stream the caller supplies.\n\n{tree}",
         );
     }
 }
@@ -444,6 +489,11 @@ fn the_qmux_tokio_feature_is_what_reaches_tokio() {
 /// over a byte stream the caller supplies; it has no UDP, no packets, and no cryptography of
 /// its own, and the draft explicitly permits carrying it over an unsecured substrate such as a
 /// unix socket. A caller who wants QMux should not be compiling ngtcp2 or OpenSSL to get it.
+///
+/// `ngnet-qmux-h3` is on the forbidden list rather than exempt from it. The join depends on
+/// QMux, not the other way round, and an edge in the reverse direction would drag nghttp3 into
+/// every plain QMux build — the exact cost this check exists to prevent, arriving through the
+/// one crate that has a plausible-looking reason to be there.
 #[test]
 fn no_other_protocol_stack_or_tls_reaches_qmux() {
     for crate_name in ["ngnet-qmux", "ngnet-qmux-sys"] {
@@ -453,6 +503,7 @@ fn no_other_protocol_stack_or_tls_reaches_qmux() {
             "ngnet-quic",
             "ngnet-quic-sys",
             "ngnet-quic-h3",
+            "ngnet-qmux-h3",
             "ngnet-h2",
             "ngnet-h2-sys",
             "ngnet-h3",
@@ -480,6 +531,14 @@ fn no_other_protocol_stack_or_tls_reaches_qmux() {
 /// The check above keeps QMux from growing into the rest of the workspace; this one keeps the
 /// rest of the workspace from growing into QMux. Both crates are unpublished and expected to
 /// churn with the draft, so anything depending on them inherits that churn.
+///
+/// `ngnet-qmux-h3` is deliberately absent from the list, and its absence is the whole point of
+/// the list being spelled out crate by crate rather than derived from workspace membership.
+/// The join is new, unpublished and expected to churn alongside QMux itself, so it is allowed
+/// to take the dependency; every crate that predates QMux is not. Adding a member here is the
+/// deliberate act that decides which side of that line a new crate falls on, and
+/// `the_qmux_adapter_depends_on_both_families` above asserts the exception is a real crate
+/// joining two real families rather than a hole in the check.
 #[test]
 fn no_existing_crate_reaches_qmux() {
     for crate_name in [
@@ -492,7 +551,7 @@ fn no_existing_crate_reaches_qmux() {
     ] {
         let tree = cargo_tree(&["-p", crate_name, "-e", "normal"]);
 
-        for forbidden in ["ngnet-qmux", "ngnet-qmux-sys"] {
+        for forbidden in ["ngnet-qmux", "ngnet-qmux-sys", "ngnet-qmux-h3"] {
             assert!(
                 !contains_at_word_boundary(&tree, forbidden),
                 "{forbidden} reached {crate_name}'s normal dependency graph.\n\

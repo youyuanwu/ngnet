@@ -11,12 +11,14 @@ members = [
     "crates/ngnet-quic-h3",
     "crates/ngnet-qmux-sys",
     "crates/ngnet-qmux",
+    "crates/ngnet-qmux-h3",
     "crates/ngnet-util",
     "tests/ngnet-h2-tests",
     "tests/ngnet-h2-bench",
     "tests/ngnet-h3-tests",
     "tests/ngnet-quic-tests",
     "tests/ngnet-quic-h3-tests",
+    "tests/ngnet-qmux-h3-tests",
     "tests/ngnet-workspace-tests",
 ]
 
@@ -84,11 +86,13 @@ ngnet-quic = { path = "crates/ngnet-quic" }
 # reaches the other.
 ngnet-qmux-sys = { path = "crates/ngnet-qmux-sys" }
 ngnet-qmux = { path = "crates/ngnet-qmux" }
-# The one crate allowed to depend on both families, and the only place they meet. Keeping
-# the adapter here rather than in either of them is what lets a caller take HTTP/3 without
-# a QUIC implementation, or QUIC without an HTTP/3 state machine; a workspace test asserts
-# that neither family reaches the other.
+# The two crates allowed to depend on both an HTTP/3 state machine and a transport family,
+# and the only places those families meet. Keeping the adapters here rather than in either
+# side is what lets a caller take HTTP/3 without a transport implementation, or a transport
+# without an HTTP/3 state machine; a workspace test asserts that no other crate joins them,
+# and that neither transport family reaches the other.
 ngnet-quic-h3 = { path = "crates/ngnet-quic-h3" }
+ngnet-qmux-h3 = { path = "crates/ngnet-qmux-h3" }
 ngnet-util = { path = "crates/ngnet-util" }
 # Build-time only, and only for the `crypto-ossl` feature of `ngnet-quic-sys`:
 # it locates the system OpenSSL that ngtcp2's crypto helper is compiled against.

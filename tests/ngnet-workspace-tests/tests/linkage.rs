@@ -173,6 +173,13 @@ fn quic_wrapper_links_tls_only_when_its_backend_is_enabled() {
 /// Asked of `readelf` rather than of the manifest for the same reason as the QUIC checks: a
 /// native library arrives through link flags a build script emits, which no manifest or
 /// `cargo tree` inspection can see.
+///
+/// `ngnet-qmux-h3` is inspected alongside the two QMux crates because it is the one place the
+/// property could plausibly break. It links nghttp3 as well as libdwnx, and a caller running
+/// HTTP/3 over QMux is the caller most likely to assume TLS is in the picture somewhere --
+/// it is HTTP/3, after all. It is not: the join adds an HTTP layer and no cryptography, and
+/// if OpenSSL ever appeared under it, that would be a transport arriving by accident rather
+/// than a decision anyone made.
 #[test]
 fn qmux_links_no_tls_in_any_configuration() {
     if !platform_uses_elf() {
@@ -184,7 +191,7 @@ fn qmux_links_no_tls_in_any_configuration() {
         return;
     }
 
-    for package in ["ngnet-qmux-sys", "ngnet-qmux"] {
+    for package in ["ngnet-qmux-sys", "ngnet-qmux", "ngnet-qmux-h3"] {
         for binary in test_executables(&["-p", package]) {
             let linked: Vec<String> = needed_libraries(&binary)
                 .into_iter()
