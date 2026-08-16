@@ -316,13 +316,20 @@ fn the_adapter_depends_on_both_families() {
 
 /// The QMux core depends only on its bindings.
 ///
-/// The same claim `http3_core_depends_only_on_its_bindings` makes, for the newest pair. It is
-/// stricter here than there, because `ngnet-qmux` has no features at all: there is no TLS
-/// backend to gate and no I/O layer to make optional, so the single dependency holds
-/// unconditionally rather than only under `--no-default-features`.
+/// The same claim `http3_core_depends_only_on_its_bindings` makes, for the newest pair, and
+/// asked the same way: with `--no-default-features`, because `ngnet-qmux` now has an
+/// asynchronous layer behind a default-on `io` feature. This is the sans-I/O crate as it
+/// existed before that layer, and the claim is that turning the layer off leaves it
+/// unchanged -- which is what Spec SC-005 asks for and what a caller who wants a state machine
+/// and nothing else is buying.
+///
+/// The shape of the assertion is not incidental. `cargo tree` prints the crate itself on the
+/// first line and one line per dependency after it, so "exactly one dependency" is "exactly
+/// one line after the first". Counting alone would pass for any single dependency at all, so
+/// the name on that line is checked too.
 #[test]
 fn qmux_core_depends_only_on_its_bindings() {
-    let tree = cargo_tree(&["-p", "ngnet-qmux", "-e", "normal"]);
+    let tree = cargo_tree(&["-p", "ngnet-qmux", "--no-default-features", "-e", "normal"]);
     let dependencies: Vec<&str> = tree
         .lines()
         .skip(1)
@@ -334,15 +341,99 @@ fn qmux_core_depends_only_on_its_bindings() {
         1,
         "the QMux core's dependency graph is no longer just its bindings: expected exactly \
          one dependency, found {}.\n\
-         Inspect it with:\n  cargo tree -p ngnet-qmux -e normal\n\n{tree}",
+         Inspect it with:\n  \
+         cargo tree -p ngnet-qmux --no-default-features -e normal\n\n{tree}",
         dependencies.len(),
     );
 
     assert!(
         dependency_name(dependencies[0]) == "ngnet-qmux-sys",
         "the QMux core has exactly one dependency, but it is not its bindings: it is `{}`.\n\
+         Inspect it with:\n  \
+         cargo tree -p ngnet-qmux --no-default-features -e normal\n\n{tree}",
+        dependency_name(dependencies[0]),
+    );
+}
+
+/// The default build -- the asynchronous layer included -- still reaches no runtime.
+///
+/// The claim that makes the seam a seam. `ngnet-qmux`'s default features compile a layer that
+/// owns a byte stream and drives a connection over it, and the caller supplies both the byte
+/// stream and the clock; if a runtime appeared in this graph, that would have stopped being
+/// true and every caller would be paying for tokio whether they use it or not.
+///
+/// Asked with default features on, which is the configuration a caller gets by writing
+/// `ngnet-qmux = "..."` and the one where feature unification across the workspace could go
+/// wrong. The neighbouring claim about the *manifest* -- that tokio is declared optional and
+/// gated behind `dep:` -- lives in `crates/ngnet-qmux/tests/invariants.rs`; a dependency
+/// arriving transitively would move this one while leaving that one green.
+#[test]
+fn the_qmux_async_layer_brings_no_runtime() {
+    let tree = cargo_tree(&["-p", "ngnet-qmux", "-e", "normal"]);
+    let dependencies: Vec<&str> = tree
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+
+    assert_eq!(
+        dependencies.len(),
+        1,
+        "the default build of ngnet-qmux resolved to more than its bindings: expected exactly \
+         one dependency, found {}. The asynchronous layer was added on the promise that it \
+         adds nothing to the dependency graph.\n\
+         Inspect it with:\n  cargo tree -p ngnet-qmux -e normal\n\n{tree}",
+        dependencies.len(),
+    );
+
+    assert!(
+        dependency_name(dependencies[0]) == "ngnet-qmux-sys",
+        "the default build has exactly one dependency and it is not its bindings: it is \
+         `{}`.\n\
          Inspect it with:\n  cargo tree -p ngnet-qmux -e normal\n\n{tree}",
         dependency_name(dependencies[0]),
+    );
+}
+
+/// And the `tokio` feature is what actually reaches tokio.
+///
+/// The positive half, and it needs making separately. Every check around it is a negative --
+/// no runtime here, none there -- and a version of this crate whose `tokio` feature had been
+/// misspelled, or whose optional dependency had been dropped, would satisfy all of them while
+/// shipping a feature that enables nothing. A feature that quietly stopped doing anything is
+/// the failure mode a list of absences cannot catch.
+///
+/// Only the *direct* dependencies are checked. tokio brings its own transitive graph, which is
+/// tokio's business and not a property of this crate; what matters here is that nothing new
+/// arrives alongside it at the top level.
+#[test]
+fn the_qmux_tokio_feature_is_what_reaches_tokio() {
+    let tree = cargo_tree(&["-p", "ngnet-qmux", "--features", "tokio", "-e", "normal"]);
+
+    assert!(
+        contains_at_word_boundary(&tree, "tokio"),
+        "the `tokio` feature did not bring tokio into ngnet-qmux's graph, so it is a feature \
+         that enables nothing.\n\
+         Inspect it with:\n  cargo tree -p ngnet-qmux --features tokio -e normal\n\n{tree}",
+    );
+
+    // `cargo tree`'s direct dependencies are the lines whose prefix has no continuation
+    // character before the branch: nesting indents by four columns per level, so a direct
+    // dependency's box-drawing prefix starts at column zero.
+    let direct: Vec<String> = tree
+        .lines()
+        .skip(1)
+        .filter(|line| line.starts_with('\u{251c}') || line.starts_with('\u{2514}'))
+        .map(dependency_name)
+        .collect();
+
+    assert_eq!(
+        direct,
+        vec!["ngnet-qmux-sys".to_string(), "tokio".to_string()],
+        "the `tokio` feature brought something other than tokio into ngnet-qmux's direct \
+         dependencies. It is meant to add a ready-made byte stream and clock, and nothing \
+         else.\n\
+         Inspect it with:\n  cargo tree -p ngnet-qmux --features tokio -e normal\n\n{tree}",
     );
 }
 

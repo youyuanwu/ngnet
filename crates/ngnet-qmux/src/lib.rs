@@ -16,13 +16,26 @@
 //! TLS over TCP is the recommended substrate because it supplies all of those at once, but
 //! this crate neither requires nor provides it.
 //!
-//! # Sans-I/O
+//! # Sans-I/O, and the layer above it
 //!
-//! This crate never touches a socket, spawns a thread, or reads a clock. A caller feeds
+//! The state machine never touches a socket, spawns a thread, or reads a clock. A caller feeds
 //! inbound bytes to [`Conn::read`] as they arrive, and asks [`Conn::write`] to serialise
-//! outbound bytes into a buffer to hand to whatever carries them. Supplying and driving that
-//! transport is the caller's job, which is what makes the crate usable on any runtime, or
-//! none.
+//! outbound bytes into a buffer to hand to whatever carries them.
+//!
+//! There are two builds of this crate, and which one a caller gets is a cargo feature:
+//!
+//! - **`--no-default-features`** is the state machine alone: one dependency, no asynchrony,
+//!   and the public API listed below. Everything a caller needs to drive QMux by hand from
+//!   blocking code, from a runtime this crate has never heard of, or from a test with no
+//!   runtime at all.
+//! - **default features** additionally compile the `io` layer, an asynchronous layer that owns
+//!   an established byte stream and drives a connection over it. It still names no runtime:
+//!   the caller describes their byte stream and their clock through two traits, and a
+//!   ready-made description for tokio ships behind the off-by-default `tokio` feature.
+//!
+//! The layer is on by default because driving the state machine by hand is the unusual case,
+//! not the common one. It costs a caller who does not want it exactly one feature flag, and
+//! costs them nothing in dependencies either way.
 //!
 //! # Panics in handlers abort
 //!
@@ -33,8 +46,9 @@
 //! # Scope
 //!
 //! One connection at a time from the state machine, client or server. There is no endpoint
-//! layer, no runtime integration, and no way to serialise a connection close -- dwnx exposes
-//! no function for the last of these. See `docs/qmux/pending-work.md`.
+//! layer, no listener, no accept loop, and no way to serialise a connection close from the
+//! state machine itself -- dwnx exposes no function for the last of these. See
+//! `docs/qmux/pending-work.md`.
 //!
 //! [dwnx]: https://github.com/ngtcp2/dwnx
 //! [QMux]: https://datatracker.ietf.org/doc/html/draft-ietf-quic-qmux
@@ -48,7 +62,10 @@
 // this file so the two cannot disagree.
 //
 // Module files are deliberately flat -- `conn.rs`, never `conn/mod.rs` -- because that test
-// derives a module's name from its file stem.
+// derives a module's name from its file stem. The `io` subtree below is the one exception, and
+// it earns it by containing no `unsafe` at all: it is declared without an allowance, so the
+// crate-level deny above rejects any `unsafe` in it outright, and a separate test pins that no
+// file beneath it grants itself one.
 #[allow(unsafe_code)]
 mod callbacks;
 #[allow(unsafe_code)]
@@ -70,6 +87,12 @@ mod write;
 
 mod handlers;
 mod time;
+
+// The asynchronous layer, behind the default-on `io` feature. Declared with **no**
+// `#[allow(unsafe_code)]`, unlike the FFI modules above, so the crate-level deny makes any
+// `unsafe` below it a compile error rather than a code-review question.
+#[cfg(feature = "io")]
+pub mod io;
 
 // Doctest-only: each item is a `compile_fail` case pinning something the API makes
 // impossible to write. Nothing is exported.

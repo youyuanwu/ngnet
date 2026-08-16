@@ -45,13 +45,31 @@ moves rather than when this crate does.
 | **The six write outcomes are distinguishable** | `tests/events.rs` and `tests/transfer.rs` between them produce a completed record, an idle connection, `WRITE_MORE`, a flow-control-blocked stream, a closed write side, and a too-small buffer. The last is the one that would otherwise be indistinguishable from idle, since dwnx answers `0` for both. |
 | **Records may be split across reads arbitrarily** | `crates/ngnet-qmux/tests/transfer.rs` runs the same transfer twice, once in bulk and once feeding a single byte at a time, and requires identical observed events. A real transport does not preserve write boundaries, so this is not a synthetic case. |
 
+## Enforced about the crate's structure
+
+In `crates/ngnet-qmux/tests/invariants.rs`, which reads the crate's own source and manifest.
+These are not the questions `tests/ngnet-workspace-tests` asks: those assert what the resolved
+dependency graph *contains*, and these assert what the crate *declares*.
+
+| Property | Why it is asked this way |
+| --- | --- |
+| **`unsafe` appears only in the modules `lib.rs` grants it to, and every grant is used** | The compiler already rejects a stray `unsafe`, because of the crate-level `#![deny(unsafe_code)]`. What it cannot express is which modules may carry the `#[allow]` that silences it, or that a grant nothing needs has been left behind. The expected list is named explicitly as well as derived, since both could otherwise grow together. |
+| **The asynchronous layer contains no `unsafe`, and grants itself none** | The layer is declared in `lib.rs` with no allowance, so the crate-level deny is what enforces it — this is the compiler-enforced form of the claim, not a grep standing in for one. The test guards the enforcement rather than the property: an `#[allow(unsafe_code)]` inside the subtree is exactly how it would be lost. |
+| **Nothing outside the layer names an async facility** | `--no-default-features` is meant to be the state machine as it existed before the layer, so a `Waker` or an `async fn` outside `src/io/` would make that false while everything still compiled. |
+| **The layer names no executor, spawner or timer** | It is allowed to be asynchronous; that is what it is for. It is not allowed to bring a runtime, because the caller keeps that choice. |
+| **The manifest declares one non-optional dependency, gates every optional one behind `dep:`, and takes no dev-dependencies** | An optional dependency no feature names is still built whenever anything in the workspace enables it, which would make the claim true of the manifest and false of the artefact. |
+| **`default = ["io"]`, `io = []`, and `tokio` implies `io` and `dep:tokio`** | The feature table is the whole of "the layer is on by default and the runtime is not" as a caller experiences it, and it is a single line away from being silently untrue. |
+| **A caller never needs `unsafe`** | The tests are the crate's own callers, including the one that implements the byte-stream seam — which is the new way a caller extends this crate, and the place a `Send` bound or a raw pointer would have forced `unsafe` on them. |
+
 ## Enforced about the workspace
 
 In `tests/ngnet-workspace-tests/`.
 
 | Property | Why it is asked this way |
 | --- | --- |
-| **`ngnet-qmux` has exactly one dependency, and it is its bindings** | `dependency_graph.rs`. Counting alone would pass for any single dependency, so the name is checked too. Stricter than the equivalent HTTP/3 check, which needs `--no-default-features`: `ngnet-qmux` has no features at all. |
+| **`ngnet-qmux` has exactly one dependency, and it is its bindings** | `dependency_graph.rs`, asked with `--no-default-features` as the HTTP/3 equivalent is, now that the asynchronous layer sits behind a default-on `io` feature. Counting alone would pass for any single dependency, so the name is checked too. |
+| **The default build reaches no runtime either** | `dependency_graph.rs`. The claim that makes the seam a seam: enabling the asynchronous layer adds code and no dependencies. Asked with default features on, because that is what a caller gets by naming the crate and where feature unification could go wrong. |
+| **The `tokio` feature is what reaches tokio** | `dependency_graph.rs`. The positive half, and it needs asking separately: every neighbouring check is an absence, and a feature that had quietly stopped enabling anything would satisfy all of them. Only the direct dependencies are pinned, so tokio's own graph stays tokio's business. |
 | **QMux reaches no other protocol stack, TLS, or runtime** | `dependency_graph.rs`. The names invite confusion, since QMux comes from the ngtcp2 authors and reuses QUIC's frame encoding, but the two share no code here. |
 | **Nothing established reaches QMux** | `dependency_graph.rs`. The reverse direction, and it needs asking separately. Both crates are unpublished and track an unratified draft, so anything depending on them inherits that churn. |
 | **No QMux binary links OpenSSL** | `linkage.rs`, via `readelf`. A native library arrives through link flags a build script emits, which no manifest inspection or `cargo tree` check can see. Unconditional here, unlike the QUIC equivalent that needs a feature matrix, because QMux has no TLS backend to turn on. |

@@ -1117,6 +1117,7 @@ name = "ngnet-qmux"
 version = "0.1.0"
 dependencies = [
  "ngnet-qmux-sys",
+ "tokio",
 ]
 
 [[package]]

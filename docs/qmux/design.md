@@ -40,7 +40,9 @@ trusted and different listening sockets stand in for ALPN.
 TLS over TCP is the recommended carrier because it supplies every required property at once.
 It is not a requirement, and `libdwnx` reflects that — its library half contains no reference
 to TLS, encryption or sockets of any kind. Neither `ngnet-qmux-sys` nor `ngnet-qmux` links a
-TLS library, has a TLS feature, or has any feature at all.
+TLS library or has a TLS feature. `ngnet-qmux-sys` has no features at all; `ngnet-qmux`'s only
+features gate its asynchronous layer and the ready-made tokio implementations of that
+layer's seams, and neither brings cryptography with it.
 
 A practical consequence shows up in the tests: two connections relaying bytes to each other in
 memory is a *legitimate deployment* of the protocol rather than a test fixture standing in for
