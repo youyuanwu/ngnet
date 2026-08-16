@@ -184,6 +184,14 @@ fn configure_probes(build: &mut cc::Build) {
     if target_os == "linux" || target_os == "android" {
         build.define("HAVE_ENDIAN_H", None);
         build.define("HAVE_BYTESWAP_H", None);
+
+        // What `AC_USE_SYSTEM_EXTENSIONS` does, and it is load-bearing rather than tidiness.
+        // glibc's `endian.h` only *declares* `be64toh`/`htobe64` when a feature-test macro
+        // asks for them. Without this the header is included, the declarations are absent, C
+        // treats the calls as implicit, and the build gets all the way to a link error naming
+        // two symbols that were never compiled -- which is a confusing way to learn that a
+        // configure step was skipped.
+        build.define("_GNU_SOURCE", None);
     } else if bsd {
         build.define("HAVE_SYS_ENDIAN_H", None);
     }

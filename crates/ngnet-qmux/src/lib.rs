@@ -28,7 +28,7 @@
 //!
 //! Protocol events are delivered to caller-supplied closures that dwnx invokes across the FFI
 //! boundary. A panic inside one cannot unwind through C, so it aborts the process. Handlers
-//! should return an error to report failure rather than panicking.
+//! should return [`Err`] to report failure rather than panicking; see [`Handlers`].
 //!
 //! # Scope
 //!
@@ -50,7 +50,11 @@
 // Module files are deliberately flat -- `conn.rs`, never `conn/mod.rs` -- because that test
 // derives a module's name from its file stem.
 #[allow(unsafe_code)]
+mod callbacks;
+#[allow(unsafe_code)]
 mod ccerr;
+#[allow(unsafe_code)]
+mod conn;
 #[allow(unsafe_code)]
 mod error;
 #[allow(unsafe_code)]
@@ -59,15 +63,31 @@ mod params;
 mod settings;
 #[allow(unsafe_code)]
 mod stream;
+#[allow(unsafe_code)]
+mod stream_io;
+#[allow(unsafe_code)]
+mod write;
 
+mod handlers;
 mod time;
 
+// Doctest-only: each item is a `compile_fail` case pinning something the API makes
+// impossible to write. Nothing is exported.
+#[cfg(doctest)]
+mod compile_fail;
+
 pub use ccerr::{CloseKind, CloseReason};
+pub use conn::{Conn, ConnBuilder, ReadOutcome, Role};
 pub use error::{Error, ErrorKind, NativeCode};
+pub use handlers::{
+    HandlerError, HandlerResult, Handlers, StreamCloseEvent, StreamDataEvent, StreamLimitKind,
+};
 pub use params::TransportParams;
 pub use settings::Settings;
 pub use stream::{Directionality, Initiator, StreamId};
+pub use stream_io::{OpenOutcome, Shutdown};
 pub use time::{Duration, Timestamp};
+pub use write::{Push, Record, RecordWriter, WriteRequest};
 
 /// The raw FFI bindings this crate is built on.
 ///
