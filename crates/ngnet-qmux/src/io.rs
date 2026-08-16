@@ -35,8 +35,11 @@
 //! **No runtime.** This subtree names no executor and spawns nothing. The caller describes
 //! their byte stream and their clock through [`AsyncByteStream`] and [`Clock`], and a
 //! ready-made description for one widely used runtime ships behind the off-by-default `tokio`
-//! feature. [`testing`] contains a second implementation that moves bytes in memory, which is
-//! what makes "this is not shaped around one runtime" evidence rather than an assertion.
+//! feature: `TokioStream` wraps anything implementing tokio's `AsyncRead` and `AsyncWrite`, so
+//! TCP, unix sockets and TLS sessions over either are all served without this crate acquiring
+//! a TLS seam or naming a socket type. [`testing`] contains a second implementation that moves
+//! bytes in memory, which is what makes "this is not shaped around one runtime" evidence
+//! rather than an assertion.
 //!
 //! **No timer.** [`Clock`] reports the time and offers no way to wait for one; see its module
 //! documentation for why an idle timeout is not enforced here.
@@ -117,6 +120,12 @@ mod framing;
 mod scheduling;
 mod stream;
 
+// The one runtime this crate names, and it names it only when asked to. Declared here rather
+// than beside the traits it implements so that a reader looking for what the seam costs a
+// caller can see the whole of it: one module, one feature, one optional dependency.
+#[cfg(feature = "tokio")]
+mod tokio;
+
 #[doc(hidden)]
 pub mod testing;
 
@@ -130,3 +139,6 @@ pub use error::{Error, ErrorKind, Result};
 pub use event::Event;
 pub use framing::RecordFramer;
 pub use stream::{AsyncByteStream, Written};
+
+#[cfg(feature = "tokio")]
+pub use tokio::{TokioClock, TokioStream};

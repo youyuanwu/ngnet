@@ -1,4 +1,4 @@
-//! The exchange body, written once because three test files and a later runtime run it.
+//! The exchange body, written once because several test files and a real runtime run it.
 //!
 //! # Why there is an executor in here
 //!
@@ -17,11 +17,12 @@
 //! # Why the bodies are generic and asynchronous
 //!
 //! [`client_exchange`] and [`server_exchange`] name no byte stream and no clock. The same two
-//! functions therefore run over the in-memory pair here and over a real socket once a runtime
-//! implementation of the seam exists, which is what makes "the seam is not shaped around one
-//! implementation" something a reader can check rather than take on trust. They are `async`
-//! for the same reason: a runtime drives them by spawning, and this file drives them by
-//! polling, and neither has to know how the other does it.
+//! functions therefore run over the in-memory pair here and, in `tests/io_tokio.rs`, over a
+//! loopback TCP socket driven by a runtime, which is what makes "the seam is not shaped around
+//! one implementation" something a reader can check rather than take on trust. They are
+//! `async` for the same reason: a runtime drives them by spawning or joining, and this file
+//! drives them by polling, and neither has to know how the other does it. What the two share
+//! beyond the bodies is [`assert_exchange`], so the expectations cannot drift apart either.
 
 // Each test target uses a different subset of this module, and an unused helper in one of them
 // is not a defect. Denying it would push every test towards using everything.
@@ -453,6 +454,22 @@ pub fn exchange<S: AsyncByteStream, C: Clock>(
         server_exchange(server, response),
     );
 
+    assert_exchange(&received_request, request, &received_response, response);
+}
+
+/// Asserts what the canonical exchange must have carried, whatever drove it.
+///
+/// Separate from [`exchange`] because the in-memory pair is driven by [`run_pair`] and a real
+/// socket is driven by a runtime, and those cannot be the same function. The *expectations*
+/// can be, and are: a loopback transfer that asserted slightly different things would be a
+/// second test rather than the same test over a second implementation, and the claim being
+/// made is the latter.
+pub fn assert_exchange(
+    received_request: &[u8],
+    request: &[u8],
+    received_response: &[u8],
+    response: &[u8],
+) {
     assert_eq!(
         received_request, request,
         "the request did not survive the exchange"
