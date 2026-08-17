@@ -19,6 +19,19 @@ repository.workspace = true
 # supplies `CompioIo`, the io_uring transport the second benchmark family measures. Both
 # adapters ship in `ngnet-h2`; this crate only enables them.
 ngnet-h2 = { workspace = true, features = ["tokio", "completion"] }
+# The cross-protocol arms. `ngnet-qmux-h3` is the join being measured; it takes its byte
+# stream and its clock from a caller, which is why `ngnet-qmux` appears here directly rather
+# than only underneath it — `TokioStream` and `TokioClock` live behind its off-by-default
+# `tokio` feature, and without the feature neither type exists. `ngnet-h3` supplies the
+# request handle and the incoming-body type the fixtures name; the join re-exports the two
+# configurations but not those, so a crate that drives a connection needs it by name.
+#
+# A benchmark crate is allowed to take all three where a library crate is not: the structural
+# check in `tests/ngnet-workspace-tests/tests/dependency_graph.rs` lists library crates, so
+# nothing here widens what any shipped crate may reach.
+ngnet-qmux-h3.workspace = true
+ngnet-qmux = { workspace = true, features = ["tokio"] }
+ngnet-h3.workspace = true
 tokio.workspace = true
 # The completion runtime under test. Its `criterion` feature adds the `AsyncExecutor` impl
 # for compio's `Runtime`, so `b.to_async(&compio_runtime)` drives it exactly as the tokio

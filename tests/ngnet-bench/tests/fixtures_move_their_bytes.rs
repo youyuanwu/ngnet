@@ -11,8 +11,9 @@
 use bytes::Bytes;
 
 use ngnet_bench::{
-    CompioSharedSocket, CompioSocket, Hyper, NgnetH2, NgnetH2Shared, TokioSharedSocket,
-    TokioSocket, body_of, compio_runtime, current_thread_runtime,
+    CompioSharedSocket, CompioSocket, Hyper, NgnetH2, NgnetH2Shared, NgnetQmuxH3,
+    NgnetQmuxH3Socket, TokioSharedSocket, TokioSocket, body_of, compio_runtime,
+    current_thread_runtime,
 };
 
 /// The benchmark sweep, plus a size that is not a multiple of the 16 KiB frame payload so a
@@ -68,6 +69,22 @@ echoes_whole!(
     compio_shared_echoes_whole,
     CompioSharedSocket,
     compio_runtime()
+);
+// The cross-protocol arms, held to exactly the same standard and for a sharper reason: a
+// QMux arm that moved fewer bytes than its HTTP/2 counterpart would not merely be fast for
+// the wrong reason, it would be evidence for a cross-protocol claim that was never measured.
+// The 1 MiB point also happens to be where the matched 65535-byte credit is exercised hardest
+// — it takes sixteen window-sized instalments — so an arm that echoes it whole is an arm
+// whose flow control is being extended rather than one that got lucky with a large window.
+echoes_whole!(
+    qmux_h3_duplex_echoes_whole,
+    NgnetQmuxH3,
+    current_thread_runtime()
+);
+echoes_whole!(
+    qmux_h3_socket_echoes_whole,
+    NgnetQmuxH3Socket,
+    current_thread_runtime()
 );
 
 /// The bodies really are distinct objects, so `body_of` is not handing every arm the same

@@ -1046,6 +1046,9 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ngnet-h2",
+ "ngnet-h3",
+ "ngnet-qmux",
+ "ngnet-qmux-h3",
  "tokio",
 ]
 

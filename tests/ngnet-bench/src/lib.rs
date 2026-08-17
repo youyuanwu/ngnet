@@ -1,11 +1,22 @@
-//! Shared harness for the `ngnet-h2` vs `hyper` HTTP/2 comparison.
+//! Shared harness for this workspace's benchmark suite: `ngnet-h2` against `hyper`, and
+//! HTTP/2 against HTTP/3-over-QMux.
 //!
-//! The two stacks are put on the same footing here so the individual benches carry no
+//! The stacks are put on the same footing here so the individual benches carry no
 //! fairness logic of their own: identical workload, identical protocol settings, and a
 //! connection that is stood up *before* anything is measured. Both ends of each connection
 //! run over a `tokio::io::duplex` — an in-memory pipe, no sockets — so what is timed is the
 //! protocol and wrapper CPU work, never the kernel. See `docs/benchmarks/interpreting.md`
 //! for what that does and does not tell you.
+//!
+//! # The third family: two protocols
+//!
+//! [`NgnetQmuxH3`] and [`NgnetQmuxH3Socket`] are the HTTP/3-over-QMux arms, and they are not
+//! a family of their own: each joins the existing family on its substrate, beside the HTTP/2
+//! arm it is there to be compared against. What differs between an HTTP/2 arm and its QMux
+//! counterpart is the protocol stack; the substrate, the runtime, the request, the body, the
+//! echo and the drain are shared code. The settings the two protocols hold in common are
+//! matched from the named constants below — see [`qmux_config`] and [`qmux_h3_config`], and
+//! `docs/benchmarks/configuration.md` for what cannot be matched and which way it leans.
 //!
 //! # The second family: a real socket, three arms
 //!
@@ -43,7 +54,7 @@ use http_body::Body;
 use http_body_util::Full;
 use tokio::io::duplex;
 use tokio::runtime::{Builder, Runtime};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 
 use compio::driver::DriverType;
 use compio::net::{TcpListener as CompioTcpListener, TcpStream as CompioTcpStream};
@@ -55,6 +66,10 @@ use ngnet_h2::http::{
     Config, IncomingBody, SendRequest, handshake_shared_with, handshake_with, serve_shared_with,
     serve_with,
 };
+
+use ngnet_h3::http::{IncomingBody as H3IncomingBody, SendRequest as H3SendRequest};
+use ngnet_qmux::io::{TokioClock, TokioStream};
+use ngnet_qmux_h3::{HttpConfig, TransportConfig, connect_with, serve_with as qmux_serve_with};
 
 use hyper::client::conn::http2 as hyper_client;
 use hyper::server::conn::http2 as hyper_server;
@@ -91,6 +106,82 @@ pub const MAX_CONCURRENT_STREAMS: u32 = 128;
 /// This crate's advertised `SETTINGS_MAX_HEADER_LIST_SIZE` ([`Config`] default).
 pub const MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
 
+// The QMux side of the same matching. Everything below exists so that the HTTP/3-over-QMux
+// arms grant the same credit and keep the same compression state as the HTTP/2 arms; where a
+// value is derived from one of the constants above, it is written as that constant rather
+// than as its number, so a change to the matched value cannot reach one stack and miss the
+// other. The two figures that are *not* derived — the stream allowance and the read-ahead —
+// are harness parameters rather than protocol settings, and each says below what it is
+// protecting against.
+
+/// The credit each QMux end grants the other **on one stream**, matched to [`WINDOW`].
+///
+/// libnghttp2 fixes an HTTP/2 stream at 65535 bytes and `ngnet-h2`'s configuration surface
+/// cannot reach it, so the matching is done from this side: the stack that exposes the
+/// setting is set to the value the other one is fixed at. A mismatch here is the single
+/// easiest way to turn a body-throughput comparison into a comparison of two windows.
+pub const QMUX_STREAM_WINDOW: u64 = WINDOW as u64;
+
+/// The credit each QMux end grants the other **across the whole connection**, also [`WINDOW`].
+///
+/// Equal in number to [`QMUX_STREAM_WINDOW`] and to HTTP/2's connection window, and not quite
+/// equal in meaning: HTTP/3's three unidirectional control streams are ordinary QMux streams
+/// and spend connection credit, where HTTP/2's control frames sit outside flow control
+/// entirely. The difference is a few hundred bytes over a connection's life against a window
+/// that is extended per consumed byte, so it biases nothing measurable — but it is a real
+/// asymmetry between the two arms rather than an exact match, and is recorded as such.
+pub const QMUX_CONNECTION_WINDOW: u64 = WINDOW as u64;
+
+/// How many bidirectional streams each QMux end lets the other open **over the connection's
+/// whole life**.
+///
+/// Not a concurrency limit, and this is the trap. QMux stream capacity is a cumulative budget
+/// that nothing recycles — neither dwnx nor `ngnet-qmux` returns it when a stream closes, and
+/// `ngnet-qmux-h3` never calls `extend_stream_limit` — so a connection admits exactly this
+/// many requests in total and the one after that **hangs**: the open waits for capacity that
+/// will never arrive, no error is reported at either end, and no timeout surrounds a Criterion
+/// measurement. These benches establish one connection and reuse it for every iteration of
+/// every sample of every parameter value, so the default of 100 is exhausted almost
+/// immediately.
+///
+/// Both bounds therefore matter, and a value outside either breaks a different way:
+///
+/// - **Too low** — anywhere near what a run can consume — and the suite stops partway through
+///   without failing, which is worse than failing.
+/// - **Too high** — above dwnx's `DWNX_MAX_STREAMS`, which is `1 << 60`
+///   (`deps/dwnx/lib/dwnx_transport_params.h:63`) — and the *peer* rejects the parameter as it
+///   decodes it, failing the connection during setup with an error that names nothing about
+///   streams. `TransportParams::validate`'s varint check does not catch this — it bounds the
+///   encoding, not dwnx's limit — so a value at `1 << 61` is accepted where it is configured
+///   and fails on the wire.
+///
+/// 2^40 is roughly a trillion: about six orders of magnitude above the ~260,000 streams a
+/// deliberately heavy soak of these fixtures spent on one connection, and about six below the
+/// ceiling. It costs nothing to sit there — 300,000 sequential streams on one connection moved
+/// RSS by 216 kB, so no state accumulates behind the allowance.
+pub const QMUX_MAX_STREAMS_BIDI: u64 = 1 << 40;
+
+/// How many unidirectional streams each QMux end lets the other open.
+///
+/// HTTP/3 needs three — control, QPACK encoder, QPACK decoder — and will do nothing at all
+/// until it has them, so a value below three yields a connection whose peer can never start.
+/// Sixteen is those three with room for a peer that opens more, and it is small on purpose:
+/// unlike the bidirectional allowance nothing consumes this repeatedly, so there is no reason
+/// to reach for a number that hides a miscount.
+pub const QMUX_MAX_STREAMS_UNI: u64 = 16;
+
+/// How many bytes the QMux layer will hold for the HTTP/3 layer before it has reported
+/// consuming some.
+///
+/// Purely local — it is not advertised and is not a protocol setting — so it is a harness
+/// parameter, and it is stated rather than left at its 1 MiB default for the same reason
+/// every other harness parameter here is stated. The constraint that matters is that it must
+/// **not fall below** [`QMUX_CONNECTION_WINDOW`]: below it, the layer refuses to read bytes
+/// the peer has already been told it may send, which stalls the connection with no error.
+/// Equal to the connection window is the smallest value that respects that, and it transfers
+/// a 1 MiB body in window-sized instalments exactly as the default does.
+pub const QMUX_READ_AHEAD: u64 = QMUX_CONNECTION_WINDOW;
+
 /// The in-memory pipe's capacity. Large enough that the pipe itself is not the bottleneck —
 /// the flow-control window is — but the same for both stacks regardless.
 const DUPLEX_CAPACITY: usize = 1 << 20;
@@ -105,6 +196,42 @@ pub fn ngnet_h2_config() -> Config {
     Config::default()
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
         .max_header_list_size(MAX_HEADER_LIST_SIZE)
+}
+
+/// The QMux transport configuration both HTTP/3 ends run with.
+///
+/// Every field that bears on the comparison is set, including where the value coincides with
+/// the default, for the same reason [`ngnet_h2_config`] restates h2's defaults: a comparison
+/// resting on two crates' defaults staying equal is one upstream edit away from silently
+/// comparing unlike things. See each constant for what it matches and what breaks if it moves.
+///
+/// The one field left alone is `max_idle_timeout`, and deliberately: its default of zero means
+/// "none", nothing in QMux enforces one in either direction, and a benchmark that advertised a
+/// deadline nobody keeps would be stating a fiction rather than matching anything. HTTP/2 has
+/// no counterpart to match it against.
+pub fn qmux_config() -> TransportConfig {
+    TransportConfig::new()
+        .initial_max_stream_data(QMUX_STREAM_WINDOW)
+        .initial_max_data(QMUX_CONNECTION_WINDOW)
+        .max_streams_bidi(QMUX_MAX_STREAMS_BIDI)
+        .max_streams_uni(QMUX_MAX_STREAMS_UNI)
+        .read_ahead(QMUX_READ_AHEAD)
+}
+
+/// The HTTP/3 configuration both ends run with, built from the *same* named constants the
+/// HTTP/2 arms use.
+///
+/// The three settings here are the ones the two protocols hold in common under different
+/// names: `max_concurrent_streams` against `SETTINGS_MAX_CONCURRENT_STREAMS`,
+/// `max_field_section_size` against `SETTINGS_MAX_HEADER_LIST_SIZE`, and
+/// `qpack_max_dtable_capacity` against HPACK's dynamic table size. `ngnet-h3`'s defaults
+/// already equal `ngnet-h2`'s, deliberately — but coinciding is not matching, so each value
+/// is written here as the constant the h2 side reads, and there is one place to change.
+pub fn qmux_h3_config() -> HttpConfig {
+    HttpConfig::default()
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .max_field_section_size(MAX_HEADER_LIST_SIZE as u64)
+        .qpack_max_dtable_capacity(HEADER_TABLE_SIZE as usize)
 }
 
 // ---------------------------------------------------------------------------
@@ -785,5 +912,331 @@ impl CompioSharedSocket {
             .expect("a response head");
         assert!(response.status().is_success());
         drain(response.into_body()).await
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The HTTP/3-over-QMux arms
+//
+// Two fixtures, one per substrate, so the cross-protocol comparison spans exactly the two
+// families the HTTP/2 arms already span: [`NgnetQmuxH3`] beside [`NgnetH2`] and [`Hyper`] on
+// the in-memory duplex, [`NgnetQmuxH3Socket`] beside [`TokioSocket`] and [`HyperSocket`] on a
+// real loopback socket. Both take the same request shape, the same body, the same echo and
+// the same drain as every arm above — `request_for`, `body_of`, `collect`, `drain` and
+// `WORKLOAD_URI` are reused rather than restated, so "the two stacks ran the same workload"
+// is a property of there being one definition rather than an assertion about two.
+//
+// The one thing that *is* restated is the echo handler, and only its signature: the HTTP/3
+// server hands its handler an `ngnet_h3::http::IncomingBody` where the HTTP/2 server hands it
+// an `ngnet_h2::http::IncomingBody`. The two are unrelated types with the same name, so a
+// second function is unavoidable; its body is one call to the shared `collect` and one to the
+// shared `response_for`, which is as close to no restatement as the type system allows.
+//
+// Both drivers are spawned with plain `tokio::spawn`, exactly as the HTTP/2 arms' are. Note
+// that this repository's own QMux HTTP/3 test harness uses a `LocalSet` and `spawn_local`
+// instead: that is forced by its `!Send` in-memory *test* byte stream, not by the join, which
+// imposes no `Send` bound anywhere and is `Send` whenever the caller's byte stream and clock
+// are. `TokioStream<S>` is `Send` when `S` is, and both `tokio::io::DuplexStream` and
+// `tokio::net::TcpStream` are — so `tokio::spawn` accepting these futures at all is the
+// check, made by the compiler rather than by a comment. The runtime arrangement is therefore
+// identical to the HTTP/2 arms' and is not a confound.
+// ---------------------------------------------------------------------------------------
+
+/// The HTTP/3 server handler: drain the request body, echo it back.
+///
+/// [`ngnet_h2_echo`] for HTTP/3. Same work, same shared helpers; only the incoming body's
+/// type differs, and that is the whole reason there are two of these.
+async fn qmux_h3_echo(request: http::Request<H3IncomingBody>) -> http::Response<BenchBody> {
+    let body = collect(request.into_body()).await;
+    response_for(body)
+}
+
+/// Refuses a concurrency the QMux arms' configuration will not admit, before it is offered.
+///
+/// The bound is [`MAX_CONCURRENT_STREAMS`], the value both stacks are configured with. On the
+/// HTTP/3 side the server is what enforces it, and it enforces it by *resetting* an exchange
+/// that arrives while that many handlers are already running rather than by queueing it
+/// (`crates/ngnet-h3/src/http/server.rs:257-264`). So a concurrency above the limit neither
+/// fails cleanly nor simply works: whether an iteration completes depends on how many handlers
+/// happen to be in flight as each head arrives, which is a benchmark that reports times for
+/// some samples and panics part-way through others.
+///
+/// Checking here rather than letting the connection answer is the general rule these fixtures
+/// follow, and the reason is sharper than this one parameter. The characteristic failure on
+/// this stack is a request that neither completes nor fails — an exhausted stream allowance, a
+/// peer whose control streams never opened, a window nobody extended — and nothing wraps a
+/// Criterion measurement in a timeout, so a parameter that gets as far as being offered cannot
+/// be recovered from. A panic with a legible message, before anything reaches the wire, is the
+/// only recovery available.
+///
+/// The transport's much larger [`QMUX_MAX_STREAMS_BIDI`] cannot bind first — that is what
+/// makes it the *cumulative* allowance and this the *concurrent* one.
+///
+/// # Panics
+///
+/// If `n` exceeds what the configuration admits.
+fn admit_concurrency(n: usize) {
+    assert!(
+        n <= MAX_CONCURRENT_STREAMS as usize,
+        "a concurrency of {n} exceeds the {MAX_CONCURRENT_STREAMS} concurrent exchanges both \
+         stacks are configured for; offered to the QMux arm, the server would reset whichever \
+         exchanges arrived over the limit, so the run would report a time for some iterations \
+         and fail part-way through others"
+    );
+}
+
+/// Refuses a body size the QMux arms' configuration will not admit, before it is offered.
+///
+/// The companion to [`admit_concurrency`], and it has a different shape because a body meets a
+/// different kind of limit. No configured value bounds a body: flow-control credit is extended
+/// per consumed byte at both the stream and the connection level, so a body larger than the
+/// window is delivered in window-sized instalments rather than refused. What that depends on
+/// is [`QMUX_READ_AHEAD`] not sitting below [`QMUX_CONNECTION_WINDOW`] — below it the layer
+/// declines to read bytes the peer was already told it could send, and a body that needs more
+/// than one instalment stops halfway with nothing reported. So the admissibility question a
+/// body actually poses is asked of the body that poses it.
+///
+/// # Panics
+///
+/// If `len` exceeds what the configuration admits.
+fn admit_body(len: usize) {
+    assert!(
+        len as u64 <= QMUX_CONNECTION_WINDOW || QMUX_READ_AHEAD >= QMUX_CONNECTION_WINDOW,
+        "a body of {len} bytes needs more than one window's worth of credit, and the \
+         configured read-ahead of {QMUX_READ_AHEAD} is below the connection window of \
+         {QMUX_CONNECTION_WINDOW}; the transfer would stall part-way with no error"
+    );
+}
+
+/// One complete exchange, before anything is timed.
+///
+/// The HTTP/2 arms need no equivalent and this asymmetry is deliberate rather than leftover,
+/// so here is why it is not redundant. A QMux connection's transport-parameter exchange is
+/// scheduled when the connection is constructed but only leaves on the first pump
+/// (`crates/ngnet-qmux/src/io/conn.rs:429-434`), and until the peer's parameters arrive every
+/// limit is zero and no stream can be opened; on top of that the HTTP/3 driver's first act is
+/// to open three unidirectional streams and exchange SETTINGS
+/// (`crates/ngnet-h3/src/http/driver.rs:407-417`). None of that happens in `establish` unless
+/// something makes it happen, so without this the *first timed iteration* would pay for the
+/// whole handshake and be reported as a measurement of a round trip. One completed
+/// request-response settles all of it: the parameters have been exchanged, the control streams
+/// are open, and the connection is in the state every subsequent iteration will find it in.
+///
+/// The HTTP/2 fixtures need none because `handshake_with` completes their handshake during
+/// setup, which is the difference — not that one stack is warmed and the other is not.
+///
+/// # Panics
+///
+/// If the exchange fails, which is the same treatment a failed exchange gets inside a timed
+/// iteration: this is setup, and setup that did not work must not be measured over.
+async fn qmux_warm_up(handle: &H3SendRequest<BenchBody>) {
+    let response = handle
+        .send_request(request_for(Bytes::new()))
+        .await
+        .expect("a warm-up response head");
+    assert!(response.status().is_success());
+    let echoed = drain(response.into_body()).await;
+    assert_eq!(echoed, 0, "the warm-up exchange echoes an empty body");
+}
+
+/// A live HTTP/3-over-QMux client connected to a live server over one duplex, with both
+/// drivers already spawned and one exchange already completed.
+///
+/// The cross-protocol counterpart of [`NgnetH2`]: same substrate, same runtime arrangement,
+/// same workload, same drain — the protocol stack is what differs, which is the whole point.
+/// The duplex halves are wrapped in `TokioStream`, QMux's byte-stream adapter for anything
+/// implementing `AsyncRead` and `AsyncWrite`; the clocks come from `TokioClock`, one per end,
+/// since a QMux connection needs a clock of its own and timestamps are never compared across
+/// connections.
+pub struct NgnetQmuxH3 {
+    handle: H3SendRequest<BenchBody>,
+    server: JoinHandle<()>,
+}
+
+impl NgnetQmuxH3 {
+    /// Stands the connection up and warms it. Call this *outside* the measured closure —
+    /// establishing it is setup, not the thing under test, and [`qmux_warm_up`] explains why
+    /// standing it up is not by itself enough.
+    ///
+    /// # Panics
+    ///
+    /// If either end cannot be built, or the warm-up exchange fails.
+    pub async fn establish() -> Self {
+        let (client_io, server_io) = duplex(DUPLEX_CAPACITY);
+
+        let server = qmux_serve_with(
+            TokioStream::new(server_io),
+            TokioClock::new(),
+            qmux_h3_echo,
+            qmux_config(),
+            qmux_h3_config(),
+        )
+        .expect("a server connection");
+        let server = tokio::spawn(async move {
+            let _ = server.await;
+        });
+
+        let (handle, connection) = connect_with::<_, _, BenchBody>(
+            TokioStream::new(client_io),
+            TokioClock::new(),
+            qmux_config(),
+            qmux_h3_config(),
+        )
+        .expect("a client connection");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        qmux_warm_up(&handle).await;
+        Self { handle, server }
+    }
+
+    /// One request, awaited to its response head and then drained to the end. See
+    /// [`NgnetH2::round_trip`], whose shape and failure handling this matches: a failed
+    /// exchange panics out of the timed closure rather than being recorded as a time.
+    ///
+    /// # Panics
+    ///
+    /// If the body is inadmissible ([`admit_body`]), or the exchange fails.
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        admit_body(body.len());
+        let response = self
+            .handle
+            .send_request(request_for(body))
+            .await
+            .expect("a response head");
+        assert!(response.status().is_success());
+        drain(response.into_body()).await
+    }
+
+    /// `n` requests issued together on the one connection and awaited as a group. See
+    /// [`NgnetH2::concurrent`], which this mirrors down to the `JoinSet` and the spawn cost,
+    /// so the two arms pay the same harness overhead.
+    ///
+    /// # Panics
+    ///
+    /// If `n` is inadmissible ([`admit_concurrency`]), or any exchange fails.
+    pub async fn concurrent(&self, n: usize) {
+        admit_concurrency(n);
+        let mut set = JoinSet::new();
+        for _ in 0..n {
+            let handle = self.handle.clone();
+            set.spawn(async move {
+                let response = handle
+                    .send_request(request_for(Bytes::new()))
+                    .await
+                    .expect("a response head");
+                drain(response.into_body()).await
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            joined.expect("a request task");
+        }
+    }
+
+    /// Takes the server away without telling the client, so the next exchange fails.
+    ///
+    /// No benchmark calls this, and none should: an arm that could lose its peer mid-run
+    /// would be measuring something other than what it claims. It exists so the harness's own
+    /// test suite can show that a failed exchange ends the run rather than being quietly
+    /// recorded as a fast iteration — a property that can only be demonstrated by causing it.
+    pub fn abandon_server(&self) {
+        self.server.abort();
+    }
+}
+
+/// A live HTTP/3-over-QMux client and server over one real loopback TCP connection.
+///
+/// The cross-protocol counterpart of [`TokioSocket`], and its mirror in every respect other
+/// than the protocol stack: the socket pair comes from the same [`tokio_socket_pair`], so
+/// `TCP_NODELAY` is set on both endpoints by the same code that sets it for the HTTP/2 arms,
+/// and the runtime, workload, echo and drain are the ones every other arm uses.
+pub struct NgnetQmuxH3Socket {
+    handle: H3SendRequest<BenchBody>,
+    server: JoinHandle<()>,
+}
+
+impl NgnetQmuxH3Socket {
+    /// Binds, connects, accepts, spawns both drivers and warms the connection — all outside
+    /// the measured closure. See [`TokioSocket::establish`], whose shape this follows, and
+    /// [`qmux_warm_up`] for the one step that has no HTTP/2 counterpart.
+    ///
+    /// # Panics
+    ///
+    /// If the socket pair cannot be established, either end cannot be built, or the warm-up
+    /// exchange fails.
+    pub async fn establish() -> Self {
+        let (client_io, server_io) = tokio_socket_pair().await;
+
+        let server = qmux_serve_with(
+            TokioStream::new(server_io),
+            TokioClock::new(),
+            qmux_h3_echo,
+            qmux_config(),
+            qmux_h3_config(),
+        )
+        .expect("a server connection");
+        let server = tokio::spawn(async move {
+            let _ = server.await;
+        });
+
+        let (handle, connection) = connect_with::<_, _, BenchBody>(
+            TokioStream::new(client_io),
+            TokioClock::new(),
+            qmux_config(),
+            qmux_h3_config(),
+        )
+        .expect("a client connection");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        qmux_warm_up(&handle).await;
+        Self { handle, server }
+    }
+
+    /// One request, awaited to its response head and then drained. See
+    /// [`NgnetQmuxH3::round_trip`].
+    ///
+    /// # Panics
+    ///
+    /// If the body is inadmissible ([`admit_body`]), or the exchange fails.
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        admit_body(body.len());
+        let response = self
+            .handle
+            .send_request(request_for(body))
+            .await
+            .expect("a response head");
+        assert!(response.status().is_success());
+        drain(response.into_body()).await
+    }
+
+    /// `n` concurrent requests on the one connection. See [`NgnetQmuxH3::concurrent`].
+    ///
+    /// # Panics
+    ///
+    /// If `n` is inadmissible ([`admit_concurrency`]), or any exchange fails.
+    pub async fn concurrent(&self, n: usize) {
+        admit_concurrency(n);
+        let mut set = JoinSet::new();
+        for _ in 0..n {
+            let handle = self.handle.clone();
+            set.spawn(async move {
+                let response = handle
+                    .send_request(request_for(Bytes::new()))
+                    .await
+                    .expect("a response head");
+                drain(response.into_body()).await
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            joined.expect("a request task");
+        }
+    }
+
+    /// Takes the server away without telling the client. See [`NgnetQmuxH3::abandon_server`].
+    pub fn abandon_server(&self) {
+        self.server.abort();
     }
 }
