@@ -70,6 +70,7 @@ submodules. [`../../running.md`](../../running.md) states the requirement in ful
 | [01-drift-baseline](01-drift-baseline.md) | 2026-08-16 | `e75118e` | Two identical passes: what an unchanged arm does here — **~1%** |
 | [02-first-survey](02-first-survey.md) | 2026-08-16 | `e75118e` | Where the arms stand, which legacy conclusions carried over, and where this stack beats hyper |
 | [03-shared-body](03-shared-body.md) | 2026-08-16 | `e75118e` | Handing bodies over, five replicates — **settled the compio verdict** |
+| [04-qmux-drift-baseline](04-qmux-drift-baseline.md) | 2026-08-17 | `524fa54` | Drift for the QMux arms, which `01` predates — socket **0.67%**, duplex **1.55%** |
 
 Still outstanding, in the order they are worth doing:
 

@@ -29,12 +29,19 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [01-drift-baseline](xeon-8370c-azure/01-drift-baseline.md) | xeon-8370c-azure | 2026-08-16 | Two identical passes: the drift bar on this host | — |
 | [02-first-survey](xeon-8370c-azure/02-first-survey.md) | xeon-8370c-azure | 2026-08-16 | Where the arms stand here, against the findings' predictions, and against hyper | [write path](../findings/write-path-and-gathering.md) |
 | [03-shared-body](xeon-8370c-azure/03-shared-body.md) | xeon-8370c-azure | 2026-08-16 | Handing bodies over, re-measured — compio verdict overturned | [handing bodies over](../findings/handing-bodies-over.md) |
+| [04-qmux-drift-baseline](xeon-8370c-azure/04-qmux-drift-baseline.md) | xeon-8370c-azure | 2026-08-17 | What an unchanged **QMux** arm does run to run — the bar the QMux work is measured against | — |
 
-**No run recorded here contains an `ngnet-qmux-h3` arm.** Every run above predates the
-cross-protocol arms, and none has been re-taken since. The HTTP/2 figures in them are still
-current — nothing about those arms changed when the QMux ones were added, by design
-([`../controls.md`](../controls.md)) — but a reader looking for a cross-protocol number will
-not find one here, and should not infer one from the absence.
+**No run recorded here compares `ngnet-qmux-h3` against anything.** Runs `01` to `03` predate the
+cross-protocol arms entirely; `04` covers them but is a drift measurement, so its QMux figures are
+the inputs to a variation calculation and not a comparison with the HTTP/2 arms beside them. The
+HTTP/2 figures in `01` to `03` are still current — nothing about those arms changed when the QMux
+ones were added, by design ([`../controls.md`](../controls.md)) — but a reader looking for a
+cross-protocol number will not find one here, and should not infer one from the absence.
+
+What `04` does give a reader is the bar: the socket QMux arm varies by **0.67%** on average and
+the duplex one by **1.55%**, and `body_throughput/ngnet-qmux-h3/1048576` alone varies by
+**10.42%**, which makes it the noisiest identifier in the suite and a poor place to look for a
+small effect.
 
 ## Adding a run
 
