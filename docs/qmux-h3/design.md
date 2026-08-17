@@ -87,8 +87,10 @@ The parking form has no answer to give a synchronous closure: it would have to b
 cannot, or truncate, which loses bytes. The non-parking form reports `Accepted(n)`, `Blocked` or
 `Closed` and returns, and those map onto the trait's own three outcomes directly.
 
-An offer may carry several `IoSlice`s. Vectored writes are deferred in the layer below, so this
-crate issues one write per slice and stops at the first that is not fully accepted — a short
+An offer may carry several `IoSlice`s. A vectored *push* into one record is deferred in the layer
+below — and it is that one, not a gathered write to the byte stream, which the layer below has
+settled against ever having (`docs/qmux/pending-work.md`) — so this crate issues one write per
+slice and stops at the first that is not fully accepted — a short
 accept means the peer's window is exhausted or the outbound buffer has reached its ceiling, and
 offering the next slice anyway would put the stream's bytes out of order. It once meant a third
 thing, that the record had filled, and that reading is what made this break wrong for a while:

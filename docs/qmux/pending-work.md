@@ -88,10 +88,56 @@ unwanted.
 | --- | --- |
 | **Establishing a byte stream** | The layer takes one already connected. There is no listener, no accept loop, no dialling and no TLS seam, and a test asserts the crate offers no way to make one. That is the scope decision the absence of an endpoint rests on — the operating system hands out one stream per peer, so a QMux "endpoint" is a TCP or unix listener the caller already has. What would settle it: nothing here; a caller who wants one uses `tokio::net` or its equivalent and hands the result over. |
 | **Serving an axum `Router` over QMux** | `ngnet-axum` serves a `Router` without hyper and is generic over a `Listener`, so an axum application over a QMux-carried connection is the obvious thing to want next. The fit is not immediate and that is the open question rather than the wiring: `Listener::Io` is bounded by `ServableTransport`, which `ngnet-axum` drives with `ngnet-h2` — so a QMux listener that produced accepted byte streams would get HTTP/2 over them, not HTTP/3 over QMux. What would settle it: deciding whether `ngnet-axum` grows an engine seam alongside its transport seam, or whether the join belongs in a crate of its own. |
-| **Vectored writes** | `dwnx_conn_writev_stream` takes a `dwnx_vec` array and the wrapper only uses the single-slice `dwnx_conn_write_stream` form. A `RecordWriter::push_vectored` taking `&[IoSlice]` would avoid a copy for callers whose payload is already fragmented, which the HTTP/3 join often is: `StreamSource::write_next` may offer several slices at once, and `ngnet-qmux-h3` issues one write per slice and stops at the first that is not fully taken. |
+| **Vectored writes** | Two different things go by that name here. One is open; the other was asked and answered, and the answer is no. **Open: `RecordWriter::push_vectored`.** `dwnx_conn_writev_stream` takes a `dwnx_vec` array and the wrapper only uses the single-slice `dwnx_conn_write_stream` form. A `push_vectored` taking `&[IoSlice]` would let one record carry several caller fragments, which the HTTP/3 join often has: `StreamSource::write_next` may offer several slices at once, and `ngnet-qmux-h3` issues one write per slice and stops at the first that is not fully taken, so a record boundary falls at every slice boundary. That is a record count, not a copy count — dwnx copies the payload into the record either way — and it is tracked from the other side in `docs/qmux-h3/pending-work.md`. **Settled: gathering this connection's output to its byte stream.** The question was whether the output can ever be presented to the byte stream as more than one region, so that a stream able to write several buffers in one operation could be handed them. It cannot, so no gathering capability exists on `AsyncByteStream` — it has one `poll_write` taking one `&[u8]`, that is deliberate, and no test claims otherwise. See *Gathered output was asked about, and the answer is no* below for the two reasons and what would change them. |
 | **Interoperability testing** | Everything is tested against dwnx itself, in memory and over a loopback socket. Nothing has been run against another QMux implementation, and no other one is known to exist yet. |
 | **Benchmarks** | None. The interesting comparison is QMux-over-TLS-over-TCP against QUIC for the same workload, which is the draft's own motivating claim about computational cost. The layer and the HTTP/3 join make it measurable now; nothing has measured it. |
 | **`dwnx_settings.log_write`** | Left as a null function pointer. Bridging it to a Rust logging closure is straightforward and would be this crate's only callback that is not a protocol event. Not needed to speak the protocol. |
+
+## Gathered output was asked about, and the answer is no
+
+This is the recorded answer to a question that will otherwise be asked again: **can this
+connection's output ever be presented to its byte stream as more than one region?** It cannot,
+and there are two independent reasons. Either one alone would settle it; both hold, which is why
+no gathering capability was added rather than added and left unused. Going in, the expectation
+was that the answer would be negative — the bias is stated so that what follows can be read as
+the case *against* one's own conclusion having been looked for, which it was: both halves were
+checked against the code and against dwnx, and the checks are named below so that a later reader
+can redo them rather than trust them.
+
+**First: there is only ever one region.** Write coalescing chose to *stop early* rather than to
+compact or to wrap. Production appends at `filled` and stops when the tail cannot take another
+whole record (`Connection::room_for_record`); a partial accept advances `written` and leaves the
+space in front of it unreclaimed; `flush` offers the byte stream exactly `outbound[written..filled]`
+and resets both cursors when it drains. Nothing wraps, nothing compacts, and nothing else writes
+into the buffer. The output is therefore the single region `[written..filled]` in every reachable
+state, and a second region could only be introduced by adopting a ring buffer — that is, by
+building the two-region state in order to have something to gather. `design.md` rejects the ring
+on its own grounds, and this is the second reason not to want it.
+
+**Second: gathering would not save a copy here, which is where the HTTP/2 answer does not
+transfer.** Gathering pays for `ngnet-h2` because the regions it gathers include *caller-owned
+payload that the session never copies* — that is what `NGHTTP2_DATA_FLAG_NO_COPY` buys, and
+`docs/benchmarks/findings/write-path-and-gathering.md` measures what it is worth: a block at or
+above the threshold goes out as the second region of a two-region `writev`, never copied. QMux
+has no equivalent to buy. dwnx frames a payload *inside* the record: `dwnx_conn_write_stream`
+reaches `dwnx_conn_write_stream_frame`, which hands the caller's vectors to the frame encoder,
+and the encoder copies them into the record buffer (`deps/dwnx/lib/dwnx_frame.c:157`). The
+payload is in the record before the record is anything the byte stream could be shown, so the
+only copy gathering could avoid is one the record layer has already made and one that coalescing
+cannot avoid either. What coalescing *did* avoid — the staging copy between a scratch buffer and
+the outbound queue — is gone already, and its removal is counted above; gathering has nothing
+left to remove.
+
+**What would change this.** A ring buffer for the outbound queue, adopted for its own reasons
+rather than for gathering's, would produce a genuine two-region state and this answer would have
+to be retaken from the first half only, since the second half would still stand and would still
+say the gathering saves no copy. A dwnx that could write a record header describing payload it
+does not own — the shape `NGHTTP2_DATA_FLAG_NO_COPY` has, and one this crate cannot add from
+outside `deps/dwnx` — would retake the second half. Short of one of those two, the answer is
+settled, and the absence of `poll_write_vectored` on `AsyncByteStream` is a decision with a
+reason rather than an omission: a declaration that nothing could act on would be a surface
+without a behaviour.
+
 
 ## Deferred design decisions
 

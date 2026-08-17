@@ -339,7 +339,10 @@ stops when the tail cannot take another whole record, even though compacting the
 remainder to the front would make room. Compaction was rejected because it is a memcpy of the
 unwritten remainder on every partial accept, paid on exactly the path that is already struggling;
 a ring buffer was rejected because two regions would leave the output in two pieces and every
-consumer of it — including a future gathering write — would have to handle both. A buffer that
+consumer of it would have to handle both. That argument no longer has a gathering write to weigh
+against it: whether the output could be presented as more than one region was asked and answered
+no, and the reasons are recorded in `pending-work.md` — the ring is the only thing that would
+produce a second region, and gathering would save no copy even if it did. A buffer that
 stays full means the peer is not keeping up, and the right answer to that is to stop producing,
 which is what stopping early does.
 

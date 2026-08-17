@@ -204,7 +204,11 @@ in flight can, and the entry above is the obvious candidate: one write per `IoSl
 at the first not fully accepted, costs nothing without a kernel and costs a syscall each with
 one. That is the same mechanism the HTTP/2 write-path finding turned on
 (`docs/benchmarks/findings/write-path-and-gathering.md`), which is a reason to suspect it and
-not evidence that it is the cause here.
+not evidence that it is the cause here. It is not the same *fix*: the HTTP/2 finding was won by
+gathering a driver pass into one `writev`, and the layer below has since established that its
+output is a single region with nothing to gather and no copy for gathering to avoid
+(`docs/qmux/pending-work.md`). What would reduce the write count here is fewer records for the
+same payload — the vectored push above — not a gathering byte stream.
 
 Two other candidates have not been ruled out: the record layer produces more records for the
 same payload than HTTP/2 produces frames, since QMux's maximum record is 16382 bytes against
