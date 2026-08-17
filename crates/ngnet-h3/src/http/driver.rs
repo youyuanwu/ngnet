@@ -444,10 +444,30 @@ impl<Q: QuicConnection> Driver<Q> {
     }
 
     /// Applies one pass of transport events, control-plane news first.
-    fn apply_events<R: Role>(&mut self, events: Vec<QuicEvent>, role: &mut R) -> Result<()> {
+    ///
+    /// Answers with the resets that named a stream this endpoint had never heard of, which
+    /// the caller must apply again once this pass has dispatched what it read — see the
+    /// note on `unheard` below for why they cannot be applied here.
+    fn apply_events<R: Role>(
+        &mut self,
+        events: Vec<QuicEvent>,
+        role: &mut R,
+    ) -> Result<Vec<(StreamId, ErrorCode)>> {
         // Two sweeps rather than one: a reset behind a megabyte of body data must not wait
         // for the body to be parsed before it is acted on.
         let mut data = Vec::new();
+        // Resets that named a stream this endpoint had never heard of. Acting on the
+        // control plane first means a reset can arrive in the same batch as the head it
+        // follows, and there was nothing to fail when it did. Left there, the head goes on
+        // to open an exchange the peer has already abandoned: a server would hand its
+        // handler a request body that will never end and never fail, and the handler would
+        // read it forever.
+        //
+        // So they are kept and handed back rather than dropped. Not replayed at the foot of
+        // this function, though: reading a head only *records* it, and the exchange it opens
+        // does not exist until the pass dispatches what it recorded, which is well after
+        // this. They are applied there instead.
+        let mut unheard = Vec::new();
         for event in events {
             match event {
                 QuicEvent::Data { .. } => data.push(event),
@@ -469,7 +489,9 @@ impl<Q: QuicConnection> Driver<Q> {
                 }
                 QuicEvent::Reset { stream, code } => {
                     self.conn.shutdown_stream_read(stream).ok();
-                    self.fail_stream(stream, code, role);
+                    if !self.fail_stream(stream, code, role) {
+                        unheard.push((stream, code));
+                    }
                 }
                 QuicEvent::StreamClosed {
                     stream,
@@ -491,7 +513,7 @@ impl<Q: QuicConnection> Driver<Q> {
                 self.read(stream, bytes, fin)?;
             }
         }
-        Ok(())
+        Ok(unheard)
     }
 
     /// Feeds received bytes to the state machine and extends receive credit.
@@ -557,9 +579,14 @@ impl<Q: QuicConnection> Driver<Q> {
             .map_err(Into::into)
     }
 
-    /// Fails one exchange without disturbing the rest of the connection.
-    fn fail_stream<R: Role>(&mut self, stream: StreamId, code: ErrorCode, role: &mut R) {
-        if let Some(entry) = self.registry.remove(stream) {
+    /// Fails one exchange without disturbing the rest of the connection, and reports
+    /// whether there was one to fail.
+    ///
+    /// A `false` answer is not "nothing happened": it means the stream is unknown to this
+    /// endpoint *so far*, which on a server is the ordinary state of a request stream whose
+    /// head is still sitting in the same batch of events, a few entries further down.
+    fn fail_stream<R: Role>(&mut self, stream: StreamId, code: ErrorCode, role: &mut R) -> bool {
+        let known = if let Some(entry) = self.registry.remove(stream) {
             let error =
                 Error::new(ErrorKind::Stream, "the peer reset this exchange").with_code(code);
             if let Some(slot) = &entry.slot {
@@ -569,8 +596,12 @@ impl<Q: QuicConnection> Driver<Q> {
                 ));
             }
             entry.incoming.fail(error);
-        }
+            true
+        } else {
+            false
+        };
         role.closed(stream);
+        known
     }
 
     /// Fails every exchange at or above a `GOAWAY` cut-off, retriably.
@@ -711,7 +742,7 @@ where
         // 1-2. Transport events, control-plane first, then reads.
         let events = poll_fn(|cx| Poll::Ready(driver.take_events(cx))).await?;
         let had_events = !events.is_empty();
-        driver.apply_events(events, &mut guard.role)?;
+        let unheard = driver.apply_events(events, &mut guard.role)?;
 
         // 3. Bodies that finished during the last pass, read before anything below can
         // wait on the transport or on the peer. A failed body's stream is suspended with
@@ -809,6 +840,14 @@ where
         let observed = driver.events.drain();
         if !observed.is_empty() {
             dispatch(&mut driver, &mut guard.role, observed)?;
+        }
+
+        // A reset that arrived alongside the head it was about, now that the head has
+        // opened the exchange it names. This is the second attempt at it: the first, in the
+        // event sweep, had nothing to fail, and dropping it there would leave a server's
+        // handler reading a request body that can no longer end or fail.
+        for (stream, code) in unheard {
+            driver.fail_stream(stream, code, &mut guard.role);
         }
 
         // 8. Transmit.

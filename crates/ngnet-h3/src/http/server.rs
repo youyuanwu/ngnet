@@ -316,7 +316,6 @@ where
             let (_, cancelled) = self.cancels.swap_remove(index);
             cancelled.trip();
         }
-        self.endings.retain(|(s, _)| *s != stream);
     }
 
     fn busy(&self) -> bool {
@@ -377,6 +376,14 @@ impl<H, F: Future, B> ServerRole<H, F, B> {
         for index in done.into_iter().rev() {
             self.endings.swap_remove(index);
         }
+        // A body the connection has finished with leaves a slot here that nothing will
+        // ever fill. This used to be cleared when a stream closed, but that discarded the
+        // ending of a body that failed *after* the peer reset the stream — and with no
+        // end-of-stream marker on that stream any more, discarding its ending left it
+        // suspended and never reset. The slot's own reference count is the honest test:
+        // once the state machine has released the body, this list holds the last handle.
+        self.endings
+            .retain(|(_, ending)| Arc::strong_count(ending) > 1);
         Ok(())
     }
 }
