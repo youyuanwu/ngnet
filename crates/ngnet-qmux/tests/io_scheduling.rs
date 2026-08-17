@@ -39,7 +39,7 @@ use io_harness::{
     peer_writes, poll_once, run_pair, write_all,
 };
 use ngnet_qmux::io::testing::Fault;
-use ngnet_qmux::io::{Config, Event, StreamWrite};
+use ngnet_qmux::io::{Config, Event, StreamBytes, StreamWrite};
 use ngnet_qmux::{Directionality, Role, StreamId};
 
 const REQUEST: &[u8] = b"the request that had to wait for stream capacity";
@@ -387,6 +387,14 @@ struct Flooded {
     delivered_halfway: u64,
     /// The highest figure the layer reported for its own read-ahead.
     high_water: u64,
+    /// Every delivery the caller kept, in the order they arrived.
+    ///
+    /// Empty unless the flood was asked to hold them. Kept rather than checked as it arrives,
+    /// because what a held delivery is at risk of is being *rewritten* after it was handed
+    /// over: a delivery is a view of a read buffer the connection would otherwise read into
+    /// again, so a reclamation rule that let a buffer go while a view of it was alive shows up
+    /// as bytes that changed after the fact and as nothing at all before it.
+    held: Vec<StreamBytes>,
 }
 
 /// A peer sending continuously against a caller that credits `budget` bytes and then stops.
@@ -396,7 +404,7 @@ struct Flooded {
 /// forever and read until the peer ran out. Within the budget each consumed byte is credited
 /// **twice**, once naming the stream and once naming the connection, which is what the HTTP/3
 /// layer above does and what the bound must not double-count.
-fn flood(budget: u64) -> Flooded {
+fn flood(budget: u64, hold: bool) -> Flooded {
     let config = Config::new()
         .initial_max_stream_data(WINDOW)
         .initial_max_data(WINDOW)
@@ -410,6 +418,7 @@ fn flood(budget: u64) -> Flooded {
     let mut credited = 0u64;
     let mut high_water = 0u64;
     let mut delivered_halfway = 0u64;
+    let mut held: Vec<StreamBytes> = Vec::new();
 
     for pass in 0..PASSES {
         loop {
@@ -427,6 +436,9 @@ fn flood(budget: u64) -> Flooded {
                         server
                             .extend_connection_credit(credit)
                             .expect("extending the connection window");
+                    }
+                    if hold {
+                        held.push(data);
                     }
                 }
                 Poll::Ready(Ok(_)) => {}
@@ -467,6 +479,7 @@ fn flood(budget: u64) -> Flooded {
         delivered,
         delivered_halfway,
         high_water,
+        held,
     }
 }
 
@@ -486,7 +499,7 @@ const SLACK: u64 = 4 * CHUNK as u64;
 /// bytes left sitting in the transport where they belong -- which is what backpressure is.
 #[test]
 fn a_caller_that_credits_nothing_stops_the_layer_reading_ahead() {
-    let flooded = flood(0);
+    let flooded = flood(0, false);
 
     assert_eq!(
         flooded.sent, PAYLOAD,
@@ -519,7 +532,7 @@ fn a_caller_that_credits_nothing_stops_the_layer_reading_ahead() {
 #[test]
 fn crediting_each_byte_twice_does_not_buy_twice_the_read_ahead() {
     const BUDGET: u64 = 16 * 1_024;
-    let flooded = flood(BUDGET);
+    let flooded = flood(BUDGET, false);
 
     assert!(
         flooded.delivered > BUDGET,
@@ -545,5 +558,61 @@ fn crediting_each_byte_twice_does_not_buy_twice_the_read_ahead() {
     assert!(
         flooded.delivered < flooded.sent as u64,
         "the layer took everything the peer sent, so nothing was ever held back"
+    );
+}
+
+/// A caller holding every delivery still sees the layer read (Spec SC-015, FR-016).
+///
+/// The same flood as above, with one difference: the caller keeps every delivery instead of
+/// dropping it. Under delivery aliasing a kept delivery is a view of a read buffer, so this is
+/// the arrangement in which a connection could plausibly stop -- if reading waited for the
+/// caller to let go, a caller that never let go would never be read to again.
+///
+/// It does not wait. The read-ahead bound is accounted in bytes delivered against bytes
+/// credited, and says nothing about whether the caller still holds them, so the credit returned
+/// here buys reading exactly as it did when the deliveries were dropped. That is the contract
+/// this test verifies rather than assumes, and the comparison against the dropping run is the
+/// verification: the same budget must buy the same reading.
+///
+/// The held bytes are checked at the end. The peer sends a constant byte, so this cannot catch
+/// a reordering -- `a_body_many_times_the_flow_control_window_transfers_intact` is where that
+/// lives -- but it can catch the failure that belongs to holding, which is a buffer read into
+/// again while a caller was still looking at it.
+#[test]
+fn a_caller_that_holds_its_deliveries_still_sees_the_layer_read() {
+    const BUDGET: u64 = 16 * 1_024;
+    let holding = flood(BUDGET, true);
+    let dropping = flood(BUDGET, false);
+
+    assert!(
+        holding.delivered > BUDGET,
+        "the credited budget was never used up, so this run says nothing about reading \
+         continuing"
+    );
+    assert_eq!(
+        holding.delivered, dropping.delivered,
+        "a caller that returned its credit and kept the data was read to less than one that \
+         returned the same credit and dropped it, so holding a delivery is stalling the \
+         connection"
+    );
+    assert!(
+        holding.high_water <= ALLOWANCE + SLACK,
+        "read-ahead reached {} against an allowance of {ALLOWANCE}, so holding deliveries \
+         loosened the bound rather than leaving it alone",
+        holding.high_water
+    );
+
+    let bytes: u64 = holding.held.iter().map(|data| data.len() as u64).sum();
+    assert_eq!(
+        bytes, holding.delivered,
+        "the caller did not keep everything it was given"
+    );
+    assert!(
+        holding
+            .held
+            .iter()
+            .all(|data| data.iter().all(|byte| *byte == 0x5a)),
+        "a delivery the caller was holding changed after it was handed over, which is a read \
+         buffer reused while a view of it was still alive"
     );
 }

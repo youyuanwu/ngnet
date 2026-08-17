@@ -213,6 +213,7 @@
 //! first error rather than the last.
 
 use core::task::{Context, Poll};
+use std::sync::Arc;
 
 use crate::ccerr::CloseReason;
 use crate::conn::{Conn, ReadOutcome, Role};
@@ -260,7 +261,21 @@ pub const DEFAULT_READ_AHEAD: u64 = DEFAULT_CONNECTION_DATA;
 /// One record. A larger buffer would let a single read straddle several records, which is
 /// harmless -- both the framer and the state machine accept any split -- but buys nothing,
 /// since a record is the unit at which anything becomes actionable.
-const READ_BUFFER: usize = MAX_RECORD;
+pub(super) const READ_BUFFER: usize = MAX_RECORD;
+
+/// How many retired read buffers a connection watches for reuse.
+///
+/// A buffer is retired while a caller still holds a delivery cut from it, and becomes reusable
+/// when that delivery is dropped. Watching costs a pointer's worth of book-keeping each; the
+/// memory is the delivery's either way, so a buffer that falls off this list is not leaked and
+/// not held -- it is simply not reused, and is freed when the last view of it goes.
+///
+/// Eight, which is more than a caller reading its deliveries promptly ever reaches -- such a
+/// caller retires nothing and the list stays empty -- and enough that a caller holding a few
+/// passes' worth still finds recycled buffers rather than allocating. It bounds what a
+/// connection holds in *watched* buffers at eight records, about 128 KiB, and that ceiling is
+/// reached only by a caller that is holding at least that much delivered data of its own.
+const READ_POOL_LIMIT: usize = 8;
 
 /// The most bytes one produced record can occupy, prefix included.
 ///
@@ -505,8 +520,23 @@ pub struct Connection<S: AsyncByteStream, C: Clock> {
     conn: Conn<'static>,
     events: EventQueue,
     framer: RecordFramer,
-    /// The read buffer, reused for the life of the connection.
-    inbound: Vec<u8>,
+    /// The buffer being read into.
+    ///
+    /// Reference-counted because a delivery is handed out as a view of it rather than as a copy
+    /// of its bytes, so the connection may read into it again only once every such view has
+    /// been dropped -- which is exactly what the strong count returning to one says. A
+    /// connection whose caller drops each delivery before the next arrives keeps this one
+    /// buffer for its whole life, as it did when the delivery was a copy.
+    inbound: Arc<Vec<u8>>,
+    /// Read buffers that were retired while a delivery still aliased them.
+    ///
+    /// Watched rather than owned outright: an entry is reusable once its last view is dropped,
+    /// and nothing here forces that to happen. What bounds the set is [`READ_POOL_LIMIT`] and
+    /// not the caller's behaviour -- a buffer that would be the ninth is simply not watched,
+    /// and its memory is freed by the delivery holding it rather than retained here. That is
+    /// what makes a caller holding deliveries unable to stall the reader: there is always a
+    /// buffer to read into, reused if one is free and fresh if none is.
+    spare: Vec<Arc<Vec<u8>>>,
     /// Produced record bytes on their way to the byte stream.
     ///
     /// Whole records, serialised in the order they were produced, and never holding more than
@@ -674,7 +704,8 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
             conn,
             events,
             framer: RecordFramer::new(),
-            inbound: vec![0; READ_BUFFER],
+            inbound: Arc::new(vec![0; READ_BUFFER]),
+            spare: Vec::new(),
             outbound: Vec::new(),
             filled: 0,
             written: 0,
@@ -1538,6 +1569,52 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         Ok(true)
     }
 
+    /// Makes sure the read buffer is one nothing else is holding.
+    ///
+    /// Does nothing at all in the ordinary case, which is a caller that has dropped the
+    /// deliveries from the last read: the strong count is one, the buffer is reusable, and this
+    /// connection reads into the same allocation it has used since it was built.
+    ///
+    /// Otherwise the buffer is retired -- put aside to be watched for the moment its last
+    /// delivery is dropped -- and replaced with a recycled one if any is free and a fresh one if
+    /// none is. Allocating rather than waiting is deliberate and is what FR-016 asks for: a
+    /// caller is entitled to hold delivered data for as long as it likes, and a reader that
+    /// blocked until the caller let go would turn that entitlement into a stall. What bounds the
+    /// memory instead is the read-ahead credit, which is unchanged and which is accounted by
+    /// bytes delivered against bytes credited rather than by whether the caller still holds
+    /// them.
+    fn claim_read_buffer(&mut self) {
+        if Arc::get_mut(&mut self.inbound).is_some() {
+            return;
+        }
+
+        // The first spare whose last delivery has been dropped. Scanned rather than popped:
+        // buffers come free in the order their deliveries are consumed, which is not the order
+        // they were retired in.
+        let recycled = self
+            .spare
+            .iter_mut()
+            .position(|buffer| Arc::get_mut(buffer).is_some())
+            .map(|index| self.spare.swap_remove(index));
+
+        let fresh = recycled.unwrap_or_else(|| Arc::new(vec![0; READ_BUFFER]));
+        let retired = core::mem::replace(&mut self.inbound, fresh);
+        if self.spare.len() < READ_POOL_LIMIT {
+            self.spare.push(retired);
+        }
+    }
+
+    /// How many read buffers this connection is holding, the one being read into included.
+    ///
+    /// Exposed so a test can assert the bound rather than trust it, and gated for the reason
+    /// [`Connection::copied_record_bytes`] gives: a counter present in one build of a benchmark
+    /// comparison and absent from the other measures the instrument.
+    #[cfg(debug_assertions)]
+    #[must_use]
+    pub fn read_buffers(&self) -> usize {
+        1 + self.spare.len()
+    }
+
     /// Reads from the byte stream until it has nothing more, feeding the framer and then the
     /// state machine.
     ///
@@ -1555,7 +1632,14 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
                 return Ok(());
             }
 
-            let filled = match self.stream.poll_read(cx, &mut self.inbound) {
+            // A buffer nobody is holding a delivery from, before anything is read into one.
+            // The connection reuses the same buffer for its whole life unless a caller is
+            // holding data cut from it, at which point it takes another rather than waiting --
+            // which is what keeps a held delivery from stalling the reader.
+            self.claim_read_buffer();
+            let buffer = Arc::get_mut(&mut self.inbound)
+                .expect("the read buffer was just claimed, so nothing else holds it");
+            let filled = match self.stream.poll_read(cx, buffer) {
                 Poll::Pending => return Ok(()),
                 Poll::Ready(Err(error)) => {
                     return Err(self.fail_stream(error, "the byte stream failed while reading"));
@@ -1579,7 +1663,12 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
             // Waking on any inbound bytes would have done as well, and would have spun a
             // blocked writer once per record for as long as the peer kept sending.
             let credit_before = self.conn.max_data_left();
+            // The buffer is named to the queue for exactly the duration of this call, which is
+            // the only window in which a handler runs. See `super::event` for why the handler
+            // needs it and why holding it any longer would stop the buffer ever being reused.
+            self.events.begin_read(&self.inbound);
             let outcome = self.conn.read(&self.inbound[..filled], now);
+            self.events.end_read();
             if self.conn.max_data_left() > credit_before {
                 self.signals.wake_credit();
             }
@@ -1941,12 +2030,13 @@ fn handlers(events: &EventQueue, signals: &Signals) -> Handlers<'static> {
 
     Handlers::new()
         .on_stream_data(move |event| {
-            data.push(Event::StreamData {
-                stream_id: event.stream_id,
-                offset: event.offset,
-                data: event.data.to_vec(),
-                fin: event.fin,
-            });
+            // `deliver` rather than `push`, because the payload is the one thing a handler
+            // cannot simply record: the borrow it is handed is valid only for this call. What
+            // the queue holds -- the buffer the state machine is being fed right now -- is what
+            // turns that borrow into something the caller can keep, without the handler having
+            // to reach the connection to ask. See `super::event` for why that is sound and for
+            // when it still copies.
+            data.deliver(event.stream_id, event.offset, event.data, event.fin);
             Ok(())
         })
         .on_stream_open(move |stream_id| {

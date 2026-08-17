@@ -114,6 +114,7 @@
 mod clock;
 mod close;
 mod conn;
+mod delivery;
 mod error;
 mod event;
 mod framing;
@@ -135,6 +136,7 @@ pub use conn::{
     Config, Connection, DEFAULT_CONNECTION_DATA, DEFAULT_MAX_STREAMS, DEFAULT_READ_AHEAD,
     DEFAULT_STREAM_DATA, OUTBOUND_CARRY, OUTBOUND_CEILING, StreamWrite,
 };
+pub use delivery::{ALIAS_THRESHOLD, StreamBytes};
 pub use error::{Error, ErrorKind, Result};
 pub use event::Event;
 pub use framing::RecordFramer;

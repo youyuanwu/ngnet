@@ -18,7 +18,7 @@ merely worked around.
 | Gap | What it costs, and what would settle it |
 | --- | --- |
 | **No way to serialise a connection close** | dwnx parses an incoming CONNECTION_CLOSE and reports it as `DWNX_ERR_DRAINING`, and it exposes `dwnx_ccerr` and its constructors for *describing* a close. There is no `dwnx_conn_write_connection_close` or equivalent, so the state machine can observe a peer's shutdown but cannot initiate one. The asynchronous layer therefore ships its own encoder in `src/io/close.rs`, and `tests/events.rs` builds a CONNECTION_CLOSE record by hand to test the receiving side. An upstream writer would make both removable: `Conn::close` would forward to it, and the layer would call that instead. |
-| **No accessor for a close the peer sent** | The parse happens — dwnx reads the kind, the error code, the frame type and the reason into a frame struct — and then the struct is private and the caller is handed `DWNX_ERR_DRAINING` with nothing attached. So this crate cannot say *why* the peer closed without decoding the record itself, which is half of why the layer retains inbound records at all. What would settle it: a getter returning the parsed `dwnx_ccerr`, at which point `src/io/close.rs`'s decoder and the framer's retention both go. |
+| **No accessor for a close the peer sent** | The parse happens — dwnx reads the kind, the error code, the frame type and the reason into a frame struct — and then the struct is private and the caller is handed `DWNX_ERR_DRAINING` with nothing attached. So this crate cannot say *why* the peer closed without decoding the record itself, which is the whole of why the layer looks inside inbound records at all. It no longer has to *retain* one to do it — a record that arrives whole is scanned where it lies — but it still has to scan every record, and a record that arrives in fragments is still reassembled first. What would settle it: a getter returning the parsed `dwnx_ccerr`, at which point `src/io/close.rs`'s decoder, the scan and the last of the retention all go. |
 | **No way to ask where a record ends** | `dwnx_conn_read` returns `0` for "that was fine, feed me more" whether it stopped between records or halfway through a length prefix, the record reader's state has no accessor, and the reader is private. A byte stream cut off mid-record is therefore indistinguishable from one that ended tidily, and reporting the second where the first happened is an incomplete transfer with no symptom. `src/io/framing.rs` reads the length prefixes itself so the layer always knows which just happened. What would settle it: any accessor reporting whether the reader stands at a boundary — one predicate would do. |
 | **No callback for the connection-level window** | dwnx invokes `extend_max_stream_data` when a peer raises a *stream's* window, and invokes nothing when a MAX_DATA frame raises the connection's: it updates `tx.max_offset` and tells nobody (`deps/dwnx/lib/dwnx_conn.c:1045-1056`). A write parked on an exhausted connection window therefore has no event to wait for. The layer samples `Conn::max_data_left` either side of every `Conn::read` and wakes the parked writer when the figure moves — correct, and a poll where a callback would do. Waking on any inbound bytes instead would have spun a blocked writer once per arriving record for as long as the peer kept talking. What would settle it: an `extend_max_data` callback beside the one that already exists per stream. |
 | **No getter for the peer's transport parameters** | `dwnx_conn_get_local_transport_params` returns the *local* set. The peer's arrive only through the `recv_transport_params` callback, so the bridge copies them into connection-owned storage and `Conn::peer_transport_params` reads that cache. A real getter upstream would let the accessor forward instead of caching. |
@@ -34,23 +34,60 @@ merely worked around.
 Recorded here rather than in `design.md` because it is a consequence of the table above rather
 than a decision: close the gaps and the cost goes with them.
 
-Every inbound byte is copied twice inside this crate before a caller sees it. The framer
-retains the payload of the record currently arriving (`src/io/framing.rs`), because it cannot
-know whether that record carries a close until the record is complete and there is no way to
-ask dwnx afterwards. And each delivery is copied out of the record dwnx is parsing into an
-owned `Vec` for `Event::StreamData` (`src/io/event.rs`), because the handler's borrow points
-into that record buffer and is valid only for the duration of the callback.
+Inbound, the crate used to copy every byte twice before a caller saw it. Both copies are now
+gone from the ordinary path, and the gaps that caused them are not — which is the distinction
+this section exists to keep.
 
-Neither copy is a choice. The first exists because dwnx exposes no accessor for a parsed close;
-give it one and the retention goes entirely. The second exists because handlers receive event
-values and cannot reach the connection — which is the deliberate design recorded in
-`design.md` — so the alternative is invoking a caller-supplied callback from inside the
-handler, which is what the sans-I/O API already offers and what the layer exists to be an
-alternative to.
+**The framer's copy is now paid only where it buys something.** It still cannot know whether a
+record carries a close until the record is complete, and there is still no way to ask dwnx
+afterwards, so it still has to look inside every record. What changed is where it looks: a
+record whose declared length is entirely present in the slice the connection just read is
+scanned **where it lies**, because those bytes are already contiguous in the read buffer this
+crate owns and the decoder wants nothing else (`src/io/framing.rs`, and `design.md` for the
+three conditions that make it sound). What is still copied is a record spread over several
+reads — which has nothing contiguous to scan and must be reassembled first — and the one
+close a connection latches, since latching means holding the bytes after the call has returned.
+So the cost went from one memcpy per record to one per fragmented record plus one per
+connection, and `RecordFramer::copied_bytes` is what says so: `io_framing.rs` asserts zero for a
+run of records that arrive whole, and asserts their full payload for the same records cut in
+two, which is the figure the whole-record case reported before.
 
-The HTTP/3 join adds none inbound. `ngnet-qmux-h3` turns that owned `Vec` into `Bytes` by
-taking the allocation over rather than copying it, and its outbound direction copies into the
-record being built exactly once — which is what `RETAINS_BUFFERS = false` means there.
+That is a narrowing, not a closing. The gap in the table above is still the reason the framer
+looks inside records at all: give dwnx an accessor for the parsed close and the scan, the
+decoder in `src/io/close.rs` and the last of the retention all go together.
+
+**The delivery copy is now paid only where holding a region would cost more than copying.**
+Each delivery used to be copied out of the record dwnx is parsing into an owned `Vec` for
+`Event::StreamData`, because the handler's borrow points into that record buffer and is valid
+only for the duration of the callback. What changed is not the borrow but what the bytes it
+points at *are*: dwnx delivers stream payload straight out of the buffer it was handed
+(`deps/dwnx/lib/dwnx_conn.c:1631-1636`), which is this connection's own read buffer, so a
+reference count can outlive a borrow where the borrow cannot. `Event::StreamData` now carries a
+`StreamBytes` — a refcounted view of that buffer and a range within it (`src/io/delivery.rs`) —
+and the connection reads into a buffer again only once every view of it has been dropped.
+
+What is still copied is a delivery below `ALIAS_THRESHOLD`, and that copy is what makes the
+retention bound true rather than nominal: a one-byte delivery aliasing a 16382-byte buffer would
+pin sixteen thousand times what it carries, so anything under a kilobyte is given an allocation
+of its own and the factor is capped at sixteen. The threshold and the factor are one decision
+and are documented together in `src/io/delivery.rs`.
+
+The handler could not simply be told which buffer to alias, because a handler cannot reach the
+connection — the deliberate design recorded in `design.md`, with compile-fail cases enforcing
+it. What it holds instead, alongside the event queue it already held, is the reference-counted
+handle for the buffer currently being parsed, which the read side sets immediately before
+feeding dwnx and clears immediately after (`src/io/event.rs`). A handle to a buffer is not a
+handle to a connection, and the compile-fail cases still fail to compile for the reasons they
+name.
+
+That is a narrowing too. The gap it turns on is not in the table above but in the shape of
+dwnx's callback: an accessor that let a caller ask for the parsed payload after the call had
+returned would remove the shared handle and the address check with it.
+
+The HTTP/3 join adds none inbound. `ngnet-qmux-h3` turns a delivery into `Bytes` by taking the
+allocation over when it owns one and by carrying the view whole into `Bytes::from_owner` when it
+does not — a move or a refcount bump, never a copy — and its outbound direction copies into the
+record being built exactly once, which is what `RETAINS_BUFFERS = false` means there.
 
 Outbound within this crate there is now none. A record used to be serialised into a scratch
 buffer and then copied into the outbound queue — one memcpy of up to 16382 bytes per record,
@@ -71,13 +108,25 @@ it is *worth* in time is a separate question, and nothing here answers it: these
 identical on every machine, and any statement about timing has to come from a recorded run under
 `docs/benchmarks/`.
 
-The two inbound copies have still not been costed. The benchmark suite in `docs/benchmarks/` now
-runs `ngnet-qmux-h3` end to end over this layer, so the sentence that used to stand here — that
-there were no benchmarks — is no longer true; but an end-to-end figure attributes nothing to
-these copies in particular, since it also contains framing, QPACK, the record layer, the pump
-and the byte stream. They therefore remain descriptions rather than numbers, and will stay so
-until something profiles them or measures a build with one of them removed. The outbound one
-is the exception, and only because it is gone: its count is asserted rather than estimated.
+What the inbound copies are *worth in time* is still not costed. The benchmark suite in
+`docs/benchmarks/` now runs `ngnet-qmux-h3` end to end over this layer, so the sentence that used
+to stand here — that there were no benchmarks — is no longer true; but an end-to-end figure
+attributes nothing to these copies in particular, since it also contains framing, QPACK, the
+record layer, the pump and the byte stream. Counts are a different matter and are asserted
+rather than estimated: the outbound copy is gone and reports zero, the framer's is now zero for
+a record that arrives whole, and the delivery copy is measured directly by the allocation
+harness in `tests/ngnet-qmux-h3-tests/tests/allocations.rs` — in the steady state it counts 24
+bytes allocated per delivery where it counted 8,216 before, for deliveries of about 8 KiB.
+Whether removing them moves a timing is a question for a recorded run under `docs/benchmarks/`,
+and nothing here answers it.
+
+One figure in that harness went the other way and is recorded because it did. A caller that lets
+the connection read far ahead of it holds deliveries cut from several read buffers at once, so
+the connection takes a fresh buffer rather than waiting for the caller — and that costs about
+one allocation per delivery where copying cost none beyond the copy itself: 2.60 allocations per
+delivery against 1.60, for the same bytes (13,502 against 13,457). The trade is deliberate.
+Waiting for the caller to let go is the stall FR-016 forbids, and the bytes — which is what the
+copy was — are unchanged.
 
 ## Things this increment does not do
 

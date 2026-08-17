@@ -4,7 +4,7 @@ use bytes::Bytes;
 use ngnet_h3::ErrorCode;
 use ngnet_h3::StreamId as H3StreamId;
 use ngnet_h3::http::QuicEvent;
-use ngnet_qmux::io::Event;
+use ngnet_qmux::io::{Event, StreamBytes};
 use ngnet_qmux::{Directionality, Initiator, StreamId};
 
 /// Converts a QMux stream identifier into the HTTP/3 layer's.
@@ -50,6 +50,26 @@ pub(crate) fn ends_a_stream(event: &QuicEvent) -> bool {
     )
 }
 
+/// Hands a QMux delivery to the HTTP/3 layer without copying it.
+///
+/// Both arms are a move or a reference-count bump, and neither is a memcpy. That is the whole
+/// requirement, and it is worth naming because the obvious spelling — `Bytes::copy_from_slice`
+/// — compiles, is correct, and silently reintroduces the copy the layer below exists to have
+/// removed.
+///
+/// A delivery that owns an allocation hands it over: `Bytes::from(Vec<u8>)` takes the
+/// allocation and is free. A delivery that is a view of the connection's read buffer has no
+/// allocation to hand over, so it is carried whole into the `Bytes` as its owner, and dropping
+/// the `Bytes` is what releases the buffer back to the connection. `Bytes::from_owner` costs one
+/// allocation for its control block — a constant few dozen bytes, not a copy of the payload and
+/// not proportional to it — and `crates/ngnet-h2/src/session.rs` uses it for the same purpose.
+fn carry(data: StreamBytes) -> Bytes {
+    match data.try_into_vec() {
+        Ok(owned) => Bytes::from(owned),
+        Err(view) => Bytes::from_owner(view),
+    }
+}
+
 /// Translates one QMux event into the event the HTTP/3 layer reads.
 ///
 /// Returns `None` for events that carry nothing the layer acts on. A window or a stream
@@ -67,7 +87,7 @@ pub(crate) fn translate(event: Event, local: Initiator) -> Option<QuicEvent> {
             // A zero-length delivery with `fin` is passed through rather than filtered. It
             // is how a peer that already sent everything ends a stream, and the HTTP/3 layer
             // requires it: suppressing it leaves a request body that never ends.
-            bytes: Bytes::from(data),
+            bytes: carry(data),
             fin,
         },
         Event::StreamOpened { stream_id: id } => {

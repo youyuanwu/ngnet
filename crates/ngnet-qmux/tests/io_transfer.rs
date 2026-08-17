@@ -211,7 +211,7 @@ fn several_events_from_one_read_arrive_as_one_ordered_sequence() {
             {
                 match seen.iter_mut().find(|(id, _)| *id == stream_id) {
                     Some((_, body)) => body.extend_from_slice(&data),
-                    None => seen.push((stream_id, data)),
+                    None => seen.push((stream_id, data.to_vec())),
                 }
                 if fin {
                     finished += 1;
@@ -289,7 +289,7 @@ fn a_single_read_carrying_several_events_yields_them_as_one_sequence() {
                 data,
                 fin,
                 ..
-            } => Some((stream_id, data, fin)),
+            } => Some((stream_id, data.to_vec(), fin)),
             _ => None,
         })
         .collect();
