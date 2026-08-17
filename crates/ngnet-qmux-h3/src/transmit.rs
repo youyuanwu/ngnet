@@ -57,99 +57,60 @@ pub(crate) fn drain<S: AsyncByteStream, C: Clock, Src: StreamSource>(
 
             // An offer of nothing, with no end-of-stream to carry, is answered without
             // touching the connection: there is nothing to write and nothing to retry.
+            //
+            // Conditioned on `!fin` and it must stay so. An otherwise-empty offer that carries
+            // the marker still has to produce its record, because that record is the only way
+            // a stream which has finished writing is ever ended; short-circuiting it would
+            // leave the peer waiting out an idle timeout for a body that had in fact arrived.
             if !fin && slices.iter().all(|slice| slice.is_empty()) {
                 return WriteOutcome::Accepted(0);
             }
 
-            let mut total: usize = 0;
-            let mut refusal: Option<WriteOutcome> = None;
-            // The end-of-stream marker must ride on the last slice that is actually written,
-            // not on the last slice offered. A trailing empty slice would otherwise take the
-            // marker, be refused -- the earlier slices in this offer may have filled the
-            // connection's output buffer, and a refusal is what a full buffer answers -- and
-            // contribute nothing to `total`, so the closure would answer `Accepted(offered)`
-            // and the driver would commit the stream as ended while QMux had sent no FIN,
-            // leaving the peer waiting for an end that never comes. The refusal is rarer than
-            // it was, since the buffer now holds several records rather than one, which makes
-            // this more worth computing rather than less: a hazard that fires occasionally is
-            // one nothing reproduces. nghttp3 does not currently emit zero-length vectors, but
-            // `ngnet-h3` does not rely on that, and the failure is silent, so the index is
-            // computed rather than assumed.
-            let last_written = slices
-                .iter()
-                .rposition(|slice| !slice.is_empty())
-                .unwrap_or(0);
-            let count = slices.len().max(1);
-
-            for index in 0..count {
-                let last = index == last_written;
-                // The end-of-stream marker rides on the final slice and only there. QMux
-                // applies it only when it takes the whole of what it was offered, so a
-                // partial accept cannot end the stream early.
-                let end = fin && last;
-                let slice: &[u8] = slices.get(index).map_or(&[], |slice| &slice[..]);
-                if slice.is_empty() && !end {
-                    continue;
+            // One call for the whole offer, where this used to be a call per slice. A slice
+            // boundary is then no longer a record boundary: the fragments are concatenated
+            // into as few records as the maximum record size permits, which for the ordinary
+            // two-fragment offer -- a request's headers and the first of its body -- is one
+            // record where it used to be two.
+            //
+            // Three properties came out of the per-slice loop and are worth naming, because
+            // each was computed there and is now structural.
+            //
+            // The **end-of-stream marker** rides the record that takes the last byte of the
+            // whole offer, and only when the whole offer was taken. The loop used to find the
+            // last non-empty slice by index, because a trailing empty slice would otherwise
+            // take the marker, be refused, and have the driver commit the stream as ended
+            // while QMux had sent no FIN. An empty fragment is now not submitted at all and
+            // there is nothing for the marker to land on wrongly; dwnx applies it only when
+            // the data it was handed fits entirely.
+            //
+            // The **refusals** are still only an offer's answer while nothing has been taken.
+            // The layer below reports a non-zero count in preference to any refusal, so a
+            // `Blocked` or a `Closed` arriving here means nothing was packed -- which is what
+            // makes returning it safe, since a refusal that lost a count would have the layer
+            // offer those bytes again and the stream would carry them twice.
+            //
+            // The **release and the verdict** are one number from one place, which is the same
+            // property the loop maintained and the reason it kept a running total: a second
+            // source for either is a second chance to disagree with the first, and disagreeing
+            // in one direction holds the application's buffers for the connection's life while
+            // disagreeing in the other frees memory nghttp3 is still reading through.
+            match conn.try_write_stream_vectored(id, slices, fin) {
+                Ok(StreamWrite::Accepted(taken)) => {
+                    if taken > 0 {
+                        released = Some((stream, taken as u64));
+                    }
+                    WriteOutcome::Accepted(taken)
                 }
-
-                match conn.try_write_stream(id, slice, end) {
-                    Ok(StreamWrite::Accepted(taken)) => {
-                        total += taken;
-                        // A short accept means the peer's window is exhausted or the
-                        // connection's output buffer has no room for a further record --
-                        // backpressure either way, because one call fills as many records as
-                        // the buffer will hold. Nothing after it can be taken this pass, and
-                        // offering it anyway would put the stream's bytes out of order.
-                        //
-                        // It used to mean a third thing, and that third thing is why this
-                        // break was wrong for a while: while a call took one record, a large
-                        // offer answered short with the buffer three-quarters empty, and this
-                        // break stood the stream down over a record boundary. That reading is
-                        // gone from the layer below rather than compensated for here, because
-                        // the difference between a filled record and a shut window is visible
-                        // only there.
-                        if taken < slice.len() {
-                            break;
-                        }
-                    }
-                    // Blocked and closed are only the offer's answer while nothing has been
-                    // taken. Once bytes are accepted the layer must hear the count, or it
-                    // would offer them a second time and the stream would carry them twice.
-                    Ok(StreamWrite::Blocked) => {
-                        if total == 0 {
-                            refusal = Some(WriteOutcome::Blocked);
-                        }
-                        break;
-                    }
-                    Ok(StreamWrite::Closed) => {
-                        if total == 0 {
-                            refusal = Some(WriteOutcome::Gone);
-                        }
-                        break;
-                    }
-                    Err(error) => {
-                        failure = Some(error);
-                        if total == 0 {
-                            refusal = Some(WriteOutcome::Blocked);
-                        }
-                        break;
-                    }
+                Ok(StreamWrite::Blocked) => WriteOutcome::Blocked,
+                Ok(StreamWrite::Closed) => WriteOutcome::Gone,
+                Err(error) => {
+                    // Fatal, and reported as a refusal only because the closure has no way to
+                    // say so: the connection is ended below, before the pass takes another
+                    // offer, so the re-offer this invites never happens.
+                    failure = Some(error);
+                    WriteOutcome::Blocked
                 }
             }
-
-            if let Some(refusal) = refusal {
-                return refusal;
-            }
-            // The release and the verdict are computed here, from the same running total, and
-            // this is the only place either is produced. That is what makes every accepted
-            // byte released exactly once: a second source for either number is a second
-            // chance to disagree with the first, and disagreeing in one direction holds the
-            // application's buffers for the connection's life while disagreeing in the other
-            // frees memory nghttp3 is still reading through.
-            if total > 0 {
-                released = Some((stream, total as u64));
-            }
-            WriteOutcome::Accepted(total)
         });
 
         if let Some((stream, bytes)) = released {

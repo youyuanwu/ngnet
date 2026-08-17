@@ -213,6 +213,7 @@
 //! first error rather than the last.
 
 use core::task::{Context, Poll};
+use std::io::IoSlice;
 use std::sync::Arc;
 
 use crate::ccerr::CloseReason;
@@ -231,7 +232,7 @@ use crate::settings::Settings;
 use crate::stream::{Directionality, StreamId};
 use crate::stream_io::{OpenOutcome, Shutdown};
 use crate::time::{Duration, Timestamp};
-use crate::write::{Push, WriteRequest};
+use crate::write::{MAX_VECTORS, Push, VectoredWriteRequest, WriteRequest};
 
 /// How many bytes the peer may send on any one stream before waiting for credit.
 ///
@@ -634,6 +635,95 @@ struct Produced {
     /// How many record bytes were written into the outbound buffer.
     bytes: usize,
     verdict: Verdict,
+}
+
+/// A cursor through a lent list of fragments, and the one place resumption is computed.
+///
+/// A vectored push reports **one total across every fragment it was given**, not a count per
+/// fragment (`deps/dwnx/lib/includes/dwnx/dwnx.h`; `dwnx_conn_write_stream_frame` sets
+/// `*pdatalen` to the single figure `wdatalen`). dwnx copies a *prefix* of the concatenation,
+/// so a short take stops wherever the record filled -- routinely in the middle of a fragment
+/// and not at a boundary between them. Resuming therefore means walking the list against a byte
+/// count, and this type is that walk, written once.
+///
+/// Written once because the alternative was found to be silent. A resumption that assumed whole
+/// fragments were taken produces a stream whose bytes are in the wrong order or missing
+/// entirely, with no error raised anywhere and nothing above to notice: the layer above is told
+/// a count, and a count computed from the same wrong assumption agrees with itself.
+struct Fragments<'a, 'd> {
+    slices: &'a [IoSlice<'d>],
+    /// The fragment the next byte comes from.
+    index: usize,
+    /// How much of that fragment has already been taken.
+    offset: usize,
+}
+
+impl<'a, 'd> Fragments<'a, 'd> {
+    fn new(slices: &'a [IoSlice<'d>]) -> Self {
+        Self {
+            slices,
+            index: 0,
+            offset: 0,
+        }
+    }
+
+    /// How many bytes are still to be offered.
+    fn remaining(&self) -> usize {
+        let mut left = 0usize;
+        for (at, slice) in self.slices.iter().enumerate().skip(self.index) {
+            left += slice.len() - if at == self.index { self.offset } else { 0 };
+        }
+        left
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remaining() == 0
+    }
+
+    /// Fills `into` with the next fragments to submit, skipping empty ones.
+    ///
+    /// Returns how many entries were filled and whether they are *all* that is left. The
+    /// second half is what decides whether an end-of-stream marker may ride this push: dwnx
+    /// applies the marker when the data it was handed in one call fits, so a push carrying
+    /// only part of the offer must not carry the marker.
+    fn chunk(&self, into: &mut [&'a [u8]]) -> (usize, bool) {
+        let mut count = 0usize;
+        for (at, slice) in self.slices.iter().enumerate().skip(self.index) {
+            let from = if at == self.index { self.offset } else { 0 };
+            let fragment = &slice[from..];
+            if fragment.is_empty() {
+                continue;
+            }
+            if count == into.len() {
+                return (count, false);
+            }
+            into[count] = fragment;
+            count += 1;
+        }
+        (count, true)
+    }
+
+    /// Records that `bytes` were taken, in order, across the fragments.
+    fn advance(&mut self, mut bytes: usize) {
+        while bytes > 0 {
+            let Some(slice) = self.slices.get(self.index) else {
+                debug_assert!(
+                    false,
+                    "a vectored push reported {bytes} bytes more than were lent to it, which \
+                     means the count it reported is not the total this cursor assumes"
+                );
+                return;
+            };
+            let left = slice.len() - self.offset;
+            if bytes < left {
+                self.offset += bytes;
+                return;
+            }
+            bytes -= left;
+            self.index += 1;
+            self.offset = 0;
+        }
+    }
 }
 
 /// The stream-level answer a production came back with.
@@ -1118,9 +1208,55 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         data: &[u8],
         fin: bool,
     ) -> Result<StreamWrite> {
+        // One fragment is the degenerate vectored case. Spelled that way rather than given a
+        // loop of its own: the two would differ only in how they walk the payload, and the
+        // walk is the part that fails silently when it is wrong.
+        self.try_write_stream_vectored(stream, &[IoSlice::new(data)], fin)
+    }
+
+    /// Writes several fragments of one stream's payload, without ever waiting.
+    ///
+    /// The vectored form of [`Connection::try_write_stream`], and the one the HTTP/3 join
+    /// uses: `StreamSource::write_next` lends a stream's pending output as a list of slices --
+    /// a request's headers and the first of its body, most often -- and this packs them into
+    /// **as few records as the maximum record size permits** rather than one record apiece.
+    /// The fragments are one payload, so they become one STREAM frame per record and the
+    /// boundary between two of them costs nothing.
+    ///
+    /// Everything [`Connection::try_write_stream`] documents holds here: the payload is spread
+    /// over as many records as the outbound buffer will hold, a short answer means
+    /// backpressure rather than a record boundary, and the count reported is the single source
+    /// of what the caller may consider taken.
+    ///
+    /// # The end-of-stream marker
+    ///
+    /// `fin` is applied by the record that takes the *last* byte of the *whole* list, and only
+    /// then. That is dwnx's rule rather than this loop's -- it sets the marker when the data
+    /// one call handed it fits entirely -- and it is why a caller need not work out which
+    /// fragment is the last non-empty one: a trailing empty fragment contributes nothing to
+    /// submit and cannot take the marker away from the fragment before it.
+    ///
+    /// A list that is empty, or that holds only empty fragments, produces a record only when
+    /// `fin` is set, which is how a stream that has finished writing is ended. Without `fin`
+    /// it produces the same `Accepted(0)` an empty payload has always produced.
+    ///
+    /// # Errors
+    ///
+    /// As [`Connection::try_write_stream`].
+    pub fn try_write_stream_vectored(
+        &mut self,
+        stream: StreamId,
+        slices: &[IoSlice<'_>],
+        fin: bool,
+    ) -> Result<StreamWrite> {
         if let Some(terminal) = &self.terminal {
             return Err(terminal.error());
         }
+
+        // The cursor is the offer's position, kept across records, and it is advanced by the
+        // production that consumed the bytes rather than recomputed here from a running total.
+        let mut fragments = Fragments::new(slices);
+        let offered = fragments.remaining();
 
         // The running total, and the single source of the answer. Every exit below reports
         // this same figure when it is non-zero, because bytes packed into a record are already
@@ -1128,7 +1264,7 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         // and a refusal that lost the count would have the caller offer them a second time.
         let mut taken = 0usize;
         loop {
-            let Some(room) = self.room_for(data.len() - taken, taken > 0) else {
+            let Some(room) = self.room_for(offered - taken, taken > 0) else {
                 // The buffer has reached the ceiling, so there is nowhere to put another
                 // record until the byte stream has taken some of what is already there -- and
                 // nothing is written from here, so it cannot make room itself. Reporting it as
@@ -1141,25 +1277,18 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
                 return Ok(accepted_or(taken, StreamWrite::Blocked));
             };
 
-            let produced = self.produce_within(
-                WriteRequest::stream(stream, &data[taken..]).with_fin(fin),
-                room,
-            )?;
+            let produced = self.produce_vectored_within(stream, &mut fragments, fin, room)?;
             // Counted before the verdict is read, and for every verdict, for the reason above.
-            // `fin` rides the record that takes the last of the payload, which is dwnx's rule
-            // and not this loop's: every push carries the flag with whatever is left, and the
-            // end-of-stream marker is applied by the push that empties it. So a payload split
-            // across records here ends the stream exactly once, on the last of them.
             taken += produced.consumed;
 
             match produced.verdict {
                 Verdict::Closed => return Ok(accepted_or(taken, StreamWrite::Closed)),
                 Verdict::Blocked => return Ok(accepted_or(taken, StreamWrite::Blocked)),
                 Verdict::Packed => {
-                    // The whole offer is packed. An empty payload lands here on its first turn
+                    // The whole offer is packed. An empty list lands here on its first turn
                     // and answers `Accepted(0)`, which is how an end-of-stream marker carrying
                     // no data is accepted.
-                    if taken == data.len() {
+                    if taken == offered {
                         return Ok(StreamWrite::Accepted(taken));
                     }
                     // Nothing taken from a payload that still has bytes in it: dwnx reports an
@@ -1777,6 +1906,37 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     /// [`Connection::room_for`] for who asks for a short record and why.
     fn produce_within(&mut self, request: WriteRequest<'_>, room: usize) -> Result<Produced> {
         let now = self.clock.now();
+        self.serialise(room, |conn, dest| pack(conn, dest, request, now))
+    }
+
+    /// As [`Connection::produce_within`], for a payload lent in fragments.
+    ///
+    /// `fragments` is advanced by exactly what this record took, which is what makes the next
+    /// record resume in the right place — including when the take stopped in the middle of a
+    /// fragment, which is the ordinary case rather than the exotic one.
+    fn produce_vectored_within(
+        &mut self,
+        stream: StreamId,
+        fragments: &mut Fragments<'_, '_>,
+        fin: bool,
+        room: usize,
+    ) -> Result<Produced> {
+        let now = self.clock.now();
+        self.serialise(room, |conn, dest| {
+            pack_vectored(conn, dest, Some(stream), fragments, fin, now)
+        })
+    }
+
+    /// Serialises one record into the buffer's tail and accounts for what it produced.
+    ///
+    /// The part both production forms share: reserving the tail, handing the record writer
+    /// nothing but that tail, and checking the two bounds afterwards. `build` is what differs
+    /// between them and is the only thing that does.
+    fn serialise(
+        &mut self,
+        room: usize,
+        build: impl FnOnce(&mut Conn<'static>, &mut [u8]) -> core::result::Result<Produced, CoreError>,
+    ) -> Result<Produced> {
         let room = room.min(MAX_RECORD);
         self.make_room(room);
         let at = self.filled;
@@ -1791,7 +1951,7 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         // Spelled out as a free function over two fields rather than as a method, because the
         // record writer borrows the connection and the destination for as long as the record is
         // being built. Splitting the borrows by field is what makes that legal.
-        match pack(&mut self.conn, &mut tail[..room], request, now) {
+        match build(&mut self.conn, &mut tail[..room]) {
             Ok(produced) => {
                 self.filled += produced.bytes;
                 // Two bounds, checked where records are made rather than where callers happen
@@ -1944,18 +2104,55 @@ fn pack(
     request: WriteRequest<'_>,
     now: Timestamp,
 ) -> core::result::Result<Produced, CoreError> {
+    // A single payload is the one-fragment case of the vectored one, and is spelled that way
+    // rather than given a loop of its own. The two loops would differ only in how they walk
+    // what is left after a short take, and that walk is the part of this path that goes wrong
+    // without raising anything: it produces a stream with bytes missing or out of order, and a
+    // count computed from the same mistake agrees with it.
+    let slices = [IoSlice::new(request.data)];
+    let mut fragments = Fragments::new(&slices);
+    pack_vectored(conn, dest, request.stream, &mut fragments, request.fin, now)
+}
+
+/// Builds one record out of a payload lent in fragments.
+///
+/// As [`pack`], with the payload arriving as a list rather than as one slice. `fragments` is
+/// advanced by exactly what this record took, so the caller's next record resumes where this
+/// one stopped -- which is routinely part-way through a fragment, because dwnx copies a prefix
+/// of the concatenation and stops where the record filled.
+///
+/// The pushes go into **one** record and produce one STREAM frame per push, so a payload whose
+/// fragments all fit costs the framing of one record rather than of one per fragment. That is
+/// the whole of what the vectored form buys, and it is a record count rather than a copy count:
+/// dwnx copies the payload into the record either way.
+fn pack_vectored(
+    conn: &mut Conn<'static>,
+    dest: &mut [u8],
+    stream: Option<StreamId>,
+    fragments: &mut Fragments<'_, '_>,
+    fin: bool,
+    now: Timestamp,
+) -> core::result::Result<Produced, CoreError> {
     let mut consumed = 0usize;
-    let mut remaining = request.data;
     let mut verdict = Verdict::Packed;
+    // The array dwnx is handed, filled from the cursor on each push. A stack array rather than
+    // an allocation: this is the write path, and one record's worth of pointers is cheaper to
+    // copy than a heap block is to acquire.
+    let mut vectors: [&[u8]; MAX_VECTORS] = [&[]; MAX_VECTORS];
 
     let mut writer = conn.record(dest, now);
     loop {
-        let step = WriteRequest {
-            stream: request.stream,
-            data: remaining,
-            fin: request.fin,
+        let (count, whole) = fragments.chunk(&mut vectors);
+        let step = VectoredWriteRequest {
+            stream,
+            data: &vectors[..count],
+            // Only the push that carries the last of the offer may carry the marker. A push
+            // that had to leave fragments behind -- there are more of them than one call
+            // submits -- must not, because dwnx reads "everything fitted" from the data it was
+            // handed in *this* call and would end the stream with fragments still unsent.
+            fin: fin && whole,
         };
-        let pushed = match writer.push(step) {
+        let pushed = match writer.push_vectored(step) {
             Ok(pushed) => pushed,
             Err(error) if consumed == 0 && error.kind() == crate::ErrorKind::Stream => {
                 verdict = Verdict::Closed;
@@ -1967,13 +2164,19 @@ fn pack(
             Push::Accepted { consumed: taken } => {
                 let taken = taken.unwrap_or(0);
                 consumed += taken;
-                remaining = &remaining[taken..];
-                if remaining.is_empty() {
+                fragments.advance(taken);
+                // The offer is spent. `whole` cannot be false here -- a push that left
+                // fragments behind leaves the cursor with something in it -- so the marker
+                // has already ridden the push that emptied the list, which is dwnx's rule
+                // rather than this loop's.
+                if fragments.is_empty() {
                     break;
                 }
             }
             Push::Complete { consumed: taken } => {
-                consumed += taken.unwrap_or(0);
+                let taken = taken.unwrap_or(0);
+                consumed += taken;
+                fragments.advance(taken);
                 break;
             }
             Push::StreamBlocked => {

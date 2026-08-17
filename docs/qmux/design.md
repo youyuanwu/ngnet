@@ -488,6 +488,25 @@ a 2 MiB upload cost 130 writes where the carry accounts for 32. The alternative 
 decision above, by re-offering after a short accept — was rejected because the layer above
 cannot tell a filled record from a shut window, and re-offering into a shut window spins.
 
+`try_write_stream_vectored` is the same call taking the payload in fragments, and it is the one
+the HTTP/3 join uses: `StreamSource::write_next` lends a stream's pending output as a list, and
+the fragments go into records together rather than one apiece. `try_write_stream` is written as
+its one-fragment case rather than kept as a loop of its own, and so are `pack` and
+`RecordWriter::push`. That is deliberate. The part that is easy to get wrong is the resumption
+— dwnx reports `*pdatalen` as one total across every vector, not a count per vector, and a
+short take routinely stops part-way through a fragment — and a walk that resumed at the wrong
+place would send some bytes twice and others never while reporting a count that agreed with
+itself. There is one walk (`Fragments`) rather than two, because a second one is a second thing
+to get wrong silently. The rejected alternative was a pair of parallel loops, single-slice and
+vectored, which reads more simply and duplicates exactly the part that has no safety net.
+
+The end-of-stream marker follows from that rather than being placed: dwnx applies it when the
+data one call handed it fits entirely, so a push that had to leave fragments behind — a list
+longer than the sixteen-entry array one push submits — must not carry it, and the loop
+suppresses it in that case only. Empty fragments are never submitted, so a trailing empty
+fragment cannot take the marker away from the payload before it, and no index has to be
+computed to avoid it.
+
 Both split a payload across records and across available credit rather than truncating, and both
 report what they took even when they then refuse: a count dropped because the verdict was a
 refusal has the caller offer those bytes a second time, and the peer receives them twice.

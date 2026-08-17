@@ -1,27 +1,21 @@
-//! What a multi-fragment offer costs.
+//! What a multi-fragment offer costs, now that it costs as little as it can.
 //!
 //! # The mechanism
 //!
 //! The HTTP/3 layer offers a stream's pending output as a vector of slices. For the first write
 //! of a request that has a body ready, that vector has two fragments: the QPACK-encoded headers
-//! and the body. QMux takes them one at a time, and each `try_write_stream` *begins* a record of
-//! its own, so the headers land in a record with room for sixteen thousand more bytes and the
-//! body starts in the next one. What a call does after that record has changed -- it now fills
-//! records until the buffer or the peer's window stops it -- but it still cannot reach back into
-//! the record the previous fragment closed, which is why the fragment boundary is still a record
-//! boundary and why this file still has something to measure.
+//! and the body. QMux submits the whole vector to dwnx in one call --
+//! `Connection::try_write_stream_vectored` over `dwnx_conn_writev_stream` -- so the fragments
+//! share records and the boundary between them costs nothing. The headers ride inside the
+//! body's records instead of occupying an undersized one of their own.
 //!
-//! Write coalescing changed what that costs without changing the record count. It used to be
-//! worse: the second fragment was *refused* while a record was outstanding, so the offer ended
-//! after its first fragment and the body waited for a later offer. The outbound buffer now holds
-//! several records, so the second fragment is accepted in the same offer and the two records
-//! leave in one write. What remains is the record itself: a
-//! fragmented offer still costs one record per fragment where a vectored push would pack them
-//! into one.
-//!
-//! Phase 3 (vectored record input) is the phase that should break the assertions below: an
-//! offer whose fragments go into one record leaves no undersized header record behind, and the
-//! request costs one record fewer.
+//! **These assertions used to pin the opposite.** Until Phase 3 the join called
+//! `try_write_stream` once per slice, and a call *begins* a record, so the headers landed in a
+//! record with sixteen thousand bytes of room left in it and the body started in the next one.
+//! This file was written then, to pin that cost so that removing it would show. It has been
+//! inverted rather than deleted, because the cost can come back: anything that goes back to a
+//! call per fragment, or that stops packing after the first fragment, restores the record and
+//! its framing, and the figures below are what notices.
 //!
 //! # Why this is measured as a difference between two requests
 //!
@@ -36,8 +30,10 @@
 //! configurations, one request with a body and one without. Everything they have in common --
 //! the connection preamble, the control streams, the QPACK stream setup -- cancels, and what is
 //! left is what carrying the body cost. The header record does not cancel: the body-less
-//! request has one too. So the difference counts the body's own records *plus the one the
-//! separate header fragment forced*, and packing the fragments takes that one away.
+//! request has one too, and still does, because a request with no body offers one fragment and
+//! one fragment is one record however it is submitted. So the difference counts the body's own
+//! records *plus whatever the separate header fragment forced* -- which is now nothing, and
+//! that is the assertion.
 //!
 //! # Why the difference is counted in bytes rather than in writes
 //!
@@ -50,13 +46,25 @@
 //! sensitive in. The figure is exact rather than approximate, and the arithmetic that accounts
 //! for every byte of it is written out at [`BODY_COST`].
 //!
+//! # Why there is no timing here, and why that is a decision
+//!
+//! Spec FR-038 requires the benchmark identifiers an effect could appear on to be named before
+//! it is measured, and FR-021 accepts a mechanism established by a count where no identifier can
+//! resolve it. This is such a case: the Phase 2 screen put the saving at about one record per
+//! request with a body -- one write in two at 1 KiB and one in sixty-six at 1 MiB -- against a
+//! run-to-run drift of 0.5% to 5% on the arms that could show it, so a timing would report a
+//! number well inside its own noise and would say nothing either way. The eight bytes and the
+//! one record below are the establishment, and they are a property of the code rather than of
+//! the machine it ran on. `docs/benchmarks/allocation-counts.md` is the same treatment applied
+//! to the HTTP/2 stack. The absence of a timing here is that decision and not an omission.
+//!
 //! # A correction to the plan's wording
 //!
 //! The implementation plan describes the cost as "one record *and one driver turn* per
-//! fragment". The record is what measurement shows; the driver turn is not, and the assertions
+//! fragment". The record is what measurement showed; the driver turn was not, and the assertions
 //! here say only what was measured. `drain` in `crates/ngnet-qmux-h3/src/transmit.rs` takes up to
 //! `MAX_OFFERS` = 64 offers per pass, and since coalescing it no longer flushes between them, so
-//! a fragment costs a record and nothing else at all: not a turn, and since the buffer has room
+//! a fragment cost a record and nothing else at all: not a turn, and since the buffer had room
 //! for it, not even a re-offer.
 
 mod transmit_harness;
@@ -87,20 +95,40 @@ const BODY: usize = 64 * 1024;
 /// would be a second implementation of dwnx's framing rather than an observation of it.
 const FULL_RECORDS: usize = 4;
 
-/// How many records the body costs, over what a body-less request costs.
+/// How many records the body's write holds, measured rather than derived.
 ///
-/// The four full records above and the remainder record the body ends in. The header record and
-/// the end-of-stream record do not appear in the difference because the body-less request pays
-/// for both of those too -- which is the point of subtracting one run from the other, and also
-/// what makes the figure sensitive to the separate header fragment in the direction that
-/// matters.
-///
-/// Today the headers occupy a record of their own and contribute nothing to the body's five, so
-/// the difference is five. Once Phase 3 packs the two fragments, the headers ride inside the
-/// body's first record and the body's last byte still lands inside the same fifth record: the
-/// body run then has five records where the body-less run has one, and this figure falls to
-/// four. That is a deliberate change to this constant, not an adjustment.
+/// Four full records and the one it ends in. The same figure as before the fragments were
+/// packed -- the body did not change size -- but the *write* that carries them holds five
+/// records now where it held six, because the header record that used to sit in front of them
+/// is gone. That sixth record is what this file exists to keep away.
 const BODY_RECORDS: usize = FULL_RECORDS + 1;
+
+/// What a request's headers cost when they had a record to themselves, measured.
+///
+/// The body run's header record as it was before the fragments were packed: 67 bytes in the
+/// body-less run, plus the five a five-digit `content-length` adds.
+const HEADER_RECORD_BYTES: usize = 72;
+
+/// What the same headers cost now that they share the body's records, measured.
+///
+/// The difference between this and [`HEADER_RECORD_BYTES`] is [`RECORD_FRAMING`], and it is the
+/// whole of what Phase 3 saved on this workload: the headers still cost their own bytes, and
+/// they no longer cost a record's worth of framing on top.
+const HEADER_PAYLOAD: usize = 64;
+
+/// A record's own overhead: its two-byte length prefix and dwnx's STREAM frame header.
+///
+/// Derived from the two figures above rather than asserted independently, because it is their
+/// difference that matters and stating it twice would let the two disagree.
+const RECORD_FRAMING: usize = HEADER_RECORD_BYTES - HEADER_PAYLOAD;
+
+/// The bytes the remainder record held before the headers joined it.
+const BODY_TAIL: usize = 54;
+
+/// The extra bytes a five-digit `content-length` costs over a one-digit one.
+///
+/// The only part of the headers that does *not* cancel between the two runs.
+const CONTENT_LENGTH_COST: usize = 5;
 
 /// What carrying the body costs in bytes over carrying none, measured rather than derived.
 ///
@@ -108,14 +136,15 @@ const BODY_RECORDS: usize = FULL_RECORDS + 1;
 /// from the payload and would not notice a record appearing or disappearing:
 ///
 /// - `4 x 16382` = 65 528, the four full records;
-/// - `54`, the remainder record the body ends in;
-/// - `5`, the extra bytes a five-digit `content-length` costs the header record, which is the
-///   only part of the header record that does *not* cancel between the two runs.
+/// - `54`, the bytes of the record the body ends in that are the body's own;
+/// - `5`, the extra bytes a five-digit `content-length` costs;
+/// - **less `8`**, the length prefix and STREAM frame header of the record the headers used to
+///   need. That subtraction is Phase 3. Going back to a call per fragment puts it back, and
+///   this constant is what refuses it.
 ///
-/// Phase 3 lowers it by one record's framing -- the length prefix and dwnx's STREAM header, a
-/// single-digit number of bytes here -- because the header record stops existing. That is a small
-/// difference and it is an exact one, which is why the constant is exact.
-const BODY_COST: usize = 4 * RECORD + 54 + 5;
+/// It is a small difference and an exact one, which is why the constant is exact rather than a
+/// bound: a bound loose enough to be comfortable would be loose enough to miss eight bytes.
+const BODY_COST: usize = FULL_RECORDS * RECORD + BODY_TAIL + CONTENT_LENGTH_COST - RECORD_FRAMING;
 
 /// The largest a record carrying nothing but a request's headers can be here.
 ///
@@ -184,8 +213,12 @@ fn exchange(body: Bytes) -> (Bytes, Turns) {
     })
 }
 
+/// A two-fragment offer costs no record of its own (Spec SC-009, FR-010).
+///
+/// The inversion of what this test used to assert. The name says what is now true; the
+/// assertions are the same measurements with the figures moved by exactly one record's framing.
 #[test]
-fn a_two_fragment_offer_still_costs_a_record_of_its_own() {
+fn a_two_fragment_offer_costs_no_record_of_its_own() {
     let (empty_echo, empty) = exchange(Bytes::new());
     let (body_echo, body) = exchange(pattern(BODY));
     assert_eq!(
@@ -215,16 +248,14 @@ fn a_two_fragment_offer_still_costs_a_record_of_its_own() {
         body.lengths
     );
 
-    // The first write that is not part of the preamble. Before coalescing it was the header
-    // record alone, because the body fragment offered alongside it was refused while that
-    // record was outstanding. It now carries the header record and the body's first records
-    // together, which is what the buffer is for -- and it is why the cost below is counted in
-    // bytes: this write is one write and several records.
+    // The first write that is not part of the preamble. It carries the whole request: the
+    // headers and the body's records together, which is what the outbound buffer is for -- and
+    // it is why the cost below is counted in bytes rather than in writes.
     let first = body.lengths[shared];
     assert!(
         first > RECORD,
         "the write after the preamble was {first} bytes, no larger than a single \
-         {RECORD}-byte record, so the header record and the body's first record did not travel \
+         {RECORD}-byte record, so the headers and the body's first record did not travel \
          together. Either the outbound buffer is being flushed between records again, or the \
          offer is being cut short after its first fragment as it was before coalescing"
     );
@@ -234,41 +265,58 @@ fn a_two_fragment_offer_still_costs_a_record_of_its_own() {
     assert_eq!(
         cost, BODY_COST,
         "carrying {BODY} bytes cost {cost} bytes more than carrying none, where {BODY_COST} is \
-         today's figure: {FULL_RECORDS} full records, one remainder record, and the five bytes \
-         the longer content-length adds to the header record. Phase 3 (vectored record input) is \
-         expected to break this by packing the headers into the body's first record, which \
-         removes one record and its framing from the total. Body-less run wrote {:?}; body run \
-         wrote {:?}",
+         the figure with the fragments packed: {FULL_RECORDS} full records, the {BODY_TAIL} \
+         bytes of the record the body ends in, the {CONTENT_LENGTH_COST} bytes the longer \
+         content-length adds, less the {RECORD_FRAMING}-byte framing of the record the headers \
+         no longer need. A cost {RECORD_FRAMING} bytes higher than this means the headers are \
+         back in a record of their own, which is a call per fragment. Body-less run wrote \
+         {:?}; body run wrote {:?}",
         empty.lengths, body.lengths
     );
 
-    // The byte figure above is a total; this is the record count inside it. The body's own
-    // records occupy every byte of the cost except the header record's five, and dividing by a
-    // full record recovers how many there were -- four that filled and one that did not, which
-    // is the figure Phase 3 lowers.
-    let body_record_bytes = cost - 5;
-    let full = body_record_bytes / RECORD;
-    let remainder = body_record_bytes % RECORD;
+    // The byte figure above is a total; this is the record count inside the write that carries
+    // the request. Every record but the last is full, so dividing recovers how many there were.
+    // Before the fragments were packed this write held six records -- a 72-byte header record
+    // and then the body's five. It holds five now, and the header record is the one missing.
+    let full = first / RECORD;
+    let remainder = first % RECORD;
     assert_eq!(
         (full, full + usize::from(remainder > 0)),
         (FULL_RECORDS, BODY_RECORDS),
-        "the body should occupy {FULL_RECORDS} full records and one remainder, \
-         {BODY_RECORDS} in all; {body_record_bytes} bytes of records divide into {full} full \
-         records and {remainder} left over"
+        "the request's write should hold {FULL_RECORDS} full records and one remainder, \
+         {BODY_RECORDS} in all; {first} bytes divide into {full} full records and {remainder} \
+         left over. A sixth record here is the headers having been given one of their own"
     );
 
-    // The count above says the header record is there; this says it is avoidable rather than
-    // merely present. The headers and the body's last record fit together inside one record, so
-    // packing the fragments would have shifted every subsequent byte by the headers' length and
-    // still ended inside the same final record -- one record fewer for the same bytes, rather
-    // than the same records rearranged. The header record's size is taken from the body-less
-    // run, where it is still a write of its own; the body run's is five bytes larger and the
-    // margin here is three orders of magnitude wider than that.
+    // And this says where the headers went, rather than merely that a record is missing. The
+    // record the body ends in is larger than the body's own tail by exactly what the headers
+    // contribute, which is only true if the two fragments were packed into the same run of
+    // records and every byte after the headers was shifted along by their length.
+    assert_eq!(
+        remainder,
+        BODY_TAIL + HEADER_PAYLOAD,
+        "the body's last record is {remainder} bytes, not the {} the body's own tail plus the \
+         headers riding inside it come to. The headers are somewhere other than inside the \
+         body's records",
+        BODY_TAIL + HEADER_PAYLOAD
+    );
+
+    // The saving is real rather than an accounting rearrangement: the headers are nowhere near
+    // a record's worth, so the record they used to occupy was almost entirely empty. Taken from
+    // the body-less run, where the header record is still a write of its own -- a request with
+    // no body lends one fragment, and one fragment is one record however it is submitted.
     let header = empty.lengths[shared];
     assert!(
-        header <= HEADER_RECORD && header + remainder <= RECORD,
-        "the header record ({header}) and the body's last record ({remainder}) do not fit \
-         inside one {RECORD}-byte record, so this workload no longer demonstrates that the \
-         header record is an avoidable cost"
+        header <= HEADER_RECORD,
+        "the header record in the body-less run is {header} bytes, which is not far enough \
+         below a full {RECORD}-byte record for its removal from the body run to be a saving \
+         rather than a rearrangement"
+    );
+    assert_eq!(
+        header + CONTENT_LENGTH_COST,
+        HEADER_RECORD_BYTES,
+        "the header record is no longer the {HEADER_RECORD_BYTES} bytes the constants above \
+         are derived from, so [`RECORD_FRAMING`] no longer means what it says and the cost \
+         assertion is measuring something else"
     );
 }

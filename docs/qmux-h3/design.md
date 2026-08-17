@@ -87,19 +87,30 @@ The parking form has no answer to give a synchronous closure: it would have to b
 cannot, or truncate, which loses bytes. The non-parking form reports `Accepted(n)`, `Blocked` or
 `Closed` and returns, and those map onto the trait's own three outcomes directly.
 
-An offer may carry several `IoSlice`s. A vectored *push* into one record is deferred in the layer
-below — and it is that one, not a gathered write to the byte stream, which the layer below has
-settled against ever having (`docs/qmux/pending-work.md`) — so this crate issues one write per
-slice and stops at the first that is not fully accepted — a short
-accept means the peer's window is exhausted or the outbound buffer has reached its ceiling, and
-offering the next slice anyway would put the stream's bytes out of order. It once meant a third
+An offer may carry several `IoSlice`s, and the whole list goes down in one call:
+`Connection::try_write_stream_vectored` in the layer below submits the fragments as one vector
+array, so they share records and a slice boundary costs nothing. That is the vectored *push*,
+which the layer below built; it is not a gathered write to the byte stream, which the layer
+below has settled against ever having (`docs/qmux/pending-work.md`). The two are easy to
+confuse and only one of them exists.
+
+Before that, this crate issued one write per slice and stopped at the first not fully accepted,
+which cost a record per slice. The stopping rule survives the change and now applies to the
+offer as a whole: a short accept means the peer's window is exhausted or the outbound buffer has
+reached its ceiling, and offering more of the same stream anyway would put its bytes out of
+order. It once meant a third
 thing, that the record had filled, and that reading is what made this break wrong for a while:
 the layer below took one record per call, so a large offer answered short with the buffer
 three-quarters empty and the stream was stood down over a record boundary. The distinction was
 settled where it is visible rather than compensated for here — `try_write_stream` fills records
-until a bound stops it, so a short accept means a bound. The end-of-stream marker rides on the
-final slice and only there, and QMux applies it only when it takes the whole of what it was
-offered, so a partial accept cannot end a stream early.
+until a bound stops it, so a short accept means a bound. The end-of-stream marker is dwnx's
+to place: it applies the marker when the data one call handed it fits entirely, so the marker
+rides the record that takes the last byte of the whole offer and a partial accept cannot end a
+stream early. Nothing here computes which slice is the last one — an empty fragment is not
+submitted at all, so a trailing empty slice cannot take the marker away from the payload in
+front of it. An offer carrying no bytes *and* the marker is the one empty offer that must still
+reach the layer below, because it is the only way a stream that has finished writing is ended;
+the short-circuit for empty offers is conditioned on the marker's absence for that reason.
 
 A pass takes a bounded number of offers and then returns. A layer with an endless supply — a
 large body — could otherwise keep the pass from returning to the driver, which has a peer to

@@ -55,6 +55,19 @@ use crate::time::Timestamp;
 /// Below this it returns `0`, which is indistinguishable from an idle connection.
 const MIN_USABLE_BUFFER: usize = 3;
 
+/// How many fragments one call to [`RecordWriter::push_vectored`] hands dwnx.
+///
+/// The array of `dwnx_vec` has to be contiguous and it has to outlive the call, so it is a
+/// stack array of a fixed width rather than an allocation made per push -- this is the write
+/// path, and a push that allocated would cost more than the record boundary the vectored form
+/// exists to remove. Sixteen because that is the widest offer the HTTP/3 layer above can make
+/// (`crates/ngnet-h3/src/send.rs`, `MAX_VECTORS`), so the common caller never reaches the
+/// truncation below.
+///
+/// A caller lending more than this is not refused; see [`RecordWriter::push_vectored`] for what
+/// happens instead and why the end-of-stream marker is what makes it delicate.
+pub(crate) const MAX_VECTORS: usize = 16;
+
 /// What to add to the record being built.
 #[derive(Clone, Copy, Debug)]
 pub struct WriteRequest<'a> {
@@ -91,6 +104,48 @@ impl<'a> WriteRequest<'a> {
     }
 
     /// Mark this data as ending the stream.
+    #[must_use]
+    pub const fn with_fin(mut self, fin: bool) -> Self {
+        self.fin = fin;
+        self
+    }
+}
+
+/// What to add to the record being built, lent as several fragments.
+///
+/// The vectored form of [`WriteRequest`]. The fragments are one payload for one stream, not
+/// one payload each: dwnx concatenates them into a single STREAM frame, so a caller holding a
+/// header and a body separately pays one frame's framing rather than two records'.
+///
+/// Empty fragments are permitted anywhere in the list and are simply not submitted, which
+/// matches what dwnx itself does with a zero-length single slice. A list that is empty, or
+/// entirely empty fragments, is a request to serialise nothing -- with `fin` set, that is how
+/// a stream that has finished writing is ended.
+#[derive(Clone, Copy, Debug)]
+pub struct VectoredWriteRequest<'a, 'd> {
+    /// The stream to carry data for, if any.
+    ///
+    /// `None` asks dwnx to serialise pending control frames without adding stream data, and
+    /// the fragments are then ignored -- exactly as in [`WriteRequest`].
+    pub stream: Option<StreamId>,
+    /// The fragments to send on that stream, in order.
+    pub data: &'a [&'d [u8]],
+    /// Whether these fragments end the stream.
+    pub fin: bool,
+}
+
+impl<'a, 'd> VectoredWriteRequest<'a, 'd> {
+    /// Send several fragments on a stream.
+    #[must_use]
+    pub const fn stream(stream: StreamId, data: &'a [&'d [u8]]) -> Self {
+        Self {
+            stream: Some(stream),
+            data,
+            fin: false,
+        }
+    }
+
+    /// Mark these fragments as ending the stream.
     #[must_use]
     pub const fn with_fin(mut self, fin: bool) -> Self {
         self.fin = fin;
@@ -197,13 +252,97 @@ impl<'c, 'h, 'b> RecordWriter<'c, 'h, 'b> {
     /// Returns an error only for conditions that end the connection; the recoverable signals
     /// are [`Push`] variants.
     pub fn push(&mut self, request: WriteRequest<'_>) -> Result<Push, Error> {
+        // One fragment is the degenerate vectored case, and it is spelled that way rather
+        // than given a second call into dwnx: `dwnx_conn_write_stream` is itself a wrapper
+        // that builds a one-element `dwnx_vec` array and calls `dwnx_conn_writev_stream`
+        // (`deps/dwnx/lib/dwnx_conn.c`), so a separate path here would be a second copy of
+        // the outcome mapping below with nothing else to distinguish it.
+        self.push_vectored(VectoredWriteRequest {
+            stream: request.stream,
+            data: &[request.data],
+            fin: request.fin,
+        })
+    }
+
+    /// Add several fragments of one stream's data to the record being built.
+    ///
+    /// The fragments become **one** STREAM frame, not one each: dwnx concatenates them as it
+    /// copies them into the record. That is the whole point of the call. A caller holding a
+    /// payload in pieces -- the HTTP/3 layer above holds a request's headers and its body
+    /// separately, and offers both at once -- would otherwise start a record per piece and
+    /// pay a record's framing for each.
+    ///
+    /// # The count that comes back is a total, not a per-fragment tally
+    ///
+    /// [`Push::Accepted`] and [`Push::Complete`] report how many bytes were taken **across
+    /// all the fragments**, in order (`deps/dwnx/lib/includes/dwnx/dwnx.h`, and
+    /// `dwnx_conn_write_stream_frame` in `deps/dwnx/lib/dwnx_conn.c`, which sets `*pdatalen`
+    /// to the single figure `wdatalen`). A caller resuming after a short take therefore has
+    /// to walk the array to find where the next push starts, and cannot assume whole
+    /// fragments were consumed: dwnx copies a *prefix* of the concatenation
+    /// (`dwnx_frame_encode_stream`), so a take can and does stop in the middle of a fragment.
+    ///
+    /// # The fragments are borrowed for the call and no longer
+    ///
+    /// Only `dest` is retained across a record; the fragments are copied into it during the
+    /// call, by `dwnx_cpymem` inside `dwnx_frame_encode_stream`. There is no retransmission
+    /// layer to keep them for. That is what lets a caller hand over memory it reclaims as
+    /// soon as this returns.
+    ///
+    /// # More fragments than one call can carry
+    ///
+    /// At most sixteen fragments are submitted per call, empty ones aside -- see the
+    /// `MAX_VECTORS` constant in this module for why sixteen. A caller lending more is not
+    /// refused: it gets the first sixteen taken and pushes the rest, which join the same
+    /// record.
+    ///
+    /// **The end-of-stream marker is suppressed on such a call**, and that is not tidiness.
+    /// dwnx sets the FIN bit when the data it was *given in this call* fits entirely, not
+    /// when the caller's whole payload does (`dwnx_conn_write_stream_frame`'s
+    /// `datalen == (uint64_t)wdatalen`). A truncated submission that happened to fit would
+    /// otherwise end the stream with fragments still unsent, and the peer would see a stream
+    /// that finished early with no error to explain it.
+    ///
+    /// # Errors
+    ///
+    /// As [`RecordWriter::push`].
+    pub fn push_vectored(&mut self, request: VectoredWriteRequest<'_, '_>) -> Result<Push, Error> {
         if self.too_small || self.len.is_some() {
             // Nothing more can go in: either the buffer never had room, or the record closed.
             return Ok(Push::Complete { consumed: None });
         }
 
+        // Empty fragments are dropped rather than submitted, which is what dwnx's own
+        // single-slice wrapper does with a zero-length payload -- it passes a vector count of
+        // zero. Dropping them also means a list padded with empties still fits its real
+        // fragments into one call.
+        let mut vectors = [sys::dwnx_vec {
+            base: core::ptr::null_mut(),
+            len: 0,
+        }; MAX_VECTORS];
+        let mut count = 0usize;
+        let mut whole = true;
+        for fragment in request.data {
+            if fragment.is_empty() {
+                continue;
+            }
+            if count == MAX_VECTORS {
+                whole = false;
+                break;
+            }
+            vectors[count] = sys::dwnx_vec {
+                // `dwnx_vec.base` is `*mut u8` in the generated bindings because the C struct
+                // is shared with the receive side, where dwnx does write through it. Nothing
+                // on this path does: the vectors reach `dwnx_frame_encode_stream`, which
+                // reads them into the record and never writes back.
+                base: fragment.as_ptr().cast_mut(),
+                len: fragment.len(),
+            };
+            count += 1;
+        }
+
         let stream_id = request.stream.map_or(-1, StreamId::get);
-        let flags = if request.fin {
+        let flags = if request.fin && whole {
             sys::DWNX_WRITE_STREAM_FLAG_FIN
         } else {
             sys::DWNX_WRITE_STREAM_FLAG_NONE
@@ -213,18 +352,19 @@ impl<'c, 'h, 'b> RecordWriter<'c, 'h, 'b> {
         let buf = self.buf.as_mut().expect("buffer is taken only by finish");
         let buf_ptr = buf.as_mut_ptr();
         let buf_len = buf.len();
-        let data_ptr = request.data.as_ptr();
-        let data_len = request.data.len();
+        let data_ptr = vectors.as_ptr();
         let now = self.now.as_nanos();
 
         let rv = self.conn.with_bridge(|raw| {
             // SAFETY: `raw` is non-null. `buf_ptr` is writable for `buf_len` bytes and stays
             // valid for the whole record, because `self` holds the borrow -- which is the
-            // reason this type exists. `data_ptr` is readable for `data_len` for the duration
-            // of the call, which is all dwnx needs: it copies stream data into the record and
-            // has no retransmission layer that would keep the pointer.
+            // reason this type exists. `data_ptr` is readable for `count` elements, each of
+            // which points at one of the caller's fragments and is readable for its own
+            // length, for the duration of the call -- which is all dwnx needs: it copies
+            // stream data into the record and has no retransmission layer that would keep
+            // either the array or what it points at.
             unsafe {
-                sys::dwnx_conn_write_stream(
+                sys::dwnx_conn_writev_stream(
                     raw,
                     buf_ptr,
                     buf_len,
@@ -232,7 +372,7 @@ impl<'c, 'h, 'b> RecordWriter<'c, 'h, 'b> {
                     flags,
                     stream_id,
                     data_ptr,
-                    data_len,
+                    count,
                     now,
                 )
             }

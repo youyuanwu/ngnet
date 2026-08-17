@@ -172,32 +172,58 @@ end to end — `docs/benchmarks/` — but an end-to-end figure cannot separate t
 framing, QPACK, the record layer and the pump. A profile of the 1 MiB body point is what would
 turn this into a number.
 
-## A multi-slice offer is written one slice at a time
+## A multi-slice offer is one write, and one run of records — settled
 
-`StreamSource::write_next` may hand over several `IoSlice`s at once. The layer below has no
-vectored write — `RecordWriter::push_vectored` is listed in `docs/qmux/pending-work.md` — so
-this crate issues one write per slice and stops at the first that is not fully accepted.
+`StreamSource::write_next` may hand over several `IoSlice`s at once, and this crate now submits
+the whole list in one call: `Connection::try_write_stream_vectored` in the layer below, over
+`RecordWriter::push_vectored` and `dwnx_conn_writev_stream`. The fragments share records, so a
+slice boundary is no longer a record boundary and a request's headers ride inside the body's
+first record instead of occupying an undersized one of their own.
 
-In practice that means at least one record per slice, not one record holding all of them. Each
-slice is a separate `try_write_stream`, and a call begins a fresh record however few bytes the
-slice holds. Until write coalescing landed this was worse: the layer below refused a second
-production while a record was still outstanding, so the write of the second slice answered
-`Blocked`, the loop broke, and the offer reported only the count the first slice had produced —
-one record *and one write and one pass through the pump* per slice. The outbound buffer now holds
-several records and one call fills as many of them as it has room and credit for, so the later
-slices of an offer are accepted rather than refused and they all leave together.
+**What it used to be.** One `try_write_stream` per slice, stopping at the first not fully
+accepted, and a call begins a fresh record however few bytes the slice holds — so at least one
+record per slice. Before write coalescing it was worse still: the layer below refused a second
+production while a record was outstanding, so the second slice answered `Blocked`, the loop
+broke, and the offer reported only what the first slice had produced — one record *and one write
+and one pass through the pump* per slice. Coalescing removed the write and the pass; this
+removes the record.
 
-What remains is the record count at slice boundaries: a fragmented offer starts a record per
-slice where a vectored push would have packed the slices into one. A 21-byte header slice
-followed by a 64 KiB body slice costs a 21-byte record and then full ones, rather than a first
-record holding the header and 16 361 bytes of body. Correct, and more records than the payload
-requires — the overhead is one record header per slice boundary, which is a few bytes on a
-16 382-byte record and matters for the small-slice case rather than the large one.
+**What it was worth, and why that is a count rather than a time.** Measured on a 64 KiB POST
+against an otherwise identical body-less request, end to end through this stack
+(`tests/ngnet-qmux-h3-tests/tests/fragmented_offers.rs`):
 
-**What would settle it:** `RecordWriter::push_vectored` in the layer below, tracked in
-`docs/qmux/pending-work.md`. Nothing above it needs to change: the offer loop here already hands
-its slices over in order, and a vectored push would simply stop the record boundary from falling
-where the slice boundary does.
+| | before | after |
+| --- | --- | --- |
+| records in the write carrying the request | 6 | 5 |
+| bytes the body cost over a body-less request | 65 587 | 65 579 |
+| writes the client's byte stream saw | 3 | 3 |
+
+One record and its eight bytes of framing — a two-byte record length prefix and dwnx's STREAM
+frame header — per request with a body. The write count does not move, because coalescing had
+already merged those records into one write; that is the honest shape of the result and not a
+disappointment, since the record is what a fragment boundary cost once the write had stopped
+costing anything.
+
+**No timing was taken, and that is a decision.** Spec FR-038 requires the benchmark identifiers
+an effect could appear on to be named before it is measured, and FR-021 accepts a mechanism
+established by a count where no identifier can resolve it. The Phase 2 screen put this saving at
+about one record per request with a body — one write in two at 1 KiB and one in sixty-six at
+1 MiB — against a run-to-run drift of 0.5% to 5% on the arms that could show it. A timed
+comparison would therefore report a number well inside its own noise and would support no
+conclusion in either direction, so none was taken. `docs/benchmarks/allocation-counts.md` is the
+same treatment applied to the HTTP/2 stack: a mechanism established by a count, with the absence
+of a time stated rather than left to be noticed.
+
+**The part that is delicate, recorded because it is silent when it is wrong.** A vectored push
+reports `*pdatalen` as **one total across every vector**, not a count per vector, so resuming
+after a short take means walking the array against a byte count — and a short take routinely
+stops part-way through a fragment rather than between two. A walk that assumed whole fragments
+were taken would send some bytes twice and others never, and would report a count that agreed
+with itself; nothing above this layer could notice. The walk lives in one place, `Fragments` in
+`crates/ngnet-qmux/src/io/conn.rs`, and the single-slice write is expressed as its degenerate
+case rather than kept as a second loop. Its guard is
+`a_take_that_stops_inside_a_fragment_resumes_inside_it` in
+`crates/ngnet-qmux/tests/io_vectored.rs`.
 
 ## Something scales with in-flight streams on a real socket
 
@@ -216,15 +242,17 @@ the same parameter, and it was worse than the same arm's own empty-body ratio. E
 got relatively better as more work was added; that point got worse.
 
 A fixed cost per exchange cannot produce that. Something that scales with the number of streams
-in flight can, and the entry above is the obvious candidate: one write per `IoSlice`, stopping
-at the first not fully accepted, costs nothing without a kernel and costs a syscall each with
-one. That is the same mechanism the HTTP/2 write-path finding turned on
+in flight can, and the entry above was the obvious candidate: one write per `IoSlice`, stopping
+at the first not fully accepted, cost nothing without a kernel and cost a syscall each with
+one. **That mechanism is gone** — the entry above is settled — which makes this lead weaker
+rather than stronger: its obvious explanation has been removed, and a shape that survives a
+pinned run now needs another one. That is the same mechanism the HTTP/2 write-path finding turned on
 (`docs/benchmarks/findings/write-path-and-gathering.md`), which is a reason to suspect it and
 not evidence that it is the cause here. It is not the same *fix*: the HTTP/2 finding was won by
 gathering a driver pass into one `writev`, and the layer below has since established that its
 output is a single region with nothing to gather and no copy for gathering to avoid
 (`docs/qmux/pending-work.md`). What would reduce the write count here is fewer records for the
-same payload — the vectored push above — not a gathering byte stream.
+same payload — the vectored push above, now built — not a gathering byte stream.
 
 Two other candidates have not been ruled out: the record layer produces more records for the
 same payload than HTTP/2 produces frames, since QMux's maximum record is 16382 bytes against
@@ -235,8 +263,8 @@ sixty-four concurrent streams in a way that is not a coincidence worth ignoring.
 `transport_concurrent_throughput` and `concurrent_throughput` across the full 1/8/64 sweep with
 drift controls, recorded under `docs/benchmarks/data/` as a run — followed, if the shape holds,
 by a syscall count per pass for the QMux arm at each concurrency. If the count grows with `N`
-where the HTTP/2 arm's does not, the vectored-write entry above is the fix and this entry
-closes with it.
+where the HTTP/2 arm's does not, the vectored-write entry above was the obvious fix and has
+already been applied, so a count that still grows would place the cause elsewhere.
 
 ## The transmit pass yields on a fixed count
 
