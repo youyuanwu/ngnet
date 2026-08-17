@@ -239,7 +239,7 @@ ngnet-h2 = { version = "*", default-features = false }
 
 ## Dependencies
 
-This repo vendors three upstream C libraries as git submodules:
+This repo vendors four upstream C libraries as git submodules:
 
 | Submodule | Tag | Purpose |
 | --- | --- | --- |
@@ -292,8 +292,8 @@ just submodules
 git clone https://github.com/youyuanwu/ngnet.git
 cd ngnet
 
-# ...then init the three top-level submodules (non-recursive)...
-git submodule update --init deps/nghttp2 deps/nghttp3 deps/ngtcp2
+# ...then init the four top-level submodules (non-recursive)...
+git submodule update --init deps/nghttp2 deps/nghttp3 deps/ngtcp2 deps/dwnx
 
 # ...plus the one nested submodule that nghttp3's own sources require.
 git -C deps/nghttp3 submodule update --init lib/sfparse

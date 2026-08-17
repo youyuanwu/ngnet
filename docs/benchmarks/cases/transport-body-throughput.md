@@ -18,14 +18,16 @@ reuses the duplex family's points so the two are comparable in shape.
 
 ## Arms and parameters
 
-| Arm | Stack | I/O model |
-| --- | --- | --- |
-| `ngnet-h2-compio` | this crate | compio, io_uring (completion) |
-| `ngnet-h2-tokio` | this crate | tokio, epoll (readiness) |
-| `hyper-tokio` | hyper | tokio, epoll (readiness) |
+| Arm | Stack | Protocol | I/O model |
+| --- | --- | --- | --- |
+| `ngnet-h2-compio` | this crate | HTTP/2 | compio, io_uring (completion) |
+| `ngnet-h2-tokio` | this crate | HTTP/2 | tokio, epoll (readiness) |
+| `ngnet-qmux-h3-tokio` | this crate | HTTP/3 over QMux | tokio, epoll (readiness) |
+| `hyper-tokio` | hyper | HTTP/2 | tokio, epoll (readiness) |
 
 Body sizes sweep **0 B, 1 KiB, 64 KiB, 1 MiB**; 0 B is reported per-iteration rather than as a
-meaningless `Throughput::Bytes(0)`.
+meaningless `Throughput::Bytes(0)`. The QMux arm is registered immediately after
+`ngnet-h2-tokio` inside the size loop, its counterpart on the protocol axis.
 
 ## Reading it
 
@@ -49,6 +51,21 @@ So a write-side gain should be large at 1 KiB, moderate at 64 KiB and **absent a
 the noisiest in the suite, having shown 10.2% spread between two repetitions of an unchanged
 arm. See [`../findings/write-path-and-gathering.md`](../findings/write-path-and-gathering.md).
 
+**That arithmetic does not carry across to the QMux arm, and reading it as though it does is
+the mistake this paragraph exists to prevent.** The table above counts HTTP/2 DATA blocks. The
+QMux arm's payload is cut twice: into HTTP/3 frames, then into QMux records whose maximum is
+16382 bytes — a number [`../configuration.md`](../configuration.md) records as reachable from
+neither stack, together with the direction it biases the comparison. So the QMux arm makes more
+records for the same body than the HTTP/2 arms make frames, and its join offers them to the
+writer one `IoSlice` at a time, both of which grow with body size rather than shrinking. If a
+cross-protocol ratio here *grows* across the sweep while the duplex family's
+[`body_throughput`](body-throughput.md) ratio falls, that pair of mechanisms is where to look
+first; [`../controls.md`](../controls.md) gives each of them a direction.
+
+The pair that isolates the protocol is `ngnet-h2-tokio` against `ngnet-qmux-h3-tokio`, never
+the compio arm against the QMux one — the latter differs in I/O model as well.
+
 ## Where its numbers are
 
-Recorded runs are indexed in [`../data/README.md`](../data/README.md).
+Recorded runs are indexed in [`../data/README.md`](../data/README.md). **No recorded run
+contains a QMux arm**; every run filed there predates it.

@@ -64,7 +64,9 @@ task, deliberately: a QMux connection owns one byte stream and shares it with no
 is nothing to demultiplex. Establishing that stream — connecting, listening, accepting, and any
 TLS on it — stays with the caller.
 
-There are no benchmarks, and nothing has been tested against another QMux implementation.
+Nothing has been tested against another QMux implementation. There are benchmarks now —
+`ngnet-qmux-h3` carries an arm in most of the suite under [`benchmarks/`](benchmarks/) — but
+they measure the HTTP/3 join end to end and attribute nothing to this layer specifically.
 
 ## HTTP/3 over QMux — [`qmux-h3/`](qmux-h3/)
 
@@ -74,7 +76,8 @@ motivation, and this crate is the only place the two families meet.
 
 - [`qmux-h3/design.md`](qmux-h3/design.md) — why the connection is shared rather than owned
   outright, the pump that keeps the first request from deadlocking, why nothing here may park,
-  and how a close the HTTP/3 driver will never poll again reaches the peer anyway.
+  how a close the HTTP/3 driver will never poll again reaches the peer anyway, and why a caller
+  configuring one of these connections is handed two configurations rather than one.
 - [`qmux-h3/pending-work.md`](qmux-h3/pending-work.md) — what is missing, starting with the fact
   that there is nothing to interoperate with.
 - [`qmux-h3/invariants.md`](qmux-h3/invariants.md) — what its suites pin, and what nothing
@@ -115,7 +118,7 @@ in a document of its own.
 
 | Document | What it covers |
 | --- | --- |
-| [`benchmarks/`](benchmarks/) | How the benchmarks are run, one page per bench case, what their numbers do and do not mean, which protocol settings are matched between the stacks being compared — and the measurements themselves, filed under the machine that produced them. |
+| [`benchmarks/`](benchmarks/) | How the benchmarks are run, one page per bench case, what their numbers do and do not mean, which protocol settings are matched between the stacks and protocols being compared — and the measurements themselves, filed under the machine that produced them. |
 | [`ci.md`](ci.md) | Every check CI runs, across all four families and the axum integration, and the ones it deliberately does not. |
 
 The benchmarks sit here rather than under a family because a comparison spans the stacks it

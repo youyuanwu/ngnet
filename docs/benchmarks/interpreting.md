@@ -24,7 +24,13 @@ Read them as a measure of **protocol, wrapper and syscall CPU work**, and nothin
 - **Single-threaded throughput does not scale with `N` the way a networked server would.**
   On one core the per-request protocol CPU cost cannot be run in parallel, so multiplexing
   `N` streams only amortises per-batch overhead; it does not multiply throughput. That is a
-  property of measuring CPU-bound work on one core, not a property of either HTTP/2 stack.
+  property of measuring CPU-bound work on one core, not a property of any stack or protocol
+  here.
+- **A cross-protocol arm is one implementation of each protocol, not the protocols.** The
+  `ngnet-qmux-h3` arms measure this workspace's HTTP/3-over-QMux join as it stands today,
+  against this workspace's HTTP/2 stack, on a byte stream neither protocol was designed
+  around. What that licenses and what it does not is set out in [`README.md`](README.md); what
+  was and was not held equal between them is [`configuration.md`](configuration.md).
 
 ## The noise caveat
 

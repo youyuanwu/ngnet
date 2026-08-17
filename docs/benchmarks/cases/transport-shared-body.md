@@ -36,6 +36,27 @@ coalescing path had already collapsed a pass into one write and so had no syscal
 to win. The order is kept anyway: changing it would make new results incomparable with the
 ones already recorded.
 
+## Why there is no QMux arm here
+
+The three other `transport_*` cases gained an `ngnet-qmux-h3-tokio` arm. This one did not, for
+the same reason as its duplex counterpart [`shared_body`](shared-body.md): **there is no
+counterpart mechanism to measure.**
+
+Every arm above is one half of a pair that differs only in the connection entry point —
+`handshake_shared_with` against `handshake_with` — and what those entry points select between
+is copying a body into libnghttp2's frame buffer or handing it over to be serialised with
+`NGHTTP2_DATA_FLAG_NO_COPY`. All three of those are libnghttp2 constructs. `ngnet-qmux-h3`
+exposes no such choice, so there is no `qmux-push`/`qmux-shared` pair to add. A lone QMux arm
+would be a stack comparison inserted into a case whose entire design — down to the 0-byte
+mechanistic control and the pre-registered exclusion rule — assumes paired twins.
+
+This is **not** the reason
+[`concurrent_throughput_multi_thread`](concurrent-throughput.md) carries no QMux arm. That one
+is a recorded defect: the arm exists, and it hangs. See
+[`../../qmux-h3/pending-work.md`](../../qmux-h3/pending-work.md). Nothing is pending for this
+case; the absence here is structural, and it would end only if `ngnet-qmux-h3` grew a no-copy
+body path of its own — at which point this case gains a *pair* of QMux arms, not one.
+
 ## Design rules this case obeys
 
 Set out in full in [`../controls.md`](../controls.md), because this case is where they were

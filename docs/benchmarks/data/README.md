@@ -30,6 +30,12 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [02-first-survey](xeon-8370c-azure/02-first-survey.md) | xeon-8370c-azure | 2026-08-16 | Where the arms stand here, against the findings' predictions, and against hyper | [write path](../findings/write-path-and-gathering.md) |
 | [03-shared-body](xeon-8370c-azure/03-shared-body.md) | xeon-8370c-azure | 2026-08-16 | Handing bodies over, re-measured — compio verdict overturned | [handing bodies over](../findings/handing-bodies-over.md) |
 
+**No run recorded here contains an `ngnet-qmux-h3` arm.** Every run above predates the
+cross-protocol arms, and none has been re-taken since. The HTTP/2 figures in them are still
+current — nothing about those arms changed when the QMux ones were added, by design
+([`../controls.md`](../controls.md)) — but a reader looking for a cross-protocol number will
+not find one here, and should not infer one from the absence.
+
 ## Adding a run
 
 1. Read [`../running.md`](../running.md) first, and in particular the five rules a run has to

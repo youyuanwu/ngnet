@@ -31,12 +31,110 @@ Each is named with its direction, because a number without its bias is not evide
   The two tokio arms share a runtime type, so the `ngnet-h2-tokio`/`hyper-tokio` pair is free
   of this one, which is another reason that pair carries most of the weight.
 
-Controlled rather than merely disclosed: `TCP_NODELAY` is set explicitly on all six endpoints
-(both sides of all three arms), since Nagle meeting delayed ACK would dominate a small-request
-benchmark and say nothing about either axis; each runtime gets exactly one worker thread, and
-each arm gets its own runtime so no arm's idle connection driver sits in another's scheduler;
-and pinning is left to external `taskset` because compio can pin natively while tokio cannot,
-so pinning one side would manufacture the asymmetry the control exists to remove.
+Controlled rather than merely disclosed: `TCP_NODELAY` is set explicitly on both endpoints of
+every socket arm — eight endpoints across the four, the three tokio-based ones through the same
+socket-pair helper and the compio one through its completion-side twin — since Nagle meeting
+delayed ACK would dominate a small-request benchmark and say nothing about either axis; each
+runtime gets exactly one worker thread, and each arm gets its own runtime so no arm's idle
+connection driver sits in another's scheduler; and pinning is left to external `taskset`
+because compio can pin natively while tokio cannot, so pinning one side would manufacture the
+asymmetry the control exists to remove.
+
+## Confounds of the cross-protocol pair
+
+These bear on `ngnet-h2` against `ngnet-qmux-h3` (and on `ngnet-h2-tokio` against
+`ngnet-qmux-h3-tokio`) and on nothing else in the suite. The settings that *could* be brought
+to the same value on both sides are on [`configuration.md`](configuration.md); what is here is
+what remained after that was done.
+
+- **The layering itself — the largest of these, and not a defect in the comparison.** The QMux
+  arms carry a stream-multiplexing transport underneath their HTTP framing: records, frames,
+  transport-level flow control, a pump between the two layers. The HTTP/2 arms carry framing
+  over a byte stream and nothing else. This **biases against the QMux arms** wherever
+  per-exchange overhead dominates, and it cannot be removed by configuration, because it is not
+  a setting — it is what the comparison is *of*. A reader wanting to know what it costs to run
+  HTTP/3 over a reliable byte stream is asking about exactly this term. The distinction worth
+  holding is between the part of the gap that is the extra layer (structural, and the point)
+  and the part that is this particular implementation of it (contingent, and the thing a later
+  measurement could move) — nothing in this suite separates the two, and no arm here is
+  positioned to.
+- **The record size, reachable from neither stack.** dwnx caps a QMux record at 16382 bytes
+  including its framing; libnghttp2 caps a DATA frame's payload at 16384 and neither value is
+  on either crate's configuration surface. So the QMux arm puts strictly less payload on the
+  wire per unit, and at 1 MiB needs one more unit than the 64 an HTTP/2 arm needs. This
+  **biases against the QMux arms**, by a fraction of a percent of a body sweep's work — at or
+  below this host's drift bar, and the wrong order of magnitude to explain any gap seen so far.
+  It is here so that a later reader hunting the mechanism behind a 1–2% body-throughput
+  difference finds it before inventing one. [`configuration.md`](configuration.md) has the
+  arithmetic and why neither side can be moved.
+- **QMux's unidirectional streams spend connection credit; HTTP/2's control frames do not.**
+  Both arms are given 65535 bytes of connection-level credit, but HTTP/3's control and QPACK
+  streams are ordinary QMux streams and consume from that allowance, where HTTP/2's `SETTINGS`,
+  `PING` and `WINDOW_UPDATE` frames sit outside flow control entirely. So the two figures are
+  equal in number and not quite in meaning, and the QMux arm has marginally less of its window
+  available to bodies. This **biases against the QMux arms**, by a few hundred bytes over a
+  connection's whole life against a window that is extended per consumed byte — which is to say
+  by nothing measurable. It is disclosed rather than controlled because the alternative,
+  granting the QMux arm a few hundred extra bytes to compensate, would replace an exactly
+  stated asymmetry with an estimated one.
+- **The warm-up asymmetry: the QMux fixtures complete an exchange during `establish` and the
+  HTTP/2 fixtures do not.** This looks like a favour to the QMux arm and is the opposite of
+  one: it is what stops the QMux arm being charged for work the HTTP/2 arm never pays inside a
+  timed region. An HTTP/2 fixture's handshake completes inside `handshake_with` during setup.
+  A QMux connection's transport-parameter exchange is scheduled at construction but only leaves
+  on the first pump, and until the peer's parameters arrive every limit is zero and no stream
+  can be opened; on top of that the HTTP/3 driver's first act is to open three unidirectional
+  streams and exchange SETTINGS. None of that happens in `establish` unless something makes it
+  happen — so without a warm-up the *first timed iteration* would pay for the whole handshake
+  and be reported as the cost of a round trip. One completed request-response settles all of
+  it. The residual, disclosed: a QMux arm's first timed iteration therefore meets a connection
+  that has already carried one exchange, where an HTTP/2 arm's meets one that has carried none.
+  On a Criterion sample of thousands of iterations that is not a measurable term, and it
+  **biases towards the QMux arms** to precisely that extent. Do not delete the warm-up as
+  redundant: it is what makes the suite's standing claim — that handshake cost is in no number
+  here, stated in [`cases/README.md`](cases/README.md) — true of these arms as well as of the
+  HTTP/2 ones.
+- **One implementation, never optimised.** `ngnet-qmux-h3` had no benchmark before this suite
+  and no measurement has been acted on since; the join is known to write one `IoSlice` at a
+  time and to copy inbound bodies twice below it, both recorded on
+  [`../qmux-h3/pending-work.md`](../qmux-h3/pending-work.md) and neither addressed. This
+  **biases against the QMux arms** and is contingent rather than structural, which is the whole
+  reason a cross-protocol figure licenses a statement about these two stacks today and not
+  about the two protocols.
+- **A multi-slice offer is written one slice at a time.** Named separately from the point above
+  because it is the same *kind* of effect as the write-path asymmetry at the top of this page,
+  and that one turned out to account for an entire 2.3× spread. `ngnet-h2`'s tokio transport
+  emits one `writev` per driver pass; the QMux join issues one write per `IoSlice` and stops at
+  the first not fully accepted, and the layer below refuses a second production while a record
+  is outstanding — so a fragmented offer costs one record and one pump pass per slice. This
+  **biases against the QMux arms, and biases them more on the socket family than on the duplex
+  family**, because that is where a write is a syscall. It is the first thing to test against
+  if a socket-family gap is ever found to exceed its duplex counterpart.
+- **Buffering: one record outstanding, against a 1 MiB pipe.** A QMux connection holds two
+  16382-byte buffers and permits at most one record outstanding at a time, where the duplex
+  family's in-memory pipe is 1 MiB deep and the HTTP/2 arm may fill it. The pipe is sized so
+  that it is not the bottleneck for the HTTP/2 arms; for the QMux arms the record discipline is
+  the bottleneck long before the pipe is. This **biases against the QMux arms on the duplex
+  family** and is a harness-visible consequence of the protocol's own design rather than a
+  choice the harness made — the pipe's capacity is equal for both arms, and equalising the
+  *effect* would mean shrinking the pipe until it constrained the HTTP/2 arm too, which would
+  change arms whose measurements are already recorded.
+
+Controlled rather than merely disclosed, on the cross-protocol pair specifically: both arms run
+on their own single-worker runtime with drivers on plain `tokio::spawn` — the QMux join imposes
+no `Send` bound and needs no `LocalSet`, so the runtime arrangement is identical rather than
+merely similar; `TCP_NODELAY` on the socket family is set by the same helper for both; and the
+request, body, echo handler and drain are one shared definition that both fixtures call, so
+"the two stacks ran the same workload" is a property of there being one definition rather than
+an assertion about two.
+
+**The drain is part of that, and is the one shared helper worth naming.** The two stacks defer
+different amounts of work until a response body is actually read, so an arm that took the
+response head and dropped the body would be measuring almost nothing on one stack and rather
+more on the other — and the gap would look like a protocol difference. Every arm, on both
+stacks, reads every response to its end through the same function, and the server side collects
+every request body through the same one. Neither is a property either stack can opt out of by
+being lazier than the other.
 
 ## Drift, and the design that survives it
 
@@ -56,7 +154,12 @@ Four devices follow from that, and every recorded run uses them:
 1. **Unchanged arms are carried as drift controls.** `hyper-tokio` is touched by none of this
    work, so whatever it does between runs is the session's noise floor. In the shared-body
    families the untouched `*-push` twins serve the same purpose for their own transport.
-   A claimed gain smaller than the controls' own movement is not a result.
+   A claimed gain smaller than the controls' own movement is not a result. The HTTP/2 arms play
+   this role for the cross-protocol comparison too: nothing about them changed when the QMux
+   arms were added — same group names, same benchmark ids, same sweeps, same registration order
+   relative to one another — so a run that moves an HTTP/2 arm has moved for a reason outside
+   this suite, and a QMux figure is read against an HTTP/2 figure taken minutes earlier on the
+   same machine rather than against anything absolute.
 2. **A mechanistic control is preferred to a statistical one where the mechanism allows.**
    The 0-byte point in the body sweeps is one: with no body there is nothing to copy and
    nothing to gather, so two arms that differ only in body strategy *cannot* legitimately
@@ -65,7 +168,14 @@ Four devices follow from that, and every recorded run uses them:
    back to back, so the two halves of a comparison sit as close together in time as Criterion
    allows. This is adjacency, not sample-level interleaving — Criterion samples one benchmark
    to completion before starting the next, and no arrangement of `bench_with_input` calls
-   changes that. Replication covers the remainder.
+   changes that. Replication covers the remainder. The cross-protocol arms obey this by
+   registration order: each QMux arm is registered **immediately after its HTTP/2
+   counterpart** — `ngnet-h2` then `ngnet-qmux-h3`, with `hyper` after both, and on the socket
+   family after `ngnet-h2-tokio` specifically, the only arm differing from it in protocol
+   alone. Appending them at the end of each loop body would have put an unrelated arm between
+   the two halves of the comparison this work exists to make. No pre-existing registration
+   moved relative to another, because emission order is a control here and the runs already
+   filed under [`data/`](data/) were taken in it.
 4. **Replication, with the exclusion rule fixed in advance.** The shared-body verdict
    aggregates paired deltas over ten independent runs, so a slow drift has to bias every one
    of them the same way to survive. Its exclusion rule — discard any replicate whose 0-byte

@@ -201,6 +201,19 @@ No socket, no runtime, no threads, no timer and no clock of its own — the cloc
 connection's, so that a timestamp the HTTP/3 layer records is comparable with the one the layer
 below stamps against.
 
-It holds no configuration either. The QMux defaults are what a connection gets. A caller who
-needs other ones is better served by an argument this crate does not yet have than by a knob
-that only half works.
+It holds no configuration *state* either, in the sense that matters here: the two `Config`
+values `connect_with` and `serve_with` accept are consumed at construction and handed to the
+layers that own them — the transport half to `ngnet-qmux`, the HTTP half to `ngnet-h3`. This
+crate keeps neither, and there is nothing to ask a `QmuxConnection` about its settings because
+it does not know them. `connect` and `serve` remain as the no-argument forms, forwarding the
+defaults, so a caller with no opinion is not made to have one.
+
+The two are given distinct names at this crate's boundary — `TransportConfig` and `HttpConfig`,
+re-exports of the underlying types rather than wrappers — because a signature taking two
+configurations that are both called `Config` cannot be read at the call site. Nothing is added
+and nothing is hidden by the renaming: a value built through `ngnet-qmux` or `ngnet-h3`
+directly is the same value.
+
+What a caller still cannot do is change any of it afterwards. That is a real gap rather than a
+narrowing, and for the stream allowance in particular it has a failure mode; see
+[`pending-work.md`](pending-work.md).

@@ -46,10 +46,22 @@ every arm, including `compio-push` and `compio-shared`, which abort unless they 
 `DriverType::IoUring` — so io_uring is genuinely available here and not silently falling back
 to a polling driver.
 
-`ngnet-bench` depends on `ngnet-h2` alone, so it needs neither the ngtcp2/nghttp3
-submodules nor OpenSSL ≥ 3.5 that the QUIC crates require: `cargo bench -p ngnet-bench`
-builds with the pinned toolchain, a C compiler, CMake and libclang, plus the `deps/nghttp2`
-submodule that `ngnet-h2-sys` compiles.
+`ngnet-bench` needs the `deps/nghttp2`, `deps/nghttp3` (with its nested `lib/sfparse`) and
+`deps/dwnx` submodules, and it still needs **neither `deps/ngtcp2` nor OpenSSL ≥ 3.5**, which
+belong to `ngnet-quic-sys` and are reached by no arm in the suite: `cargo bench -p ngnet-bench`
+builds with the pinned toolchain, a C compiler, CMake and libclang, plus those three
+submodules. [`../../running.md`](../../running.md) states the requirement in full.
+
+> **Editorial note, 2026-08-17.** The paragraph above previously read that `ngnet-bench`
+> "depends on `ngnet-h2` alone, so it needs neither the ngtcp2/nghttp3 submodules nor
+> OpenSSL ≥ 3.5". That was true of runs 01–03 and of every measurement recorded on this page,
+> and it stopped being true when the HTTP/3-over-QMux arms were added: the crate now compiles
+> nghttp3 and dwnx as well. The OpenSSL half of the claim is unchanged and still holds. The
+> paragraph is corrected rather than annotated in place because it describes what a reader has
+> to install *today* to reproduce anything here, and a stale prerequisite list is a build
+> failure rather than a historical curiosity. Nothing else on this page has been touched, and
+> in particular no run, number or verdict below has been altered — runs 01–03 were taken
+> before the QMux arms existed and their submodule requirement really was the smaller one.
 
 ## Runs
 

@@ -32,6 +32,33 @@ not there needs an explanation for why the socket swallowed it. Without one, it 
 
 Body sizes sweep **0 B, 1 KiB, 64 KiB, 1 MiB**, the same points as every other sweep.
 
+## Why there is no QMux arm here
+
+Every other duplex case gained an HTTP/3-over-QMux arm. This one did not, and the reason is
+specific to what this case measures rather than to anything wrong with the QMux stack.
+
+**There is no counterpart mechanism to put in the arm.** The two arms above differ in exactly
+one thing: whether the body is copied into libnghttp2's frame buffer or handed over as the
+caller's own `Bytes` and serialised with `NGHTTP2_DATA_FLAG_NO_COPY`. That flag, that frame
+buffer and the `handshake_shared`/`serve_shared` entry points that opt into avoiding it are
+libnghttp2 constructs. `ngnet-qmux-h3` has no equivalent pair of entry points, no equivalent
+flag, and therefore no second arm to be the first arm's twin.
+
+A QMux arm here could only be a *third* strategy standing beside the pair, not a member of it —
+and this case's whole design is the paired-twin comparison described below, in which the 0-byte
+point is a mechanistic control precisely because the two arms are identical but for the entry
+point. Adding an arm that shares no mechanism with either twin would put a number on the page
+that the case's controls do not cover and that its finding could not be read against.
+
+**This reason is not the reason
+[`concurrent_throughput_multi_thread`](concurrent-throughput.md) has no QMux arm, and the two
+must not be filed together.** There, the mechanism exists and the arm was written; it was left
+out because it hangs, which is a recorded defect on
+[`../../qmux-h3/pending-work.md`](../../qmux-h3/pending-work.md). Here nothing is broken and
+nothing is pending: there is simply no such thing to measure. If `ngnet-qmux-h3` ever grows an
+opt-in no-copy body path of its own, this case gets a twin pair for it — a fourth and fifth
+arm, not one arm — and the omission ends for a reason unrelated to the other.
+
 ## Design rules this case obeys
 
 The full reasoning is in [`../controls.md`](../controls.md); in brief:

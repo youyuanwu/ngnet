@@ -57,7 +57,13 @@ then copied into the outbound queue. That one is an artefact of `RecordWriter` b
 the connection and its destination buffer for the whole record, which is the borrow that makes
 the write path sound at all (see `design.md`), and it is bounded by one record.
 
-There are no benchmarks, so all of this is a description rather than a number.
+These copies have still not been costed. The benchmark suite in `docs/benchmarks/` now runs
+`ngnet-qmux-h3` end to end over this layer, so the sentence that used to stand here — that
+there were no benchmarks — is no longer true; but an end-to-end figure attributes nothing to
+these copies in particular, since it also contains framing, QPACK, the record layer, the pump
+and the byte stream. All of the above therefore remains a description rather than a number,
+and it will stay one until something profiles the copies or measures a build with one of them
+removed.
 
 ## Things this increment does not do
 

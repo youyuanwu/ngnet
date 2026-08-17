@@ -1,12 +1,66 @@
 # Running the benchmarks
 
+## What has to be in place first
+
+The benchmark crate builds three C libraries from source, and the set grew when the
+HTTP/3-over-QMux arms landed. A checkout that used to be sufficient no longer is, so this
+section is the first thing to check when `cargo bench -p ngnet-bench` fails before it runs
+anything.
+
+| Submodule | Reached through | Needed by |
+| --- | --- | --- |
+| `deps/nghttp2` | `ngnet-h2-sys` | every HTTP/2 arm |
+| `deps/nghttp3` **and its nested `lib/sfparse`** | `ngnet-h3-sys` | every QMux arm |
+| `deps/dwnx` | `ngnet-qmux-sys` | every QMux arm |
+
+`nghttp3/lib/sfparse` is not optional and is not a test dependency: the structured-field
+parser is part of the library, and nghttp3 does not compile without it. "Clone
+non-recursively" is therefore correct for `nghttp2` and `dwnx` and quietly wrong for
+`nghttp3`. The [`justfile`](../../justfile) encodes the exact set so it does not have to be
+remembered:
+
+```sh
+just submodules
+
+# Or, to see what is checked out, missing (-) or at an unexpected commit (+):
+just submodules-status
+```
+
+By hand, if `just` is not installed — or is older than 1.27, which cannot parse the
+[`justfile`](../../justfile)'s `[doc(...)]` attributes and fails with
+`error: Unknown attribute 'doc'` before running anything:
+
+```sh
+git submodule update --init deps/nghttp2 deps/nghttp3 deps/dwnx
+git -C deps/nghttp3 submodule update --init lib/sfparse
+
+# The equivalent of `just submodules-status`:
+git submodule status --recursive
+```
+
+Building those three needs a C compiler, CMake 3.14 or newer, and libclang for `bindgen`.
+
+**What is still not needed is OpenSSL 3.5 or newer.** That requirement belongs to
+`ngnet-quic-sys`, which builds ngtcp2 and drives its handshake through OpenSSL's QUIC TLS API,
+and no arm in this suite reaches it — `deps/ngtcp2` need not be checked out to run the
+benchmarks at all. This is worth stating rather than leaving implicit, because the naive
+reading of "the benchmarks now cover HTTP/3" is that they must have acquired a QUIC transport
+and therefore a TLS stack with an unusually new OpenSSL floor. They have not: QMux runs over
+the same loopback TCP connection the HTTP/2 arms use, and the QMux arms are unencrypted. On a
+host whose OpenSSL predates 3.5, `cargo bench -p ngnet-bench` works and
+`cargo bench --workspace` does not; prefer the `-p` form for that reason alone.
+
+`cargo tree -p ngnet-bench --prefix none | grep '^ngnet-.*-sys' | sort -u` is the check that
+settles the question on any given day, rather than trusting this table. It lists exactly the
+three `-sys` crates above, and `ngnet-quic-sys` is not among them.
+
 ## The commands
 
 ```sh
 # Everything. The real-socket benches need the completion feature and a host with io_uring.
 cargo bench -p ngnet-bench
 
-# The three-arm real-socket comparison, on one pinned core so the numbers are comparable.
+# The four-arm real-socket comparison, on one pinned core so the numbers are comparable.
 taskset -c 3 cargo bench -p ngnet-bench --bench transport_concurrent_throughput
 
 # One at a time.
