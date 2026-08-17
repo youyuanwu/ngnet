@@ -30,9 +30,50 @@
 //!
 //! # Retention, and why a close is latched rather than windowed
 //!
-//! The framer keeps the payload of the record currently arriving, and nothing else -- until a
-//! record completes and turns out to contain a close, at which point that payload is **latched
-//! permanently** and no further record is retained.
+//! The framer keeps the payload of the record currently arriving **only while that record is
+//! arriving in pieces**, and nothing else -- until a record completes and turns out to contain
+//! a close, at which point that payload is **latched permanently** and no further record is
+//! retained.
+//!
+//! The qualification is the whole of the scan-in-place arrangement, and it is stated here
+//! because it is what the retention bound now means. A record whose declared length is all
+//! present in the slice `consume` was handed is scanned **where it lies**: the bytes are
+//! already contiguous in the caller's read buffer, `decode_close_frame` needs nothing but a
+//! contiguous payload, and copying them into a buffer of this framer's own in order to look at
+//! them buys a second copy of every record for the sake of the one record in a connection's
+//! life that carries a close. So the copy is paid only where it buys something -- a record
+//! spread over several reads, which has nothing contiguous to scan and must be reassembled
+//! before it can be looked at at all.
+//!
+//! The rejected alternative is scanning each fragment as it arrives and keeping no record
+//! buffer whatever. It loses closes, in the same silent way a sliding window does: a close
+//! frame cut across two reads is in neither fragment, and a frame *before* the close cut
+//! across two reads leaves the scan unable to find where the next frame begins.
+//!
+//! Three conditions gate the fast path, and the first two silently mis-decode if dropped:
+//!
+//! 1. **Nothing of this record has been retained yet.** An earlier `consume` may have delivered
+//!    the record's first half, in which case the slice at hand holds the remaining declared
+//!    length and *not* the whole record. Scanning it would look at the tail of a record and
+//!    call it a whole one.
+//! 2. **The slice holds the whole declared remainder.** The same requirement from the other
+//!    end: a record continuing into the next read is not complete here.
+//! 3. **No close has been latched.** Defensive rather than load-bearing, and stated as such:
+//!    after a latch nothing further is retained, so an empty retention buffer would no longer
+//!    mean "this record has not started". Nothing currently mis-decodes if it is dropped,
+//!    because `finish_record` returns early once a close is latched — but that makes condition
+//!    1 mean two different things depending on a fact stated somewhere else, and the direction
+//!    of the bias here is toward the condition that is true on its own.
+//!
+//! What is scanned is exactly the declared length's worth and never the rest of the slice:
+//! `decode_close_frame` takes a payload with its length prefix already stripped, so handing it
+//! the raw inbound bytes would let it walk out of one record and decode a close out of the
+//! next record's length prefix and frames -- latching, for the record that did not contain it,
+//! a close reason assembled from someone else's fields.
+//!
+//! A close found in place is still **copied**, because latching it means holding it after
+//! `consume` has returned and the slice it was found in belongs to the caller. That copy is
+//! once per connection.
 //!
 //! The rejected alternative is the natural one: a sliding window holding the most recent
 //! complete record, replaced when the next record starts. It loses closes. `Conn::read` reports
@@ -48,7 +89,8 @@
 //!
 //! # The bound
 //!
-//! One record in progress plus one latched close: at most two records' worth. A record is at
+//! One record in progress plus one latched close: at most two records' worth, and in the
+//! ordinary case -- records arriving whole -- nothing at all. A record is at
 //! most [`DEFAULT_MAX_RECORD_SIZE`](crate::DEFAULT_MAX_RECORD_SIZE) = 16382 bytes, and dwnx
 //! overwrites any configured maximum with that value at construction, so the ceiling is fixed
 //! rather than negotiated. The framer's retention is therefore under 32 KiB per connection,
@@ -199,12 +241,17 @@ enum State {
 #[derive(Debug)]
 pub struct RecordFramer {
     state: State,
-    /// The payload of the record currently arriving, empty once a close has been latched.
+    /// What has arrived so far of a record that is spanning several reads.
+    ///
+    /// Empty for a record that arrived whole -- that one is scanned where it lies and never
+    /// enters this buffer -- and empty once a close has been latched, after which nothing
+    /// further is retained. Kept allocated across records so that a connection whose peer
+    /// fragments its records pays the growth once rather than per record.
     record: Vec<u8>,
     /// The payload of the record that carried the peer's close, kept for as long as the
     /// connection object lives.
     close: Option<Vec<u8>>,
-    /// How many payload bytes have been copied into `record`, cumulatively.
+    /// How many payload bytes have been copied into the framer's retention, cumulatively.
     ///
     /// Compiled only where debug assertions are, and [`RecordFramer::copied_bytes`] says why
     /// that gate rather than another.
@@ -255,26 +302,39 @@ impl RecordFramer {
                     let (complete, taken) = prefix.feed(rest);
                     rest = &rest[taken..];
                     if let Some(length) = complete {
-                        self.begin_record(length)?;
+                        self.begin_record(length, rest.len())?;
                     }
                 }
                 State::Payload(remaining) => {
                     let take = (*remaining).min(rest.len());
-                    if self.close.is_none() {
-                        self.record.extend_from_slice(&rest[..take]);
+                    // The three conditions the module documentation states, in the order it
+                    // states them: nothing of this record retained, the whole declared
+                    // remainder present, and no close latched. All three, because each one
+                    // alone admits a slice that is not this record's whole payload.
+                    let in_place =
+                        self.record.is_empty() && take == *remaining && self.close.is_none();
+                    *remaining -= take;
+                    let complete = *remaining == 0;
+
+                    // Exactly the declared length's worth. The bytes after it in `rest` belong
+                    // to the next record and must not be scanned as part of this one.
+                    let (payload, tail) = rest.split_at(take);
+                    rest = tail;
+
+                    if !in_place && self.close.is_none() {
+                        self.record.extend_from_slice(payload);
                         // Counted at the copy rather than at the record boundary, so that a
                         // record delivered in fragments is charged the same total as one
-                        // delivered whole -- which is the equality a scan-in-place change has
-                        // to preserve for the arriving-whole case and break for nothing else.
+                        // delivered whole -- which is the equality that makes this count a
+                        // measure of the copying rather than of the framing.
                         #[cfg(debug_assertions)]
                         {
                             self.copied += take;
                         }
                     }
-                    *remaining -= take;
-                    rest = &rest[take..];
-                    if *remaining == 0 {
-                        self.finish_record();
+
+                    if complete {
+                        self.finish_record(in_place.then_some(payload));
                     }
                 }
             }
@@ -320,7 +380,9 @@ impl RecordFramer {
     /// How many bytes the framer is holding.
     ///
     /// Bounded by one record in progress plus one latched close; see the module documentation.
-    /// Exposed so a test can assert the bound rather than trust it.
+    /// Zero between records, and zero *during* a record that arrived whole, since such a
+    /// record is scanned where it lies. Exposed so a test can assert the bound rather than
+    /// trust it.
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         self.record.len() + self.close.as_ref().map_or(0, Vec::len)
@@ -331,11 +393,15 @@ impl RecordFramer {
     /// Exposed for the same reason [`RecordFramer::retained_bytes`] is -- so a test can assert
     /// the cost rather than trust the prose -- and gated for a reason that one has no need of.
     ///
-    /// The copy it counts sits on the receive hot path, one memcpy per record for every record
-    /// that arrives, and a later measurement compares a benchmark run against another run of
-    /// the same benchmarks. Instrumentation compiled into one side of that comparison and not
-    /// the other measures the instrument, so this counter must be absent from a benchmark
-    /// build rather than merely unused in one.
+    /// What it counts is now a record that arrived in fragments and had to be reassembled
+    /// before it could be scanned, plus the one close a connection latches. It used to count
+    /// one memcpy per record for every record that arrives, which is the figure the
+    /// scan-in-place arrangement removed and which `tests/io_framing.rs` asserts is zero for a
+    /// run of whole records. The gate below is unchanged and its reason is unchanged: a later
+    /// measurement compares a benchmark run against another run of the same benchmarks, and
+    /// instrumentation compiled into one side of that comparison and not the other measures
+    /// the instrument, so this counter must be absent from a benchmark build rather than
+    /// merely unused in one.
     ///
     /// `cfg(test)` is the obvious gate and cannot be it. This crate's integration tests are
     /// separate compilation units linked against the ordinary library, so a `cfg(test)` item
@@ -361,7 +427,10 @@ impl RecordFramer {
     }
 
     /// Starts a record of `length` bytes, having just read its prefix.
-    fn begin_record(&mut self, length: u64) -> Result<()> {
+    ///
+    /// `available` is how much of the current slice is left behind the prefix, which is what
+    /// decides whether this record will be scanned where it lies or reassembled here.
+    fn begin_record(&mut self, length: u64, available: usize) -> Result<()> {
         if length == 0 {
             return Err(Error::new(
                 ErrorKind::Protocol,
@@ -377,7 +446,12 @@ impl RecordFramer {
         }
 
         self.record.clear();
-        if self.close.is_none() {
+        // Reserved only for a record that will actually be accumulated. The reservation exists
+        // to stop a record arriving in fragments regrowing the buffer once per fragment; a
+        // record whose whole payload is already in the slice at hand is never put in the
+        // buffer at all, so reserving for it would be an allocation on the receive hot path
+        // bought for nothing. `available` is what the length prefix has already told us.
+        if self.close.is_none() && available < length {
             self.record.reserve(length);
         }
         self.state = State::Payload(length);
@@ -385,7 +459,11 @@ impl RecordFramer {
     }
 
     /// Completes the record in progress, latching it if it carried a close.
-    fn finish_record(&mut self) {
+    ///
+    /// `in_place` carries the record's whole payload when it arrived contiguously and was
+    /// therefore never copied into the retention buffer; [`None`] means the payload was
+    /// reassembled in `record` and is scanned from there.
+    fn finish_record(&mut self, in_place: Option<&[u8]>) {
         self.state = State::Length(LengthPrefix::default());
 
         if self.close.is_some() {
@@ -393,11 +471,27 @@ impl RecordFramer {
         }
         // The whole record is scanned, never just its first frame: a record may carry several
         // frames and dwnx returns to its frame-type state for each
-        // (`deps/dwnx/lib/dwnx_record_reader.c:88-103`), so a close may follow anything.
-        if decode_close_frame(&self.record).is_some() {
-            self.close = Some(core::mem::take(&mut self.record));
-        } else {
-            self.record.clear();
+        // (`deps/dwnx/lib/dwnx_record_reader.c:88-103`), so a close may follow anything. Which
+        // buffer the payload is in changes; that it is scanned end to end does not.
+        match in_place {
+            Some(payload) => {
+                if decode_close_frame(payload).is_some() {
+                    // Copied because latching means holding it beyond this call, and these
+                    // bytes are the caller's read buffer. Once per connection.
+                    self.close = Some(payload.to_vec());
+                    #[cfg(debug_assertions)]
+                    {
+                        self.copied += payload.len();
+                    }
+                }
+            }
+            None => {
+                if decode_close_frame(&self.record).is_some() {
+                    self.close = Some(core::mem::take(&mut self.record));
+                } else {
+                    self.record.clear();
+                }
+            }
         }
     }
 }

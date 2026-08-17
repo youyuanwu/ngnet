@@ -31,8 +31,12 @@ fn params() -> TransportParams {
     TransportParams::new().with_all_limits(1 << 20, 8)
 }
 
-/// The bytes of a record, prefix stripped -- what a [`RecordFramer`] retains and what
+/// The bytes of a record, prefix stripped -- what a [`RecordFramer`] scans and what
 /// [`decode_close_frame`] is given.
+///
+/// "Scans" rather than "retains": a record that arrives whole is scanned where it lies and is
+/// never retained at all. What is stripped is the same either way, and it is the stripping that
+/// matters here -- the decoder is given the payload, never the record.
 ///
 /// [`RecordFramer`]: ngnet_qmux::io::RecordFramer
 fn payload_of(record: &[u8]) -> &[u8] {

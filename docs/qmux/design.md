@@ -436,6 +436,29 @@ worth hearing. A close is terminal, so latching costs one record and loses nothi
 one record in progress plus one latched close — under 32 KiB, whatever the peer does, since dwnx
 overwrites any configured maximum with 16382.
 
+What is retained, though, is now narrower than that bound suggests, and the ordinary case
+retains nothing. A record whose declared length is entirely present in the slice `consume` was
+handed is **scanned where it lies**: the bytes are already contiguous in the connection's read
+buffer, the decoder wants nothing but a contiguous payload, and copying them into a buffer of
+the framer's own to look at them is a second copy of every record bought for the one record in a
+connection's life that carries a close. The copy is paid only where it buys something — a record
+spread over several reads, which has nothing contiguous to scan and must be reassembled before
+it can be looked at at all — and once more for a close found in place, which has to be copied
+because latching it means holding it after `consume` has returned. The rejected alternative was
+scanning each fragment as it arrives and keeping no buffer at all: it loses a close cut across
+two reads, silently, which is the same failure mode as the window.
+
+Three conditions gate the scan-in-place path, and `src/io/framing.rs` states them where they are
+applied. The retention buffer must be empty *and* the slice must hold the whole declared
+remainder — either alone admits the tail of a half-arrived record being scanned as though it
+were a whole one. What is scanned is exactly the declared length's worth and never the rest of
+the slice, because the decoder takes a payload with its length prefix already stripped and would
+otherwise walk into the next record and assemble a close out of its fields. The third, that no
+close has been latched, is defensive: it keeps "the retention buffer is empty" meaning "this
+record has not started" rather than depending on a check made elsewhere.
+`io_framing.rs` fails on each of the first two if it is removed, and
+`RecordFramer::copied_bytes` reports zero for a run of records that arrive whole.
+
 The decoder scans frames rather than assuming the close is first, because
 `dwnx_record_reader_reset` returns to the frame-type state while bytes remain in the record: a
 close may legally follow other frames. And the test that matters feeds an encoded close to a
