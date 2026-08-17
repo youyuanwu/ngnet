@@ -225,6 +225,72 @@ case rather than kept as a second loop. Its guard is
 `a_take_that_stops_inside_a_fragment_resumes_inside_it` in
 `crates/ngnet-qmux/tests/io_vectored.rs`.
 
+## Window extensions are batched here, because the HTTP/3 layer does not batch them — settled
+
+The question Spec FR-037 asks is whether flow-control extensions and the read-ahead wakeups they
+cause are *already* coalesced within one transmit pass. `CodeResearch.md` left it open, having
+not read the HTTP/3 driver's credit path. It has now been read, and the answer is **no**.
+
+**The evidence.** `Driver::extend` in `crates/ngnet-h3/src/http/driver.rs` makes two
+`extend_credit` calls for the same bytes — the stream's window and the connection's, which are
+separate and neither implies the other — and it is reached from three places inside a single
+pass: once per `QuicEvent::Data` the driver applied, via `Driver::read`; once per stream whose
+QPACK-deferred credit was released; and once per credit entry the caller returned by reading.
+Nothing between those sites accumulates, and every one of them used to become an
+`extend_stream_credit` or `extend_connection_credit` call on the connection below, each of which
+marks the connection as having something to produce and each connection-level one of which also
+wakes the read-ahead pump. Read rather than assumed: the reading is pinned by a count, in
+`tests/ngnet-qmux-h3-tests/tests/credit_batching.rs`, so a driver that starts coalescing fails a
+test that names this finding rather than silently invalidating it.
+
+**What was done.** Batched at this seam. `Inner::defer_credit` accumulates a run — one sum per
+stream, one for the connection — and `Inner::flush_credit` applies it at the first interaction
+with the layer below that follows: `poll_event`, `poll_open_uni`, `poll_open_bi`,
+`poll_transmit`, `reset`, `stop_sending`, `close`, and the tail's `poll_finish`.
+
+**Why here and not in `ngnet-h3`.** `ngnet-h3` is shared with the QUIC stack, which cannot be
+fully built on this host — so a change there could not have been verified against the other
+consumer of the trait it changes. This seam is QMux-only, and the bias of that choice is stated
+plainly: it fixes the cost for this transport and leaves it in place for the other one.
+
+**The rejected alternative.** Flushing only in `poll_transmit`, which is the largest batch
+available and the one place a pass demonstrably ends. Rejected because the driver's loop can
+park between reporting credit and transmitting — `poll_open_bi` waits for stream capacity the
+peer has not granted — and credit stranded behind that park is a window the peer is never told
+about while both ends wait for the other. The rule adopted instead is that a run ends at the
+*next interaction of any kind*, which needs no list of which interactions can park.
+
+**What it is worth, by count.** Eight concurrent 64 KiB downloads, measured end to end
+(`credit_batching.rs`):
+
+| | before | after |
+| --- | --- | --- |
+| `extend_credit` calls the driver made | 42 | 42 |
+| extensions applied to the QMux connection | 42 | 31 |
+| connection-window extensions, and so read-ahead wakeups | 21 | 10 |
+
+The "before" column needs no stashed build: every call was forwarded straight through, so the
+driver's call count *is* what the connection below used to see. The stream half of the total
+does not move here — each stream that delivers in a pass needs its own stream-window extension
+either way, and these bodies deliver at most once per stream per run — so the whole of the
+saving is the shared connection window, which is also the one that fires the pump's waker.
+
+**No timing was taken, and that is a decision**, on the same grounds as the vectored-write
+entry above: FR-021 accepts a mechanism established by a count where no benchmark identifier can
+resolve it, and eleven fewer calls into a state machine per eight-stream exchange is not
+something an end-to-end arm can separate from its own drift.
+
+**Bias in the measurement, stated.** The harness stops at the completed exchange rather than at
+a closed connection, so credit still held when the run ends is never applied. That flatters the
+"after" figure by at most one flush — one connection extension — which is inside the margin the
+test asserts.
+
+**What is bounded, and what happens at the bound.** The per-stream run is a `Vec` scanned
+linearly, which is right for the single-digit stream counts a pass delivers on and wrong for
+hundreds. `MAX_PENDING_STREAMS` (sixty-four, the driver's own per-pass offer bound) applies the
+run early rather than letting the scan grow, so the worst case is exactly the behaviour this
+replaced rather than something worse.
+
 ## Something scales with in-flight streams on a real socket
 
 This is a lead, not a finding, and the numbers behind it are **not measurements**: they come

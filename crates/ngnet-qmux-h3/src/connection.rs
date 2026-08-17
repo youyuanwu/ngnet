@@ -17,7 +17,7 @@ use ngnet_qmux::io::{
     AsyncByteStream, Clock, Config, Connection as LayerConnection, Error as LayerError,
     ErrorKind as LayerErrorKind,
 };
-use ngnet_qmux::{CloseKind, CloseReason, Initiator, Role, Shutdown};
+use ngnet_qmux::{CloseKind, CloseReason, Initiator, Role, Shutdown, StreamId as LayerStreamId};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::event::{ends_a_stream, qmux_stream, stream_id, translate};
@@ -58,6 +58,67 @@ impl Ending {
     }
 }
 
+/// Window extensions the HTTP/3 layer has reported and this connection has not yet applied.
+///
+/// # Why they are held at all
+///
+/// The HTTP/3 driver does not coalesce them. `Driver::extend`
+/// (`crates/ngnet-h3/src/http/driver.rs`) makes **two** `extend_credit` calls for the same
+/// bytes -- the stream's window and the connection's, which are separate and neither implies
+/// the other -- and it is reached from three places in one pass: once per `QuicEvent::Data`
+/// applied, once per stream whose deferred credit was released, and once per credit entry the
+/// caller returned by reading. A pass that delivers a body in eight parts therefore forwards
+/// sixteen calls, and every one of them reached the layer below.
+///
+/// Each of those calls costs a call into dwnx and sets `produce_pending`, and each *connection*
+/// extension additionally fires the read-ahead waker. None of that is expensive on its own and
+/// all of it is redundant: the frames dwnx emits depend on the window's total, not on how many
+/// times it was told about it, so applying one sum has exactly the effect of applying its
+/// parts. What changes is the number of times the layer below is disturbed.
+///
+/// # Why holding them is safe
+///
+/// A run of these is flushed at the *first* transport interaction that follows it --
+/// `poll_event`, `poll_transmit`, an open, a reset, a stop-sending, a close, or the tail --
+/// so no credit outlives the run of `extend_credit` calls that produced it. That is stricter
+/// than "flush in `poll_transmit`", which would be enough for the driver as it is written
+/// today: the pass reaches `poll_transmit` on every iteration, but it can *park* before it at
+/// `poll_open_bi` waiting for stream capacity, and credit stranded there is a window the peer
+/// never hears about while both ends wait for the other. The rejected alternative is that
+/// narrower rule, and it was rejected because it makes this crate's correctness depend on the
+/// shape of a loop in another crate.
+///
+/// `now` is the one method that does not flush, because it touches nothing: the driver calls
+/// it in the middle of a run of credit reports, and flushing there would break exactly the run
+/// this exists to coalesce.
+#[derive(Default)]
+struct PendingCredit {
+    /// Per-stream sums, in the order the streams were first reported.
+    ///
+    /// A `Vec` with a linear scan rather than a map: a run holds one entry per stream that
+    /// delivered in the pass, which is single digits in every workload measured, and a hash
+    /// per report would cost more than the scan it replaced. Bounded by [`MAX_PENDING_STREAMS`]
+    /// so the scan cannot grow without limit.
+    streams: Vec<(LayerStreamId, u64)>,
+    /// The connection-level sum, which every stream contributes to.
+    connection: u64,
+}
+
+impl PendingCredit {
+    fn is_empty(&self) -> bool {
+        self.streams.is_empty() && self.connection == 0
+    }
+}
+
+/// How many streams a run may accumulate before it is applied early.
+///
+/// A bound rather than a tuning knob. The scan above is linear, and a pass that delivered on
+/// hundreds of streams would make it quadratic in the number of streams; applying early costs
+/// exactly what not batching cost, so the worst case is the behaviour this replaced rather
+/// than something worse. Sixty-four is the driver's own per-pass offer bound, which is the
+/// nearest thing to a natural figure available.
+const MAX_PENDING_STREAMS: usize = 64;
+
 /// Everything the HTTP/3 layer's transport needs, behind one lock.
 ///
 /// See the [crate documentation](crate) for why it is shared at all, and why the lock is a
@@ -92,6 +153,27 @@ pub(crate) struct Inner<S: AsyncByteStream, C: Clock> {
     close: Option<CloseReason>,
     /// Whether the tail has run to completion.
     finished: bool,
+    /// Window extensions reported by the HTTP/3 layer and not yet applied.
+    credit: PendingCredit,
+    /// How many times credit has been applied to the layer below.
+    ///
+    /// The instrument the batching is stated over. It counts *applications*, one per
+    /// `extend_stream_credit` or `extend_connection_credit` call, so it is directly
+    /// comparable with the number of `extend_credit` calls the HTTP/3 driver made: before
+    /// batching the two were equal by construction, and the distance between them now is what
+    /// the batching is worth. Kept in release builds as well as test ones because it is one
+    /// `u64` add on a path that already takes a lock, and a counter compiled out of the build
+    /// that is measured is not evidence about that build.
+    credit_applications: u64,
+    /// How many of those were connection-window extensions.
+    ///
+    /// Counted apart because it is the sharper of the two figures. Every stream that
+    /// delivered in a pass needs its own stream-window extension whether or not the reports
+    /// are batched, so the stream half can only shrink when one stream delivers twice; the
+    /// connection window is one window shared by all of them, and the driver reports it once
+    /// per delivery. It is also the extension that wakes the read-ahead pump, so this is the
+    /// count of wakeups the batching removes.
+    connection_credit_applications: u64,
 }
 
 impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
@@ -110,6 +192,68 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
             reported_ending: false,
             close: None,
             finished: false,
+            credit: PendingCredit::default(),
+            credit_applications: 0,
+            connection_credit_applications: 0,
+        }
+    }
+
+    /// Records credit the HTTP/3 layer reported, without applying it.
+    ///
+    /// See [`PendingCredit`] for why it is held and for how long.
+    fn defer_credit(&mut self, stream: Option<LayerStreamId>, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        match stream {
+            Some(stream) => {
+                if let Some(entry) = self.credit.streams.iter_mut().find(|(id, _)| *id == stream) {
+                    entry.1 = entry.1.saturating_add(bytes);
+                } else {
+                    self.credit.streams.push((stream, bytes));
+                }
+            }
+            // The connection window, shared across every stream. The layer reports the same
+            // bytes to both levels, and extending only the stream stalls the whole connection
+            // once enough has flowed in total -- late, and with nothing to explain it.
+            None => self.credit.connection = self.credit.connection.saturating_add(bytes),
+        }
+        if self.credit.streams.len() >= MAX_PENDING_STREAMS {
+            self.flush_credit();
+        }
+    }
+
+    /// Applies everything [`Inner::defer_credit`] has accumulated.
+    ///
+    /// Called from every entry point that reaches the layer below, so a run of credit reports
+    /// is applied before anything can observe or depend on the windows it moves.
+    fn flush_credit(&mut self) {
+        if self.credit.is_empty() {
+            return;
+        }
+        if self.ending.is_some() {
+            // Nothing below will act on it, and the layer below reports an ended connection
+            // as an error rather than ignoring the call. Dropped rather than applied, which
+            // is what the unbatched path did by returning early for the same reason.
+            self.credit.streams.clear();
+            self.credit.connection = 0;
+            return;
+        }
+        for (stream, bytes) in self.credit.streams.drain(..) {
+            // Absorbed rather than propagated. The layer below refuses to extend a stream
+            // this endpoint never receives on, which is exactly what the HTTP/3 layer asks
+            // for when it consumes from a stream that has since gone: it reports the bytes
+            // it read without asking whether the stream is still there, and it has no way to
+            // tell such a refusal from a real one. Failing the connection over it would kill
+            // a healthy connection on the ordinary path where a request is cancelled.
+            let _ = self.conn.extend_stream_credit(stream, bytes);
+            self.credit_applications += 1;
+        }
+        let connection = core::mem::take(&mut self.credit.connection);
+        if connection > 0 {
+            let _ = self.conn.extend_connection_credit(connection);
+            self.credit_applications += 1;
+            self.connection_credit_applications += 1;
         }
     }
 
@@ -164,6 +308,12 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
     }
 
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Result<QuicEvent>> {
+        // Reading an event is an interaction with the layer below like any other. It is not
+        // where the saving is -- the driver drains events before it reports anything -- but
+        // the rule is worth more than the exception: a run of credit reports ends at the next
+        // interaction, without a list of which kinds count.
+        self.flush_credit();
+
         pump::pump(self, cx);
 
         // Releases first. They belong to bytes the layer handed over earlier and hold its
@@ -217,6 +367,10 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
     }
 
     fn poll_open(&mut self, cx: &mut Context<'_>, bidi: bool) -> Poll<Result<H3StreamId>> {
+        // The one that must not be forgotten. This can park -- an open waits for stream
+        // capacity the peer has not granted -- and credit stranded behind a park is a window
+        // the peer is never told about while both ends wait for the other.
+        self.flush_credit();
         pump::pump(self, cx);
         if self.ending.is_some() {
             return Poll::Ready(Err(self.ended()));
@@ -254,6 +408,9 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
         if self.finished {
             return Poll::Ready(());
         }
+        // The tail writes what is queued and shuts the write side down. Credit still held
+        // here would be a window the peer was owed and never told about.
+        self.flush_credit();
         let done = match &self.close {
             // Encodes the close if it has not been encoded, appends it behind whatever is
             // still queued, flushes, and shuts the write side down. Its failure is
@@ -416,6 +573,37 @@ impl<S: AsyncByteStream, C: Clock> QmuxConnection<S, C> {
         self.with(|inner| inner.poll_finish(cx))
     }
 
+    /// How many times this connection has applied window credit to the layer below.
+    ///
+    /// One per `extend_stream_credit` or `extend_connection_credit` call made on the QMux
+    /// connection, which is directly comparable with the number of
+    /// [`QuicConnection::extend_credit`] calls the HTTP/3 driver made: before those calls were
+    /// batched the two figures were equal by construction, so the distance between them is
+    /// what the batching is worth. That is the measurement Spec FR-037 asks for, and it is
+    /// taken in `tests/ngnet-qmux-h3-tests/tests/credit_batching.rs`.
+    ///
+    /// `#[doc(hidden)]` for the same reason `ngnet_qmux::io::testing` is: a test instrument
+    /// has to be reachable from a test in another crate, and the only way to do that is to
+    /// make it public. It is not part of the supported surface and carries no stability
+    /// promise. The alternative -- a counter compiled only under `cfg(test)` -- was rejected
+    /// because it is not reachable from an integration test at all, and a figure taken from a
+    /// build nobody ships is not evidence about the build they do.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn credit_applications(&self) -> u64 {
+        self.with(|inner| inner.credit_applications)
+    }
+
+    /// How many of those were connection-window extensions.
+    ///
+    /// The sharper half of the measurement, and the one that counts read-ahead wakeups. See
+    /// [`Self::credit_applications`] for why this is reachable at all.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn connection_credit_applications(&self) -> u64 {
+        self.with(|inner| inner.connection_credit_applications)
+    }
+
     /// A second handle onto the same connection, for the tail to hold.
     pub(crate) fn share(&self) -> Self {
         Self {
@@ -468,6 +656,8 @@ impl<S: AsyncByteStream, C: Clock> QuicConnection for QmuxConnection<S, C> {
         source: &mut Src,
     ) -> Poll<Result<()>> {
         self.with(|inner| {
+            // Before the pass, so the frames the extensions queue leave with it.
+            inner.flush_credit();
             transmit::drain(inner, cx, source);
             // A failure met here is not reported here. The driver reaches `poll_event`
             // after every transmit pass, and reporting the ending from one place keeps the
@@ -493,32 +683,29 @@ impl<S: AsyncByteStream, C: Clock> QuicConnection for QmuxConnection<S, C> {
         self.shutdown(stream, Shutdown::Read, code)
     }
 
+    /// Records the extension; the layer below is told at the next interaction with it.
+    ///
+    /// The HTTP/3 driver forwards these one at a time and twice per delivery -- see
+    /// [`PendingCredit`] for the count, for why holding a run of them is safe, and for what
+    /// was rejected in its place. The audit FR-037 asked for came back "not coalesced", and
+    /// this is where they are coalesced instead: `ngnet-h3` is shared with the QUIC stack,
+    /// and a change made at this seam leaves it untouched.
     fn extend_credit(&mut self, stream: Option<H3StreamId>, bytes: u64) -> Result<()> {
         self.with(|inner| {
             if inner.ending.is_some() {
                 return Ok(());
             }
-            let extended = match stream {
-                Some(stream) => inner.conn.extend_stream_credit(qmux_stream(stream), bytes),
-                // The connection window, shared across every stream. The layer reports the
-                // same bytes to both levels, and extending only the stream stalls the whole
-                // connection once enough has flowed in total — late, and with nothing to
-                // explain it.
-                None => inner.conn.extend_connection_credit(bytes),
-            };
-            // Absorbed rather than propagated. The layer below refuses to extend a stream
-            // this endpoint never receives on, which is exactly what the HTTP/3 layer asks
-            // for when it consumes from a stream that has since gone: it reports the bytes
-            // it read without asking whether the stream is still there, and it has no way to
-            // tell such a refusal from a real one. Failing the connection over it would kill
-            // a healthy connection on the ordinary path where a request is cancelled.
-            let _ = extended;
+            inner.defer_credit(stream.map(qmux_stream), bytes);
             Ok(())
         })
     }
 
     fn close(&mut self, code: ErrorCode, reason: &[u8]) -> Result<()> {
         self.with(|inner| {
+            // The close is written by the tail, and the tail flushes credit too -- but the
+            // rule is that a run of credit reports ends at the next interaction of any kind,
+            // and an exception here would be one more thing to be right about.
+            inner.flush_credit();
             // Recorded, not written. This method has no `Context`, and writing a close means
             // waiting for a byte stream that may not be taking bytes — so the close is
             // encoded and flushed by `poll_finish`, which does have one. A transport that
@@ -543,6 +730,9 @@ impl<S: AsyncByteStream, C: Clock> QuicConnection for QmuxConnection<S, C> {
 impl<S: AsyncByteStream, C: Clock> QmuxConnection<S, C> {
     fn shutdown(&mut self, stream: H3StreamId, half: Shutdown, code: ErrorCode) -> Result<()> {
         self.with(|inner| {
+            // A reset or a stop-sending is an interaction with the layer below, so a run of
+            // credit reports ends here as it does anywhere else.
+            inner.flush_credit();
             if inner.ending.is_some() {
                 return Ok(());
             }

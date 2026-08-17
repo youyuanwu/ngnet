@@ -208,6 +208,38 @@ layer below classifies it as an internal refusal, and any other failure ends the
 Failing the connection over either would kill a healthy connection carrying every other
 exchange, every time one exchange was cancelled.
 
+## Window extensions are held for the length of a run
+
+The HTTP/3 driver reports flow-control credit one delivery at a time and twice over -- the
+stream's window and the connection's are separate, and it tells the transport about each
+separately. It does not accumulate them: within one transmit pass it can report a dozen times.
+Forwarding each report straight through made each one a call into the record layer that marked
+the connection as having something to produce, and each connection-level one also woke the
+read-ahead pump.
+
+So they are held here instead. A run accumulates one sum per stream and one for the connection,
+and is applied at the first interaction with the layer below that follows -- an event poll, a
+stream open, a transmit, a reset, a stop-sending, a close, or the tail. Holding is safe because
+a window extension is not a promise to the peer until it is written, and nothing between the
+report and the flush can observe the window it moves; sums rather than a list because the layer
+below takes a byte count and does not care how many reports it came from.
+
+The rule is "the next interaction of any kind" rather than "the transmit pass", and the
+difference matters: the driver can park between reporting credit and transmitting -- opening a
+request stream waits for capacity the peer has not granted -- and credit stranded behind that
+park is a window the peer is never told about while both ends wait for the other. A rule that
+named only the transmit pass would need a list of which other calls can park, and that list
+would have to stay right.
+
+The run is bounded. The per-stream sums are a `Vec` scanned linearly, which suits the single
+digits a pass delivers on and not hundreds; past that bound the run is applied early, so the
+worst case is what forwarding each report immediately used to cost rather than something worse.
+
+An extension for a stream that has since gone is discarded by the layer below, exactly as it was
+before the batching -- see the section above on refusals that are absorbed. Credit held when the
+connection ends is dropped rather than applied, because the layer below reports an ended
+connection as an error rather than ignoring the call.
+
 ## Orderly endings are events; failures are errors
 
 The layer below distinguishes a peer that closed, a byte stream that ended between records, a
