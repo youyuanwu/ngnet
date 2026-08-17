@@ -52,20 +52,32 @@ The HTTP/3 join adds none inbound. `ngnet-qmux-h3` turns that owned `Vec` into `
 taking the allocation over rather than copying it, and its outbound direction copies into the
 record being built exactly once — which is what `RETAINS_BUFFERS = false` means there.
 
-Outbound within this crate there is one more: a record is serialised into a scratch buffer and
-then copied into the outbound queue. That one is an artefact of `RecordWriter` borrowing both
-the connection and its destination buffer for the whole record, which is the borrow that makes
-the write path sound at all (see `design.md`). Each copy is bounded by one record; the queue it
-copies into is bounded by `OUTBOUND_CEILING`, since coalescing let it hold more than one record
-at a time.
+Outbound within this crate there is now none. A record used to be serialised into a scratch
+buffer and then copied into the outbound queue — one memcpy of up to 16382 bytes per record,
+about a megabyte of copying per megabyte sent — and it is not any more: `Conn::record` is handed
+a slice of the outbound buffer's own tail, so the bytes dwnx writes are already where the byte
+stream will be offered them. `RecordWriter` still borrows the connection and its destination for
+the whole record, which is the borrow that makes the write path sound at all (see `design.md`);
+what changed is which buffer the destination is a piece of. A test asserts the count rather than
+the prose: `Connection::copied_record_bytes` reports zero for a transfer of any size, and the one
+thing it still counts is the encoded connection close, which is a few dozen bytes once per
+connection and exists only because dwnx has no writer for a close — the first gap in the table
+above.
 
-These copies have still not been costed. The benchmark suite in `docs/benchmarks/` now runs
-`ngnet-qmux-h3` end to end over this layer, so the sentence that used to stand here — that
+The removal was measured, not assumed: on this machine, a client sending a megabyte over a byte
+stream that accepts everything went from 1,049,226 bytes copied to 0, and construction went from
+15 allocations and 33,228 bytes to 14 and 16,846 — the scratch buffer was the difference. What
+it is *worth* in time is a separate question, and nothing here answers it: these are counts,
+identical on every machine, and any statement about timing has to come from a recorded run under
+`docs/benchmarks/`.
+
+The two inbound copies have still not been costed. The benchmark suite in `docs/benchmarks/` now
+runs `ngnet-qmux-h3` end to end over this layer, so the sentence that used to stand here — that
 there were no benchmarks — is no longer true; but an end-to-end figure attributes nothing to
 these copies in particular, since it also contains framing, QPACK, the record layer, the pump
-and the byte stream. All of the above therefore remains a description rather than a number,
-and it will stay one until something profiles the copies or measures a build with one of them
-removed.
+and the byte stream. They therefore remain descriptions rather than numbers, and will stay so
+until something profiles them or measures a build with one of them removed. The outbound one
+is the exception, and only because it is gone: its count is asserted rather than estimated.
 
 ## Things this increment does not do
 

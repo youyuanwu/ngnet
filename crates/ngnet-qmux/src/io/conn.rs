@@ -2,10 +2,11 @@
 //!
 //! # What this owns
 //!
-//! One byte stream, one clock, one [`Conn`], and the four buffers that stand between them: the
-//! bytes read from the stream, the record being serialised, the bytes waiting to be written,
-//! and the events the handlers recorded. Everything the module documentation calls "the loop
-//! written once" is in [`Connection::pump`].
+//! One byte stream, one clock, one [`Conn`], and the three buffers that stand between them:
+//! the bytes read from the stream, the bytes waiting to be written -- which is where records
+//! are serialised, rather than being serialised elsewhere and copied in -- and the events the
+//! handlers recorded. Everything the module documentation calls "the loop written once" is in
+//! [`Connection::pump`].
 //!
 //! # The pump order, which is the whole design
 //!
@@ -84,6 +85,66 @@
 //! output of this connection is **always one contiguous region**, so a gathering write -- one
 //! that hands the byte stream several buffers at once -- would have nothing to gather here.
 //! Only the ring would have produced two regions, and the ring is what was rejected.
+//!
+//! # A record is serialised where it will be sent from
+//!
+//! There is no staging buffer. [`Conn::record`] is handed a slice of the outbound buffer
+//! itself, so the bytes dwnx writes are already in the place the byte stream will be offered
+//! them, and the memcpy that used to move a finished record out of a scratch buffer and into
+//! the queue is gone -- one per record, of up to [`MAX_RECORD`] bytes, so about a megabyte of
+//! copying per megabyte sent.
+//!
+//! **The buffer is held at its full length, with `filled` as the fill cursor.** That is the
+//! arrangement, and the reason for it is that the destination has to be *initialised* memory:
+//! `crates/ngnet-qmux/tests/invariants.rs` forbids `unsafe` anywhere under `src/io/`, so
+//! writing into a `Vec`'s spare capacity -- the obvious way to serialise into a buffer's tail
+//! -- is not available here, since reaching that capacity as a slice needs
+//! `set_len` or `spare_capacity_mut` and a promise about initialisation that only `unsafe` can
+//! make. Zeroing the buffer once, on the growth that first needs it, and tracking how much of
+//! it means something is the safe form of the same thing: the zeroing is paid per connection
+//! rather than per record, and `outbound.len()` stops being the interesting quantity. What the
+//! queue holds is `outbound[..filled]`; what is still to send is `outbound[written..filled]`;
+//! what is past `filled` is scratch space that no reader ever sees.
+//!
+//! **The slice handed to the record writer is exactly one record wide, never the whole tail.**
+//! This is the part that would corrupt the wire in silence rather than fail, so it is stated
+//! here as well as at `Connection::produce_within`, which enforces it. dwnx does not cap a
+//! record on the write path: `dwnx_qre_start` initialises the record with the whole buffer it
+//! is given (`deps/dwnx/lib/dwnx_qre.c:36-41`), `dwnx_qre_stream_max_datalen` bounds a
+//! payload only by what is left of that buffer (`:47-80`), and `dwnx_qre_final` writes the
+//! record's length as a **fixed two-byte varint** (`:107`) whose encoder asserts the value is
+//! below 16384 and, where that assertion is compiled out, truncates it to sixteen bits
+//! (`deps/dwnx/lib/dwnx_conv.c:145-157`) -- a record whose declared length is nothing like its
+//! real one, and a peer that has lost record framing from that byte onward. Nothing in
+//! [`Conn::record`]'s own contract stops it; a buffer of 64 KiB is a perfectly legal argument
+//! that produces an illegal record.
+//!
+//! How that failure presents was checked rather than assumed, because the two answers call for
+//! different guards. `crates/ngnet-qmux-sys/build.rs` does not define `NDEBUG` and neither does
+//! `cc` on its behalf, so as *this* workspace builds dwnx the assertion holds in the release
+//! profile as well as the debug one: handing the writer the whole tail aborts both builds, and
+//! it was tried both ways to find that out. The truncation is what the same mistake would do
+//! against a dwnx built with assertions off, which is an ordinary way to build C and not a
+//! hypothetical. So the guard in `tests/io_writes.rs` asserts the property on the wire -- no
+//! record longer than its length prefix can describe -- rather than relying on either
+//! behaviour, and this comment states which one this workspace actually has.
+//!
+//! The rule is therefore "never more than one maximum record", and deliberately not "always
+//! exactly one": `Connection::room_for` still hands a *shorter* slice to a record continuing
+//! an offer whose remainder fits, which is what keeps a body's last few bytes from travelling
+//! alone. Short is safe in the direction that matters, because the record can only be smaller
+//! than the two-byte length can describe.
+//!
+//! **What decides that the tail is too short is arithmetic on the cursors, done before a
+//! record is begun.** It is not [`Record::BufferTooSmall`](crate::Record::BufferTooSmall), and
+//! the difference is not stylistic: that error fires only below three bytes
+//! (`crate::write`'s `MIN_USABLE_BUFFER`), and `Connection::produce_within` reports it as a
+//! record of zero bytes with a `Packed` verdict, which `Connection::write_side` reads as
+//! "the state machine has nothing queued" and answers by clearing `produce_pending`. A
+//! connection with output to send would stop producing it and nothing would say so. So the
+//! question "is there room" is answered by `Connection::room_for_record` and
+//! `Connection::room_for`, both of which compare cursors against
+//! [`OUTBOUND_CEILING`] and neither of which needs a record to have been started to answer.
 //!
 //! # One call fills records until a bound stops it
 //!
@@ -204,10 +265,15 @@ const READ_BUFFER: usize = MAX_RECORD;
 /// The most bytes one produced record can occupy, prefix included.
 ///
 /// This is a property of the buffer a record is serialised into rather than an assertion about
-/// dwnx: the record writer is handed `scratch`, which is exactly this long, and it cannot write
-/// past what it was given. It is what the reserve in [`OUTBOUND_CEILING`] is for, and the
-/// arithmetic below is only sound because it is an upper bound on a single record rather than
-/// a typical size.
+/// dwnx: the record writer is handed a slice of the outbound buffer exactly this long, and it
+/// cannot write past what it was given. It is what the reserve in [`OUTBOUND_CEILING`] is for,
+/// and the arithmetic below is only sound because it is an upper bound on a single record
+/// rather than a typical size.
+///
+/// It is also the *largest* slice a record may be built into, and not merely a convenient one.
+/// dwnx fills whatever buffer it is handed and then describes the result with a two-byte
+/// length; a longer slice is how a record gets produced that the length cannot describe. The
+/// module documentation has the citations.
 const MAX_RECORD: usize = crate::DEFAULT_MAX_RECORD_SIZE as usize;
 
 /// How many bytes one write is **guaranteed** to be able to carry.
@@ -246,6 +312,12 @@ pub const OUTBOUND_CARRY: usize = 64 * 1024;
 /// demand rather than being allocated at construction -- an idle connection, and one whose
 /// peer keeps up, never reaches the ceiling and never pays for it, and the growth is amortised
 /// over the life of a connection that does.
+///
+/// It bounds the buffer's *length*, and since records are serialised into that length rather
+/// than appended to it, the length is grown exactly to what a record needs rather than by
+/// doubling. A doubling growth would put the capacity above this figure while the queue
+/// obeyed it, which is a bound on the wrong quantity: what a slow peer makes this side hold is
+/// the memory, not the cursor.
 pub const OUTBOUND_CEILING: usize = OUTBOUND_CARRY + MAX_RECORD;
 
 /// What a connection advertises to its peer.
@@ -437,24 +509,47 @@ pub struct Connection<S: AsyncByteStream, C: Clock> {
     inbound: Vec<u8>,
     /// Produced record bytes on their way to the byte stream.
     ///
-    /// Whole records, appended in the order they were produced, and never longer than
-    /// [`OUTBOUND_CEILING`] -- a bound this side enforces by refusing to begin a record the
-    /// buffer's tail could not hold in full. Reused for the life of the connection and grown
-    /// on demand, so a connection whose peer keeps up never allocates the ceiling.
+    /// Whole records, serialised in the order they were produced, and never holding more than
+    /// [`OUTBOUND_CEILING`] bytes of them -- a bound this side enforces by refusing to begin a
+    /// record the buffer's tail could not hold in full. Reused for the life of the connection
+    /// and grown on demand, so a connection whose peer keeps up never allocates the ceiling.
+    ///
+    /// **Its length is not how much it holds.** The buffer is kept at full length so that its
+    /// tail is initialised memory a record can be serialised straight into; `filled` is what
+    /// says how much of it means anything. See the module documentation for why the
+    /// alternative -- writing into a `Vec`'s spare capacity -- is not available under a rule
+    /// that forbids `unsafe` here.
     outbound: Vec<u8>,
+    /// How much of `outbound` holds produced record bytes.
+    ///
+    /// The queue's real length, and the quantity every bound and every emptiness test is
+    /// stated over. Bytes past it are the initialised scratch space the next record is built
+    /// in, and no reader of this connection is ever shown them.
+    filled: usize,
     /// How much of `outbound` the byte stream has already accepted.
     ///
     /// The single place a partial accept resumes from, and the reason accumulating several
     /// records needs no other bookkeeping. It may now sit *inside* a record as well as between
     /// two of them; the byte stream cannot tell the difference, because what it is offered is
-    /// `outbound[written..]` either way. The bytes in front of it are dead space until the
-    /// buffer empties -- see the module documentation for why nothing reclaims them.
+    /// `outbound[written..filled]` either way. The bytes in front of it are dead space until
+    /// the buffer empties -- see the module documentation for why nothing reclaims them.
     written: usize,
-    /// The buffer records are serialised into, reused for the life of the connection.
+    /// How many bytes have been copied into `outbound` rather than serialised into it.
     ///
-    /// Its length is [`MAX_RECORD`], which is what makes that constant an upper bound on a
-    /// produced record rather than an assumption about dwnx.
-    scratch: Vec<u8>,
+    /// Zero for every record: [`Conn::record`] is handed the buffer's own tail, so a record's
+    /// bytes are never moved after they are written. What still counts here is the encoded
+    /// connection close, which arrives as an owned buffer from
+    /// [`encode_close_record`](crate::io::close::encode_close_record) and is copied in -- once
+    /// per connection, at its end, on a path where one more memcpy of a few dozen bytes buys
+    /// nothing to remove.
+    ///
+    /// Exposed through [`Connection::copied_record_bytes`], and gated for the same reason
+    /// [`RecordFramer::copied_bytes`] is: a counter that is present in one build of a
+    /// benchmark comparison and absent from the other measures the instrument. See that
+    /// accessor for why `cfg(debug_assertions)` is the gate rather than `cfg(test)` or a
+    /// feature.
+    #[cfg(debug_assertions)]
+    copied: usize,
     /// Whether the state machine may have something to serialise.
     ///
     /// Set at construction -- which is what makes the transport-parameter announcement leave
@@ -506,7 +601,7 @@ impl Terminal {
 struct Produced {
     /// How many bytes of the offered payload went into the record.
     consumed: usize,
-    /// How many record bytes were appended to the outbound buffer.
+    /// How many record bytes were written into the outbound buffer.
     bytes: usize,
     verdict: Verdict,
 }
@@ -581,8 +676,10 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
             framer: RecordFramer::new(),
             inbound: vec![0; READ_BUFFER],
             outbound: Vec::new(),
+            filled: 0,
             written: 0,
-            scratch: vec![0; MAX_RECORD],
+            #[cfg(debug_assertions)]
+            copied: 0,
             // The announcement. Nothing can be opened until the peer's parameters arrive, and
             // they arrive only if the peer sent them -- so both sides must speak without being
             // spoken to, or two connections wait for each other and neither reports anything
@@ -646,7 +743,7 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         if let Err(error) = self.pump(cx, Flush::Everything) {
             return Poll::Ready(Err(error));
         }
-        if self.outbound.is_empty() {
+        if self.filled == 0 {
             Poll::Ready(Ok(()))
         } else {
             Poll::Pending
@@ -702,7 +799,32 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     /// smaller "still to send" one.
     #[must_use]
     pub fn queued_output(&self) -> usize {
-        self.outbound.len()
+        self.filled
+    }
+
+    /// How many bytes this connection has copied on its way to the byte stream.
+    ///
+    /// Zero for a connection that has only sent records, however many it sent, because a
+    /// record is serialised into the outbound buffer rather than into a staging buffer that is
+    /// then copied into it. What moves this is the encoded connection close, which is a few
+    /// dozen bytes once per connection. It used to grow by a whole record per record, which is
+    /// what this exists to make a test rather than a claim.
+    ///
+    /// Gated exactly as [`RecordFramer::copied_bytes`] is, and for exactly its reason: the
+    /// figure this counter is evidence about is compared between two benchmark builds, and a
+    /// counter compiled into one of them and not the other is measured along with the code.
+    /// `cfg(test)` cannot be the gate -- this crate's integration tests are separate
+    /// compilation units and would not see it -- and a cargo feature cannot either, since a
+    /// feature off by default is invisible to the verification commands while one on by
+    /// default is in the benchmark build. `cfg(debug_assertions)` holds for the dev profile
+    /// `cargo test` uses and not for the bench profile, which inherits release.
+    ///
+    /// The cost is that `cargo test --release` cannot name this, which is why the tests that
+    /// use it are gated too.
+    #[cfg(debug_assertions)]
+    #[must_use]
+    pub fn copied_record_bytes(&self) -> usize {
+        self.copied
     }
 
     /// The next thing that happened on the connection.
@@ -1158,8 +1280,14 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
                 Ok(false) => return Poll::Pending,
                 Err(error) => return Poll::Ready(Err(error)),
             }
-            self.outbound
-                .extend_from_slice(&encode_close_record(reason));
+            // The one thing that still reaches the outbound buffer as a copy rather than
+            // being serialised into it. `encode_close_record` builds an owned buffer of its
+            // own -- it is this layer's encoder, not dwnx's, because dwnx has no writer for a
+            // close (`docs/qmux/pending-work.md`) -- so there is a source buffer whether this
+            // path wants one or not. It is a few dozen bytes, once, on the way out of a
+            // connection, and `copied_record_bytes` counts it rather than pretending
+            // otherwise.
+            self.append(&encode_close_record(reason));
             self.closing = Some(Closing::Queued);
             // Latched now rather than when the shutdown completes, so an operation issued
             // between the two reports the close that is already on its way rather than
@@ -1301,7 +1429,7 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     /// [`MAX_RECORD`] is the reserve [`OUTBOUND_CEILING`] carries, so a record begun here can
     /// always be finished without the buffer exceeding the ceiling.
     fn room_for_record(&self) -> bool {
-        self.outbound.len() + MAX_RECORD <= OUTBOUND_CEILING
+        self.filled + MAX_RECORD <= OUTBOUND_CEILING
     }
 
     /// How large a record may be built now, or [`None`] if none may be.
@@ -1337,7 +1465,7 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     /// framing allowance. That is an assertion about dwnx's varint encoding rather than about
     /// the buffer, and it is wrong in the direction that overruns the ceiling.
     fn room_for(&self, remaining: usize, continuing: bool) -> Option<usize> {
-        let space = OUTBOUND_CEILING.saturating_sub(self.outbound.len());
+        let space = OUTBOUND_CEILING.saturating_sub(self.filled);
         if space >= MAX_RECORD {
             return Some(MAX_RECORD);
         }
@@ -1365,19 +1493,22 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     /// connection is about to be dropped.
     fn drain_pending(&mut self, cx: &mut Context<'_>) -> Result<bool> {
         self.write_side(cx, Flush::Everything)?;
-        Ok(self.written >= self.outbound.len())
+        Ok(self.written >= self.filled)
     }
 
     /// Offers the outbound buffer to the byte stream until it is empty or refuses.
     ///
-    /// Returns whether the buffer is now empty. It offers `outbound[written..]` however many
+    /// Returns whether the buffer is now empty. It offers `outbound[written..filled]` however many
     /// records that spans, which is the whole of what accumulating them costs the write path:
     /// the byte stream is handed a longer slice and reports a count against it exactly as
     /// before, and `written` resumes wherever that count left off -- at a record boundary or
     /// inside one.
     fn flush(&mut self, cx: &mut Context<'_>) -> Result<bool> {
-        while self.written < self.outbound.len() {
-            match self.stream.poll_write(cx, &self.outbound[self.written..]) {
+        while self.written < self.filled {
+            match self
+                .stream
+                .poll_write(cx, &self.outbound[self.written..self.filled])
+            {
                 Poll::Pending | Poll::Ready(Ok(Written::NotNow)) => return Ok(false),
                 Poll::Ready(Err(error)) => {
                     return Err(self.fail_stream(error, "the byte stream failed while writing"));
@@ -1393,12 +1524,16 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
                     return Ok(false);
                 }
                 Poll::Ready(Ok(Written::Accepted(taken))) => {
-                    self.written = self.outbound.len().min(self.written + taken);
+                    self.written = self.filled.min(self.written + taken);
                 }
             }
         }
 
-        self.outbound.clear();
+        // The cursors are reset and the buffer is left exactly as long as it was. Clearing it
+        // would give back the initialisation that lets the next record be serialised in place,
+        // and it is the initialisation rather than the allocation that would then be paid
+        // again on every pass.
+        self.filled = 0;
         self.written = 0;
         Ok(true)
     }
@@ -1483,7 +1618,46 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         Ok(Some(produced))
     }
 
-    /// Serialises one record and appends it to the outbound buffer.
+    /// Makes sure the buffer's tail holds `room` bytes a record may be serialised into.
+    ///
+    /// The tail has to be *initialised*, not merely reserved, because there is no `unsafe`
+    /// under `src/io/` and so no way to hand out a `Vec`'s spare capacity as a `&mut [u8]`.
+    /// Growing the length with zeros is the safe form of the same thing, and the zeroing is
+    /// paid once per connection per step of growth rather than once per record: the buffer is
+    /// never shortened afterwards, so a connection that has reached its working size never
+    /// grows again.
+    ///
+    /// The growth is to exactly what is needed rather than by doubling, which is deliberate
+    /// and costs a handful of reallocations over a connection's whole life. Doubling would put
+    /// the *capacity* above [`OUTBOUND_CEILING`] -- 128 KiB behind an 80 KiB queue -- and the
+    /// ceiling is a promise about the memory a slow peer can make this side hold, which is the
+    /// capacity and not the cursor. `reserve_exact` asks the allocator for the same thing, and
+    /// where it can extend the block in place there is no copy at all.
+    fn make_room(&mut self, room: usize) {
+        let needed = self.filled + room;
+        if self.outbound.len() < needed {
+            self.outbound.reserve_exact(needed - self.outbound.len());
+            self.outbound.resize(needed, 0);
+        }
+    }
+
+    /// Copies `bytes` into the queue, growing it if it must.
+    ///
+    /// The one path that puts bytes into the outbound buffer without serialising them there,
+    /// used by the close and by nothing else; [`Connection::copied_record_bytes`] is what says
+    /// so and what would notice a second caller appearing.
+    fn append(&mut self, bytes: &[u8]) {
+        self.make_room(bytes.len());
+        let at = self.filled;
+        self.outbound[at..at + bytes.len()].copy_from_slice(bytes);
+        #[cfg(debug_assertions)]
+        {
+            self.copied += bytes.len();
+        }
+        self.filled += bytes.len();
+    }
+
+    /// Serialises one record into the outbound buffer.
     ///
     /// A failure here is fatal and is latched as such; see the module documentation for why a
     /// retry would desynchronise the stream.
@@ -1493,11 +1667,20 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
 
     /// As [`Connection::produce`], with the record held to `room` bytes.
     ///
-    /// `room` is a length of `scratch`, and holding a record to a size means giving the writer
-    /// nothing else to write into -- the same mechanism that makes [`MAX_RECORD`] an upper
-    /// bound rather than an expectation. A caller that has no reason to shorten a record
-    /// passes [`MAX_RECORD`] and gets the whole buffer, which is what [`Connection::produce`]
+    /// `room` is how much of the buffer's tail the record writer is shown, and holding a record
+    /// to a size means giving the writer nothing else to write into -- the same mechanism that
+    /// makes [`MAX_RECORD`] an upper bound rather than an expectation. A caller that has no
+    /// reason to shorten a record passes [`MAX_RECORD`], which is what [`Connection::produce`]
     /// is.
+    ///
+    /// **The clamp to [`MAX_RECORD`] is a correctness bound, not tidiness.** The tail beyond
+    /// the fill cursor is usually longer than a record, and handing all of it over is the one
+    /// mistake on this path that produces a wrong wire rather than an error: dwnx fills what it
+    /// is given and then describes the result with a fixed two-byte length, which above 16383
+    /// aborts where the C keeps its assertions -- both profiles, as this workspace builds it --
+    /// and truncates to sixteen bits where they are compiled out. The module documentation
+    /// carries the citations and what was measured. Nothing in [`Conn::record`]'s contract
+    /// refuses an over-long buffer, so this line is the refusal.
     ///
     /// dwnx is documented as accepting a buffer smaller than a full record, and a buffer too
     /// small to hold anything at all comes back as an empty record rather than as a failure,
@@ -1505,32 +1688,40 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     /// [`Connection::room_for`] for who asks for a short record and why.
     fn produce_within(&mut self, request: WriteRequest<'_>, room: usize) -> Result<Produced> {
         let now = self.clock.now();
-        let room = room.min(self.scratch.len());
-        // Spelled out as a free function over three fields rather than as a method, because
-        // the record writer borrows the connection and the scratch buffer for as long as the
-        // record is being built, and the produced bytes are then copied out of the scratch
-        // buffer into the outbound one. Splitting the borrows by field is what makes that
-        // legal without a copy through a temporary.
-        match pack(
-            &mut self.conn,
-            &mut self.scratch[..room],
-            &mut self.outbound,
-            request,
-            now,
-        ) {
+        let room = room.min(MAX_RECORD);
+        self.make_room(room);
+        let at = self.filled;
+        // `split_at_mut` rather than an index range, and the head half is dropped rather than
+        // named. What the record writer is given has to be the tail and nothing else: it holds
+        // that borrow for as long as the record is being built, which is the property
+        // `compile_fail.rs`'s `the_record_buffer_is_borrowed_for_the_whole_record` pins, and
+        // binding the head here would be the one way to have a live path to the buffer beside
+        // it. Nothing needs the head -- the bytes in front of the cursor are already written or
+        // already queued -- so nothing is offered one.
+        let (_, tail) = self.outbound.split_at_mut(at);
+        // Spelled out as a free function over two fields rather than as a method, because the
+        // record writer borrows the connection and the destination for as long as the record is
+        // being built. Splitting the borrows by field is what makes that legal.
+        match pack(&mut self.conn, &mut tail[..room], request, now) {
             Ok(produced) => {
-                // The ceiling, checked where records are appended rather than where callers
-                // happen to look. Every caller of this asks `room_for_record` or
-                // `room_for` first and no record can exceed the room it was given, so the
-                // bound holds by construction -- which is exactly the kind of claim that stops
-                // holding when a fifth caller appears. A test can only observe the buffer
-                // between calls, so without this the peak *inside* a production run would be
-                // unmeasured.
+                self.filled += produced.bytes;
+                // Two bounds, checked where records are made rather than where callers happen
+                // to look. Every caller of this asks `room_for_record` or `room_for` first and
+                // no record can exceed the room it was given, so both hold by construction --
+                // which is exactly the kind of claim that stops holding when a fifth caller
+                // appears. A test can only observe the buffer between calls, so without these
+                // the peak *inside* a production run would be unmeasured.
                 debug_assert!(
-                    self.outbound.len() <= OUTBOUND_CEILING,
+                    produced.bytes <= MAX_RECORD,
+                    "a record of {} bytes was produced, past the {MAX_RECORD}-byte maximum a \
+                     two-byte record length can describe",
+                    produced.bytes
+                );
+                debug_assert!(
+                    self.filled <= OUTBOUND_CEILING,
                     "the outbound buffer reached {} bytes, past the {OUTBOUND_CEILING}-byte \
                      ceiling: a record was produced without asking for room first",
-                    self.outbound.len()
+                    self.filled
                 );
                 Ok(produced)
             }
@@ -1628,11 +1819,16 @@ const fn accepted_or(taken: usize, refusal: StreamWrite) -> StreamWrite {
     }
 }
 
-/// Builds one record into `scratch` and appends it to `outbound`.
+/// Builds one record into `dest`, which is a slice of the outbound buffer's tail.
 ///
-/// Free rather than a method so the connection, the scratch buffer and the outbound buffer are
-/// borrowed as three separate things: the record writer holds the first two for as long as the
-/// record is being built, and the third receives the bytes afterwards.
+/// Free rather than a method so the connection and the destination are borrowed as two
+/// separate things: the record writer holds both for as long as the record is being built, and
+/// a method would have to hold the whole connection instead.
+///
+/// `dest` is at most one maximum record long and the caller is what makes that true; see
+/// `Connection::produce_within` for what happens to a record built into a longer one. The
+/// bytes are left where they were written and the count is what comes back, which is the whole
+/// of the difference from the arrangement this replaced.
 ///
 /// # The error path
 ///
@@ -1655,8 +1851,7 @@ const fn accepted_or(taken: usize, refusal: StreamWrite) -> StreamWrite {
 /// bytes" it appears to be, and the caller has an accepted count to be told about instead.
 fn pack(
     conn: &mut Conn<'static>,
-    scratch: &mut [u8],
-    outbound: &mut Vec<u8>,
+    dest: &mut [u8],
     request: WriteRequest<'_>,
     now: Timestamp,
 ) -> core::result::Result<Produced, CoreError> {
@@ -1664,7 +1859,7 @@ fn pack(
     let mut remaining = request.data;
     let mut verdict = Verdict::Packed;
 
-    let mut writer = conn.record(scratch, now);
+    let mut writer = conn.record(dest, now);
     loop {
         let step = WriteRequest {
             stream: request.stream,
@@ -1705,13 +1900,17 @@ fn pack(
 
     // Finished even when a stream said no: the record may still carry control frames that were
     // packed before the stream was consulted, and abandoning it would discard them.
+    //
+    // What comes back is a slice of `dest` -- the bytes are already where they belong -- so all
+    // that is taken from it is the length. `Record::Empty` and `Record::BufferTooSmall` are
+    // both zero, and both mean the same thing to the caller: this production put nothing in the
+    // buffer.
     let record = writer.finish()?;
-    let bytes = record.bytes().unwrap_or(&[]);
-    outbound.extend_from_slice(bytes);
+    let bytes = record.bytes().map_or(0, <[u8]>::len);
 
     Ok(Produced {
         consumed,
-        bytes: bytes.len(),
+        bytes,
         verdict,
     })
 }
@@ -1809,7 +2008,7 @@ impl<S: AsyncByteStream, C: Clock> core::fmt::Debug for Connection<S, C> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Connection")
             .field("role", &self.role())
-            .field("outbound", &(self.outbound.len() - self.written))
+            .field("outbound", &(self.filled - self.written))
             .field("read_ahead", &self.read_ahead.outstanding())
             .field("closing", &self.closing)
             .field("terminal", &self.terminal)

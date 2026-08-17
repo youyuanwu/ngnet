@@ -560,3 +560,103 @@ fn the_octets_a_peer_receives_survive_a_change_of_write_shape() {
         generous_log.writes()
     );
 }
+
+/// No record on the wire is longer than the two-byte length in front of it can describe.
+///
+/// The assertion is cheap and the failure it guards against is not. A record is now serialised
+/// straight into the outbound buffer, whose free tail is normally several records long, and
+/// dwnx does not cap a record on the write path: `dwnx_qre_start` initialises the record with
+/// the whole destination it is handed (`deps/dwnx/lib/dwnx_qre.c:36-41`),
+/// `dwnx_qre_stream_max_datalen` bounds the payload only by what is left of that destination
+/// (`:47-80`), and `dwnx_qre_final` then writes the record's length as a fixed two-byte varint
+/// (`:107`) whose encoder asserts the value is below 16384 and, where that assertion is
+/// compiled out, truncates it to sixteen bits (`deps/dwnx/lib/dwnx_conv.c:145-157`).
+///
+/// Which of those happens was checked rather than assumed. This workspace builds dwnx without
+/// `NDEBUG` in either profile, so the perturbation -- handing the record writer the buffer's
+/// whole tail -- aborts in debug *and* in release rather than truncating quietly. It is still
+/// worth asserting on the wire: the same mistake against a dwnx built with assertions off
+/// produces a peer that has lost record framing and no error anywhere, and `Conn::record`'s
+/// contract refuses an over-long buffer nowhere. This is what refuses it, from the outside.
+///
+/// The transfer is deliberately large enough that most records begin with an empty buffer in
+/// front of them -- the case where the tail is at its longest and a missing clamp would show.
+/// `record_lengths` re-derives the framing from the bytes, so a truncated length would fail
+/// there, inside the helper, rather than here.
+#[test]
+fn no_record_exceeds_what_its_own_length_prefix_can_describe() {
+    let limit = DEFAULT_MAX_RECORD_SIZE as usize;
+    let data = payload(PAYLOAD);
+
+    let (mut conn, mut far, _log) = client_with_peer(|_| {});
+    let received = send_fixed_payload(&mut conn, &mut far, &data);
+    let lengths = record_lengths(&received);
+
+    assert!(
+        lengths.len() > 8,
+        "the workload produced only {} records, which is too few for the case this guards -- a \
+         missing clamp shows where the buffer's tail is longest",
+        lengths.len()
+    );
+    for (index, length) in lengths.iter().enumerate() {
+        assert!(
+            *length <= limit,
+            "record {index} is {length} bytes, past the {limit}-byte maximum: the record writer \
+             was given more than one record's room, and a length above 16383 is truncated to \
+             sixteen bits rather than refused"
+        );
+    }
+}
+
+/// A record's bytes are never moved after they are written (Spec FR-036, SC-036).
+///
+/// `copied_record_bytes` counts what reaches the outbound buffer by memcpy rather than by being
+/// serialised there. It used to grow by a whole record per record -- `pack` built each one in a
+/// scratch buffer and appended the result -- so a megabyte of payload cost a megabyte of
+/// copying, one memcpy of up to 16382 bytes per record. It is now zero however much is sent.
+///
+/// The close at the end is what shows the counter can move at all: `encode_close_record` builds
+/// an owned buffer, because this layer encodes a close itself where dwnx has no writer for one,
+/// so those bytes are copied in and counted. An assertion of zero with nothing able to raise it
+/// would pass just as well against a counter that had been disconnected.
+#[cfg(debug_assertions)]
+#[test]
+fn producing_records_copies_nothing_while_the_close_is_copied() {
+    let data = payload(PAYLOAD);
+
+    let (mut conn, mut far, _log) = client_with_peer(|_| {});
+    let received = send_fixed_payload(&mut conn, &mut far, &data);
+
+    assert!(
+        received.len() > data.len(),
+        "the peer received {} bytes for a {}-byte payload, so this run did not send what it \
+         meant to",
+        received.len(),
+        data.len()
+    );
+    assert_eq!(
+        conn.copied_record_bytes(),
+        0,
+        "{} record bytes were copied into the outbound buffer for a {}-byte payload; records \
+         are serialised into that buffer and nothing should move them afterwards",
+        conn.copied_record_bytes(),
+        data.len()
+    );
+
+    let reason = ngnet_qmux::CloseReason::application(7, b"done");
+    run(async {
+        poll_fn(|cx| conn.poll_close(cx, &reason)).await.ok();
+    });
+    let close = drain_written(&mut far);
+
+    assert_eq!(
+        conn.copied_record_bytes(),
+        close.len(),
+        "the close record is the one thing copied into the outbound buffer, and the counter \
+         should say so exactly"
+    );
+    assert!(
+        !close.is_empty(),
+        "no close record reached the peer, so this half of the test proved nothing"
+    );
+}

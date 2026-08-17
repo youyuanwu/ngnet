@@ -312,8 +312,8 @@ exactly the reason it gave: that bounds outbound memory by the backlog.
 
 The reserve has one relaxation, and it is enforced the same way the reserve itself is. A record
 whose contents are already known to be small — the last few bytes of an offer a call has been
-filling records for — is given a *shortened* scratch buffer rather than the whole one, so it
-cannot exceed the space that is actually free. Without it, an offer that came to a few dozen
+filling records for — is given a *shortened* destination rather than a full record's worth, so
+it cannot exceed the space that is actually free. Without it, an offer that came to a few dozen
 bytes more than the reserve allowed answered short, and those bytes then travelled alone in a
 write of their own at the end of the pass: one extra write per stream, which at concurrency 64
 cost more than multi-record production had gained. The rejected alternative was to predict the
@@ -342,6 +342,48 @@ a ring buffer was rejected because two regions would leave the output in two pie
 consumer of it — including a future gathering write — would have to handle both. A buffer that
 stays full means the peer is not keeping up, and the right answer to that is to stop producing,
 which is what stopping early does.
+
+### A record is serialised where it will be sent from
+
+There is no staging buffer on the write path. `Conn::record` is handed a slice of the outbound
+buffer itself, so the bytes dwnx writes are already in the place the byte stream will be offered
+them. What that removes is one memcpy of up to 16382 bytes per record — about a megabyte of
+copying per megabyte sent — and `Connection::copied_record_bytes` is what says it is gone, rather
+than this paragraph.
+
+The arrangement it needs is a buffer held at *full length* with a fill cursor beside it, and the
+reason is a rule rather than a preference: `crates/ngnet-qmux/tests/invariants.rs` forbids
+`unsafe` anywhere under `src/io/`, and a `Vec`'s spare capacity cannot be handed out as a
+`&mut [u8]` without it. Zeroing on growth is the safe form of the same thing; it is paid once per
+connection per step of growth, where the copy it replaces was paid once per record. The buffer's
+length therefore stops being how much it holds — `filled` is — and every emptiness test, bound
+and slice in the layer is stated over the cursor. Growth is to exactly what a record needs rather
+than by doubling, because a doubling growth would put the capacity above `OUTBOUND_CEILING` while
+the queue obeyed it, and the ceiling is a promise about memory rather than about a cursor.
+
+**The slice handed to the record writer is exactly one record wide, and never the whole tail.**
+That is the part that would corrupt the wire in silence rather than fail. dwnx does not cap a
+record on the write path: it initialises the record with whatever destination it is given, bounds
+a payload only by what is left of that destination, and then writes the record's length as a
+fixed two-byte varint whose encoder asserts the value is below 16384 and, where that assertion is
+compiled out, truncates it to sixteen bits. As this workspace builds dwnx the assertion survives
+in both profiles — checked by making the mistake deliberately, in debug and in release, and
+finding an abort both times — but a dwnx built with assertions off would produce a record whose
+declared length is nothing like its real one and a peer that has lost framing from that byte
+onward. `Conn::record`'s contract refuses an over-long buffer nowhere, so the layer refuses it,
+and `tests/io_writes.rs` asserts the property on the wire where neither build's behaviour is
+assumed.
+
+The rule is "never more than one maximum record" and deliberately not "always exactly one": the
+relaxation above still hands a *shorter* slice to a record continuing an offer, which is safe in
+the only direction that matters, since a record can only be smaller than its length prefix can
+describe.
+
+What decides that the tail is too short is arithmetic on the cursors, done before a record is
+begun — not `Record::BufferTooSmall`, which fires only below three bytes and arrives as a record
+of zero bytes with a "packed" verdict, which the write side reads as "the state machine has
+nothing queued". A connection with output to send would stop producing it and nothing would say
+so.
 
 Reading comes last, and the order *within* the read matters as much. The bytes go to the framer
 first and to `Conn::read` second, and only then is the outcome acted on. dwnx reports

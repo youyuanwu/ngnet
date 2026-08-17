@@ -379,6 +379,21 @@ impl<'h> Conn<'h> {
     ///
     /// The buffer should normally be [`crate::DEFAULT_MAX_RECORD_SIZE`] bytes; a smaller one is
     /// permitted and yields a smaller record.
+    ///
+    /// # A larger one is not permitted, and nothing here refuses it
+    ///
+    /// dwnx fills whatever buffer it is given and then describes the result with a **fixed
+    /// two-byte** record length (`dwnx_qre_final` in `deps/dwnx/lib/dwnx_qre.c`), so a record
+    /// built into a longer buffer can reach a length that prefix cannot express. The encoder
+    /// asserts the value is below 16384 (`deps/dwnx/lib/dwnx_conv.c`) and, where that assertion
+    /// is compiled out, truncates it to sixteen bits — which is a well-formed prefix in front
+    /// of the wrong number of bytes, and a peer that has lost record framing with no error
+    /// raised anywhere.
+    ///
+    /// Neither this call nor [`RecordWriter::push`] checks it, because the check belongs where
+    /// the buffer is chosen and this crate is a binding rather than a policy. A caller that
+    /// serialises into a larger buffer — the asynchronous layer does, into its outbound
+    /// queue — passes a subslice of one record's width, not the whole of it.
     pub fn record<'c, 'b>(
         &'c mut self,
         buf: &'b mut [u8],
