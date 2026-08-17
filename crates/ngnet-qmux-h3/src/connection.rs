@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use bytes::Bytes;
 use http_body::Body;
 use ngnet_h3::http::{
-    Connection as H3Connection, IncomingBody, QuicConnection, QuicEvent, Result as H3Result,
-    SendRequest, StreamSource,
+    Config as H3Config, Connection as H3Connection, IncomingBody, QuicConnection, QuicEvent,
+    Result as H3Result, SendRequest, StreamSource,
 };
 use ngnet_h3::{ErrorCode, StreamId as H3StreamId, Timestamp as H3Timestamp};
 use ngnet_qmux::io::{
@@ -308,7 +308,57 @@ impl<S: AsyncByteStream, C: Clock> QmuxConnection<S, C> {
     ///
     /// Fails if the QMux state machine cannot be built.
     pub fn client(stream: S, clock: C) -> Result<Self> {
-        Self::build(LayerConnection::client(stream, clock, Config::new()))
+        Self::client_with(stream, clock, Config::new())
+    }
+
+    /// Starts a client connection with transport settings other than the defaults.
+    ///
+    /// [`Self::client`] is this with [`Config::new`], and nothing else: the defaults are an
+    /// argument like any other rather than a separate code path, so a connection built here
+    /// and a connection built there differ only in what they advertise.
+    ///
+    /// # What the configuration governs
+    ///
+    /// Everything on [`Config`] except `read_ahead` becomes a transport parameter this end
+    /// *advertises to the peer*, which makes every one of them a permission granted rather
+    /// than a limit imposed on oneself. `initial_max_stream_data` and `initial_max_data` are
+    /// how many bytes the peer may send on one stream and across the connection before it
+    /// has to wait for credit; `max_streams_bidi` and `max_streams_uni` are how many streams
+    /// of each kind the peer may open. So a caller who wants *its own* requests to be able to
+    /// send a large body sets the credit on the **other** end's configuration, and a client
+    /// that wants to open many streams needs the **server** to have raised
+    /// `max_streams_bidi`. `read_ahead` is the exception and is purely local: it bounds how
+    /// many bytes this layer will hand upward before the HTTP/3 layer reports having consumed
+    /// some, and setting it below `initial_max_data` throttles a peer that was told it could
+    /// send more.
+    ///
+    /// HTTP/3 itself needs three unidirectional streams before it will do anything at all, so
+    /// a `max_streams_uni` below three yields a connection whose peer can never start. That
+    /// is the same hazard as the one below, met sooner.
+    ///
+    /// # The stream allowance is not recycled
+    ///
+    /// Worth stating here because it is where a caller meets it, and because the failure it
+    /// produces does not look like a failure. Stream capacity is **not** returned when a
+    /// stream closes — neither dwnx nor the QMux layer recycles it — and this crate never
+    /// calls [`ngnet_qmux::io::Connection::extend_stream_limit`]. A connection therefore
+    /// admits exactly `max_streams_bidi` client-opened requests over its whole life, however
+    /// long ago the earlier ones finished, and the one after that **hangs**: the peer's open
+    /// simply never completes, no error is reported at either end, and a caller sees a future
+    /// that never resolves rather than something it can handle.
+    ///
+    /// A caller reusing one connection across many exchanges should therefore size this for
+    /// the connection's whole lifetime rather than for its concurrency, which is what it
+    /// would mean in a stack that recycled. The ceiling is dwnx's `DWNX_MAX_STREAMS`, which is
+    /// `1 << 60`; a value above it is not rejected here but is rejected by the peer when it
+    /// decodes the parameters, which fails the connection during setup.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the QMux state machine cannot be built, which includes a configuration whose
+    /// values do not fit the encoding the transport parameters use.
+    pub fn client_with(stream: S, clock: C, config: Config) -> Result<Self> {
+        Self::build(LayerConnection::client(stream, clock, config))
     }
 
     /// Starts a server connection over an established byte stream. See [`Self::client`].
@@ -317,7 +367,26 @@ impl<S: AsyncByteStream, C: Clock> QmuxConnection<S, C> {
     ///
     /// Fails if the QMux state machine cannot be built.
     pub fn server(stream: S, clock: C) -> Result<Self> {
-        Self::build(LayerConnection::server(stream, clock, Config::new()))
+        Self::server_with(stream, clock, Config::new())
+    }
+
+    /// Starts a server connection with transport settings other than the defaults.
+    ///
+    /// The server half of [`Self::client_with`], which describes what the configuration
+    /// governs and why a low stream allowance presents as a hang rather than as an error.
+    /// The description applies unchanged, but the *consequences* land differently, because
+    /// what a QMux end advertises is what its peer may do: this configuration's
+    /// `max_streams_bidi` is the number of requests the client may ever open, and its
+    /// `initial_max_stream_data` is the size of request body the client may send. A server
+    /// that means to accept large uploads or long-lived connections sets them here; nothing
+    /// the client configures for itself can raise them.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the QMux state machine cannot be built, which includes a configuration whose
+    /// values do not fit the encoding the transport parameters use.
+    pub fn server_with(stream: S, clock: C, config: Config) -> Result<Self> {
+        Self::build(LayerConnection::server(stream, clock, config))
     }
 
     fn build(built: ngnet_qmux::io::Result<LayerConnection<S, C>>) -> Result<Self> {
@@ -583,9 +652,65 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn core::error::Error + Send + Sync>>,
 {
-    let backend = QmuxConnection::client(stream, clock)?;
+    connect_with::<S, C, B>(stream, clock, Config::new(), H3Config::default())
+}
+
+/// Starts an HTTP/3 client with settings other than the defaults.
+///
+/// [`connect`] is this with [`Config::new`] and [`ngnet_h3::http::Config::default`], so the
+/// two agree by construction rather than by being kept in step.
+///
+/// # Why two configurations rather than one
+///
+/// They belong to different layers and answer different questions, and this crate is the
+/// join between those layers rather than a restatement of either. `transport` is QMux's:
+/// flow-control credit, how many streams the peer may open, the advertised idle timeout, the
+/// local read-ahead bound — see [`QmuxConnection::client_with`] for what each governs.
+/// `http` is HTTP/3's: the bound on a header block (`max_field_section_size`), the QPACK
+/// dynamic table and blocked-stream allowances, how many events the driver takes per pass,
+/// and — on a server — how many handler futures may be in flight at once. Merging them into
+/// one type would oblige this crate to restate an HTTP/3 configuration surface it does not
+/// own and would have to track, which is exactly the coupling the join exists to avoid.
+///
+/// One quantity is worth naming because it lives on both: a limit on concurrent streams. The
+/// HTTP/3 configuration's `max_concurrent_streams` bounds the server's in-flight handlers and
+/// never reaches the wire, while the transport configuration's `max_streams_bidi` is a
+/// transport parameter the peer is bound by. They are not two names for one setting and
+/// setting one does not set the other; a caller who means to permit N concurrent requests
+/// has to say so in both places.
+///
+/// # The stream allowance is not recycled
+///
+/// Restated here because this is the entry point most callers use, and because it is the one
+/// way a plausible configuration produces a connection that neither works nor fails. QMux
+/// stream capacity is spent permanently: the transport configuration's `max_streams_bidi` is
+/// the number of requests the peer may open over the connection's *whole life*, not the
+/// number it may have outstanding, and this crate never extends it. A client that reuses one
+/// connection for more exchanges than the server allowed finds the next request's future
+/// simply never resolving — the open waits for capacity that will not arrive, and neither end
+/// reports an error. Size it for the connection's lifetime, and treat a request that hangs on
+/// a long-lived connection as this until proven otherwise.
+///
+/// # Errors
+///
+/// Fails if the QMux connection or the HTTP/3 layer cannot be built, which includes a
+/// transport configuration whose values do not fit the encoding the transport parameters use.
+pub fn connect_with<S, C, B>(
+    stream: S,
+    clock: C,
+    transport: Config,
+    http: H3Config,
+) -> Result<Connected<S, C, B, impl Future<Output = H3Result<()>>>>
+where
+    S: AsyncByteStream,
+    C: Clock,
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn core::error::Error + Send + Sync>>,
+{
+    let backend = QmuxConnection::client_with(stream, clock, transport)?;
     let tail = backend.share();
-    let (sender, driving) = ngnet_h3::http::handshake::<_, B>(backend).map_err(Error::http3)?;
+    let (sender, driving) =
+        ngnet_h3::http::handshake_with::<_, B>(backend, http).map_err(Error::http3)?;
     Ok((sender, Connection::new(driving, tail)))
 }
 
@@ -610,9 +735,53 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn core::error::Error + Send + Sync>>,
 {
-    let backend = QmuxConnection::server(stream, clock)?;
+    serve_with(stream, clock, handler, Config::new(), H3Config::default())
+}
+
+/// Serves HTTP/3 with settings other than the defaults.
+///
+/// The server half of [`connect_with`], which explains why the two configurations stay
+/// separate and how the two concurrency limits differ. What changes on this side is who is
+/// constrained by what: a QMux end advertises permissions to its peer, so the `transport`
+/// argument here is what decides how many requests *the client* may open
+/// (`max_streams_bidi`) and how large a request body it may send
+/// (`initial_max_stream_data`, `initial_max_data`). A client cannot raise either by
+/// configuring itself. The `http` argument's `max_concurrent_streams`, by contrast, is
+/// entirely local: it bounds how many handler futures this driver holds at once and is never
+/// advertised.
+///
+/// # The stream allowance is not recycled
+///
+/// A server sets the number that binds, so this is its hazard more than the client's. QMux
+/// stream capacity is never returned when a stream closes and this crate never extends it, so
+/// `max_streams_bidi` is the number of requests this connection will serve over its whole
+/// life. Once they are spent, further opens are not refused — they are simply never granted,
+/// which the client sees as a request that hangs and this end sees as a connection that has
+/// gone quiet. A server holding connections open across many exchanges should size the
+/// allowance for the connection's lifetime rather than for the concurrency it expects.
+///
+/// # Errors
+///
+/// Fails if the QMux connection or the HTTP/3 layer cannot be built, which includes a
+/// transport configuration whose values do not fit the encoding the transport parameters use.
+pub fn serve_with<S, C, H, F, B>(
+    stream: S,
+    clock: C,
+    handler: H,
+    transport: Config,
+    http: H3Config,
+) -> Result<Connection<S, C, H3Connection<impl Future<Output = H3Result<()>>>>>
+where
+    S: AsyncByteStream,
+    C: Clock,
+    H: FnMut(http::Request<IncomingBody>) -> F,
+    F: Future<Output = http::Response<B>>,
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn core::error::Error + Send + Sync>>,
+{
+    let backend = QmuxConnection::server_with(stream, clock, transport)?;
     let tail = backend.share();
-    let driving = ngnet_h3::http::serve(backend, handler).map_err(Error::http3)?;
+    let driving = ngnet_h3::http::serve_with(backend, handler, http).map_err(Error::http3)?;
     Ok(Connection::new(driving, tail))
 }
 
