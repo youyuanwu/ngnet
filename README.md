@@ -213,7 +213,7 @@ the gap was never the I/O model. It was the number of write syscalls per pass. `
 gathers its writes (`writev`, no copy of large blocks), which collapsed a multiplexed pass
 from 513 writes to 1 and left the two **within noise of each other** — so pick on ergonomics
 and runtime fit rather than on throughput. See
-[`docs/h2/benchmarks/`](docs/h2/benchmarks/), which gives the numbers, the mechanism and the
+[`docs/benchmarks/`](docs/benchmarks/), which gives the numbers, the mechanism and the
 confounds that bound what they license.
 
 For bodies you already hold as [`bytes::Bytes`](https://docs.rs/bytes), an opt-in set of
@@ -224,7 +224,7 @@ the readiness transport a 1 MiB upload runs 24–31% faster depending on the mac
 collapsing the write count; on the completion transport the gain is a few percent at 1 MiB and
 reverses into a small loss below 64 KiB, where the frame headers the shared path has to mint
 are not yet paid for.
-[`docs/h2/benchmarks/findings/handing-bodies-over.md`](docs/h2/benchmarks/findings/handing-bodies-over.md)
+[`docs/benchmarks/findings/handing-bodies-over.md`](docs/benchmarks/findings/handing-bodies-over.md)
 reports both, on two machines.
 
 ### When to disable the feature

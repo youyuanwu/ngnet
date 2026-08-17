@@ -1034,19 +1034,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ngnet-h2"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "compio",
- "http",
- "http-body",
- "ngnet-h2-sys",
- "tokio",
-]
-
-[[package]]
-name = "ngnet-h2-bench"
+name = "ngnet-bench"
 version = "0.1.0"
 dependencies = [
  "bytes",
@@ -1058,6 +1046,18 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ngnet-h2",
+ "tokio",
+]
+
+[[package]]
+name = "ngnet-h2"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "compio",
+ "http",
+ "http-body",
+ "ngnet-h2-sys",
  "tokio",
 ]
 

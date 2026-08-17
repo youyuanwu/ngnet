@@ -17,7 +17,9 @@ reason. Anything genuinely shared sits at this level.
 | [`h2/design.md`](h2/design.md) | How the crates fit together, the mechanisms the async layer rests on, and why each was chosen over the alternative that looks simpler. |
 | [`h2/pending-work.md`](h2/pending-work.md) | Known gaps and deferred decisions, each with the evidence that produced it and what would settle it. |
 | [`h2/invariants.md`](h2/invariants.md) | The properties the `ngnet-h2` suite pins rather than merely exercises, and where each is enforced. |
-| [`h2/benchmarks/`](h2/benchmarks/) | How the `ngnet-h2` vs hyper benchmarks are run, one page per bench case, what their numbers do and do not mean, which protocol settings are matched between the two stacks — and the measurements themselves, filed under the machine that produced them. |
+
+The benchmarks are no longer filed here: they compare stacks across protocol families, so they
+sit at the shared level, in [`benchmarks/`](benchmarks/).
 
 ## HTTP/3 — [`h3/`](h3/)
 
@@ -27,7 +29,8 @@ reason. Anything genuinely shared sits at this level.
 | [`h3/pending-work.md`](h3/pending-work.md) | Known gaps and deferred decisions, with what would settle each. |
 | [`h3/invariants.md`](h3/invariants.md) | The properties the `ngnet-h3` suite pins, and where each is enforced. |
 
-There are no HTTP/3 benchmarks yet.
+The benchmark suite lives at [`benchmarks/`](benchmarks/); which protocols and which stacks
+each case covers is recorded there, case by case.
 
 ## QUIC — [`quic/`](quic/)
 
@@ -112,7 +115,11 @@ in a document of its own.
 
 | Document | What it covers |
 | --- | --- |
+| [`benchmarks/`](benchmarks/) | How the benchmarks are run, one page per bench case, what their numbers do and do not mean, which protocol settings are matched between the stacks being compared — and the measurements themselves, filed under the machine that produced them. |
 | [`ci.md`](ci.md) | Every check CI runs, across all four families and the axum integration, and the ones it deliberately does not. |
+
+The benchmarks sit here rather than under a family because a comparison spans the stacks it
+compares; the suite's own index says which cases cover which of them.
 
 ## Orientation
 
