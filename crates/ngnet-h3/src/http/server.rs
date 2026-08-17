@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use http_body::Body;
 
-use super::body::{Ending, IncomingBody, Outgoing};
+use super::body::{Ending, IncomingBody, Outgoing, ending_pending};
 use super::config::Config;
 use super::connection::Connection;
 use super::driver::{self, Driver, DriverGuard, REQUEST_CANCELLED, Role};
@@ -188,6 +188,10 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn core::error::Error + Send + Sync>>,
 {
+    /// A request arrives on a stream the peer opened, so a stream this endpoint has never
+    /// heard of is one whose head may still be in the batch being applied.
+    const ACCEPTS_STREAMS: bool = true;
+
     fn advance(&mut self, conn: &mut Conn<Events>, _events: &mut Events) -> Result<()> {
         self.finish_bodies(conn)?;
 
@@ -316,11 +320,13 @@ where
             let (_, cancelled) = self.cancels.swap_remove(index);
             cancelled.trip();
         }
-        self.endings.retain(|(s, _)| *s != stream);
     }
 
     fn busy(&self) -> bool {
-        self.tasks.any_woken()
+        // An ending nobody has read yet is a stream that has stopped producing bytes and
+        // has not been reset. Parking on one would leave the peer waiting on a message
+        // this endpoint has already abandoned, until the peer happened to say something.
+        self.tasks.any_woken() || ending_pending(&self.endings)
     }
 
     fn done(&self) -> bool {
@@ -334,6 +340,10 @@ where
             cancelled.trip();
         }
         self.tasks.abandon_all();
+    }
+
+    fn settle(&mut self, conn: &mut Conn<Events>) -> Result<()> {
+        self.finish_bodies(conn)
     }
 }
 
@@ -370,6 +380,14 @@ impl<H, F: Future, B> ServerRole<H, F, B> {
         for index in done.into_iter().rev() {
             self.endings.swap_remove(index);
         }
+        // A body the connection has finished with leaves a slot here that nothing will
+        // ever fill. This used to be cleared when a stream closed, but that discarded the
+        // ending of a body that failed *after* the peer reset the stream — and with no
+        // end-of-stream marker on that stream any more, discarding its ending left it
+        // suspended and never reset. The slot's own reference count is the honest test:
+        // once the state machine has released the body, this list holds the last handle.
+        self.endings
+            .retain(|(_, ending)| Arc::strong_count(ending) > 1);
         Ok(())
     }
 }

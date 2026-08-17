@@ -8,7 +8,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http_body::Body;
 
-use super::body::{Ending, IncomingBody, Outgoing};
+use super::body::{Ending, IncomingBody, Outgoing, ending_pending};
 use super::config::Config;
 use super::connection::Connection;
 use super::driver::{self, Driver, DriverGuard, REQUEST_CANCELLED, Role};
@@ -378,7 +378,9 @@ where
     fn closed(&mut self, _stream: StreamId) {}
 
     fn busy(&self) -> bool {
-        !self.queue.is_empty()
+        // As on the server: an ending that no pass has acted on is a reset that has not
+        // been queued yet, and the driver must not go quiet while one is owed.
+        !self.queue.is_empty() || ending_pending(&self.endings)
     }
 
     fn done(&self) -> bool {
@@ -388,6 +390,10 @@ where
 
     fn abandon(&mut self) {
         self.queue.abandon();
+    }
+
+    fn settle(&mut self, conn: &mut Conn<Events>) -> Result<()> {
+        self.finish_bodies(conn)
     }
 }
 
@@ -438,6 +444,16 @@ impl<B> ClientRole<B> {
         for index in done.into_iter().rev() {
             self.endings.swap_remove(index);
         }
+        // A body that was dropped without ending — its exchange abandoned, its stream
+        // closed — leaves a slot here that nothing will ever fill. Nothing else removes
+        // one: a client learns of a stream closing only as the state machine finishing
+        // with it, which says nothing about which body it belonged to. The slot's own
+        // reference count does say: once the connection has released the body, this list
+        // holds the last handle to it. Pruned every pass because `busy` walks this list
+        // every pass, and a list that only ever grew would make an idle connection slower
+        // the longer it had been useful.
+        self.endings
+            .retain(|(_, ending)| Arc::strong_count(ending) > 1);
         Ok(())
     }
 }

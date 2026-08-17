@@ -195,19 +195,21 @@ pub fn pattern(len: usize) -> Bytes {
     Bytes::from((0..len).map(|i| (i % 251) as u8).collect::<Vec<u8>>())
 }
 
-/// A body that offers a backlog, pauses, and then fails.
+/// A body that offers what it was given, pauses, and then fails.
 ///
 /// An application whose response falls apart partway through, which is the only way an
 /// HTTP/3 response gets abandoned once its headers have gone out: the status line has
 /// already been promised, so the stream has to be reset rather than the answer changed.
 ///
-/// Two details make the failure land *mid-body*, and both were arrived at the hard way. The
-/// chunks are handed over in one pass, so the transport has far more queued than it can
-/// write before the failure -- a body that produced everything in a single chunk would only
-/// be polled again once the whole of it had been written, and the reset would arrive after a
-/// complete delivery. And the failure waits, so the headers and the first bytes are on the
-/// wire before it happens -- without the pause the reset overtakes the response entirely,
-/// which is a real case but a different one.
+/// The pause is what puts the headers and the bytes already offered on the wire before the
+/// failure happens -- without it the reset overtakes the response entirely, which is a real
+/// case but a different one.
+///
+/// How much is offered is the caller's to choose, and the choice decides which case is
+/// being exercised. The chunks are handed over in one pass, so many of them leave the
+/// transport with far more queued than it can write and the reset has a backlog to discard;
+/// one small chunk leaves nothing queued at all, and then the reset is the only thing that
+/// distinguishes an abandoned message from a complete one.
 pub struct Failing {
     chunk: Bytes,
     remaining: usize,

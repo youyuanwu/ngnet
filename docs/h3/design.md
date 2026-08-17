@@ -130,6 +130,10 @@ Conflating them livelocks a send loop.
   stream whose window is exhausted stays at the top of the priority queue and is offered
   ahead of every other stream forever.
 
+A deferral is also how a stream is abandoned, which is not backpressure at all and is the
+one case where nothing later resumes it — see *A caller's body failure is not the state
+machine's* below.
+
 ## Assertions are not error reports
 
 nghttp3 states a great many preconditions with C `assert`, which aborts where it is compiled
@@ -302,8 +306,55 @@ the process — so containment is checked and the replay path copies.
 
 `BodyOutcome::Fail` is connection-fatal: it poisons the connection and releases every
 retained buffer. A caller's body reporting an error must not do that to every unrelated
-exchange sharing the connection, so the layer ends the body, resets that one stream, and
-reports `ErrorKind::Body`.
+exchange sharing the connection, so the layer abandons the one stream instead — it
+withholds the end-of-stream marker entirely, resets that stream with
+`H3_REQUEST_CANCELLED`, and reports `ErrorKind::Body` to a client that is waiting to be
+told.
+
+Withholding the marker is the part that had to be learnt. The layer used to end the failed
+body exactly as it ended a successful one and reset the stream afterwards, which is two
+statements about one stream that contradict each other. Which of them the peer believed
+depended on how much happened to be queued behind the marker: with a backlog the reset
+discarded it and the truncation was plain, and with none the marker had already landed, so
+the peer had a complete message and ignored a reset for a stream it considered finished.
+Nothing about that is transport-specific — ngtcp2 declines to send a reset at all once the
+marker has been acknowledged, so on QUIC a short body was reliably rather than merely
+occasionally truncated in silence. A response without a content-length gives its receiver
+no way to notice.
+
+So the failure path returns `BodyOutcome::Defer`. That is not a euphemism for a variant
+that ought to exist: nghttp3's data callback has exactly two non-erroring answers, and the
+other one produces the marker, so deferring is the only way to say "produce nothing
+further for this stream" at all. A `BodyOutcome::Abandon` would still have to become
+`NGHTTP3_ERR_WOULDBLOCK` underneath and would buy a name at the cost of every match on the
+enumeration in the workspace.
+
+Deferring brings an obligation with it, because a deferred stream that is never resumed
+and never reset waits forever — a silent stall, which is worse than the truncation being
+removed. Three things discharge it. The recorded ending is read at the *top* of a driver
+pass, through `Role::settle`, rather than where the rest of the role's work happens: the
+pass can wait for a bidirectional stream the transport has not opened, or decide the
+connection is finished, before it ever reaches the role's ordinary advance, and under the
+old behaviour those merely delayed a reset nobody was waiting for. Both roles report
+themselves busy while an ending is unread, so the driver cannot park in the window between
+the body failing during one pass's transmit and the reset being queued at the top of the
+next. And the reset drain tells nghttp3 the write side is done, so it stops offering write
+turns to a suspended stream that will never answer with bytes.
+
+The error code is `H3_REQUEST_CANCELLED`, which is what it always was. RFC 9114 §4.1.1
+names it for abandoning a message part-way in either direction, and pairs it with the
+protection this whole arrangement exists to obtain: a response cancelled after a partial
+delivery SHOULD NOT be used.
+
+Two faults that the end-of-stream marker had been covering surfaced once it was gone, and
+are fixed alongside it. A reset can arrive in the same batch of transport events as the
+head it follows, and the driver sweeps the control plane first, so there was no exchange to
+fail yet and the reset was dropped; with the failed body's stream no longer ending itself,
+that left a server handler reading a request body that could neither end nor fail. Unheard
+resets are now kept and applied once the pass has opened the exchanges it read. And a
+server discarded a stream's ending when the peer reset it, which was harmless while the
+body still ended itself; the ending is now pruned by ownership, as the client already
+pruned its own.
 
 ### One addition to the core
 
