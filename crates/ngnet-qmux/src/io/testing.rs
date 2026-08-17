@@ -26,6 +26,20 @@
 //! [`TestByteStream::set_write_cap`]) and the capacity bound ([`TestByteStream::set_capacity`])
 //! are the harness's whole point rather than an optional extra, and [`Fault`] covers the two
 //! endings and the transient refusal.
+//!
+//! # Why the writes are counted
+//!
+//! How many times a connection called [`AsyncByteStream::poll_write`] is not recoverable from
+//! the bytes that came out the other end: one call carrying four records and four calls
+//! carrying one each deliver the identical stream, and on a real socket the difference is
+//! three system calls. A test that wants to say "this pass wrote once" therefore has to be
+//! told, which is what [`TestByteStream::write_log`] is for.
+//!
+//! The handle is separate from the stream and shared with it, because a connection takes its
+//! byte stream **by value** and never gives it back: a counter reachable only through the
+//! stream would be reachable only before the connection existed. So the log is taken first and
+//! read afterwards, which is the same arrangement the HTTP/2 stack's recording transport uses
+//! (`crates/ngnet-h2/tests/http_zero_alloc.rs`).
 
 use core::cell::{Cell, RefCell};
 use core::task::{Context, Poll, Waker};
@@ -108,6 +122,63 @@ impl Pipe {
     }
 }
 
+/// What a test byte stream's write side was asked to do, shared with the stream itself.
+///
+/// Obtained from [`TestByteStream::write_log`] before the stream is handed to a connection,
+/// and read afterwards. Every entry is one [`AsyncByteStream::poll_write`] call **that
+/// accepted bytes**, recording the length of the slice that call was offered.
+///
+/// # What is and is not counted
+///
+/// A call answered [`Written::NotNow`] moves nothing and is not recorded. It is the harness's
+/// own refusal -- the capacity bound or [`Fault::WriteNotNow`] -- rather than the connection's
+/// choice, and counting it would charge the connection for the test's arrangement. The bias
+/// that introduces runs in one direction only: the log can undercount how many times a
+/// connection reached for the byte stream, never overcount, so a test asserting "this pass
+/// wrote more times than it needed to" is asserting a lower bound on the real figure.
+///
+/// The recorded length is what the call was **offered**, not what it accepted, and the two
+/// differ exactly when a cap or the capacity bound is in force. Offered is the useful one:
+/// it is the size of the region the connection had ready to write at that instant, which is
+/// the quantity a coalescing change moves. With no cap and no capacity bound set, an offer is
+/// always accepted whole and the distinction disappears -- which is why the tests that read
+/// lengths as record sizes are written without caps and say so.
+#[derive(Clone)]
+pub struct WriteLog {
+    entries: Rc<RefCell<Vec<usize>>>,
+}
+
+impl WriteLog {
+    /// How many writes have moved bytes.
+    #[must_use]
+    pub fn writes(&self) -> usize {
+        self.entries.borrow().len()
+    }
+
+    /// The length each of those writes was offered, in order.
+    #[must_use]
+    pub fn lengths(&self) -> Vec<usize> {
+        self.entries.borrow().clone()
+    }
+
+    /// The total of those lengths.
+    ///
+    /// Equal to the number of bytes that reached the peer only when nothing capped a write;
+    /// see the type documentation for why the offered length is the one recorded.
+    #[must_use]
+    pub fn offered_bytes(&self) -> usize {
+        self.entries.borrow().iter().sum()
+    }
+
+    /// Forgets everything recorded so far.
+    ///
+    /// For a test whose measured window starts after some traffic it did not arrange -- the
+    /// transport-parameter announcement every connection makes unprompted, most often.
+    pub fn clear(&self) {
+        self.entries.borrow_mut().clear();
+    }
+}
+
 /// An in-memory byte stream, one half of a [`stream_pair`].
 ///
 /// Neither half is `Send`.
@@ -117,6 +188,7 @@ pub struct TestByteStream {
     read_cap: Cell<Option<usize>>,
     write_cap: Cell<Option<usize>>,
     fault: Cell<Option<Fault>>,
+    writes: Rc<RefCell<Vec<usize>>>,
 }
 
 impl TestByteStream {
@@ -184,6 +256,17 @@ impl TestByteStream {
         let taken: Vec<u8> = outbox.bytes.drain(..).collect();
         outbox.wake_writer();
         taken
+    }
+
+    /// A handle onto this half's record of its own writes.
+    ///
+    /// Taken before the stream is handed to a connection, since the connection keeps the only
+    /// other reference to it; see [`WriteLog`] for what an entry means.
+    #[must_use]
+    pub fn write_log(&self) -> WriteLog {
+        WriteLog {
+            entries: Rc::clone(&self.writes),
+        }
     }
 }
 
@@ -256,6 +339,10 @@ impl AsyncByteStream for TestByteStream {
         }
 
         outbox.bytes.extend(bytes[..accepted].iter().copied());
+        // Recorded here rather than at the top of the call, so that the log holds exactly the
+        // writes that moved bytes: the two early returns above are a broken stream and a
+        // one-shot refusal, neither of which a connection asked for.
+        self.writes.borrow_mut().push(bytes.len());
         outbox.wake_reader();
         Poll::Ready(Ok(Written::Accepted(accepted)))
     }
@@ -288,6 +375,7 @@ pub fn stream_pair() -> (TestByteStream, TestByteStream) {
             read_cap: Cell::new(None),
             write_cap: Cell::new(None),
             fault: Cell::new(None),
+            writes: Rc::new(RefCell::new(Vec::new())),
         },
         TestByteStream {
             inbox: to_right,
@@ -295,6 +383,7 @@ pub fn stream_pair() -> (TestByteStream, TestByteStream) {
             read_cap: Cell::new(None),
             write_cap: Cell::new(None),
             fault: Cell::new(None),
+            writes: Rc::new(RefCell::new(Vec::new())),
         },
     )
 }
@@ -434,6 +523,90 @@ mod tests {
             Poll::Ready(Ok(0)),
             "the ending is reported only once the bytes are gone"
         );
+    }
+
+    /// The write log records one entry per write that moved bytes, and its offered length.
+    #[test]
+    fn the_write_log_holds_one_entry_per_write_that_moved_bytes() {
+        let (mut a, _b) = stream_pair();
+        let log = a.write_log();
+        assert_eq!(log.writes(), 0, "nothing has been written yet");
+
+        assert_eq!(
+            poll_once(|cx| a.poll_write(cx, b"hello")),
+            Poll::Ready(Ok(Written::Accepted(5)))
+        );
+        assert_eq!(
+            poll_once(|cx| a.poll_write(cx, b"!")),
+            Poll::Ready(Ok(Written::Accepted(1)))
+        );
+        assert_eq!(log.lengths(), vec![5, 1]);
+        assert_eq!(log.offered_bytes(), 6);
+
+        log.clear();
+        assert_eq!(log.writes(), 0, "clearing forgets the window before it");
+    }
+
+    /// A refusal is the harness's own doing, so it is not charged to the connection.
+    ///
+    /// Both refusals are exercised, because they arise differently: the one-shot fault takes
+    /// the early return at the top of `poll_write`, and the capacity bound takes the
+    /// zero-room branch after the outbox is borrowed.
+    #[test]
+    fn a_refused_write_is_not_recorded() {
+        let (mut a, _b) = stream_pair();
+        let log = a.write_log();
+
+        a.inject(Fault::WriteNotNow);
+        assert_eq!(
+            poll_once(|cx| a.poll_write(cx, b"refused")),
+            Poll::Ready(Ok(Written::NotNow))
+        );
+
+        a.set_capacity(Some(0));
+        assert_eq!(
+            poll_once(|cx| a.poll_write(cx, b"refused")),
+            Poll::Ready(Ok(Written::NotNow))
+        );
+
+        assert_eq!(
+            log.writes(),
+            0,
+            "a write that moved nothing is not a write the connection issued"
+        );
+    }
+
+    /// Under a cap the entry is what the call was offered, which is larger than it took.
+    #[test]
+    fn a_capped_write_records_what_it_was_offered() {
+        let (mut a, _b) = stream_pair();
+        let log = a.write_log();
+        a.set_write_cap(Some(3));
+
+        assert_eq!(
+            poll_once(|cx| a.poll_write(cx, b"hello")),
+            Poll::Ready(Ok(Written::Accepted(3)))
+        );
+        assert_eq!(
+            log.lengths(),
+            vec![5],
+            "the offered length is recorded, not the accepted count"
+        );
+    }
+
+    /// Each half keeps its own log, or a test could not say which side wrote.
+    #[test]
+    fn the_two_halves_count_separately() {
+        let (mut a, b) = stream_pair();
+        let log_a = a.write_log();
+        let log_b = b.write_log();
+
+        assert_eq!(
+            poll_once(|cx| a.poll_write(cx, b"one")),
+            Poll::Ready(Ok(Written::Accepted(3)))
+        );
+        assert_eq!(log_a.writes(), 1);
+        assert_eq!(log_b.writes(), 0);
     }
 
     #[test]

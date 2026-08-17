@@ -316,3 +316,156 @@ fn a_fresh_framer_stands_at_a_boundary_and_holds_nothing() {
     assert_eq!(framer.retained_bytes(), 0);
     assert!(framer.latched_close().is_none());
 }
+
+/// A close behind a *real* frame, in a record the framer never saw whole in one call.
+///
+/// [`a_close_behind_another_frame_in_its_record_is_latched`] makes the same claim about a
+/// record delivered in one piece behind padding. This one is the awkward variant and it exists
+/// to pin a precondition rather than to repeat that claim: the scan reaches the close only
+/// because the framer has the record's payload *reassembled in its own buffer* by the time
+/// `finish_record` runs (`src/io/framing.rs`, the payload arm of `consume` feeding the scan in
+/// `finish_record`). A change that scanned the arriving bytes where they lie, rather than
+/// copying them first, has nothing to scan when the record arrives in fragments and nothing to
+/// find when the close is not in the fragment it happens to be looking at.
+///
+/// The frame in front of the close is a MAX_DATA frame rather than padding, so the scan has to
+/// know a frame's length to step over it rather than merely skip zero bytes.
+#[test]
+fn a_close_behind_a_real_frame_is_found_however_the_record_was_cut() {
+    let reason = CloseReason::transport(0x0b, b"after a MAX_DATA frame");
+    let mut payload = vec![0x10, 0x44, 0x00];
+    payload.extend_from_slice(&close_frame(&reason));
+    let stream = record(&payload);
+
+    for split in 0..=stream.len() {
+        let mut framer = RecordFramer::new();
+        framer.consume(&stream[..split]).expect("the first chunk");
+        framer.consume(&stream[split..]).expect("the second chunk");
+
+        let decoded = framer
+            .close_reason()
+            .unwrap_or_else(|| panic!("the close was lost when the record was cut at {split}"));
+        assert_eq!(decoded.kind(), CloseKind::Transport);
+        assert_eq!(decoded.error_code(), 0x0b);
+        assert_eq!(decoded.reason(), b"after a MAX_DATA frame");
+    }
+}
+
+/// Every payload byte of every record is copied into the framer's retention.
+///
+/// The number asserted is the sum of the records' payloads and nothing else, because that is
+/// what the code does today: `consume`'s payload arm copies each chunk of payload into
+/// `record` while no close has been latched, and copies no length prefix -- prefixes are
+/// consumed by `LengthPrefix::feed`, which never reaches the retention buffer. So a stream of
+/// four records costs exactly their four payloads, whatever the byte stream's chunking was,
+/// and the two framers below are fed the same stream cut two different ways to say so.
+///
+/// This is the figure Phase 6 (inbound scan in place) is expected to drive down for records
+/// that arrive whole -- at which point this assertion is inverted deliberately, and the number
+/// it is inverted to has to be justified the same way this one is.
+#[cfg(debug_assertions)]
+#[test]
+fn a_run_of_whole_records_copies_exactly_their_payloads() {
+    let payloads: [&[u8]; 4] = [&[0x10, 0x44, 0x00], &[0x01; 300], &[0x02; 7], &[0x00]];
+    let total: usize = payloads.iter().map(|payload| payload.len()).sum();
+
+    let mut stream = Vec::new();
+    for payload in payloads {
+        stream.extend_from_slice(&record(payload));
+    }
+
+    let mut whole = RecordFramer::new();
+    whole.consume(&stream).expect("a well-formed stream");
+    assert_eq!(
+        whole.copied_bytes(),
+        total,
+        "one memcpy per record, of exactly that record's payload"
+    );
+
+    // The same stream, one byte at a time. A copy charged per call rather than per byte would
+    // differ here, and a copy that took in the length prefixes would exceed `total` in both.
+    let mut single = RecordFramer::new();
+    for byte in &stream {
+        single.consume(&[*byte]).expect("a well-formed stream");
+    }
+    assert_eq!(
+        single.copied_bytes(),
+        total,
+        "the chunking is not observable in the cost, only in how it is paid"
+    );
+
+    // And a partly-arrived record is charged for what has arrived, which is what makes the
+    // count a measure of the copying rather than of the framing.
+    let half = &record(&[0x03; 64])[..2 + 25];
+    let mut partial = RecordFramer::new();
+    partial.consume(half).expect("a valid prefix");
+    assert_eq!(partial.copied_bytes(), 25);
+}
+
+/// Once a close is latched the copying stops, because there is nothing further to deliver.
+///
+/// `consume` copies only while `close` is `None`, so the count freezes at the close record's
+/// own payload however much the peer sends afterwards. Asserted because it is the reason the
+/// retention bound holds, and a scan-in-place change has to keep it: a framer that resumed
+/// copying after a close would grow without limit on a peer that kept writing.
+#[cfg(debug_assertions)]
+#[test]
+fn nothing_is_copied_once_a_close_has_been_latched() {
+    let reason = CloseReason::application(7, b"enough");
+    let close = encode_close_record(&reason);
+    let close_payload = close.len() - 1;
+
+    let mut framer = RecordFramer::new();
+    framer.consume(&close).expect("a close record");
+    assert_eq!(
+        framer.copied_bytes(),
+        close_payload,
+        "the close record's own payload is copied like any other"
+    );
+
+    for _ in 0..4 {
+        framer
+            .consume(&record(&[0x04; 512]))
+            .expect("a well-formed record");
+    }
+    assert_eq!(
+        framer.copied_bytes(),
+        close_payload,
+        "records behind a latched close are framed but not retained, so nothing is copied"
+    );
+}
+
+/// The copy counter is absent from a build with debug assertions off, which is the benchmark
+/// build.
+///
+/// Asserted against the source because that is where the decision lives and the only place it
+/// can be checked from: a test cannot observe the absence of a field in a profile it is not
+/// compiled into. The gate matters beyond tidiness -- a later phase compares one benchmark run
+/// against another, and a counter present in one build and not the other would make the
+/// difference between them partly the instrument's.
+///
+/// The check is deliberately narrow: it asserts the gate sits immediately above the increment
+/// and above the accessor, so removing either gate fails here rather than silently putting a
+/// per-record counter on the receive path of every measured run.
+#[test]
+fn the_copy_counter_is_gated_out_of_a_release_build() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("io")
+            .join("framing.rs"),
+    )
+    .expect("reading the framer's source");
+
+    for gated in [
+        "#[cfg(debug_assertions)]\n                        {\n                            self.copied += take;",
+        "#[cfg(debug_assertions)]\n    #[must_use]\n    pub fn copied_bytes(&self) -> usize {",
+        "#[cfg(debug_assertions)]\n    copied: usize,",
+    ] {
+        assert!(
+            source.contains(gated),
+            "the copy counter has lost its `cfg(debug_assertions)` gate, which puts it into \
+             the benchmark build: expected to find\n{gated}"
+        );
+    }
+}

@@ -204,6 +204,12 @@ pub struct RecordFramer {
     /// The payload of the record that carried the peer's close, kept for as long as the
     /// connection object lives.
     close: Option<Vec<u8>>,
+    /// How many payload bytes have been copied into `record`, cumulatively.
+    ///
+    /// Compiled only where debug assertions are, and [`RecordFramer::copied_bytes`] says why
+    /// that gate rather than another.
+    #[cfg(debug_assertions)]
+    copied: usize,
 }
 
 impl Default for RecordFramer {
@@ -220,6 +226,8 @@ impl RecordFramer {
             state: State::Length(LengthPrefix::default()),
             record: Vec::new(),
             close: None,
+            #[cfg(debug_assertions)]
+            copied: 0,
         }
     }
 
@@ -254,6 +262,14 @@ impl RecordFramer {
                     let take = (*remaining).min(rest.len());
                     if self.close.is_none() {
                         self.record.extend_from_slice(&rest[..take]);
+                        // Counted at the copy rather than at the record boundary, so that a
+                        // record delivered in fragments is charged the same total as one
+                        // delivered whole -- which is the equality a scan-in-place change has
+                        // to preserve for the arriving-whole case and break for nothing else.
+                        #[cfg(debug_assertions)]
+                        {
+                            self.copied += take;
+                        }
                     }
                     *remaining -= take;
                     rest = &rest[take..];
@@ -308,6 +324,40 @@ impl RecordFramer {
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         self.record.len() + self.close.as_ref().map_or(0, Vec::len)
+    }
+
+    /// How many payload bytes this framer has copied into its retention, cumulatively.
+    ///
+    /// Exposed for the same reason [`RecordFramer::retained_bytes`] is -- so a test can assert
+    /// the cost rather than trust the prose -- and gated for a reason that one has no need of.
+    ///
+    /// The copy it counts sits on the receive hot path, one memcpy per record for every record
+    /// that arrives, and a later measurement compares a benchmark run against another run of
+    /// the same benchmarks. Instrumentation compiled into one side of that comparison and not
+    /// the other measures the instrument, so this counter must be absent from a benchmark
+    /// build rather than merely unused in one.
+    ///
+    /// `cfg(test)` is the obvious gate and cannot be it. This crate's integration tests are
+    /// separate compilation units linked against the ordinary library, so a `cfg(test)` item
+    /// here would be invisible to `tests/io_framing.rs` -- the same constraint that put
+    /// [`super::testing`] in the library rather than under `tests/`. A cargo feature is
+    /// available and was rejected too: the crate's feature set is asserted by
+    /// `tests/invariants.rs` and a feature nobody enables by default would leave every
+    /// verification command in the plan unable to see this, while a feature enabled by default
+    /// would be in the benchmark build, which is the one thing that must not happen.
+    ///
+    /// `cfg(debug_assertions)` is what remains, and it is a better fit than either: it holds
+    /// for the dev profile that `cargo test` uses and not for the bench profile, which
+    /// inherits release. The field, the increment and this accessor are all absent from a
+    /// benchmark build, so the claim that this phase changes nothing on a hot path is a
+    /// property of the artefact rather than an assertion about it.
+    ///
+    /// The cost is that `cargo test --release` cannot name this; `tests/io_framing.rs` records
+    /// how it handles that and why the trade is the right way round.
+    #[cfg(debug_assertions)]
+    #[must_use]
+    pub fn copied_bytes(&self) -> usize {
+        self.copied
     }
 
     /// Starts a record of `length` bytes, having just read its prefix.
