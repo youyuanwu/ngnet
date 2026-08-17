@@ -14,28 +14,37 @@ use crate::pump;
 ///
 /// Bounded so a layer with an endless supply — a large body, say — cannot keep this pass
 /// from returning to the driver, which has acknowledgements and a peer to attend to. Each
-/// accepted offer becomes at most one record, so a full pass moves on the order of a
-/// megabyte and then yields.
+/// accepted offer becomes as many records as the connection's outbound buffer will hold
+/// rather than one, so the bound on what a full pass moves is this count times that buffer:
+/// a few megabytes, written out as it goes rather than held.
 const MAX_OFFERS: usize = 64;
 
 /// Pulls from the HTTP/3 layer while the connection can carry more.
 ///
-/// The connection is pumped *between* offers rather than only at the end. QMux allows one
-/// record to be outstanding at a time: until the record an offer produced has reached the
-/// byte stream, the next offer is refused. Pumping between them is therefore what makes a
-/// pass move more than a single record, and skipping it would turn a large body into one
-/// record per wakeup.
+/// The connection is pumped *between* offers rather than only at the end, and the two pumps
+/// are deliberately different operations.
+///
+/// Between offers it is [`pump::pump_buffered`]: it lets the connection read, and lets it write
+/// when its output buffer has no room for another record, but leaves what a pass has produced
+/// to accumulate. That is what turns a run of offers into a run of records in one write. It
+/// used to be a flushing pump, because the layer below refused the next offer until the last
+/// record had reached the byte stream; that rule is gone, and a flushing pump here would now
+/// buy nothing while costing a write per record.
+///
+/// After the loop it is [`pump::pump`], which writes everything. That is the pass's obligation
+/// to its driver: whatever the offers produced is on the byte stream by the time this returns,
+/// because no other call is obliged to come along and move it.
 pub(crate) fn drain<S: AsyncByteStream, C: Clock, Src: StreamSource>(
     inner: &mut Inner<S, C>,
     cx: &mut Context<'_>,
     source: &mut Src,
 ) {
     for _ in 0..MAX_OFFERS {
-        // Ends the pass when the connection has ended, and equally when the byte stream is
-        // not taking more: offering into a full outbound buffer collects nothing but
+        // Ends the pass when the connection has ended, and equally when it can take no
+        // further record: offering into a buffer with no room collects nothing but
         // `Blocked`, which would tell the layer its streams are stalled when only the socket
         // is, and take them out of the running until something else woke them.
-        if !pump::pump(inner, cx) {
+        if !pump::pump_buffered(inner, cx) {
             break;
         }
 
@@ -56,12 +65,16 @@ pub(crate) fn drain<S: AsyncByteStream, C: Clock, Src: StreamSource>(
             let mut refusal: Option<WriteOutcome> = None;
             // The end-of-stream marker must ride on the last slice that is actually written,
             // not on the last slice offered. A trailing empty slice would otherwise take the
-            // marker, be refused because a record is already outstanding, and contribute
-            // nothing to `total` -- so the closure would answer `Accepted(offered)` and the
-            // driver would commit the stream as ended while QMux had sent no FIN, leaving the
-            // peer waiting for an end that never comes. nghttp3 does not currently emit
-            // zero-length vectors, but `ngnet-h3` does not rely on that, and the failure is
-            // silent, so the index is computed rather than assumed.
+            // marker, be refused -- the earlier slices in this offer may have filled the
+            // connection's output buffer, and a refusal is what a full buffer answers -- and
+            // contribute nothing to `total`, so the closure would answer `Accepted(offered)`
+            // and the driver would commit the stream as ended while QMux had sent no FIN,
+            // leaving the peer waiting for an end that never comes. The refusal is rarer than
+            // it was, since the buffer now holds several records rather than one, which makes
+            // this more worth computing rather than less: a hazard that fires occasionally is
+            // one nothing reproduces. nghttp3 does not currently emit zero-length vectors, but
+            // `ngnet-h3` does not rely on that, and the failure is silent, so the index is
+            // computed rather than assumed.
             let last_written = slices
                 .iter()
                 .rposition(|slice| !slice.is_empty())
@@ -82,9 +95,19 @@ pub(crate) fn drain<S: AsyncByteStream, C: Clock, Src: StreamSource>(
                 match conn.try_write_stream(id, slice, end) {
                     Ok(StreamWrite::Accepted(taken)) => {
                         total += taken;
-                        // A short accept means the record filled or the peer's window did.
-                        // Nothing after it can be taken this pass, and offering it anyway
-                        // would put the stream's bytes out of order.
+                        // A short accept means the peer's window is exhausted or the
+                        // connection's output buffer has no room for a further record --
+                        // backpressure either way, because one call fills as many records as
+                        // the buffer will hold. Nothing after it can be taken this pass, and
+                        // offering it anyway would put the stream's bytes out of order.
+                        //
+                        // It used to mean a third thing, and that third thing is why this
+                        // break was wrong for a while: while a call took one record, a large
+                        // offer answered short with the buffer three-quarters empty, and this
+                        // break stood the stream down over a record boundary. That reading is
+                        // gone from the layer below rather than compensated for here, because
+                        // the difference between a filled record and a shut window is visible
+                        // only there.
                         if taken < slice.len() {
                             break;
                         }
@@ -141,7 +164,10 @@ pub(crate) fn drain<S: AsyncByteStream, C: Clock, Src: StreamSource>(
         }
     }
 
-    // Whatever the last offer produced is still sitting in the outbound buffer, and no other
-    // call is obliged to come along and move it.
+    // Everything the pass produced is still sitting in the connection's outbound buffer, and
+    // no other call is obliged to come along and move it. This is the forced flush of the whole
+    // arrangement: the offers above left their records to accumulate on the promise that this
+    // line writes them, and a pass that returned without it would leave a driver waiting on a
+    // peer that had heard nothing.
     pump::pump(inner, cx);
 }

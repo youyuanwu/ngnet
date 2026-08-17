@@ -162,14 +162,26 @@ or an arm built with the inbound copy removed, is what would turn this into a nu
 vectored write — `RecordWriter::push_vectored` is listed in `docs/qmux/pending-work.md` — so
 this crate issues one write per slice and stops at the first that is not fully accepted.
 
-In practice that means one slice per offer, not one record holding all of them. The layer below
-refuses a second production while a record is still outstanding, so the write of the second
-slice answers `Blocked`, the loop breaks, and the offer reports the count the first slice
-produced. A fragmented offer therefore takes one record and one pass through the pump per
-slice, where a vectored push would have packed them into a single record. Correct, and more
-records than the payload requires.
+In practice that means at least one record per slice, not one record holding all of them. Each
+slice is a separate `try_write_stream`, and a call begins a fresh record however few bytes the
+slice holds. Until write coalescing landed this was worse: the layer below refused a second
+production while a record was still outstanding, so the write of the second slice answered
+`Blocked`, the loop broke, and the offer reported only the count the first slice had produced —
+one record *and one write and one pass through the pump* per slice. The outbound buffer now holds
+several records and one call fills as many of them as it has room and credit for, so the later
+slices of an offer are accepted rather than refused and they all leave together.
 
-There is now a symptom that may or may not belong to this, recorded in the next entry.
+What remains is the record count at slice boundaries: a fragmented offer starts a record per
+slice where a vectored push would have packed the slices into one. A 21-byte header slice
+followed by a 64 KiB body slice costs a 21-byte record and then full ones, rather than a first
+record holding the header and 16 361 bytes of body. Correct, and more records than the payload
+requires — the overhead is one record header per slice boundary, which is a few bytes on a
+16 382-byte record and matters for the small-slice case rather than the large one.
+
+**What would settle it:** `RecordWriter::push_vectored` in the layer below, tracked in
+`docs/qmux/pending-work.md`. Nothing above it needs to change: the offer loop here already hands
+its slices over in order, and a vectored push would simply stop the record boundary from falling
+where the slice boundary does.
 
 ## Something scales with in-flight streams on a real socket
 
@@ -209,9 +221,13 @@ closes with it.
 ## The transmit pass yields on a fixed count
 
 A pass takes at most sixty-four offers and then returns, so a layer with an endless supply
-cannot keep it from returning to the driver. Sixty-four accepted offers is on the order of a
-megabyte, which is a guess rather than a measurement: too low costs wakeups on a large body,
-too high delays the events the driver has to attend to.
+cannot keep it from returning to the driver. Sixty-four accepted offers used to be on the order
+of a megabyte, which was a guess rather than a measurement: too low costs wakeups on a large
+body, too high delays the events the driver has to attend to. Multi-record production loosened
+that reading — an offer is now worth as many records as the outbound buffer will hold, so the
+cap bounds offers rather than bytes and what bounds the bytes is the buffer's ceiling. The
+constant is unchanged, and the trade it encodes is now less about bytes than about how many
+different streams a pass will visit.
 
 **What would settle it:** a benchmark showing which end of that trade actually costs anything.
 The suite added in `docs/benchmarks/` does not, because it holds the count fixed at sixty-four

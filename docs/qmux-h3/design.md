@@ -52,16 +52,28 @@ that is only read if something reads it. An implementation that moved bytes only
 streams open, which is waiting on the record. The same shape strands the window updates that
 would release a peer whose flow control is exhausted.
 
-The pump is also what a transmit pass does *between* offers rather than only after them. QMux
-permits one record outstanding at a time, so until the record an offer produced has reached the
-byte stream the next offer is refused. Skipping the intermediate pump would turn a large body
-into one record per wakeup.
+The pump is also what a transmit pass does *between* offers rather than only after them, and
+there the pump is deliberately a different one. It used to be the flushing pump, because QMux
+permitted one record outstanding at a time and refused the next offer until the last record had
+reached the byte stream; skipping it would have turned a large body into one record per wakeup.
+QMux now holds several records — see "Produce up to the ceiling, write once, then read" in
+`docs/qmux/design.md` — so the intermediate pump is `pump_buffered`: it still reads, and it still
+writes when the buffer has no room for another record, but it leaves what the pass has produced
+to accumulate. A flushing pump here would now buy nothing and cost a write per record, which is
+the whole of what the coalescing was for.
 
-And it is why the pump's answer is read rather than discarded. `try_write_stream` refuses every
-offer while a record is still outstanding, so a transmit pass that kept offering after the pump
-reported "not caught up" would collect a run of spurious `Blocked` verdicts and teach the
-HTTP/3 layer that its streams are stalled when only the socket is — taking them out of the
-running until something else happened to wake them.
+What flushes instead is the single pump *after* the loop, and that one is not optional. A pass
+returns to its driver, and no other call is obliged to come along and move what it left behind;
+a driver may not poll again until the peer says something, and the peer may be waiting for
+precisely those bytes. Every entry point of the layer below that a caller can stop polling after
+flushes for the same reason — the one exception is the buffered pump itself, whose caller is
+mid-pass and owes the flush at the end of it.
+
+And it is why the pump's answer is read rather than discarded. `try_write_stream` refuses an
+offer once the outbound buffer has no room for another record, so a transmit pass that kept
+offering after the pump reported "no room" would collect a run of spurious `Blocked` verdicts and
+teach the HTTP/3 layer that its streams are stalled when only the socket is — taking them out of
+the running until something else happened to wake them.
 
 ## Nothing here may park
 
@@ -77,14 +89,21 @@ cannot, or truncate, which loses bytes. The non-parking form reports `Accepted(n
 
 An offer may carry several `IoSlice`s. Vectored writes are deferred in the layer below, so this
 crate issues one write per slice and stops at the first that is not fully accepted — a short
-accept means the record filled or the peer's window did, and offering the next slice anyway
-would put the stream's bytes out of order. The end-of-stream marker rides on the final slice
-and only there, and QMux applies it only when it takes the whole of what it was offered, so a
-partial accept cannot end a stream early.
+accept means the peer's window is exhausted or the outbound buffer has reached its ceiling, and
+offering the next slice anyway would put the stream's bytes out of order. It once meant a third
+thing, that the record had filled, and that reading is what made this break wrong for a while:
+the layer below took one record per call, so a large offer answered short with the buffer
+three-quarters empty and the stream was stood down over a record boundary. The distinction was
+settled where it is visible rather than compensated for here — `try_write_stream` fills records
+until a bound stops it, so a short accept means a bound. The end-of-stream marker rides on the
+final slice and only there, and QMux applies it only when it takes the whole of what it was
+offered, so a partial accept cannot end a stream early.
 
 A pass takes a bounded number of offers and then returns. A layer with an endless supply — a
 large body — could otherwise keep the pass from returning to the driver, which has a peer to
-attend to.
+attend to. The bound is on offers rather than on bytes, and each offer is now worth as many
+records as the outbound buffer will hold rather than one, so the cap is looser in bytes than it
+reads; the buffer's own ceiling is what bounds the bytes.
 
 ## The close nobody would otherwise write
 

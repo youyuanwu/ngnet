@@ -142,8 +142,8 @@ impl Wake for Flag {
 /// How many polls either phase may take before the run is declared broken.
 ///
 /// Reached only by a connection that is woken and makes no progress. Generous enough for the
-/// largest payload here moving one record per poll, which is what the unoptimized connection
-/// does.
+/// largest payload here moving one record per poll, which is the worst case a connection could
+/// exhibit before write coalescing and is now an upper bound rather than a description.
 const MAX_POLLS: usize = 100_000;
 
 /// Windows wide enough that the whole payload can be written before the peer is ever polled.

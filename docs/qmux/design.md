@@ -290,20 +290,58 @@ validates and advertises `max_idle_timeout` and then never acts on it, and has n
 expiry API of any kind. A clock that could wait would imply an enforcement this stack does not
 perform.
 
-### Flush, then produce, then read
+### Produce up to the ceiling, write once, then read
 
-The pump's order is the whole design, and the obvious alternative — produce everything the
-state machine owes, then write it out — is wrong twice over.
+The pump's order is the whole design. It used to be *flush, produce one record, flush*, so that
+a record was produced only into an empty outbound buffer and at most one record was ever
+outstanding. That rule was overturned deliberately, because it cost one write — one syscall, on
+a real transport — per 16382-byte record, and a driver turn that produces sixty records paid
+sixty of them where one would have carried the same bytes. What replaced it is: produce while
+the buffer has room for another whole record, write what has accumulated, then read.
 
-A record is produced only into an *empty* outbound buffer. So the previous record has
-necessarily reached the byte stream in full before the next one exists, and at most one record
-is ever outstanding. That bounds what a slow peer can make this side hold to a single record —
-16382 bytes — rather than to however much the caller has queued behind it. Producing first
-would bound outbound memory by the backlog instead, which is the first thing wrong with it. The
-second is that records would then have to be interleaved correctly on the way out, and a record
-interleaved with the tail of its predecessor is not a record the peer can parse. Having only
-one record's worth of bytes in flight also makes a partial accept impossible to get wrong:
-there is exactly one place to resume from.
+The old rule was defended by three arguments, and the replacement has to answer all three.
+
+*Bounded memory.* One record outstanding bounded what a slow peer could make this side hold to
+16382 bytes. The bound is now stated rather than implied: `OUTBOUND_CEILING` in
+`crates/ngnet-qmux/src/io/conn.rs` is the memory the outbound buffer may occupy, and a record is
+begun only while the buffer still has a whole record's room beneath it. The bound is still a
+constant and still independent of what the caller has queued — it is simply a larger constant,
+chosen so that the guaranteed carry beneath it is 64 KiB. Producing everything the state machine
+owes and *then* writing, which is the alternative the old passage rejected, remains rejected for
+exactly the reason it gave: that bounds outbound memory by the backlog.
+
+The reserve has one relaxation, and it is enforced the same way the reserve itself is. A record
+whose contents are already known to be small — the last few bytes of an offer a call has been
+filling records for — is given a *shortened* scratch buffer rather than the whole one, so it
+cannot exceed the space that is actually free. Without it, an offer that came to a few dozen
+bytes more than the reserve allowed answered short, and those bytes then travelled alone in a
+write of their own at the end of the pass: one extra write per stream, which at concurrency 64
+cost more than multi-record production had gained. The rejected alternative was to predict the
+record's size from the payload plus a framing allowance, which is an assertion about dwnx's
+varint encoding rather than about the buffer, and wrong in the direction that overruns the
+ceiling.
+
+*Correct interleaving.* A record interleaved with the tail of its predecessor is not a record the
+peer can parse. Nothing interleaves: each record is appended to the buffer whole, in the order it
+was produced, and no record begins before its predecessor is complete. That is a weaker property
+than "one record outstanding", and it is implied by it — which is why the old rule was sufficient
+and is not necessary. The buffer is a byte queue, not a set of records, and the write side never
+reorders it.
+
+*Exactly one place to resume from.* A partial accept resumes from `written`, which is a single
+byte cursor into the buffer and was one before this change too. What is new is that `written` may
+now come to rest *inside* a record rather than only at a record boundary, because a write that
+carried three records and a half stops mid-record. Nothing above the cursor cares: the buffer is
+bytes, the resume point is the cursor, and the next write offers the same buffer from it.
+
+The free space a partial accept leaves at the *front* of the buffer is not reclaimed. Production
+stops when the tail cannot take another whole record, even though compacting the unwritten
+remainder to the front would make room. Compaction was rejected because it is a memcpy of the
+unwritten remainder on every partial accept, paid on exactly the path that is already struggling;
+a ring buffer was rejected because two regions would leave the output in two pieces and every
+consumer of it — including a future gathering write — would have to handle both. A buffer that
+stays full means the peer is not keeping up, and the right answer to that is to stop producing,
+which is what stopping early does.
 
 Reading comes last, and the order *within* the read matters as much. The bytes go to the framer
 first and to `Conn::read` second, and only then is the outcome acted on. dwnx reports
@@ -370,6 +408,17 @@ returns. It exists because the HTTP/3 transport abstraction offers its outbound 
 *synchronous* closure — handed a stream, some slices, and a verdict to return — with no
 `Context` anywhere in reach. A layer that could only park would have nothing legal to do inside
 it, and discovering that at the join would have meant changing this API after the fact.
+
+One call fills **as many records as the buffer will hold**, and that is a property the caller
+above depends on rather than an optimization it cannot see. A short answer from this form means
+a bound was reached — the peer's window is shut, or the buffer is at its ceiling — and never
+that a record filled. The distinction is invisible from above: the HTTP/3 layer is told a count
+and nothing else, and it reads a short count as congestion and stands the stream down for the
+rest of its pass. While a call took one record, every large offer answered short, so a stream
+with a megabyte to send moved sixteen kilobytes of it per pass however much room the buffer had;
+a 2 MiB upload cost 130 writes where the carry accounts for 32. The alternative — leaving the
+decision above, by re-offering after a short accept — was rejected because the layer above
+cannot tell a filled record from a shut window, and re-offering into a shut window spins.
 
 Both split a payload across records and across available credit rather than truncating, and both
 report what they took even when they then refuse: a count dropped because the verdict was a

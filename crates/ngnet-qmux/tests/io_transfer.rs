@@ -20,8 +20,8 @@ use std::task::Poll;
 
 use io_harness::{
     announcement_record, client_exchange, connected_pair, connected_pair_one_byte_at_a_time,
-    drain_written, exchange, flush, next_event, open_bidi, poll_once, run, run_pair,
-    server_exchange, write_all,
+    connected_pair_with, drain_written, exchange, flush, next_event, open_bidi, poll_once, run,
+    run_pair, server_exchange, write_all,
 };
 use ngnet_qmux::io::testing::{TestClock, stream_pair};
 use ngnet_qmux::io::{Config, Connection, Event};
@@ -47,6 +47,66 @@ fn a_client_and_a_server_complete_a_bidirectional_transfer() {
 fn a_transfer_survives_one_byte_per_call() {
     let (mut client, mut server) = connected_pair_one_byte_at_a_time(Config::new());
     exchange(&mut client, &mut server, REQUEST, RESPONSE);
+}
+
+/// A megabyte through a byte stream that stops part way through records (Spec SC-002).
+///
+/// The case coalescing created. While a record was produced only into an empty outbound
+/// buffer, a partial accept could stop only *between* records: the write side offered exactly
+/// one record and resumed inside it, and the record boundary and the buffer boundary were the
+/// same place. A write is now offered everything that has accumulated, so an accept stops
+/// wherever the transport felt like stopping -- inside a length prefix, one byte before the end
+/// of a record, in the middle of the third of four. Nothing above the cursor knows or cares,
+/// which is the claim, and byte-identity over a megabyte is the evidence for it.
+///
+/// Four caps rather than one, because the interesting stops are at different distances from a
+/// record boundary and a single cap exercises one arithmetic. Seven is small and coprime with
+/// everything; a thousand divides no record; 16381 is one byte short of the record limit, which
+/// is the boundary a fencepost error lands on; 40000 spans more than two records, which is the
+/// case where one accept covers several boundaries at once. Each is paired with a pipe that
+/// holds a few times the cap, so the write also has to stop and be resumed *across* calls
+/// rather than only within one.
+///
+/// The bytes are a function of their offset, so a duplicated or reordered chunk fails the
+/// comparison rather than hiding in a run of identical values.
+#[test]
+fn a_megabyte_survives_writes_that_stop_inside_records() {
+    const BODY: usize = 1 << 20;
+    let request: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
+    let response: Vec<u8> = (0..4_096).map(|i| (i % 241) as u8).collect();
+
+    // Windows above the body, so what is being tested is the write path rather than flow
+    // control, which has tests of its own in `io_scheduling.rs`.
+    let config = Config::new()
+        .initial_max_stream_data(2 << 20)
+        .initial_max_data(4 << 20);
+
+    for cap in [7usize, 1_000, 16_381, 40_000] {
+        let (mut client, mut server) = connected_pair_with(config, config, |side| {
+            side.set_write_cap(Some(cap));
+            side.set_capacity(Some(cap * 3 + 1));
+        });
+        let (received_response, received_request) = run_pair(
+            client_exchange(&mut client, &request),
+            server_exchange(&mut server, &response),
+        );
+        assert_eq!(
+            received_request.len(),
+            request.len(),
+            "with {cap} bytes accepted per write the transfer stopped {} bytes short, which is \
+             what a resume from the wrong offset looks like from here",
+            request.len() - received_request.len()
+        );
+        assert_eq!(
+            received_request, request,
+            "the body did not survive writes capped at {cap} bytes: some record was resumed at \
+             the wrong offset, or part of one was sent twice"
+        );
+        assert_eq!(
+            received_response, response,
+            "the answer did not survive the same treatment in the other direction"
+        );
+    }
 }
 
 /// A payload far larger than one record, which is the case a single record cannot serve.

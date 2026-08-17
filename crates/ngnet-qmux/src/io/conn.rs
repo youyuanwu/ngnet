@@ -9,17 +9,31 @@
 //!
 //! # The pump order, which is the whole design
 //!
-//! **Flush, then produce, then read.** Not "produce everything, then flush", which is the
-//! shape that suggests itself and is wrong twice over.
+//! **Produce up to the ceiling, write once, then read.** Records accumulate in the outbound
+//! buffer and leave together, rather than each one being written before the next is built.
 //!
-//! Flushing first is what keeps at most one record outstanding. A record is produced only
-//! into an *empty* outbound buffer, so the previous one has necessarily reached the byte
-//! stream in full before the next exists. That bounds what a slow peer can make this side
-//! hold to a single record -- 16382 bytes -- rather than to however much the caller queued;
-//! and it makes a partial accept impossible to get wrong, because there is only ever one
-//! record's worth of bytes to resume from. A layer that produced first would hold the whole
-//! backlog in memory and would have to interleave records correctly on the way out, and a
-//! record interleaved with the tail of its predecessor is not a record the peer can parse.
+//! This layer used to alternate strictly -- flush, produce one record, flush -- and the rule
+//! that came out of it, "at most one record outstanding", was documented here and in
+//! `docs/qmux/design.md` with three reasons. Coalescing keeps all three and pays for them
+//! differently, because the alternation costs one write per record and a multiplexed pass
+//! produces dozens of tiny ones: sixty-four concurrent exchanges with empty bodies issued
+//! seventy writes averaging twenty-seven bytes each, where a buffer of any plausible size
+//! merges them into three (`.paw/work/qmux-h3-perf/Phase2Screen.md`).
+//!
+//! - *Bounded memory* was the first reason, and the bound is now [`OUTBOUND_CEILING`] rather
+//!   than one record. Production stops while the buffer cannot take another maximum-size
+//!   record, so what a slow peer can make this side hold is a documented constant that does
+//!   not depend on how much a caller offered or how slowly the peer reads.
+//! - *Correct interleaving* was the second, and it holds for a weaker reason than the old
+//!   rule gave: a record is appended to the buffer **whole and in order**, and none is begun
+//!   before its predecessor is complete. What the peer must never see is a record interleaved
+//!   with the tail of another, and appending finished records end to end cannot produce that.
+//!   The old rule implied this one; it was never the only thing that could.
+//! - *Exactly one place to resume from* was the third, and it is unchanged: `written` is a
+//!   byte cursor into the buffer, and a partial accept resumes at a byte offset regardless of
+//!   how many record boundaries lie behind it. What is new is that the offset may now fall
+//!   *inside* a record rather than only at its end -- which the byte stream cannot tell apart,
+//!   since it is handed a slice either way.
 //!
 //! Reading last, and in a particular order within the read, is what makes a peer's close
 //! legible. The bytes go to [`RecordFramer`] *first* and to [`Conn::read`] *second*, and only
@@ -32,8 +46,61 @@
 //!
 //! A read is followed by one more write pass when it left something to say, so a window
 //! extension or a ping response provoked by what just arrived leaves in the same wakeup
-//! instead of waiting for the next one. That pass obeys the same flush-then-produce rule; it
-//! is an extra turn of the same crank, not an exception to it.
+//! instead of waiting for the next one. It is an extra turn of the same crank, not an
+//! exception to it.
+//!
+//! # Two kinds of flush, and why the distinction is the whole of the gain
+//!
+//! A *forced* flush offers the buffer until the byte stream has taken all of it or refused.
+//! An *opportunistic* one offers it only when it can no longer take another record -- to make
+//! room, not to empty it.
+//!
+//! Every public entry point here ends with a forced flush, because the caller may stop polling
+//! the moment it returns and output held back for a pass that never comes is a stalled
+//! connection rather than a slow one. The single exception is
+//! [`poll_pump_buffered`](Connection::poll_pump_buffered), which exists for a caller that is
+//! *mid-turn* -- the HTTP/3 join offers this connection up to sixty-four times before
+//! returning to its driver, and pumps in between so the pass can move more than one record.
+//! Were that pump to flush, a driver turn would still pay one write per record and coalescing
+//! would achieve nothing while every test inside this file still passed. Its contract is that
+//! the caller ends its turn with [`poll_pump`](Connection::poll_pump) or an ending path.
+//!
+//! # What a partial accept leaves behind, and why nothing reclaims it
+//!
+//! Once part of the buffer has been accepted, the space at its front is free but unreachable:
+//! production appends at the back, and `written` is the only cursor. The buffer therefore
+//! stops taking records while its *tail* is short, even though its head is empty -- **stop
+//! early**.
+//!
+//! Two alternatives were considered. *Compacting* -- moving the unwritten remainder to the
+//! front -- costs a memcpy on the path a later commit exists to remove a memcpy from, and buys
+//! room only in the case where the peer is already the bottleneck. *Wrapping* -- treating the
+//! buffer as a ring of two regions -- costs the write side its single contiguous slice, which
+//! [`AsyncByteStream`] has no way to accept as two. Stopping early is the simplest of the
+//! three, and the case it degrades is the case where the peer is not keeping up, where a
+//! connection that produced *less* is doing the right thing anyway.
+//!
+//! The consequence is worth stating in one place because a later question turns on it: the
+//! output of this connection is **always one contiguous region**, so a gathering write -- one
+//! that hands the byte stream several buffers at once -- would have nothing to gather here.
+//! Only the ring would have produced two regions, and the ring is what was rejected.
+//!
+//! # One call fills records until a bound stops it
+//!
+//! [`Connection::try_write_stream`] does not stop at a record. It keeps producing for the same
+//! offer while the buffer has room and the stream has both bytes and credit, and reports the
+//! total. Stopping at a record was the obvious reading of "produce one record" and it was
+//! wrong for a reason that is invisible from this file: the caller above is told a *count* and
+//! nothing else, and a count short of the offer is the only signal it has for congestion, so
+//! it stands the stream down for the rest of its pass. Every large offer answered short, and a
+//! stream with a megabyte to send moved one record of it per pass while the buffer sat four
+//! fifths empty. Leaving the resumption to that caller instead was rejected because it cannot
+//! tell a filled record from a shut window, and re-offering into a shut window spins.
+//!
+//! The relaxation this needs is in `Connection::room_for`, and it is stated there:
+//! a record *continuing* an offer may be built into less than a full reserve when what is left
+//! of the offer is smaller than the space, so the last few bytes of a body are not stranded to
+//! travel alone in the pass's closing flush.
 //!
 //! # A push error is fatal, and never retried
 //!
@@ -132,7 +199,54 @@ pub const DEFAULT_READ_AHEAD: u64 = DEFAULT_CONNECTION_DATA;
 /// One record. A larger buffer would let a single read straddle several records, which is
 /// harmless -- both the framer and the state machine accept any split -- but buys nothing,
 /// since a record is the unit at which anything becomes actionable.
-const READ_BUFFER: usize = crate::DEFAULT_MAX_RECORD_SIZE as usize;
+const READ_BUFFER: usize = MAX_RECORD;
+
+/// The most bytes one produced record can occupy, prefix included.
+///
+/// This is a property of the buffer a record is serialised into rather than an assertion about
+/// dwnx: the record writer is handed `scratch`, which is exactly this long, and it cannot write
+/// past what it was given. It is what the reserve in [`OUTBOUND_CEILING`] is for, and the
+/// arithmetic below is only sound because it is an upper bound on a single record rather than
+/// a typical size.
+const MAX_RECORD: usize = crate::DEFAULT_MAX_RECORD_SIZE as usize;
+
+/// How many bytes one write is **guaranteed** to be able to carry.
+///
+/// The quantity to reason about when asking how many writes a transfer costs: a connection
+/// with this much or more to send offers at least this much in a single call, so P bytes of
+/// output cost at most P divided by this figure, rounded up, writes. It is not the same
+/// quantity as [`OUTBOUND_CEILING`], and conflating the two is how a bound gets stated that
+/// nothing can rely on -- the ceiling includes a reserve that a record already in progress may
+/// consume, so it is not available to be carried.
+///
+/// **64 KiB, and the reduction that buys was predicted before it was measured.** Against the
+/// write counts a driver turn issues today, this value removes 96% of them at concurrency 64
+/// with an empty body, 79% with a 64 KiB body, and 75% at the worst point measured -- a
+/// megabyte across sixty-four streams, where the floor is arithmetic (bytes divided by the
+/// carry) rather than anything about the design. A larger carry moves the last of those to
+/// 94% at 256 KiB and 99.9% unbounded; it was not taken, because the first two points are
+/// where the small writes are and a 64 KiB carry bounds the buffer at four records rather than
+/// at a megabyte. The figures are the capacity sweep in `.paw/work/qmux-h3-perf/Phase2Screen.md`.
+///
+/// Stated in advance deliberately: the arithmetic above is satisfied by *any* value, including
+/// one that turns sixty-five writes into thirty-two and is indistinguishable from none at all,
+/// so a bound with no predicted reduction beside it is a bound that cannot be judged.
+pub const OUTBOUND_CARRY: usize = 64 * 1024;
+
+/// The most memory one connection may hold in produced-but-unwritten output.
+///
+/// [`OUTBOUND_CARRY`] plus one maximum record. The reserve is what makes the carry a
+/// *guarantee*: a record is begun only while the buffer still has a whole record's room, so
+/// the last one started can always be finished, and the buffer ends at most this long.
+///
+/// The figure does not depend on how much a caller offers or on how slowly the peer reads,
+/// which is the property the old one-record rule was defending. What it costs is per
+/// connection and paid whether or not the peer is slow, since the buffer is reused rather than
+/// released: about 80 KiB against the 16382 bytes the alternation held. The buffer grows on
+/// demand rather than being allocated at construction -- an idle connection, and one whose
+/// peer keeps up, never reaches the ceiling and never pays for it, and the growth is amortised
+/// over the life of a connection that does.
+pub const OUTBOUND_CEILING: usize = OUTBOUND_CARRY + MAX_RECORD;
 
 /// What a connection advertises to its peer.
 ///
@@ -275,18 +389,26 @@ impl Config {
 pub enum StreamWrite {
     /// This many bytes were taken, counted from the front of what was offered.
     ///
-    /// May be fewer than offered, because a record holds a bounded amount and the peer's
-    /// flow-control window may hold less again. The remainder is not lost and not sent: offer
-    /// it again. A zero here means the offer was empty -- an end-of-stream marker carrying no
-    /// data is accepted this way.
+    /// May be fewer than offered, and when it is, the shortfall is **backpressure**: either the
+    /// peer's flow-control window is exhausted or the connection's output buffer has no room
+    /// for a further record. It is not a record filling -- one call fills as many records as
+    /// the buffer will hold -- so a caller may treat a short count as a reason to stand this
+    /// stream down rather than as an invitation to offer the remainder immediately. The
+    /// remainder is not lost and not sent: offer it again. A zero here means the offer was
+    /// empty -- an end-of-stream marker carrying no data is accepted this way.
     Accepted(usize),
 
     /// Nothing was taken, and nothing will be until something changes.
     ///
     /// Either the peer's flow-control credit for this stream is exhausted and it must extend
-    /// the window, or a record produced earlier has not finished reaching the byte stream and
-    /// producing another would break the one-record-outstanding rule. A caller offers the same
-    /// bytes again after the connection has been pumped.
+    /// the window, or the connection's output buffer cannot take another record until the byte
+    /// stream has taken some of what is already in it. A caller offers the same bytes again
+    /// after the connection has been pumped.
+    ///
+    /// The second cause is a *bound being reached*, not a record being outstanding: records
+    /// accumulate and leave together, and this answer arrives only once the accumulated output
+    /// is within one record of [`OUTBOUND_CEILING`]. A caller that met it on every second
+    /// offer under the old rule will meet it once in several dozen now.
     Blocked,
 
     /// The stream's write side is closed, so nothing will ever be taken.
@@ -313,11 +435,25 @@ pub struct Connection<S: AsyncByteStream, C: Clock> {
     framer: RecordFramer,
     /// The read buffer, reused for the life of the connection.
     inbound: Vec<u8>,
-    /// Produced record bytes on their way to the byte stream. Never more than one record.
+    /// Produced record bytes on their way to the byte stream.
+    ///
+    /// Whole records, appended in the order they were produced, and never longer than
+    /// [`OUTBOUND_CEILING`] -- a bound this side enforces by refusing to begin a record the
+    /// buffer's tail could not hold in full. Reused for the life of the connection and grown
+    /// on demand, so a connection whose peer keeps up never allocates the ceiling.
     outbound: Vec<u8>,
     /// How much of `outbound` the byte stream has already accepted.
+    ///
+    /// The single place a partial accept resumes from, and the reason accumulating several
+    /// records needs no other bookkeeping. It may now sit *inside* a record as well as between
+    /// two of them; the byte stream cannot tell the difference, because what it is offered is
+    /// `outbound[written..]` either way. The bytes in front of it are dead space until the
+    /// buffer empties -- see the module documentation for why nothing reclaims them.
     written: usize,
     /// The buffer records are serialised into, reused for the life of the connection.
+    ///
+    /// Its length is [`MAX_RECORD`], which is what makes that constant an upper bound on a
+    /// produced record rather than an assumption about dwnx.
     scratch: Vec<u8>,
     /// Whether the state machine may have something to serialise.
     ///
@@ -386,6 +522,27 @@ enum Verdict {
     Closed,
 }
 
+/// What a write pass does with what it produced.
+///
+/// The two halves of the flush policy the module documentation sets out. Passed rather than
+/// inferred, because the difference cannot be worked out from inside: whether output may wait
+/// depends on whether the *caller* is coming back, which only the caller knows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Flush {
+    /// Write only to make room, leaving the rest to accumulate.
+    ///
+    /// For a caller still in the middle of its turn. Output left here is not abandoned: the
+    /// same caller finishes with [`Flush::Everything`], and until then every further record it
+    /// produces joins what is already waiting -- which is the whole of the write-count
+    /// reduction.
+    WhenFull,
+    /// Write everything before returning to the caller.
+    ///
+    /// For every path a caller can stop polling from. Output held past one of these would wait
+    /// for a pass that nothing is obliged to make.
+    Everything,
+}
+
 impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     /// A client connection over an established byte stream.
     ///
@@ -425,7 +582,7 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
             inbound: vec![0; READ_BUFFER],
             outbound: Vec::new(),
             written: 0,
-            scratch: vec![0; READ_BUFFER],
+            scratch: vec![0; MAX_RECORD],
             // The announcement. Nothing can be opened until the peer's parameters arrive, and
             // they arrive only if the peer sent them -- so both sides must speak without being
             // spoken to, or two connections wait for each other and neither reports anything
@@ -467,8 +624,7 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         self.conn.peer_transport_params()
     }
 
-    /// Drives the connection: flush what is queued, produce what is pending, read what has
-    /// arrived.
+    /// Drives the connection: produce what is pending, write it out, read what has arrived.
     ///
     /// Every other entry point does this first, so a caller never has to. It is public because
     /// a caller who is neither reading events nor writing -- one waiting on something else
@@ -478,12 +634,16 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     /// means bytes are still queued and the byte stream cannot take them yet; the waker fires
     /// when it can.
     ///
+    /// This is the *forced* half of the flush policy: nothing produced is left waiting for a
+    /// later call. See [`Connection::poll_pump_buffered`] for the other half, and the module
+    /// documentation for why there are two.
+    ///
     /// # Errors
     ///
     /// Reports whichever ending the connection reached, including the orderly ones; see
     /// [`ErrorKind::is_orderly`].
     pub fn poll_pump(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if let Err(error) = self.pump(cx) {
+        if let Err(error) = self.pump(cx, Flush::Everything) {
             return Poll::Ready(Err(error));
         }
         if self.outbound.is_empty() {
@@ -491,6 +651,58 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         } else {
             Poll::Pending
         }
+    }
+
+    /// Drives the connection, but writes only to make room.
+    ///
+    /// For a caller in the middle of a turn that will make further offers and then finish with
+    /// [`Connection::poll_pump`]. The HTTP/3 join is the caller this exists for: it offers this
+    /// connection up to sixty-four times before returning to its driver, and pumps in between
+    /// so that a large body moves more than one record per wakeup. If that pump wrote
+    /// everything, the turn would pay one write per record and the accumulation this layer
+    /// does would be worth nothing -- which is a failure that no test of the connection alone
+    /// can see, because the connection alone would still be coalescing correctly.
+    ///
+    /// [`Poll::Ready`] means the connection can take another record. [`Poll::Pending`] means
+    /// the accumulated output is within one record of [`OUTBOUND_CEILING`] and the byte stream
+    /// would not take enough of it to make room; the waker fires when it will. That is a
+    /// different question from [`Connection::poll_pump`]'s, and it is the one an offer loop
+    /// needs answered: an offer made into a full buffer collects nothing but
+    /// [`StreamWrite::Blocked`].
+    ///
+    /// **The caller owes a forced flush.** Output accumulated here waits for the next pass, and
+    /// nothing else is obliged to make one; a caller that ends its turn on this call strands
+    /// whatever it produced. Ending the turn with [`Connection::poll_pump`],
+    /// [`Connection::poll_close`] or [`Connection::poll_finish`] discharges the obligation.
+    ///
+    /// # Errors
+    ///
+    /// As [`Connection::poll_pump`].
+    pub fn poll_pump_buffered(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if let Err(error) = self.pump(cx, Flush::WhenFull) {
+            return Poll::Ready(Err(error));
+        }
+        if self.room_for_record() {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    /// How many produced bytes are waiting for the byte stream.
+    ///
+    /// Never more than [`OUTBOUND_CEILING`], which is the bound this layer offers in place of
+    /// the "one record outstanding" it used to keep. Exposed because that bound is a promise
+    /// about a connection's memory under a slow peer, and a promise nothing can observe is one
+    /// nothing can hold this layer to.
+    ///
+    /// Counts the bytes the byte stream has already accepted as well as the ones it has not,
+    /// because both occupy the buffer: the space in front of the cursor is not reused until the
+    /// buffer empties. That makes this the figure the ceiling is stated over rather than the
+    /// smaller "still to send" one.
+    #[must_use]
+    pub fn queued_output(&self) -> usize {
+        self.outbound.len()
     }
 
     /// The next thing that happened on the connection.
@@ -507,7 +719,11 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     ///
     /// Reports the connection's ending once the queue is empty.
     pub fn poll_next_event(&mut self, cx: &mut Context<'_>) -> Poll<Result<Event>> {
-        let pumped = self.pump(cx);
+        // Forced: a caller reading events may never write at all, and the window extensions
+        // and ping answers this pass produces are exactly what the peer is waiting for before
+        // it sends the next event. Accumulating those would be a connection that goes quiet in
+        // proportion to how well it is being read.
+        let pumped = self.pump(cx, Flush::Everything);
         if let Some(event) = self.events.pop() {
             if let Event::StreamData { data, .. } = &event {
                 // Delivery is what read-ahead is measured in: from here the bytes are the
@@ -556,7 +772,19 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     }
 
     fn poll_open(&mut self, cx: &mut Context<'_>, kind: OpenKind) -> Poll<Result<StreamId>> {
-        if let Err(error) = self.pump(cx) {
+        // Forced, like every entry point a caller can stop polling after. The open itself
+        // queues a record rather than producing one, so what this flush carries is whatever was
+        // already waiting -- which is exactly the output a caller who now parks on the returned
+        // stream would otherwise strand.
+        //
+        // An opportunistic pump here was tried and reverted: it measured no fewer writes in
+        // any arm of the concurrency sweep, because a driver opens the streams a pass needs
+        // before it offers anything onto them, so the buffer it would have left unflushed is
+        // empty. What it did cost was the clean rule -- every entry point but
+        // `poll_pump_buffered` forces -- and a caller that opened a stream and then parked on
+        // something outside this connection would have stranded whatever an earlier
+        // `try_write_stream` or `extend_connection_credit` had queued.
+        if let Err(error) = self.pump(cx, Flush::Everything) {
             return Poll::Ready(Err(error));
         }
 
@@ -608,17 +836,50 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         data: &[u8],
         fin: bool,
     ) -> Poll<Result<usize>> {
-        if let Err(error) = self.pump(cx) {
+        if let Err(error) = self.pump(cx, Flush::WhenFull) {
             return Poll::Ready(Err(error));
         }
 
+        let outcome = self.write_stream_records(cx, stream, data, fin);
+        if let Poll::Ready(Err(_)) = &outcome {
+            // Nothing to flush towards: the ending is latched, and a write issued on a
+            // connection that has just failed can only report the same failure again.
+            return outcome;
+        }
+        // The forced flush, and it is owed on *every* other exit above -- including the ones
+        // that park. A payload that filled the peer's window produced records and then reported
+        // a refusal, and those records are how the peer learns to extend the window: holding
+        // them back until some later pass makes the wait for that extension a wait for
+        // something this side is itself preventing.
+        //
+        // Unconditional rather than skipped where the loop already met a refusal. That costs
+        // one repeated offer to a byte stream that has just said no, on the path where the
+        // connection is backed up anyway; distinguishing the cases would put a second reason to
+        // flush in a second place, which is the shape this policy exists to avoid.
+        match self.flush(cx) {
+            Ok(_) => outcome,
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+
+    /// Produces records for `data` until it is spent or the connection will take no more.
+    ///
+    /// The loop [`Connection::poll_write_stream`] wraps. Split out so that the forced flush
+    /// that follows it is written once and cannot be missed on one of the five ways out.
+    fn write_stream_records(
+        &mut self,
+        cx: &mut Context<'_>,
+        stream: StreamId,
+        data: &[u8],
+        fin: bool,
+    ) -> Poll<Result<usize>> {
         let mut written = 0usize;
         loop {
             let produced = match self.write_record(cx, stream, &data[written..], fin) {
                 Err(error) => return Poll::Ready(Err(error)),
-                // The byte stream cannot take the record that is already queued, so producing
-                // another would break the one-record-outstanding rule. Its own waker is
-                // registered, so no re-arm is needed here.
+                // The output buffer is within one record of its ceiling and the byte stream
+                // would not take enough of it to make room, so there is nowhere to put another
+                // record. Its own waker is registered, so no re-arm is needed here.
                 Ok(None) => {
                     return if written > 0 {
                         Poll::Ready(Ok(written))
@@ -671,7 +932,29 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     /// [`Connection::poll_write_stream`]; what differs is that exhausted credit comes back as
     /// [`StreamWrite::Blocked`] instead of parking, and a finished stream as
     /// [`StreamWrite::Closed`] instead of an error. Nothing is written to the byte stream
-    /// here: the record joins the outbound buffer and leaves on the next pump.
+    /// here: the records join the outbound buffer and leave on the next pump.
+    ///
+    /// # One call fills records until something stops it
+    ///
+    /// The payload is spread over **as many records as the outbound buffer will hold**, not
+    /// over one. That is what makes a short answer mean something: this returns fewer bytes
+    /// than it was offered only when the peer's flow-control window is exhausted or the buffer
+    /// has no room for a further record -- both of which are backpressure a caller must wait
+    /// out -- and never merely because a record filled, which is an event only this layer can
+    /// see and can always answer by starting another one.
+    ///
+    /// The distinction is the point. Taking one record per call was the earlier behaviour, and
+    /// it made every large offer answer short; the layer above reads a short answer as
+    /// congestion and stands the stream down for the rest of its pass, so a stream with a
+    /// megabyte to send moved sixteen kilobytes of it per pass however much room the buffer
+    /// had. The rejected alternative was to leave the decision up there -- re-offer after a
+    /// short accept -- and it is not available: that layer is told a count and nothing else,
+    /// so re-offering on a short accept would spin against a stream whose window is shut.
+    ///
+    /// Where the two are indistinguishable the loop **stops**, biasing towards one more offer
+    /// from the caller rather than towards a production that cannot make progress: a caller
+    /// that offers again when it need not have costs a call, and a loop that continues when it
+    /// must not have costs a core.
     ///
     /// # Errors
     ///
@@ -685,28 +968,57 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         if let Some(terminal) = &self.terminal {
             return Err(terminal.error());
         }
-        // Producing into a buffer that still holds a record would queue two, and the second
-        // cannot be written before the first regardless. Reporting it as blocked is honest and
-        // needs no new variant: the caller's response -- offer the same bytes again later --
-        // is the same one exhausted credit calls for.
-        if !self.outbound.is_empty() {
-            return Ok(StreamWrite::Blocked);
-        }
 
-        let produced = self.produce(WriteRequest::stream(stream, data).with_fin(fin))?;
-        // The count outranks the verdict. A record can take part of the payload and only then
-        // find the window exhausted, and those bytes leave on the next pump whatever the
-        // verdict says; answering `Blocked` and losing the count would have the caller offer
-        // them again and the peer would receive them twice.
-        if produced.consumed > 0 {
-            return Ok(StreamWrite::Accepted(produced.consumed));
+        // The running total, and the single source of the answer. Every exit below reports
+        // this same figure when it is non-zero, because bytes packed into a record are already
+        // committed to the peer -- the state machine has advanced the stream's send offset --
+        // and a refusal that lost the count would have the caller offer them a second time.
+        let mut taken = 0usize;
+        loop {
+            let Some(room) = self.room_for(data.len() - taken, taken > 0) else {
+                // The buffer has reached the ceiling, so there is nowhere to put another
+                // record until the byte stream has taken some of what is already there -- and
+                // nothing is written from here, so it cannot make room itself. Reporting it as
+                // blocked is honest and needs no new variant: the caller's response -- offer
+                // the rest again later -- is the same one exhausted credit calls for.
+                //
+                // This used to refuse while the buffer held *anything*, which cost one record
+                // per offer and one write per record. The refusal is now a bound being reached
+                // rather than a record being outstanding.
+                return Ok(accepted_or(taken, StreamWrite::Blocked));
+            };
+
+            let produced = self.produce_within(
+                WriteRequest::stream(stream, &data[taken..]).with_fin(fin),
+                room,
+            )?;
+            // Counted before the verdict is read, and for every verdict, for the reason above.
+            // `fin` rides the record that takes the last of the payload, which is dwnx's rule
+            // and not this loop's: every push carries the flag with whatever is left, and the
+            // end-of-stream marker is applied by the push that empties it. So a payload split
+            // across records here ends the stream exactly once, on the last of them.
+            taken += produced.consumed;
+
+            match produced.verdict {
+                Verdict::Closed => return Ok(accepted_or(taken, StreamWrite::Closed)),
+                Verdict::Blocked => return Ok(accepted_or(taken, StreamWrite::Blocked)),
+                Verdict::Packed => {
+                    // The whole offer is packed. An empty payload lands here on its first turn
+                    // and answers `Accepted(0)`, which is how an end-of-stream marker carrying
+                    // no data is accepted.
+                    if taken == data.len() {
+                        return Ok(StreamWrite::Accepted(taken));
+                    }
+                    // Nothing taken from a payload that still has bytes in it: dwnx reports an
+                    // exhausted *connection* window this way rather than as a blocked stream.
+                    // Producing again would pack another empty record and ask the same
+                    // question, which is the one way this loop could fail to terminate.
+                    if produced.consumed == 0 {
+                        return Ok(accepted_or(taken, StreamWrite::Blocked));
+                    }
+                }
+            }
         }
-        Ok(match produced.verdict {
-            Verdict::Closed => StreamWrite::Closed,
-            Verdict::Blocked => StreamWrite::Blocked,
-            Verdict::Packed if !data.is_empty() => StreamWrite::Blocked,
-            Verdict::Packed => StreamWrite::Accepted(0),
-        })
     }
 
     /// Shuts down one or both halves of a stream, telling the peer why.
@@ -921,31 +1233,45 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         }
     }
 
-    /// Flush, produce, read -- and one more write pass for whatever the read left to say.
-    fn pump(&mut self, cx: &mut Context<'_>) -> Result<()> {
+    /// Produce, write, read -- and one more write pass for whatever the read left to say.
+    ///
+    /// `flush` is the caller's answer to "am I coming back before anything else polls this
+    /// connection?", and it decides whether produced output may wait for the rest of the turn
+    /// or must leave now. See [`Flush`].
+    fn pump(&mut self, cx: &mut Context<'_>, flush: Flush) -> Result<()> {
         if let Some(terminal) = &self.terminal {
             return Err(terminal.error());
         }
 
-        self.write_side(cx)?;
+        self.write_side(cx, flush)?;
         self.read_side(cx)?;
         if self.produce_pending {
-            self.write_side(cx)?;
+            self.write_side(cx, flush)?;
         }
         Ok(())
     }
 
-    /// Writes what is queued and produces what is pending, alternating.
+    /// Produces what is pending into the outbound buffer, writing when the buffer is full and,
+    /// where the caller asked for it, once more at the end.
     ///
-    /// The alternation is the point: production happens only into an empty outbound buffer, so
-    /// each record is fully written before the next exists.
-    fn write_side(&mut self, cx: &mut Context<'_>) -> Result<()> {
+    /// The loop is bounded by the buffer rather than by the byte stream: it produces while
+    /// there is room for another whole record, and writes only to make room. That is what puts
+    /// several records in one write. A caller that will not be back sets [`Flush::Everything`]
+    /// and the last of them leaves before this returns.
+    ///
+    /// Production stops when the buffer's *tail* is short, even when the byte stream has
+    /// already taken bytes off its front -- the stop-early decision, whose alternatives and
+    /// consequence are in the module documentation.
+    fn write_side(&mut self, cx: &mut Context<'_>, flush: Flush) -> Result<()> {
         loop {
-            if !self.flush(cx)? {
+            if !self.room_for_record() && !self.flush(cx)? {
+                // The buffer is full and the byte stream would not take it. Nothing more can
+                // be produced, and there is nothing left to force out: the flush that just
+                // failed registered whatever wake will end the wait.
                 return Ok(());
             }
             if !self.produce_pending || self.closing.is_some() {
-                return Ok(());
+                break;
             }
 
             let produced = self.produce(WriteRequest::control_only())?;
@@ -955,12 +1281,77 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
                 // cannot arise here -- but they are answered rather than ignored, because the
                 // alternative is a loop that never ends if that ever stops being true.
                 self.produce_pending = false;
-                return Ok(());
+                break;
             }
         }
+
+        if flush == Flush::Everything {
+            self.flush(cx)?;
+        }
+        Ok(())
     }
 
-    /// Produces whatever the state machine has queued and writes it out.
+    /// Whether another record may be produced.
+    ///
+    /// The one question the whole flush policy turns on, asked in the four places that decide
+    /// whether to build a record. It is arithmetic on the buffer's length rather than on what
+    /// is left to send, because the space in front of `written` is not available to a record:
+    /// production appends at the back.
+    ///
+    /// [`MAX_RECORD`] is the reserve [`OUTBOUND_CEILING`] carries, so a record begun here can
+    /// always be finished without the buffer exceeding the ceiling.
+    fn room_for_record(&self) -> bool {
+        self.outbound.len() + MAX_RECORD <= OUTBOUND_CEILING
+    }
+
+    /// How large a record may be built now, or [`None`] if none may be.
+    ///
+    /// [`Connection::room_for_record`] with one addition, and the addition is what keeps a
+    /// multi-record offer from stranding its own last few bytes.
+    ///
+    /// A whole record's reserve is what the ceiling normally holds back, because a record
+    /// begun without knowing how large it will be may run to [`MAX_RECORD`]. That is not the
+    /// only case. When a call has already packed records for an offer and what is left of the
+    /// payload is *smaller than the free space*, the record that would carry it is small too
+    /// -- and it can be held to that size rather than assumed to be, by handing the record
+    /// writer a buffer only that long. The bound is then enforced the same way [`MAX_RECORD`]
+    /// is: the writer cannot write past what it was given.
+    ///
+    /// Without it, a 64 KiB body offered in one go filled four records, found the reserve one
+    /// record wide and forty bytes of payload left, and answered short. Those forty bytes then
+    /// travelled alone, in a write of their own, because the pass that produced them ends with
+    /// a forced flush -- one extra write per stream, which cost more at concurrency 64 than
+    /// the whole of what multi-record production had gained there (130 writes against 69). The
+    /// guard is
+    /// `tests/ngnet-qmux-h3-tests/tests/concurrent_driver_writes.rs`'s multiplexed-pass ratio,
+    /// which is what fails if this clause is removed.
+    ///
+    /// `continuing` is what limits the concession to that case. A *first* record is always
+    /// given the full reserve, so an offer this connection has no room for is refused outright
+    /// rather than trickled into whatever space is left -- and an offer of nothing but an
+    /// end-of-stream marker keeps today's answer, which matters because a record that could
+    /// not be built and a record carrying a fin are both zero bytes of payload and only the
+    /// reserve tells them apart.
+    ///
+    /// The rejected alternative was to compute the record's size from the payload plus a
+    /// framing allowance. That is an assertion about dwnx's varint encoding rather than about
+    /// the buffer, and it is wrong in the direction that overruns the ceiling.
+    fn room_for(&self, remaining: usize, continuing: bool) -> Option<usize> {
+        let space = OUTBOUND_CEILING.saturating_sub(self.outbound.len());
+        if space >= MAX_RECORD {
+            return Some(MAX_RECORD);
+        }
+        // Strictly greater: the record has to hold the payload *and* its framing, and a space
+        // exactly the size of what is left cannot. Where the framing still does not fit, the
+        // record takes what it can and the call answers short, which is the same answer it
+        // would have given without this clause.
+        if continuing && space > remaining {
+            return Some(space);
+        }
+        None
+    }
+
+    /// Produces whatever the state machine has queued and writes all of it out.
     ///
     /// Returns whether everything is now on the byte stream. The ending paths need this and
     /// cannot use [`Connection::flush`] alone: a reset or a stop-sending issued just before
@@ -968,15 +1359,22 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     /// production pass turns it into a record. Flushing alone writes what is already there
     /// and silently drops what is not — which loses exactly the frames that explain to the
     /// peer why the ending is happening.
+    ///
+    /// [`Flush::Everything`] for the same reason the ending is the reason this exists: there is
+    /// no later pass. An ending that accumulated would leave the explanation in a buffer whose
+    /// connection is about to be dropped.
     fn drain_pending(&mut self, cx: &mut Context<'_>) -> Result<bool> {
-        self.write_side(cx)?;
+        self.write_side(cx, Flush::Everything)?;
         Ok(self.written >= self.outbound.len())
     }
 
     /// Offers the outbound buffer to the byte stream until it is empty or refuses.
     ///
-    /// Returns whether the buffer is now empty, which is also the question "may another record
-    /// be produced".
+    /// Returns whether the buffer is now empty. It offers `outbound[written..]` however many
+    /// records that spans, which is the whole of what accumulating them costs the write path:
+    /// the byte stream is handed a longer slice and reports a count against it exactly as
+    /// before, and `written` resumes wherever that count left off -- at a record boundary or
+    /// inside one.
     fn flush(&mut self, cx: &mut Context<'_>) -> Result<bool> {
         while self.written < self.outbound.len() {
             match self.stream.poll_write(cx, &self.outbound[self.written..]) {
@@ -1062,10 +1460,15 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         }
     }
 
-    /// Flushes, then produces one record for `stream`, then flushes again.
+    /// Produces one record for `stream`, making room for it first if the buffer is full.
     ///
-    /// Returns [`None`] when the outbound buffer could not be emptied, in which case nothing
-    /// was produced.
+    /// Returns [`None`] when the buffer cannot take another record and the byte stream would
+    /// not take enough of it to change that, in which case nothing was produced.
+    ///
+    /// It used to flush, produce and flush again, which is what made a payload cost one write
+    /// per record. Nothing is written here now unless the buffer is full; the records this
+    /// produces leave together, in the forced flush
+    /// [`Connection::poll_write_stream`] ends with.
     fn write_record(
         &mut self,
         cx: &mut Context<'_>,
@@ -1073,11 +1476,10 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         data: &[u8],
         fin: bool,
     ) -> Result<Option<Produced>> {
-        if !self.flush(cx)? {
+        if !self.room_for_record() && !self.flush(cx)? {
             return Ok(None);
         }
         let produced = self.produce(WriteRequest::stream(stream, data).with_fin(fin))?;
-        self.flush(cx)?;
         Ok(Some(produced))
     }
 
@@ -1086,7 +1488,24 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     /// A failure here is fatal and is latched as such; see the module documentation for why a
     /// retry would desynchronise the stream.
     fn produce(&mut self, request: WriteRequest<'_>) -> Result<Produced> {
+        self.produce_within(request, MAX_RECORD)
+    }
+
+    /// As [`Connection::produce`], with the record held to `room` bytes.
+    ///
+    /// `room` is a length of `scratch`, and holding a record to a size means giving the writer
+    /// nothing else to write into -- the same mechanism that makes [`MAX_RECORD`] an upper
+    /// bound rather than an expectation. A caller that has no reason to shorten a record
+    /// passes [`MAX_RECORD`] and gets the whole buffer, which is what [`Connection::produce`]
+    /// is.
+    ///
+    /// dwnx is documented as accepting a buffer smaller than a full record, and a buffer too
+    /// small to hold anything at all comes back as an empty record rather than as a failure,
+    /// so the caller sees a production that took nothing and stops -- see
+    /// [`Connection::room_for`] for who asks for a short record and why.
+    fn produce_within(&mut self, request: WriteRequest<'_>, room: usize) -> Result<Produced> {
         let now = self.clock.now();
+        let room = room.min(self.scratch.len());
         // Spelled out as a free function over three fields rather than as a method, because
         // the record writer borrows the connection and the scratch buffer for as long as the
         // record is being built, and the produced bytes are then copied out of the scratch
@@ -1094,12 +1513,27 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         // legal without a copy through a temporary.
         match pack(
             &mut self.conn,
-            &mut self.scratch,
+            &mut self.scratch[..room],
             &mut self.outbound,
             request,
             now,
         ) {
-            Ok(produced) => Ok(produced),
+            Ok(produced) => {
+                // The ceiling, checked where records are appended rather than where callers
+                // happen to look. Every caller of this asks `room_for_record` or
+                // `room_for` first and no record can exceed the room it was given, so the
+                // bound holds by construction -- which is exactly the kind of claim that stops
+                // holding when a fifth caller appears. A test can only observe the buffer
+                // between calls, so without this the peak *inside* a production run would be
+                // unmeasured.
+                debug_assert!(
+                    self.outbound.len() <= OUTBOUND_CEILING,
+                    "the outbound buffer reached {} bytes, past the {OUTBOUND_CEILING}-byte \
+                     ceiling: a record was produced without asking for room first",
+                    self.outbound.len()
+                );
+                Ok(produced)
+            }
             Err(error) => Err(self.fail(Error::from(error).with_context(
                 "serialising a record failed, which loses whatever it had already packed",
             ))),
@@ -1178,6 +1612,20 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
 enum OpenKind {
     Bidi,
     Uni,
+}
+
+/// The count if there is one, and the refusal otherwise.
+///
+/// Written once because the choice is the same at all four exits of
+/// [`Connection::try_write_stream`] and getting it wrong at one of them is not visible at the
+/// exit itself: a refusal that discarded a non-zero count would have the caller offer those
+/// bytes again, and the peer would receive them twice.
+const fn accepted_or(taken: usize, refusal: StreamWrite) -> StreamWrite {
+    if taken > 0 {
+        StreamWrite::Accepted(taken)
+    } else {
+        refusal
+    }
 }
 
 /// Builds one record into `scratch` and appends it to `outbound`.

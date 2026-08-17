@@ -2,8 +2,8 @@
 //!
 //! # Why this is measured through the whole join and not through [`Connection`] alone
 //!
-//! `crates/ngnet-qmux/tests/io_writes.rs` already pins one write per record at the QMux layer,
-//! where a test offers bytes to a connection and counts what comes out. That is the cheaper
+//! `crates/ngnet-qmux/tests/io_writes.rs` already counts writes at the QMux layer, where a test
+//! offers bytes to a connection directly and counts what comes out. That is the cheaper
 //! measurement and it is not the one Spec FR-001 is stated over. FR-001 is stated over the
 //! *driver-visible transmit pass*: the bounded run of offers the HTTP/3 layer makes to the
 //! transport -- at most sixty-four, `MAX_OFFERS` in `crates/ngnet-qmux-h3/src/transmit.rs` --
@@ -17,13 +17,36 @@
 //! stream a write log, and polls the two drivers itself through
 //! [`transmit_harness`](transmit_harness).
 //!
-//! # What is pinned, and what is expected to invert it
+//! # What is pinned now that coalescing has landed
 //!
-//! Everything asserted here is today's *unoptimized* behaviour. Phase 4 (write coalescing) is
-//! the phase that should make these assertions fail: when a pass fills its outbound buffer with
-//! many records and writes once, `RECORD_WRITES` stops being the number of writes and the
-//! largest write stops being one record. A phase that changes the shape of the writes without
-//! failing anything here has not done what it says.
+//! These assertions used to pin one write per record, and Phase 4 was expected to break them.
+//! All of them are now broken, but not in one step, and the second step is the one worth
+//! recording here.
+//!
+//! Coalescing alone left this axis almost unchanged -- 134 writes to 130 -- and the reason was
+//! not the buffer. Instrumenting the offer loop showed what a pass did: nghttp3 offered the
+//! whole remaining body in one slice, two megabytes of it, `try_write_stream` took *one
+//! record's worth* and answered short, and a short accept is backpressure, so
+//! `Offers::write_next` (`crates/ngnet-h3/src/http/driver.rs`) stood the stream aside. The pass
+//! ended with the outbound buffer a fifth full. The buffer had room for four more records and
+//! was never asked for them.
+//!
+//! What removed it was making `try_write_stream` fill records until the *buffer* stops it
+//! rather than until *a record* does, so that a short accept means what the layer above already
+//! believed it meant. A pass now moves as much of a body as the ceiling allows, and this test's
+//! upload went from 130 writes to 28 -- 2 MiB in writes of 81 910 bytes, which is the ceiling.
+//!
+//! # Why this is the file SC-001 is demonstrated in
+//!
+//! SC-001 asks for the carry arithmetic to hold over *a pass whose payload fills at least
+//! sixty-four records*, at the level a driver turn is visible. Until the fix above, no driver
+//! turn on this axis contained such a pass to demonstrate it over: the busiest turn carried a
+//! record at a time. It does now -- one turn carries the whole two megabytes, which is 128 full
+//! records -- so the criterion is checked here rather than deferred to the concurrent file,
+//! where a pass reaches sixty-four records only by adding streams.
+//!
+//! The other axis -- several streams in flight at once -- is measured in
+//! `concurrent_driver_writes.rs`, and the two are still different questions.
 //!
 //! [`Connection`]: ngnet_qmux::io::Connection
 
@@ -33,6 +56,7 @@ use bytes::Bytes;
 use http::Request;
 use http_body_util::Full;
 use ngnet_qmux::DEFAULT_MAX_RECORD_SIZE;
+use ngnet_qmux::io::OUTBOUND_CARRY;
 use ngnet_qmux::io::testing::{TestClock, stream_pair};
 use ngnet_qmux_h3::{HttpConfig, TransportConfig};
 use ngnet_qmux_h3_tests::{Payload, drain, ok, pattern};
@@ -123,8 +147,20 @@ fn upload() -> (Bytes, Turns) {
     })
 }
 
+/// The bound FR-001 states, and the write size that proves records now travel together.
+///
+/// Two claims, and they are different in kind. The first is arithmetic: with a
+/// `OUTBOUND_CARRY`-byte guaranteed carry, no transmit pass can issue more writes than the
+/// output it produced divided by that carry, rounded up. It holds here with room to spare and
+/// it is not the interesting one, because a pass on this axis produces one record.
+///
+/// The second is the observable consequence of coalescing: a write larger than one record. It
+/// was impossible before -- the connection flushed each record as it produced it, so no write
+/// could carry more than `RECORD` bytes -- and it is what says the buffer is doing its job at
+/// all. The largest write here carries the request's head record together with the first body
+/// record, which is the one pass on this axis that has two records to merge.
 #[test]
-fn today_a_transmit_pass_writes_once_per_record() {
+fn a_write_can_carry_more_than_one_record() {
     let (echoed, turns) = upload();
     assert_eq!(
         echoed,
@@ -133,46 +169,95 @@ fn today_a_transmit_pass_writes_once_per_record() {
          something other than the transfer this test claims to measure"
     );
 
-    let full = turns.lengths.iter().filter(|len| **len == RECORD).count();
-    assert_eq!(
-        full,
-        FULL_RECORDS,
-        "the body should have filled {FULL_RECORDS} records and did not, so the workload is no \
-         longer the one the counts below were measured for. {} writes were issued in total, the \
-         largest {} bytes; the first few were {:?}",
-        turns.total(),
-        turns.lengths.iter().copied().max().unwrap_or(0),
-        &turns.lengths[..8.min(turns.lengths.len())]
+    let largest = turns.lengths.iter().copied().max().unwrap_or(0);
+    assert!(
+        largest > RECORD,
+        "no write carried more than one record ({largest} bytes at most, against a record cap \
+         of {RECORD}), so nothing was coalesced at all. Before this change the connection \
+         flushed each record as it produced it and this was the one thing that could not \
+         happen; if it has stopped happening, either the outbound buffer is being flushed \
+         between records again or the forced flush has moved somewhere that runs per record"
     );
 
-    let largest = turns.lengths.iter().copied().max().unwrap_or(0);
-    assert_eq!(
-        largest, RECORD,
-        "today the connection flushes each record as it is produced -- `write_record` in \
-         `crates/ngnet-qmux/src/io/conn.rs` flushes, produces one record and flushes again -- so \
-         no write can carry more than the one record that was outstanding. Phase 4 (write \
-         coalescing) is expected to break this: a pass that fills the outbound buffer and writes \
-         once will issue writes far larger than a single record"
+    let bytes: usize = turns.lengths.iter().sum();
+    assert!(
+        turns.total() <= bytes.div_ceil(OUTBOUND_CARRY) + turns.lengths.len(),
+        "the run issued {} writes for {bytes} bytes, which no arrangement of a \
+         {OUTBOUND_CARRY}-byte carry can produce",
+        turns.total()
     );
+}
+
+/// A single stream's body no longer costs a write per record, and a turn obeys the carry.
+///
+/// This is SC-001 at the level it is stated over. Two claims, and the first is the criterion:
+/// the turn that carries the body issues no more writes than the bytes it carried divided by
+/// the *guaranteed carry*, rounded up. The payload it is demonstrated over fills 128 full
+/// records, which is comfortably the "at least sixty-four" the criterion asks for -- and the
+/// record count is asserted rather than assumed, because a turn that carried less would satisfy
+/// the arithmetic without demonstrating anything.
+///
+/// The second is the guard FR-027 asks for: the run issues fewer writes than the body takes
+/// records. Removing multi-record production restores one write per record on this axis and
+/// that inequality inverts immediately -- it was 130 writes against 128 records before the fix
+/// and 28 against 128 after it -- so this fails if the optimization is taken out, which is what
+/// it is here for.
+///
+/// Stated as inequalities against measured quantities rather than as the write counts
+/// themselves, because the counts move with QPACK output and framing overhead and this test is
+/// not entitled to freeze either.
+#[test]
+fn a_body_that_fills_sixty_four_records_writes_by_the_carry() {
+    let (_echoed, turns) = upload();
+
+    // Grouped so a turn's writes and the bytes they carried are the same turn's, which is what
+    // the criterion is stated over: a bound on writes per byte within one pass says nothing if
+    // the numerator and the denominator come from different passes.
+    let mut per_turn: Vec<Vec<usize>> = Vec::with_capacity(turns.writes.len());
+    let mut cursor = 0;
+    for count in &turns.writes {
+        per_turn.push(turns.lengths[cursor..cursor + count].to_vec());
+        cursor += count;
+    }
+    assert_eq!(
+        cursor,
+        turns.lengths.len(),
+        "the per-turn counts do not account for every write, so grouping them by turn would \
+         misattribute one"
+    );
+
+    let busiest = per_turn
+        .iter()
+        .max_by_key(|turn| turn.iter().sum::<usize>())
+        .expect("the upload issued writes");
+    let carried: usize = busiest.iter().sum();
+    let records = carried / RECORD;
 
     assert!(
-        turns.busiest() >= FULL_RECORDS,
-        "today one poll of the driver carries the whole body and pays a write for every record \
-         in it, so the busiest turn should issue at least {FULL_RECORDS} writes; it issued {}. \
-         The measured figure is 134: the four remaining preamble records, the request's header \
-         record, {FULL_RECORDS} full body records and the body's remainder record, all in the \
-         turn that follows the one carrying the client's announcement. Phase 4 is expected to \
-         break this assertion, since FR-001 requires that pass to write a number of times \
-         proportional to the payload divided by what one write can carry, not to the record \
-         count. Per-turn writes: {:?}",
-        turns.busiest(),
+        records >= 64,
+        "the busiest turn carried {carried} bytes, which is {records} full records: SC-001 is \
+         stated over a pass whose payload fills at least sixty-four, so a turn smaller than \
+         that demonstrates the arithmetic over a workload the criterion does not cover. Writes \
+         per turn: {:?}",
+        turns.writes
+    );
+    assert!(
+        busiest.len() <= carried.div_ceil(OUTBOUND_CARRY),
+        "the busiest turn issued {} writes for {carried} bytes, more than the {} a \
+         {OUTBOUND_CARRY}-byte guaranteed carry accounts for. Writes per turn: {:?}",
+        busiest.len(),
+        carried.div_ceil(OUTBOUND_CARRY),
         turns.writes
     );
 
     assert!(
-        turns.total() > FULL_RECORDS,
-        "the run as a whole issued {} writes for {FULL_RECORDS} body records, which is fewer \
-         than the records themselves; the log is not recording what this test thinks it is",
-        turns.total()
+        turns.total() < FULL_RECORDS,
+        "the run issued {} writes for a body of {FULL_RECORDS} full records, which is at least \
+         one apiece: a write per record is what this file measured before `try_write_stream` \
+         filled more than one record per call, so this is what fails if that is taken out \
+         again. The largest write was {} bytes; the first few were {:?}",
+        turns.total(),
+        turns.lengths.iter().copied().max().unwrap_or(0),
+        &turns.lengths[..8.min(turns.lengths.len())]
     );
 }

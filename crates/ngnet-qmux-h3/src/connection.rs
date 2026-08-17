@@ -228,7 +228,11 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
         };
         match opened {
             // The open itself is only a record; pumping again is what puts it on the wire,
-            // and the peer will not answer on a stream it has not heard of.
+            // and the peer will not answer on a stream it has not heard of. Forced rather than
+            // buffered, unlike the pumps between offers: a driver opens the streams a pass
+            // needs before it offers anything onto any of them, so there is nothing buffered
+            // here for a record to accumulate with, and the buffered form was measured across
+            // the concurrency sweep and saved no write anywhere.
             Poll::Ready(Ok(id)) => {
                 pump::pump(self, cx);
                 Poll::Ready(Ok(stream_id(id)))

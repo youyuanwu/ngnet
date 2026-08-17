@@ -2,10 +2,10 @@
 //!
 //! # Why this exists beside `driver_writes.rs`
 //!
-//! `driver_writes.rs` pins the cost of a *single* stream carrying a large body: one write per
-//! record, and one turn that carries the lot. That is the body axis. This file measures the
-//! other axis — the number of streams in flight — because the two are not the same question
-//! and the plan's central inference depends on which one is answered.
+//! `driver_writes.rs` pins the cost of a *single* stream carrying a large body: a write per
+//! carry-sized buffer, and one turn that carries the lot. That is the body axis. This file
+//! measures the other axis — the number of streams in flight — because the two are not the
+//! same question and the plan's central inference depends on which one is answered.
 //!
 //! The inference under test is recorded in `.paw/work/qmux-h3-perf/ImplementationPlan.md`: the
 //! HTTP/2 stack measured a large gain from writing once per pass rather than once per protocol
@@ -16,16 +16,43 @@
 //! concurrency, and it is answered by counting writes per turn as the number of open streams
 //! grows.
 //!
-//! # What is pinned, and what is expected to invert it
+//! # What is pinned now that coalescing has landed
 //!
-//! Everything asserted here is today's *unoptimized* behaviour, exactly as in
-//! `driver_writes.rs`. The claims are deliberately shape claims rather than exact counts —
-//! that writes per turn scale with the streams in flight, and that a coalescing buffer of a
-//! stated capacity could remove almost all of them — because the exact counts depend on QPACK
-//! output sizes and on how the harness's round-robin interleaves the two drivers, neither of
-//! which this work is entitled to freeze. Phase 4 (write coalescing) is the phase expected to
-//! fail these: once a turn's records leave in one write, `per_turn` collapses towards one and
-//! the removable count collapses towards zero.
+//! These assertions used to pin today's unoptimized behaviour and to name Phase 4 as the phase
+//! expected to break them. It did break two of them and it did not break the third, and the
+//! difference between those two outcomes is the finding this file now records.
+//!
+//! Coalescing merges the records produced within one *transmit pass*, because a pass must end
+//! with a forced write -- nothing else is obliged to come along and move what it produced
+//! (FR-003). So a point in this grid improves in proportion to how many records a pass has to
+//! merge:
+//!
+//! - **A multiplexed pass carrying bodies** offers stream after stream before it ends, and their
+//!   records leave together. This is where the gain is, and it is large: at concurrency 64 with
+//!   64 KiB bodies the run fell from 390 writes to 66, and with 1 MiB bodies from 4230 to 848.
+//!   The 64 KiB figures were 69 and 897 with coalescing alone; the rest came from making one
+//!   offer fill records to the buffer's ceiling rather than stopping at the first, which is
+//!   what the body axis needed and what this axis got for free.
+//!
+//!   That second change is also what this file's multiplexed-pass ratio now guards from the
+//!   other side. A call that fills records to a *full-record* reserve
+//!   strands the last few dozen bytes of each body, and a pass ends with a forced write, so
+//!   those tails leave one write apiece: 130 writes at concurrency 64 with 64 KiB bodies,
+//!   worse than coalescing alone. The tail-fit clause in `Connection::room_for` is what this
+//!   ratio fails without.
+//! - **A pass carrying one empty-bodied request** has one small record in it and nothing to
+//!   merge. The empty-body arm therefore barely moves -- 70 writes to 66 at concurrency 64 --
+//!   and what did move is the connection preamble rather than the requests. The cause is not the
+//!   buffer: it is that each request is submitted in a driver pass of its own, and every pass
+//!   owes its driver a write.
+//!
+//! The plan expected the second of those to collapse too, from a model in
+//! `.paw/work/qmux-h3-perf/Phase2Screen.md` that merged every write within a harness *turn*.
+//! A turn is a poll of the connection future and contains many passes, so the model was an upper
+//! bound rather than a prediction, and the distance between them is exactly the per-pass forced
+//! write. Making that smaller is a question about how the driver batches submissions, not about
+//! what the transport does with what it is handed; it is recorded in
+//! `docs/qmux-h3/pending-work.md`.
 //!
 //! Run with `--nocapture` to see the table these figures were reported from; the numbers are
 //! printed rather than only asserted because the screen in
@@ -42,6 +69,7 @@ use http::Request;
 use http_body_util::Full;
 use ngnet_qmux::DEFAULT_MAX_RECORD_SIZE;
 use ngnet_qmux::io::testing::{TestClock, stream_pair};
+use ngnet_qmux::io::{OUTBOUND_CARRY, OUTBOUND_CEILING};
 use ngnet_qmux_h3::{HttpConfig, TransportConfig};
 use ngnet_qmux_h3_tests::{Payload, drain, ok, pattern};
 use transmit_harness::{Turns, collected};
@@ -357,14 +385,22 @@ fn sweep(body: usize) -> Vec<Point> {
     points
 }
 
-/// Prints the whole grid the screen quotes, and asserts the one thing that has to hold across
+/// Prints the whole grid the screen quotes, and asserts the two things that have to hold across
 /// all of it.
 ///
 /// Separate from the shape assertions below because it is the expensive one — 1 MiB across 64
 /// streams is driven a poll at a time — and because what it exists to show is a *table*, not a
 /// single inequality.
+///
+/// The claim that used to live here was that no write could exceed one record, because the
+/// connection flushed each record as it produced it. Its replacement is the pair of bounds that
+/// coalescing is supposed to hold between: no write is larger than the buffer is allowed to
+/// grow, which is FR-004's ceiling observed from outside the crate that declares it, and no
+/// point issues more writes than its bytes divided by the guaranteed carry plus one per pass,
+/// which is FR-001's arithmetic with the per-pass forced write named as the term it cannot
+/// remove.
 #[test]
-fn today_every_point_in_the_sweep_writes_once_per_record() {
+fn every_point_in_the_sweep_stays_within_the_ceiling() {
     for body in BODIES {
         for point in sweep(body) {
             let largest = point
@@ -375,102 +411,136 @@ fn today_every_point_in_the_sweep_writes_once_per_record() {
                 .max()
                 .unwrap_or(0);
             assert!(
-                largest <= RECORD,
-                "today the connection flushes each record as it is produced -- `write_record` \
-                 in `crates/ngnet-qmux/src/io/conn.rs` flushes, produces one record and flushes \
-                 again -- so no write can carry more than one record. A write of {largest} \
-                 bytes at concurrency {} with a {body}-byte body means two records travelled \
-                 together, which is what Phase 4 is expected to make true everywhere in this \
-                 grid",
+                largest <= OUTBOUND_CEILING,
+                "a write of {largest} bytes at concurrency {} with a {body}-byte body exceeds \
+                 the {OUTBOUND_CEILING}-byte ceiling the outbound buffer is allowed to reach. \
+                 The buffer may only begin a record while a whole record still fits under the \
+                 ceiling, so a larger write means either the ceiling moved or a record was \
+                 begun without checking for room",
                 point.concurrency
+            );
+
+            let passes = point.total;
+            assert!(
+                point.total <= point.bytes().div_ceil(OUTBOUND_CARRY) + passes,
+                "the point at concurrency {} with a {body}-byte body issued {} writes for {} \
+                 bytes, which a {OUTBOUND_CARRY}-byte carry cannot account for even allowing \
+                 one forced write per pass",
+                point.concurrency,
+                point.total,
+                point.bytes()
             );
         }
     }
 }
 
+/// A write now carries more than one record wherever a pass has more than one to carry.
+///
+/// The direct inversion of the old grid-wide claim, and the narrowest statement that is true:
+/// not "every write is large" but "a write is no longer capped at a record". A 64 KiB body
+/// gives every pass several records even at concurrency 1, which is why this arm is the one
+/// asserted on; an empty-bodied pass has a single small record and merging it with nothing
+/// produces a write the size of one record, which would make this assertion fail for a reason
+/// that has nothing to do with the buffer.
 #[test]
-fn today_writes_per_turn_grow_with_the_streams_in_flight() {
-    let points = sweep(EMPTY);
-    let single = &points[0];
-    let many = &points[points.len() - 1];
+fn a_write_carries_several_records_when_a_pass_produces_several() {
+    for point in sweep(LARGE) {
+        let largest = point
+            .turn_lengths
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        assert!(
+            largest > RECORD,
+            "no write at concurrency {} carried more than one record ({largest} bytes at most, \
+             against a record cap of {RECORD}), so nothing was coalesced. Each {LARGE}-byte \
+             body is four full records and a remainder, so a pass has records to merge whatever \
+             the concurrency; a largest write of one record means they are being flushed as \
+             they are produced again",
+            point.concurrency
+        );
+    }
+}
 
-    assert_eq!(
-        single.concurrency, 1,
-        "the first point must be the single-stream one"
-    );
+/// A multiplexed pass writes far less often than it produces records.
+///
+/// This is the reduction the whole work was undertaken for, stated as a ratio rather than as a
+/// count so that it survives QPACK output sizes and the harness's interleaving, neither of which
+/// this test is entitled to freeze.
+///
+/// Only the multiplexed points are asserted on, and deliberately: a pass needs more than one
+/// record in it before merging can remove anything, and at concurrency 1 with a 64 KiB body a
+/// pass carries one body record. That is not a weakness of the ceiling -- it is the same
+/// single-stream limit `driver_writes.rs` pins and explains.
+#[test]
+fn a_multiplexed_pass_writes_far_less_often_than_it_produces_records() {
+    let points = sweep(LARGE);
+
+    for point in &points {
+        if point.concurrency < 8 {
+            continue;
+        }
+        let records = point.bytes().div_ceil(RECORD);
+        assert!(
+            point.total * 2 < records,
+            "at concurrency {} with {LARGE}-byte bodies the run moved {} bytes -- at least \
+             {records} records -- in {} writes, so a write carried fewer than two records on \
+             average where the measurements this was written from carried between two and a \
+             half and four. Writes per turn: {:?}",
+            point.concurrency,
+            point.bytes(),
+            point.total,
+            point.per_turn
+        );
+    }
+}
+
+/// An empty-bodied request still costs about one write, and the buffer is not what decides it.
+///
+/// The guard that did *not* invert, kept as a guard on a deficiency so that the day it does
+/// invert somebody has to come here and say why.
+///
+/// Each request is submitted in a driver pass of its own; the pass produces one small head
+/// record and then owes its driver a write, because FR-003 forbids leaving output waiting for a
+/// later pass that may never come. There is nothing in the buffer to merge it with. A larger
+/// ceiling would change nothing; what would change it is the driver submitting several requests
+/// before it transmits, which is above this layer.
+#[test]
+fn an_empty_bodied_request_still_costs_about_a_write() {
+    let points = sweep(EMPTY);
+    let many = &points[points.len() - 1];
     assert_eq!(
         many.concurrency, 64,
         "the last point must be the sixty-four-stream one"
     );
 
     assert!(
-        many.busiest() > 8 * single.busiest(),
-        "with empty bodies the only thing that can add writes to a turn is another stream, so \
-         a turn at concurrency 64 should carry many times the writes a turn at concurrency 1 \
-         does; it carried {} against {}. If this stops being true, the multiplexed pass this \
-         stack is being optimized for does not exist and Phase 4's expected gain has no \
-         mechanism. Per-turn writes at 64: {:?}",
-        many.busiest(),
-        single.busiest(),
+        many.total >= many.concurrency,
+        "sixty-four empty-bodied requests cost {} writes, fewer than one each. That is better \
+         than this test expects and the improvement should be described here rather than \
+         passing unremarked: something has begun merging across passes, or the driver has begun \
+         submitting more than one request per pass. Writes per turn: {:?}",
+        many.total,
         many.per_turn
     );
 
     assert!(
-        many.total > 8 * single.total,
-        "total writes should scale with the streams in flight when each stream's payload is \
-         empty; {} against {}",
-        many.total,
-        single.total
+        many.total < 2 * many.concurrency,
+        "sixty-four empty-bodied requests cost {} writes, which is more than the one per request \
+         their passes account for, so something is writing more than once per pass",
+        many.total
     );
-}
 
-#[test]
-fn today_a_multiplexed_turn_is_almost_entirely_coalescable() {
-    let points = sweep(EMPTY);
-    let many = &points[points.len() - 1];
-
-    for capacity in CAPACITIES {
-        let coalesced = many.coalesced(capacity);
-        assert!(
-            coalesced * 4 < many.total,
-            "at concurrency 64 with empty bodies the records of one turn are small and many, so \
-             a coalescing buffer of {capacity} bytes should absorb the great majority of them: \
-             {} writes should fall well below a quarter of the {} issued today, and fell to \
-             {coalesced}. Phase 4 is expected to make this assertion unmeasurable by making the \
-             two figures equal",
-            coalesced,
-            many.total
-        );
-    }
-}
-
-#[test]
-fn today_a_large_body_adds_records_that_coalescing_can_also_absorb() {
-    let points = sweep(LARGE);
-
-    for point in &points {
-        let full = point
-            .turn_lengths
-            .iter()
-            .flatten()
-            .filter(|len| **len == RECORD)
-            .count();
-        assert!(
-            full >= 4 * point.concurrency,
-            "each {LARGE}-byte body fills four whole records, so {} streams should produce at \
-             least {} full-record writes; {full} were seen. A shortfall means the workload is \
-             no longer the one these figures were measured for",
-            point.concurrency,
-            4 * point.concurrency
-        );
-
-        // The unbounded figure is the ceiling on what coalescing could ever remove, so a point
-        // where it is not below today's count is a point where coalescing has nothing to win.
-        assert!(
-            point.coalesced(usize::MAX) < point.total,
-            "coalescing must be able to remove at least one write at concurrency {} with a \
-             {LARGE}-byte body, or there is nothing here for Phase 4 to do",
-            point.concurrency
-        );
-    }
+    let single = &points[0];
+    assert!(
+        many.busiest() > 8 * single.busiest(),
+        "with empty bodies a turn's writes still track the streams in flight, because each \
+         stream is submitted in a pass of its own and each pass writes once: {} against {}. If \
+         this has stopped being true the per-pass cost has gone, and this file's account of why \
+         the empty arm barely moved is out of date",
+        many.busiest(),
+        single.busiest()
+    );
 }

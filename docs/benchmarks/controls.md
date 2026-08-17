@@ -110,24 +110,29 @@ what remained after that was done.
   **biases against the QMux arms** and is contingent rather than structural, which is the whole
   reason a cross-protocol figure licenses a statement about these two stacks today and not
   about the two protocols.
-- **A multi-slice offer is written one slice at a time.** Named separately from the point above
+- **A multi-slice offer starts a record per slice.** Named separately from the point above
   because it is the same *kind* of effect as the write-path asymmetry at the top of this page,
   and that one turned out to account for an entire 2.3× spread. `ngnet-h2`'s tokio transport
   emits one `writev` per driver pass; the QMux join issues one write per `IoSlice` and stops at
-  the first not fully accepted, and the layer below refuses a second production while a record
-  is outstanding — so a fragmented offer costs one record and one pump pass per slice. This
-  **biases against the QMux arms, and biases them more on the socket family than on the duplex
-  family**, because that is where a write is a syscall. It is the first thing to test against
-  if a socket-family gap is ever found to exceed its duplex counterpart.
-- **Buffering: one record outstanding, against a 1 MiB pipe.** A QMux connection holds two
-  16382-byte buffers and permits at most one record outstanding at a time, where the duplex
-  family's in-memory pipe is 1 MiB deep and the HTTP/2 arm may fill it. The pipe is sized so
-  that it is not the bottleneck for the HTTP/2 arms; for the QMux arms the record discipline is
-  the bottleneck long before the pipe is. This **biases against the QMux arms on the duplex
-  family** and is a harness-visible consequence of the protocol's own design rather than a
-  choice the harness made — the pipe's capacity is equal for both arms, and equalising the
-  *effect* would mean shrinking the pipe until it constrained the HTTP/2 arm too, which would
-  change arms whose measurements are already recorded.
+  the first not fully accepted, and the layer below begins a fresh record for each — so a
+  fragmented offer costs a record boundary per slice where a vectored push would pack them into
+  one. It used to cost a pump pass per slice as well, because a second production was refused
+  while a record was outstanding; write coalescing removed that half. This **biases against the
+  QMux arms, and biases them more on the socket family than on the duplex family**, because that
+  is where a write is a syscall. It is the first thing to test against if a socket-family gap is
+  ever found to exceed its duplex counterpart.
+- **Buffering: an 80 KiB outbound ceiling, against a 1 MiB pipe.** A QMux connection accumulates
+  records up to `OUTBOUND_CEILING` — a 64 KiB guaranteed carry plus one record's reserve — and
+  writes what it has, where the duplex family's in-memory pipe is 1 MiB deep and the HTTP/2 arm
+  may fill it. The figure in this entry used to be one 16382-byte record, which is what the
+  arms recorded before write coalescing ran against; the ceiling is roughly five times that and
+  the bias is correspondingly smaller, not gone. The pipe is sized so that it is not the
+  bottleneck for the HTTP/2 arms; for the QMux arms the ceiling is still the bottleneck first.
+  This **biases against the QMux arms on the duplex family** and is a harness-visible consequence
+  of a bound the transport chose rather than a choice the harness made — the pipe's capacity is
+  equal for both arms, and equalising the *effect* would mean shrinking the pipe until it
+  constrained the HTTP/2 arm too, which would change arms whose measurements are already
+  recorded.
 
 Controlled rather than merely disclosed, on the cross-protocol pair specifically: both arms run
 on a single-worker runtime with drivers on plain `tokio::spawn` — the QMux join imposes no

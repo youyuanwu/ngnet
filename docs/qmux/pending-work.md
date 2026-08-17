@@ -55,7 +55,9 @@ record being built exactly once — which is what `RETAINS_BUFFERS = false` mean
 Outbound within this crate there is one more: a record is serialised into a scratch buffer and
 then copied into the outbound queue. That one is an artefact of `RecordWriter` borrowing both
 the connection and its destination buffer for the whole record, which is the borrow that makes
-the write path sound at all (see `design.md`), and it is bounded by one record.
+the write path sound at all (see `design.md`). Each copy is bounded by one record; the queue it
+copies into is bounded by `OUTBOUND_CEILING`, since coalescing let it hold more than one record
+at a time.
 
 These copies have still not been costed. The benchmark suite in `docs/benchmarks/` now runs
 `ngnet-qmux-h3` end to end over this layer, so the sentence that used to stand here — that
