@@ -48,6 +48,35 @@ In `tests/ngnet-qmux-h3-tests/`, over the in-memory pair and over a loopback TCP
 | **A client that disappears is not a protocol failure** | `loopback.rs`, `a_client_that_disappears_is_not_a_protocol_failure`, over a real socket, because a peer that vanishes is a property of the transport rather than of the harness. |
 | **A request completes over loopback TCP** | `loopback.rs`, `a_request_completes_over_loopback_tcp`. The in-memory pair is a legitimate deployment of QMux rather than a stand-in, but it preserves write boundaries a socket does not. |
 
+## Enforced about the configuration passthrough
+
+In `tests/ngnet-qmux-h3-tests/tests/config.rs`. Every assertion here is made against what the
+**peer** received rather than against what this end was told, because a configuration that is
+accepted, stored and then not sent leaves every exchange working exactly as it did — a test
+that only checked an exchange succeeded would pass over a passthrough that dropped its argument
+on the floor. The observer is a bare `ngnet_qmux::io::Connection` opposite the subject, which
+sees the transport parameters as `Event::PeerTransportParams` and the HTTP/3 SETTINGS frame as
+ordinary control-stream bytes it decodes. That is a stronger claim than any accessor on
+`QmuxConnection` would give, and it is available today, whereas the accessor is not — see the
+observability entry in `pending-work.md`.
+
+| Property | Where |
+| --- | --- |
+| **A supplied transport configuration reaches the peer, in both roles** | `a_server_advertises_the_transport_configuration_it_was_given` and `a_client_advertises_the_transport_configuration_it_was_given`. Both roles are asserted because they are separate code paths and a passthrough wired into one of them is the likely half-fix. |
+| **A supplied HTTP/3 configuration reaches the peer's SETTINGS** | `the_http3_configuration_reaches_the_connections_settings`. Transport parameters and SETTINGS travel by entirely different means, so the transport assertion says nothing about the HTTP half. |
+| **A connection built through the new entry points still exchanges** | `a_connection_built_with_a_supplied_configuration_exchanges_bodies_both_ways`. Advertising the right numbers and working are different claims. |
+| **The defaulting entry points advertise what they always did** | `the_defaulting_entry_points_advertise_what_they_always_did` and `the_defaulting_entry_points_still_exchange`. `connect`/`serve` forward the defaults, so their behaviour is unchanged by construction; these pin it so that a later change to the defaults is a decision rather than a silent difference. |
+
+Two of that file's tests pin **defects rather than features**, deliberately, so that fixing
+either is a test failure and a decision:
+
+| Behaviour pinned | Where |
+| --- | --- |
+| **A stream allowance is spent once and never returned** | `a_small_stream_allowance_is_spent_once_and_never_returned`. `max_streams_bidi` is a lifetime budget, not a concurrency limit, and nothing calls `extend_stream_limit` when a stream closes — so a connection that outlives its allowance presents that as a request which never resolves rather than as an error. The test uses a bounded wait, because the behaviour it asserts is a hang. |
+| **An allowance above the transport maximum fails the connection rather than being rejected** | `a_stream_allowance_at_the_transport_maximum_is_accepted` and `a_stream_allowance_above_the_transport_maximum_fails_the_connection`. `TransportParams::validate` only checks that the value fits a varint, so a value above dwnx's `1 << 60` ceiling passes validation and then fails at setup. |
+
+Both are recorded in `pending-work.md`, which is where the argument for changing them belongs.
+
 ## Enforced about the workspace
 
 In `tests/ngnet-workspace-tests/`.

@@ -21,6 +21,7 @@ use http_body_util::{BodyExt, Full};
 use ngnet_h3::http::{IncomingBody, SendRequest};
 use ngnet_qmux::io::testing::{TestByteStream, TestClock, stream_pair};
 use ngnet_qmux::io::{TokioClock, TokioStream};
+use ngnet_qmux_h3::{HttpConfig, TransportConfig};
 use tokio::net::TcpStream;
 
 /// The body type the tests send and receive.
@@ -82,6 +83,43 @@ where
 
     let (sender, connection) =
         ngnet_qmux_h3::connect::<_, _, Out>(client_io, clock).expect("starting the client");
+    tokio::task::spawn_local(async move {
+        let _ = connection.await;
+    });
+    sender
+}
+
+/// [`memory_pair`], with configurations other than the defaults.
+///
+/// Both ends are built through the `_with` entry points and both are given the *same* pair of
+/// configurations. That is deliberate rather than incidental: a QMux end's transport
+/// configuration is a set of permissions it advertises to its peer, so configuring one end
+/// only would leave a test unable to say which direction its observation came from. A test
+/// that needs the asymmetry — the stream allowance a server grants a client, say — should
+/// build the two ends itself from [`memory_streams`].
+///
+/// # Panics
+///
+/// If either end cannot be built.
+pub fn memory_pair_with<H, F, B>(handler: H, transport: TransportConfig, http: HttpConfig) -> Sender
+where
+    H: FnMut(Request<IncomingBody>) -> F + 'static,
+    F: Future<Output = Response<B>> + 'static,
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn core::error::Error + Send + Sync>>,
+{
+    let (client_io, server_io) = stream_pair();
+    let clock = TestClock::new();
+
+    let server = ngnet_qmux_h3::serve_with(server_io, clock.clone(), handler, transport, http)
+        .expect("serving");
+    tokio::task::spawn_local(async move {
+        let _ = server.await;
+    });
+
+    let (sender, connection) =
+        ngnet_qmux_h3::connect_with::<_, _, Payload>(client_io, clock, transport, http)
+            .expect("starting the client");
     tokio::task::spawn_local(async move {
         let _ = connection.await;
     });

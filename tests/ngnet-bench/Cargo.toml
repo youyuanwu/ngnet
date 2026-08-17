@@ -1,0 +1,94 @@
+[package]
+name = "ngnet-bench"
+version = "0.1.0"
+description = "Criterion benchmarks for this workspace's HTTP/2 and HTTP/3-over-QMux stacks: ngnet-h2 against hyper, ngnet-h2 against ngnet-qmux-h3, and completion I/O against readiness I/O"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# This crate exists so the comparison against a third-party HTTP/2 stack lives outside
+# `ngnet-h2`, which takes exactly one dependency and no dev-dependencies. Everything the
+# benches need is declared in the workspace and pulled in here, never there. The same
+# reasoning now covers the cross-protocol arms: `ngnet-qmux-h3` is held to the same rule, so
+# whatever an HTTP/3-over-QMux arm needs is declared here rather than in the crate it
+# measures. A benchmark crate outside every measured crate is also what lets one comparison
+# span two protocol families without either family depending on the other.
+[dependencies]
+# The `tokio` feature supplies this crate's own `TokioIo` transport adapter; `completion`
+# supplies `CompioIo`, the io_uring transport the second benchmark family measures. Both
+# adapters ship in `ngnet-h2`; this crate only enables them.
+ngnet-h2 = { workspace = true, features = ["tokio", "completion"] }
+# The cross-protocol arms. `ngnet-qmux-h3` is the join being measured; it takes its byte
+# stream and its clock from a caller, which is why `ngnet-qmux` appears here directly rather
+# than only underneath it — `TokioStream` and `TokioClock` live behind its off-by-default
+# `tokio` feature, and without the feature neither type exists. `ngnet-h3` supplies the
+# request handle and the incoming-body type the fixtures name; the join re-exports the two
+# configurations but not those, so a crate that drives a connection needs it by name.
+#
+# A benchmark crate is allowed to take all three where a library crate is not: the structural
+# check in `tests/ngnet-workspace-tests/tests/dependency_graph.rs` lists library crates, so
+# nothing here widens what any shipped crate may reach.
+ngnet-qmux-h3.workspace = true
+ngnet-qmux = { workspace = true, features = ["tokio"] }
+ngnet-h3.workspace = true
+tokio.workspace = true
+# The completion runtime under test. Its `criterion` feature adds the `AsyncExecutor` impl
+# for compio's `Runtime`, so `b.to_async(&compio_runtime)` drives it exactly as the tokio
+# benches drive a tokio runtime.
+compio = { workspace = true, features = ["criterion"] }
+
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+# The library target carries fixtures, not benchmarks, and libtest would otherwise be handed
+# the Criterion arguments meant for the benches below — `cargo bench -- --save-baseline x`
+# fails on `Unrecognized option` before a single measurement is taken. Excluding the lib from
+# `cargo bench` costs nothing: `cargo test` still builds and tests it.
+[lib]
+bench = false
+
+# `harness = false` on each bench hands the whole `main` to Criterion rather than to
+# libtest, which is what lets Criterion time and report the iterations itself.
+[[bench]]
+name = "serial_latency"
+harness = false
+
+[[bench]]
+name = "concurrent_throughput"
+harness = false
+
+[[bench]]
+name = "body_throughput"
+harness = false
+
+# The real-socket family. Same three measures as above, over a real loopback TCP connection,
+# with three arms: `CompioSocket` (ngnet-h2 on io_uring), `TokioSocket` (ngnet-h2 on epoll) and
+# `HyperSocket` (hyper on epoll). Read pairwise — the first two isolate the I/O model, the
+# last two isolate the HTTP/2 stack.
+[[bench]]
+name = "transport_serial_latency"
+harness = false
+
+[[bench]]
+name = "transport_concurrent_throughput"
+harness = false
+
+[[bench]]
+name = "transport_body_throughput"
+harness = false
+
+[[bench]]
+name = "shared_body"
+harness = false
+
+[[bench]]
+name = "transport_shared_body"
+harness = false

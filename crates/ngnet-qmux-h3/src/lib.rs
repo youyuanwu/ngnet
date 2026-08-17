@@ -47,9 +47,17 @@
 //! # What this crate does not do
 //!
 //! No sockets, no runtime, no timer, no TLS. A byte stream and a clock come in; whoever
-//! built them owns those concerns. It also holds no configuration of its own: the QMux
-//! defaults are what a connection gets, and a caller who needs other ones is better served
-//! by an argument this crate does not yet have than by a knob that only half works.
+//! built them owns those concerns. It also holds no configuration of its own, and that is
+//! still true now that the entry points take one: [`connect_with`] and [`serve_with`] carry
+//! a [`TransportConfig`] and an [`HttpConfig`] straight through to the two layers that own
+//! them, and this crate neither defaults them itself nor restates a field of either. A knob
+//! of its own would be a third place to look for the answer to a question two crates already
+//! answer.
+//!
+//! Both types are re-exported here so that reaching a `_with` entry point does not oblige a
+//! caller to depend on `ngnet-qmux` or `ngnet-h3` directly merely to name an argument. They
+//! are renamed on the way through because both are called `Config` where they live, and a
+//! crate that hands a caller two of them cannot leave the reader to work out which is which.
 
 #![deny(missing_docs)]
 // This crate is a join between two safe APIs and has no FFI boundary of its own. Unlike the
@@ -63,5 +71,19 @@ mod event;
 mod pump;
 mod transmit;
 
-pub use connection::{Connected, Connection, QmuxConnection, connect, serve};
+pub use connection::{
+    Connected, Connection, QmuxConnection, connect, connect_with, serve, serve_with,
+};
 pub use error::{Error, ErrorKind, Result};
+/// The HTTP/3 layer's configuration, as [`connect_with`] and [`serve_with`] take it.
+///
+/// `ngnet_h3::http::Config` under a name that says which of this crate's two configurations
+/// it is. Nothing is added and nothing is hidden: it is the same type, so a value built
+/// through `ngnet-h3` directly is the same value.
+pub use ngnet_h3::http::Config as HttpConfig;
+/// The QMux transport's configuration, as [`connect_with`] and [`serve_with`] take it.
+///
+/// `ngnet_qmux::io::Config` under a name that says which of this crate's two configurations
+/// it is. Nothing is added and nothing is hidden: it is the same type, so a value built
+/// through `ngnet-qmux` directly is the same value.
+pub use ngnet_qmux::io::Config as TransportConfig;
