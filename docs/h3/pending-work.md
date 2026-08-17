@@ -81,6 +81,27 @@ without reporting acknowledgement**, which the sans-I/O core does not currently 
 would be a small addition beside `add_ack_offset`, and it is deliberately not being invented
 speculatively before a transport that needs it exists.
 
+### A stream this end resets keeps its body registered until the connection is dropped
+
+`Conn::close_stream` is the only thing that releases a stream's body entry, and the driver
+reaches it from one place: a `StreamClosed` event. A transport reports that for a stream the
+*peer* finished with, and none of them reports it for a reset this end issued — the layer
+asked for the reset, so there is nothing to tell it. So the entry, and whatever body buffers
+it still holds, survive until the connection itself is dropped, which drains the registry.
+
+This is true of every locally initiated reset — a caller dropping a response future, an
+unread incoming body being dropped, a server abandoning an exchange — and predates the change
+that made a failed body reset rather than end its stream. It is bounded by the connection's
+lifetime rather than unbounded, and the reset does tell nghttp3 the write side is finished, so
+no further bytes are ever offered for the stream; what remains is memory held longer than it
+is useful on a long-lived connection that resets many streams.
+
+**Settle it by closing the stream where the reset is issued**, which needs care: the driver
+would be declaring a stream closed on its own authority rather than on the transport's report,
+and a `StreamClosed` arriving afterwards must not then be a second close. The honest form is
+probably for the reset drain to record the stream as closed-by-us and for the event handler to
+recognise its own work.
+
 ### The trait has no timer, datagram, priority or stream-limit surface
 
 quiche and ngtcp2 both require their caller to arm and fire a timer; an implementation over
@@ -174,10 +195,20 @@ connection-level error that surfaces is a generic callback failure. `ngnet-h2` p
 source error with `Fail(BodyError)`.
 
 Deferred rather than rejected. The h2 shape would transfer, and the argument for it is
-production diagnosis: a file read failing mid-body becomes indistinguishable from any other
-callback failure. **Worth doing before the API stabilises**, since adding a field to the
+production diagnosis. **Worth doing before the API stabilises**, since adding a field to the
 variant is a breaking change afterwards — though `BodyOutcome` is `#[non_exhaustive]`, which
 buys some room.
+
+The motivating example used to be a file read failing mid-body, and that example has moved
+rather than gone away. A caller's body failing in the asynchronous layer no longer travels
+through `Fail` at all — it abandons its own stream by deferring and being reset, which is
+what keeps one exchange's misfortune from poisoning the connection — but the cause is
+discarded at that seam too: `Outgoing::next` drops the `http_body` error, and the client is
+told `ErrorKind::Body` with a fixed message rather than what its body actually said. So
+there are now two places to carry a cause and they would be settled by different changes:
+a field on the variant here, and a source error threaded through `Ending::Failed` in
+`src/http/`. The second is the cheaper of the two and reaches the caller who is actually
+waiting to hear.
 
 ### Test hooks are `#[doc(hidden)]` rather than private
 

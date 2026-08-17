@@ -206,6 +206,15 @@ pub enum BodyOutcome {
     /// without deferring is not expressible, because nghttp3 would take it as a
     /// zero-length frame rather than as "ask me again".
     ///
+    /// It says a second thing as well, and the second is the more consequential of the
+    /// two: it is also how a source abandons one stream. "Ask me again" and "never ask me
+    /// again" produce the same bytes on the wire — which is to say none, and no
+    /// end-of-stream marker — so the difference lies entirely in what happens next.
+    /// Resuming the stream means the first; resetting it means the second. See
+    /// [`Fail`](Self::Fail), where the whole mechanism is written down, and note the
+    /// obligation it carries: a deferred stream that is neither resumed nor reset waits
+    /// for bytes that will never come.
+    ///
     /// [`Conn::resume_stream`]: crate::Conn::resume_stream
     Defer,
     /// The body cannot be produced, and the exchange must stop.
@@ -216,8 +225,19 @@ pub enum BodyOutcome {
     /// connection is poisoned and every retained buffer released.
     ///
     /// A source that wants to abandon one stream without taking the connection with it
-    /// should end its body instead and have the caller reset the stream through its QUIC
-    /// layer, which is the only place a per-stream reset can come from.
+    /// returns [`Defer`](Self::Defer) — never an `Eof` — and has the caller reset that
+    /// stream through its QUIC layer, which is the only place a per-stream reset can come
+    /// from. Deferring is what withholds the end-of-stream marker, and withholding it is
+    /// the point: a marker and a reset are two statements about one stream that
+    /// contradict each other, and a peer with nothing queued behind the marker has
+    /// already been told the message was complete by the time the reset arrives. It then
+    /// rightly ignores the reset, and a truncated message looks like a whole one. The
+    /// reset must be the only thing the peer is ever told about how the message ended.
+    ///
+    /// This is the route the asynchronous layer in `src/http/` takes when a caller's body
+    /// reports an error, and `crates/ngnet-h3/tests/http_failed_body.rs` watches the
+    /// result at the transport seam: for a stream whose body failed, zero end-of-stream
+    /// markers and exactly one reset, carrying `H3_REQUEST_CANCELLED`.
     Fail,
 }
 
