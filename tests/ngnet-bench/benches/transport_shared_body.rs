@@ -30,6 +30,12 @@
 //! A gain that shows up here but not in the duplex family (`shared_body.rs`), with no mechanism
 //! to explain the difference, is drift. Two apparent regressions in PR #7 dissolved exactly
 //! that way.
+//!
+//! This group carries **no HTTP/3-over-QMux arm**, for the same reason its duplex counterpart
+//! does not: the comparison is an HTTP/2 body-handover entry point against its copying twin,
+//! and the QMux stack has no counterpart mechanism to stand on either side of it. That is a
+//! different reason from the one `concurrent_throughput_multi_thread` has, and
+//! `docs/benchmarks/README.md` keeps the two apart.
 
 use std::hint::black_box;
 

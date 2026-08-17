@@ -11,6 +11,14 @@
 //!
 //! Arms are paired and interleaved, and `hyper-tokio` is carried as an untouched drift
 //! control, for the reasons set out at length in `transport_shared_body.rs`.
+//!
+//! This group carries **no HTTP/3-over-QMux arm**, and for a different reason than
+//! `concurrent_throughput_multi_thread` does: there is nothing to compare. What is measured
+//! here is an HTTP/2 body-handover entry point against its copying twin, and no counterpart
+//! mechanism exists on the QMux stack, so a QMux arm would be a third quantity beside a
+//! two-sided comparison rather than a half of one. Note that this makes the group
+//! single-*protocol* and not single-stack — it does carry a `hyper-tokio` arm.
+//! `docs/benchmarks/README.md` records the two distinct reasons a group may lack a QMux arm.
 
 use std::hint::black_box;
 

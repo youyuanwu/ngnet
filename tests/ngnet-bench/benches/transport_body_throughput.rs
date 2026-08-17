@@ -3,22 +3,36 @@
 //! iteration moves `size` bytes up and `size` back; throughput is normalised to one body's
 //! worth. The sweep reuses the duplex family's points so the two are comparable in shape.
 //!
-//! Three arms, read pairwise: `ngnet-h2-compio` against `ngnet-h2-tokio` isolates the I/O model,
+//! Four arms, read pairwise: `ngnet-h2-compio` against `ngnet-h2-tokio` isolates the I/O model,
+//! `ngnet-h2-tokio` against `ngnet-qmux-h3-tokio` isolates the protocol stack,
 //! `ngnet-h2-tokio` against `hyper-tokio` isolates the HTTP/2 stack, and `ngnet-h2-compio` against
 //! `hyper-tokio` varies both.
+//!
+//! The QMux arm is paired with `ngnet-h2-tokio` because it is tokio-based and so differs from
+//! that arm in protocol alone; it is registered immediately after it inside the size loop, so
+//! at each size the two halves of the cross-protocol comparison are emitted back to back.
 //!
 //! This is where the write-path asymmetry named in `docs/benchmarks/controls.md` bites
 //! hardest: the two
 //! readiness arms buffer or borrow outbound bytes in ways the completion arm structurally
 //! cannot, so a large-body difference is partly write strategy and not purely I/O model or
 //! stack.
+//!
+//! The QMux arm brings a second asymmetry of the same kind to the large sizes. Its 1 MiB point
+//! moves a body through a stream window and a connection window each matched to libnghttp2's
+//! fixed 65535, so it pays repeated credit extensions exactly as the HTTP/2 arms do — but
+//! underneath a transport that frames and paces where a TCP arm hands bytes straight to the
+//! kernel. That layer is part of what the cross-protocol pair compares rather than a defect in
+//! it; `docs/benchmarks/configuration.md` records what is matched, what is fixed on one side
+//! and met by the other, and what neither stack exposes.
 
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use ngnet_bench::{
-    CompioSocket, HyperSocket, TokioSocket, body_of, compio_runtime, current_thread_runtime,
+    CompioSocket, HyperSocket, NgnetQmuxH3Socket, TokioSocket, body_of, compio_runtime,
+    current_thread_runtime,
 };
 
 /// 0 B exercises the headers-only path; the rest climb until the initial window and the
@@ -32,6 +46,9 @@ fn transport_body_throughput(c: &mut Criterion) {
     // One runtime per arm; see `transport_serial_latency` for why.
     let tokio = current_thread_runtime();
     let tokio_socket = tokio.block_on(TokioSocket::establish());
+
+    let qmux = current_thread_runtime();
+    let qmux_socket = qmux.block_on(NgnetQmuxH3Socket::establish());
 
     let hyper = current_thread_runtime();
     let hyper_socket = hyper.block_on(HyperSocket::establish());
@@ -58,6 +75,16 @@ fn transport_body_throughput(c: &mut Criterion) {
             b.to_async(&tokio)
                 .iter(|| async { black_box(tokio_socket.round_trip(payload.clone()).await) });
         });
+
+        group.bench_with_input(
+            BenchmarkId::new("ngnet-qmux-h3-tokio", size),
+            &size,
+            |b, _| {
+                let payload = payload.clone();
+                b.to_async(&qmux)
+                    .iter(|| async { black_box(qmux_socket.round_trip(payload.clone()).await) });
+            },
+        );
 
         group.bench_with_input(BenchmarkId::new("hyper-tokio", size), &size, |b, _| {
             let payload = payload.clone();
