@@ -83,6 +83,14 @@ pub(crate) trait Role {
     /// Hands the role a stream the backend just opened.
     fn give_stream(&mut self, _stream: StreamId) {}
 
+    /// Whether an exchange can appear on a stream this endpoint never opened.
+    ///
+    /// A server learns of a request when its head arrives, so a stream it has never heard
+    /// of is the ordinary state of one whose head is a few entries further down the batch
+    /// being applied. A client opens every stream it uses and registers it as it does, so
+    /// a stream unknown to a client is one that will stay unknown.
+    const ACCEPTS_STREAMS: bool = false;
+
     /// Submits whatever the role has queued.
     fn advance(&mut self, conn: &mut Conn<Events>, events: &mut Events) -> Result<()>;
 
@@ -456,17 +464,25 @@ impl<Q: QuicConnection> Driver<Q> {
         // Two sweeps rather than one: a reset behind a megabyte of body data must not wait
         // for the body to be parsed before it is acted on.
         let mut data = Vec::new();
-        // Resets that named a stream this endpoint had never heard of. Acting on the
-        // control plane first means a reset can arrive in the same batch as the head it
-        // follows, and there was nothing to fail when it did. Left there, the head goes on
-        // to open an exchange the peer has already abandoned: a server would hand its
-        // handler a request body that will never end and never fail, and the handler would
-        // read it forever.
+        // Resets that named a stream this endpoint had never heard of, and could still hear
+        // of before the pass is out. Acting on the control plane first means a reset can
+        // arrive in the same batch as the head it follows, and there was nothing to fail
+        // when it did. Left there, the head goes on to open an exchange the peer has
+        // already abandoned: a server would hand its handler a request body that will never
+        // end and never fail, and the handler would read it forever.
         //
         // So they are kept and handed back rather than dropped. Not replayed at the foot of
         // this function, though: reading a head only *records* it, and the exchange it opens
         // does not exist until the pass dispatches what it recorded, which is well after
         // this. They are applied there instead.
+        //
+        // Same batch is the whole of it. A reset whose head arrives in some *later* batch is
+        // still dropped, which would be the same hang — but a transport that has reported a
+        // stream reset does not go on to deliver more of that stream: ngtcp2 terminates the
+        // receiving side and discards what follows, and this layer has just shut the read
+        // side down as well. If a transport is ever found that does, the durable answer is a
+        // short-lived record of reset streams consulted wherever a head opens an exchange,
+        // not a longer-lived version of this vector.
         let mut unheard = Vec::new();
         for event in events {
             match event {
@@ -489,7 +505,12 @@ impl<Q: QuicConnection> Driver<Q> {
                 }
                 QuicEvent::Reset { stream, code } => {
                     self.conn.shutdown_stream_read(stream).ok();
-                    if !self.fail_stream(stream, code, role) {
+                    // Only where an unknown stream can still become an exchange. A client
+                    // registers its streams as it opens them, so replaying a reset it could
+                    // not place would let a peer cancel a request the client submits later
+                    // in this very pass — widening the fix into a way to lose an exchange
+                    // that was never abandoned.
+                    if !self.fail_stream(stream, code, role) && R::ACCEPTS_STREAMS {
                         unheard.push((stream, code));
                     }
                 }

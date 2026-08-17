@@ -349,11 +349,13 @@ fn a_reset_reaches_a_transport_that_reports_nothing_at_all() {
 }
 
 #[test]
-fn the_reset_follows_the_failing_body_within_two_transmit_passes() {
+fn the_reset_follows_the_failing_body_on_the_very_next_transmit() {
     // A body is pulled during a transmit and the record of how it ended is read at the top of
-    // the next pass, where the reset is queued and drained onto the transport in that same
-    // pass. Two passes is therefore the whole window, and it is bounded by the design rather
-    // than by luck: nothing in between may wait (SC-008).
+    // the next pass, above everything that could wait, so the reset is drained onto the
+    // transport before that pass transmits anything of its own. The window is therefore not
+    // merely bounded but empty: no transmit separates the failure from the reset. Asserting
+    // the two-pass bound SC-008 asks for would leave room for a delay the design does not
+    // have, and a regression that reintroduced one would pass.
     let log = Log::new();
     let (transport, _controls) = support::stub();
     let (handle, driver) =
@@ -380,9 +382,10 @@ fn the_reset_follows_the_failing_body_within_two_transmit_passes() {
     let reset_on = log
         .transmits_before_reset(request_stream(0))
         .expect("a failed body should be reset");
-    assert!(
-        reset_on >= failed_on && reset_on - failed_on <= 2,
-        "the body failed on transmit {failed_on} and the reset went out on {reset_on}"
+    assert_eq!(
+        reset_on, failed_on,
+        "the body failed on transmit {failed_on} and the reset went out on {reset_on}, so a \
+         transmit passed in between and the reset waited on something"
     );
 }
 

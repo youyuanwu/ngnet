@@ -188,6 +188,10 @@ where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn core::error::Error + Send + Sync>>,
 {
+    /// A request arrives on a stream the peer opened, so a stream this endpoint has never
+    /// heard of is one whose head may still be in the batch being applied.
+    const ACCEPTS_STREAMS: bool = true;
+
     fn advance(&mut self, conn: &mut Conn<Events>, _events: &mut Events) -> Result<()> {
         self.finish_bodies(conn)?;
 
