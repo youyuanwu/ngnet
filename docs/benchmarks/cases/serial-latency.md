@@ -28,7 +28,7 @@ mean/median, confidence intervals and outlier detection all mean what they say.
 | `ngnet-qmux-h3` | this crate | HTTP/3 over QMux | `tokio::io::duplex` |
 | `hyper` | hyper | HTTP/2 | `tokio::io::duplex` |
 
-All three on one `current_thread` runtime each. Every connection is stood up once outside the
+All three on one `current_thread` runtime. Every connection is stood up once outside the
 timed closure; each iteration issues one request and drains the response.
 
 Read pairwise, because the three arms answer two different questions and one non-question:

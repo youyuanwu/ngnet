@@ -227,7 +227,7 @@ result just as effectively, which is why they are enumerated too.
 
 | Parameter | Value | Equal across the arms? |
 | --- | --- | --- |
-| Runtime | one worker thread per arm — `current_thread` on tokio, single-threaded compio | Yes. Each arm gets its own runtime, so no arm's idle connection driver sits registered in another's scheduler. |
+| Runtime | one worker thread per arm — `current_thread` on tokio, single-threaded compio | Yes, but by different means in each family, and the difference is worth knowing. The socket family gives **each arm its own runtime**, so no arm's idle connection driver sits registered in another's scheduler. The duplex family runs **all of an arm-set's connections on one shared `current_thread` runtime**, which is equally fair for a different reason: there is one worker thread either way, and an idle driver there is parked on a duplex read with no timer to fire — `ngnet-qmux`'s clock exposes only `now()` and arms nothing, and `max_idle_timeout` is left at zero — so a driver that is not being measured is never polled. |
 | Task arrangement | drivers on plain `tokio::spawn`; concurrent requests through a `JoinSet` | Yes, deliberately: the QMux fixtures mirror the HTTP/2 fixtures down to the spawn, so both arms pay the same harness overhead. |
 | `TCP_NODELAY` (socket family) | set on both endpoints of every arm | Yes — the QMux socket fixture takes the same socket-pair helper the HTTP/2 socket arms take, so it is set by the same code rather than by a second copy of it. |
 | Duplex capacity (duplex family) | 1 MiB | Yes. Large enough that the pipe is not the bottleneck; the flow-control window is. |
@@ -238,9 +238,9 @@ result just as effectively, which is why they are enumerated too.
 
 ### A parameter one stack will not admit is refused, not offered
 
-Both QMux fixtures check a requested concurrency and body size against what they configured,
-before anything reaches the wire, and panic with a legible message if it does not fit. This is
-not defensive tidiness. The characteristic failure on this stack is an exchange that neither
+Both QMux fixtures check a requested concurrency against what they configured, before anything
+reaches the wire, and panic with a legible message if it does not fit. This is not defensive
+tidiness. The characteristic failure on this stack is an exchange that neither
 completes nor fails, and since nothing wraps a Criterion measurement in a timeout, a parameter
 that gets as far as being offered cannot be recovered from — a panic during the iteration's
 setup is the only recovery available.
@@ -248,7 +248,16 @@ setup is the only recovery available.
 Concurrency is the case that motivates it: the HTTP/3 server enforces its limit by *resetting*
 an exchange that arrives while that many handlers are already running, rather than by queueing
 it, so an over-limit sweep would report times for some iterations and fail partway through
-others. A body is checked differently, because a body meets a different kind of limit — no
-configured value bounds it, since credit is extended per consumed byte at both levels, so what
-the check actually asks is whether the read-ahead is large enough for the body to arrive in
-instalments at all.
+others.
+
+**A body is not checked at runtime at all, and that is the honest position rather than an
+omission.** No configured value bounds a body: credit is extended per consumed byte at both the
+stream and the connection level, so a body larger than the window arrives in window-sized
+instalments rather than being refused, and there is consequently no body size for a fixture to
+reject. The one thing a multi-instalment body does depend on — that the read-ahead is not below
+the connection window, since beneath it the layer stops reading bytes it has already granted and
+the transfer stalls silently — is a relation between two constants and nothing to do with the
+body's length. It is asserted as a `const` in the bench library, so lowering the read-ahead
+fails the *build* rather than waiting to be caught by a run on some machine. A per-body runtime
+check would have looked more thorough while being a test whose answer never depended on its
+argument.

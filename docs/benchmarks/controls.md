@@ -78,22 +78,31 @@ what remained after that was done.
   granting the QMux arm a few hundred extra bytes to compensate, would replace an exactly
   stated asymmetry with an estimated one.
 - **The warm-up asymmetry: the QMux fixtures complete an exchange during `establish` and the
-  HTTP/2 fixtures do not.** This looks like a favour to the QMux arm and is the opposite of
-  one: it is what stops the QMux arm being charged for work the HTTP/2 arm never pays inside a
-  timed region. An HTTP/2 fixture's handshake completes inside `handshake_with` during setup.
-  A QMux connection's transport-parameter exchange is scheduled at construction but only leaves
+  HTTP/2 fixtures do not.** It is worth being exact about why, because the obvious explanation
+  is wrong. It is *not* that an HTTP/2 fixture handshakes during setup and a QMux one does not.
+  `handshake_with` performs no I/O — it constructs a driver, and `ngnet-h2`'s own documentation
+  says nothing moves until that driver is polled — and no fixture on either stack awaits
+  anything after spawning its drivers. On a `current_thread` runtime, `block_on(establish())`
+  therefore returns without either driver having run, and **both** stacks defer their handshake
+  to the first execution of the timed closure.
+  <br><br>
+  What keeps that out of every reported number, on both stacks, is Criterion's warm-up phase:
+  it runs the closure unmeasured for three seconds before sampling begins, which absorbs a
+  first iteration that handshakes. The suite's standing claim in
+  [`cases/README.md`](cases/README.md) — that handshake cost is in no number here — rests on
+  that, and always has.
+  <br><br>
+  The QMux warm-up is defence in depth rather than the mechanism. What it defends against is
+  the size of the deferred work on this stack: a transport-parameter exchange that only leaves
   on the first pump, and until the peer's parameters arrive every limit is zero and no stream
-  can be opened; on top of that the HTTP/3 driver's first act is to open three unidirectional
-  streams and exchange SETTINGS. None of that happens in `establish` unless something makes it
-  happen — so without a warm-up the *first timed iteration* would pay for the whole handshake
-  and be reported as the cost of a round trip. One completed request-response settles all of
-  it. The residual, disclosed: a QMux arm's first timed iteration therefore meets a connection
-  that has already carried one exchange, where an HTTP/2 arm's meets one that has carried none.
-  On a Criterion sample of thousands of iterations that is not a measurable term, and it
-  **biases towards the QMux arms** to precisely that extent. Do not delete the warm-up as
-  redundant: it is what makes the suite's standing claim — that handshake cost is in no number
-  here, stated in [`cases/README.md`](cases/README.md) — true of these arms as well as of the
-  HTTP/2 ones.
+  can be opened; three unidirectional streams the HTTP/3 driver opens before anything else; and
+  a SETTINGS exchange on top. Against a run given a short `--warm-up-time`, or a sample count
+  low enough that one anomalous iteration tells, that is a much larger thing to leave to
+  chance than HTTP/2's preface and SETTINGS. The residual, disclosed: a QMux arm's first timed
+  iteration meets a connection that has already carried one exchange where an HTTP/2 arm's
+  meets one that has carried none, which **biases towards the QMux arms** by an amount that is
+  not measurable across thousands of iterations. Do not delete the warm-up as redundant — it is
+  redundant only for as long as the warm-up phase is left at its default.
 - **One implementation, never optimised.** `ngnet-qmux-h3` had no benchmark before this suite
   and no measurement has been acted on since; the join is known to write one `IoSlice` at a
   time and to copy inbound bodies twice below it, both recorded on
@@ -121,9 +130,11 @@ what remained after that was done.
   change arms whose measurements are already recorded.
 
 Controlled rather than merely disclosed, on the cross-protocol pair specifically: both arms run
-on their own single-worker runtime with drivers on plain `tokio::spawn` — the QMux join imposes
-no `Send` bound and needs no `LocalSet`, so the runtime arrangement is identical rather than
-merely similar; `TCP_NODELAY` on the socket family is set by the same helper for both; and the
+on a single-worker runtime with drivers on plain `tokio::spawn` — the QMux join imposes no
+`Send` bound and needs no `LocalSet`, so the runtime arrangement is identical rather than
+merely similar, and the two arms of a cross-protocol pair always share whichever arrangement
+their family uses (see the runtime row in
+[`configuration.md`](configuration.md), which differs by family); `TCP_NODELAY` on the socket family is set by the same helper for both; and the
 request, body, echo handler and drain are one shared definition that both fixtures call, so
 "the two stacks ran the same workload" is a property of there being one definition rather than
 an assertion about two.

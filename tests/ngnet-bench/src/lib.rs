@@ -985,28 +985,30 @@ fn admit_concurrency(n: usize) {
     );
 }
 
-/// Refuses a body size the QMux arms' configuration will not admit, before it is offered.
+/// The condition under which a body of any size is admissible, checked once at compile time.
 ///
-/// The companion to [`admit_concurrency`], and it has a different shape because a body meets a
-/// different kind of limit. No configured value bounds a body: flow-control credit is extended
-/// per consumed byte at both the stream and the connection level, so a body larger than the
-/// window is delivered in window-sized instalments rather than refused. What that depends on
-/// is [`QMUX_READ_AHEAD`] not sitting below [`QMUX_CONNECTION_WINDOW`] — below it the layer
-/// declines to read bytes the peer was already told it could send, and a body that needs more
-/// than one instalment stops halfway with nothing reported. So the admissibility question a
-/// body actually poses is asked of the body that poses it.
+/// The companion to [`admit_concurrency`], and deliberately *not* its twin, because a body
+/// meets a different kind of limit and the difference decides where the check belongs. No
+/// configured value bounds a body: flow-control credit is extended per consumed byte at both
+/// the stream and the connection level, so a body larger than the window is delivered in
+/// window-sized instalments rather than refused. There is therefore no body size to reject,
+/// and a per-body runtime check would be a test whose answer does not depend on its argument.
 ///
-/// # Panics
+/// What a multi-instalment body does depend on is [`QMUX_READ_AHEAD`] not sitting below
+/// [`QMUX_CONNECTION_WINDOW`]. Below it the layer declines to read bytes the peer was already
+/// told it could send, and a body needing more than one instalment stops halfway with nothing
+/// reported at either end — the same silent-stall failure mode the stream allowance has, and
+/// just as invisible to a benchmark.
 ///
-/// If `len` exceeds what the configuration admits.
-fn admit_body(len: usize) {
-    assert!(
-        len as u64 <= QMUX_CONNECTION_WINDOW || QMUX_READ_AHEAD >= QMUX_CONNECTION_WINDOW,
-        "a body of {len} bytes needs more than one window's worth of credit, and the \
-         configured read-ahead of {QMUX_READ_AHEAD} is below the connection window of \
-         {QMUX_CONNECTION_WINDOW}; the transfer would stall part-way with no error"
-    );
-}
+/// That is a relation between two constants, so it is asserted as one. A `const` block fails
+/// the *build* if a later edit lowers the read-ahead beneath the window, which is strictly
+/// stronger than a runtime assertion that can only fire on a machine actually running the
+/// suite — and it is honest about the fact that no value of any body length can trip it.
+const _: () = assert!(
+    QMUX_READ_AHEAD >= QMUX_CONNECTION_WINDOW,
+    "the configured read-ahead is below the connection window, so a body needing more than \
+     one instalment would stall part-way with no error reported at either end"
+);
 
 /// One complete exchange, before anything is timed.
 ///
@@ -1097,9 +1099,9 @@ impl NgnetQmuxH3 {
     ///
     /// # Panics
     ///
-    /// If the body is inadmissible ([`admit_body`]), or the exchange fails.
+    /// If the exchange fails. No body size is inadmissible; see the `const` assertion
+    /// beside [`admit_concurrency`] for why that is a property of the constants, not of `body`.
     pub async fn round_trip(&self, body: Bytes) -> usize {
-        admit_body(body.len());
         let response = self
             .handle
             .send_request(request_for(body))
@@ -1200,9 +1202,9 @@ impl NgnetQmuxH3Socket {
     ///
     /// # Panics
     ///
-    /// If the body is inadmissible ([`admit_body`]), or the exchange fails.
+    /// If the exchange fails. No body size is inadmissible; see the `const` assertion
+    /// beside [`admit_concurrency`] for why that is a property of the constants, not of `body`.
     pub async fn round_trip(&self, body: Bytes) -> usize {
-        admit_body(body.len());
         let response = self
             .handle
             .send_request(request_for(body))
