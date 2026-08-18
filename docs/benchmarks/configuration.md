@@ -174,7 +174,8 @@ body-throughput gap should find this before inventing one.
 
 **Its standing has risen since, without its size changing.** More units used to mean more
 *writes* as well as more framing work, because the QMux write path issued one write per record;
-that is gone, and removing it was worth −30% at 1 MiB and −25.9% at 64 KiB over a socket
+that is gone. The whole set of six changes it belongs to was worth −30% at 1 MiB and −25.9% at
+64 KiB over a socket; how much of that is this one has not been measured on any socket arm
 ([`findings/qmux-write-path.md`](findings/qmux-write-path.md)). So a per-byte mechanism that
 was previously one of two, and much the smaller, is now the only one of its kind left on the
 QMux side. It is still a fraction of a percent and still the wrong size to explain a visible

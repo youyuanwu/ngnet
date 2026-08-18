@@ -9,7 +9,7 @@ once it has survived its drift controls; the measurements it rests on stay in
 | [Write path and gathering](write-path-and-gathering.md) | The arms separated on **write syscalls per pass**, not on the I/O model. Gathering closed the gap: −52.2% at N=8, −58.9% at N=64. |
 | [Reusing the coalescing buffer](coalescing-buffer-reuse.md) | About 4–7% for the completion transport, from not rebuilding the coalescing buffer every pass. |
 | [Handing bodies over](handing-bodies-over.md) | `NGHTTP2_DATA_FLAG_NO_COPY` is worth −24% to −31% at 1 MiB on the readiness transport, and a small but real gain on the completion one. |
-| [The QMux write path](qmux-write-path.md) | Coalescing a pass's records into one write is worth **−30% on bodies** and **−8.5% on socket concurrency**, and costs a few percent where there is no payload to amortise it. The same parameter moves the *other* way over a duplex, which is the evidence. A separate change cut allocation a hundredfold and was slower; it was reverted. |
+| [The QMux write path](qmux-write-path.md) | Six changes to the QMux write and read paths, together worth **−30% on bodies** and **−8.5% on socket concurrency**, costing a few percent where there is no payload to amortise them. The same parameter moves the *other* way over a duplex, which is the evidence that the mechanism is the syscall count. Coalescing is the only change attributed to a share of the gain; the rest are not resolved individually. A seventh cut allocation a hundredfold, was slower, and was reverted. |
 
 ## Where each finding stands
 

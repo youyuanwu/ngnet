@@ -59,7 +59,8 @@ neither stack, together with the direction it biases the comparison. So the QMux
 records for the same body than the HTTP/2 arms make frames. That used to be one of *two*
 mechanisms growing with body size; the other — its join offering those records to the writer one
 `IoSlice` at a time — is gone, and removing it is the largest single movement any QMux arm in
-this suite has recorded: −30.4% at 1 MiB and −25.9% at 64 KiB
+this suite has recorded for a QMux arm: −30.4% at 1 MiB and −25.9% at 64 KiB — a figure for the
+whole write-path change set, not for that mechanism alone, which no run attributes on a socket arm
 ([`../findings/qmux-write-path.md`](../findings/qmux-write-path.md)). The record count remains
 and still grows with body size. If a cross-protocol ratio here *grows* across the sweep while
 the duplex family's [`body_throughput`](body-throughput.md) ratio falls, that is now the

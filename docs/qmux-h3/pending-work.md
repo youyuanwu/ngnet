@@ -280,15 +280,17 @@ already merged those records into one write; that is the honest shape of the res
 disappointment, since the record is what a fragment boundary cost once the write had stopped
 costing anything.
 
-**No timing was taken, and that is a decision.** Spec FR-038 requires the benchmark identifiers
-an effect could appear on to be named before it is measured, and FR-021 accepts a mechanism
-established by a count where no identifier can resolve it. The Phase 2 screen put this saving at
-about one record per request with a body — one write in two at 1 KiB and one in sixty-six at
-1 MiB — against a run-to-run drift of 0.5% to 5% on the arms that could show it. A timed
-comparison would therefore report a number well inside its own noise and would support no
-conclusion in either direction, so none was taken. `docs/benchmarks/allocation-counts.md` is the
-same treatment applied to the HTTP/2 stack: a mechanism established by a count, with the absence
-of a time stated rather than left to be noticed.
+**The establishment is a count, and the prediction that a timing would say nothing was wrong.**
+FR-021 accepts a mechanism established by a count, and the record and byte counts are that. The
+argument originally made here — that a timed comparison would report a number inside its own
+noise — quoted the Phase 2 screen's saving as one write in two at 1 KiB and one in sixty-six at
+1 MiB, and omitted the screen's middle point, **one write out of six at 64 KiB**, which is around
+seventeen percent and does not sit inside a 0.5%-to-5% band. A timing does exist:
+[`07-qmux-per-commit-attribution`](../benchmarks/data/xeon-8370c-azure/07-qmux-per-commit-attribution.md)
+reports **−7.7% at 64 KiB against a control worst of 5.18%** — outside the band, in the noisiest
+step of seven, and marginal rather than settled. It deserves a run of its own before it is quoted
+as a figure. The counts stay the establishment; the correction is kept because an argument built
+by leaving out the inconvenient point is the kind that should be visible afterwards.
 
 **The part that is delicate, recorded because it is silent when it is wrong.** A vectored push
 reports `*pdatalen` as **one total across every vector**, not a count per vector, so resuming

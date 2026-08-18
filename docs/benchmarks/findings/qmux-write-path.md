@@ -60,28 +60,26 @@ anything other than the mechanism claimed.
 
 ## Where the gain came from
 
-Per-commit, on two of the targets, each step against its predecessor:
+[`07-qmux-per-commit-attribution`](../data/xeon-8370c-azure/07-qmux-per-commit-attribution.md)
+measures each commit against its predecessor, on two duplex targets, with the ten unchanged
+identifiers in the same session as controls. Its answer is mostly *this cannot say*, and that is
+worth stating plainly:
 
-| Step | `body_throughput/0` | `body_throughput/1024` | `body_throughput/1048576` | `body_throughput/65536` | `serial_latency/ngnet-qmux-h3` |
-| --- | --- | --- | --- | --- | --- |
-| write coalescing | +3.3% | -3.4% | -21.7% | -8.6% | -0.3% |
-| direct serialisation | -0.7% | -1.3% | -2.8% | -1.2% | +1.5% |
-| scan in place | +1.9% | +1.6% | -2.8% | -1.3% | +0.1% |
-| delivery aliasing | +2.5% | +3.3% | -0.6% | +4.8% | +4.7% |
-| vectored record input | -0.0% | -2.9% | -0.7% | -7.7% | +1.3% |
-| credit batching | -0.7% | -1.2% | -1.0% | -2.3% | -0.1% |
-| **cumulative through this sequence** | +6.4% | -3.9% | -27.8% | -15.8% | +7.3% |
-| **the state that shipped**, from [`06`](../data/xeon-8370c-azure/06-qmux-write-path.md) | +3.9% | -4.2% | -30.3% | -17.5% | +1.2% |
-Read that table with two caveats. The steps were measured in the order the commits were made, so
-every step after the fourth was measured on a build containing a change that was later reverted.
-And two repetitions per side is this suite's minimum, so a step of a percent or two is not a
-result; a step of ten is.
+- **Write coalescing is the change that produced the body gains**, and it is the only step
+  resolved on those identifiers: −21.7% at a megabyte and −8.6% at 64 KiB, against a control worst
+  of 4.47% in its own step.
+- **Direct serialisation, scanning in place and credit batching each move every identifier by less
+  than their step's own control movement.** They are not shown to be worth nothing; they are
+  smaller than this instrument can see. Their establishment is by count, which is what the
+  requirement they were made under provides for.
+- **Vectored record input at 64 KiB is marginal: −7.7% against a control worst of 5.18%**, in the
+  noisiest step of the seven. It had been predicted unresolvable; this is weak evidence against
+  that prediction, not a figure to quote.
 
-What it says plainly: **coalescing is most of the gain on large bodies** (−21.7% at a megabyte on
-its own), and the rest is spread thinly. One entry is a genuine surprise —
-**vectored record input at 64 KiB, −7.7%** — which had been predicted in advance to be too small
-to resolve, on the reasoning that it removes about one record per request. That prediction was
-wrong and the entry is left in rather than tidied away.
+**No socket identifier is attributed to any commit, by that run or any other.** The −8.5% at
+concurrency 64 that is this finding's best evidence for the mechanism is a whole-set figure. Which
+change produced it has not been measured, and the sign flip below is an argument about mechanism
+rather than an attribution.
 
 ## The one that was thrown away
 
@@ -154,8 +152,11 @@ one where the mechanism predicts two different signs and so cannot be satisfied 
 - **Nothing about compio, `shared_body`, or a multi-worker runtime.** No QMux arm exists in any of
   them, and the multi-worker group has none because of a recorded hang — which, incidentally, did
   not reproduce in 1520 attempts through the fixtures while this work was being done.
-- **The small regressions are not settled.** Four of the six are inside the worst control movement
-  in their session. They are reported because a result may not be quoted in one direction only.
+- **The small regressions are settled on one family and not the other.** All eight positive
+  deltas are inside their session's control band; against each arm's own figure from `04`, the two
+  socket ones (+1.7% and +4.0%) are outside its 1.41% and the four duplex ones are well inside its
+  10.42%. So there is a small per-exchange cost on the socket arms and no established one on the
+  duplex arms. Reported because a result may not be quoted in one direction only.
 - **Nothing about memory.** Coalescing deliberately raised what a connection may hold awaiting a
   write from one record to about 80 KiB. That is a cost, it is by design, and it is not measured
   here.

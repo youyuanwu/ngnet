@@ -32,6 +32,7 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [04-qmux-drift-baseline](xeon-8370c-azure/04-qmux-drift-baseline.md) | xeon-8370c-azure | 2026-08-17 | What an unchanged **QMux** arm does run to run — the bar the QMux work is measured against | — |
 | [05-qmux-delivery-aliasing](xeon-8370c-azure/05-qmux-delivery-aliasing.md) | xeon-8370c-azure | 2026-08-17 | Aliasing deliveries instead of copying them — **slower, and reverted** | [the QMux write path](../findings/qmux-write-path.md) |
 | [06-qmux-write-path](xeon-8370c-azure/06-qmux-write-path.md) | xeon-8370c-azure | 2026-08-17 | The QMux write-path work end to end — **−30% on bodies, −8.5% on socket concurrency** | [the QMux write path](../findings/qmux-write-path.md) |
+| [07-qmux-per-commit-attribution](xeon-8370c-azure/07-qmux-per-commit-attribution.md) | xeon-8370c-azure | 2026-08-17 | Which change produced the gain — **coalescing**, and the rest not resolved | [the QMux write path](../findings/qmux-write-path.md) |
 
 **No run recorded here compares `ngnet-qmux-h3` against anything.** Runs `01` to `03` predate the
 cross-protocol arms entirely; `04` covers them but is a drift measurement, so its QMux figures are

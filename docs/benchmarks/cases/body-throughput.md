@@ -57,7 +57,8 @@ outer loop and the arms are the inner one.
   effect and would need a mechanism. There were three candidates: the record-size difference,
   the join's one-write-per-`IoSlice` offer, and the copies below it. Two have since been
   removed and one measured — coalescing and direct serialisation took the write count and the
-  outbound copy out, worth −30.3% at 1 MiB on this group
+  outbound copy out. The six changes together are worth −30.3% at 1 MiB on this group, of which
+  coalescing alone accounts for −21.7% and direct serialisation is not resolved separately
   ([`../findings/qmux-write-path.md`](../findings/qmux-write-path.md)), and the remaining
   inbound copy was measured by removing it and found to cost nothing worth having
   ([`../data/xeon-8370c-azure/05-qmux-delivery-aliasing.md`](../data/xeon-8370c-azure/05-qmux-delivery-aliasing.md)).

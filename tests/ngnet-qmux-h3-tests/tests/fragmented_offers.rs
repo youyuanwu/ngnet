@@ -46,17 +46,19 @@
 //! sensitive in. The figure is exact rather than approximate, and the arithmetic that accounts
 //! for every byte of it is written out at [`BODY_COST`].
 //!
-//! # Why there is no timing here, and why that is a decision
+//! # Why the establishment here is a count
 //!
-//! Spec FR-038 requires the benchmark identifiers an effect could appear on to be named before
-//! it is measured, and FR-021 accepts a mechanism established by a count where no identifier can
-//! resolve it. This is such a case: the Phase 2 screen put the saving at about one record per
-//! request with a body -- one write in two at 1 KiB and one in sixty-six at 1 MiB -- against a
-//! run-to-run drift of 0.5% to 5% on the arms that could show it, so a timing would report a
-//! number well inside its own noise and would say nothing either way. The eight bytes and the
-//! one record below are the establishment, and they are a property of the code rather than of
-//! the machine it ran on. `docs/benchmarks/allocation-counts.md` is the same treatment applied
-//! to the HTTP/2 stack. The absence of a timing here is that decision and not an omission.
+//! Spec FR-021 accepts a mechanism established by a count, and the eight bytes and one record
+//! below are that: properties of the code rather than of the machine it ran on.
+//!
+//! The original argument was stronger than the evidence supported, and the correction is worth
+//! keeping. The Phase 2 screen put the saving at one write out of two at 1 KiB, **one out of six
+//! at 64 KiB**, and one out of sixty-six at 1 MiB. The case for not timing this quoted the first
+//! and the last against a drift of 0.5% to 5%; the 64 KiB point is around seventeen percent and
+//! does not sit inside that band. A timing was in fact taken --
+//! `docs/benchmarks/data/xeon-8370c-azure/07-qmux-per-commit-attribution.md` -- and reported
+//! -7.7% at 64 KiB against a control worst of 5.18%, which is outside the band and marginal.
+//! The count remains the establishment; the timing is weak evidence in the same direction.
 //!
 //! # A correction to the plan's wording
 //!

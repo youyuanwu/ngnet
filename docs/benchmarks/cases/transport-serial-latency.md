@@ -74,7 +74,8 @@ reading used to name a specific suspect — the QMux join offered one `IoSlice` 
 writer — and the suspect is gone: records now accumulate in a bounded buffer and a pass writes
 once. [`../controls.md`](../controls.md) still gives the residual confound its direction, and
 what is left of it here is small, because this case has no payload for a coalesced write to
-carry: this arm moved +4.0% when coalescing landed
+carry: this arm moved +4.0% across the whole write-path change set, which is outside this arm's
+own 1.41% drift figure and is not attributed to any one of the six
 ([`../findings/qmux-write-path.md`](../findings/qmux-write-path.md)), the wrong way, which is
 what a bounded buffer's bookkeeping costs when there is nothing to amortise it over.
 

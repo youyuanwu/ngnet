@@ -92,7 +92,7 @@ an oversight, and it is what should be read before anyone adds the arm back.
   The same caution used to apply to the QMux arm, whose write path issued one write per
   `IoSlice`. It no longer does: records now accumulate in a bounded buffer and leave together,
   and this group shows what that is worth without a kernel — which is *nothing*, and slightly
-  worse than nothing. Its socket sibling gained 8.5% at N=64 from the same change while this
+  worse than nothing. Its socket sibling gained 8.5% at N=64 from the same change set while this
   group's arm lost 1.8%
   ([`../findings/qmux-write-path.md`](../findings/qmux-write-path.md)), which is the same
   blindness pointing the other way: the bookkeeping is visible here and what it buys is not.

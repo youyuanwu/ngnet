@@ -33,7 +33,9 @@ the set that shipped is worth.
 ## Results
 
 Microseconds per iteration, lower is better. **Bold** marks a delta larger than the worst control
-movement in the same session, which is the only bar this machine offers.
+movement in this session (4.47%). That is a coarser bar than the per-arm figures
+[`04`](04-qmux-drift-baseline.md) records — duplex 10.42% worst, socket 1.41% worst — which is the
+bar the requirement names and the one the small deltas are read against below.
 
 | Benchmark id | family | base (µs) | after (µs) | paired delta | spread |
 | --- | --- | --- | --- | --- | --- |
@@ -93,8 +95,9 @@ band narrower than the one actually observed.
 
 - **It does not attribute the gain among the five changes that shipped.** This is one paired
   comparison of the whole set.
-  [`findings/qmux-write-path.md`](../../findings/qmux-write-path.md) carries the per-commit
-  attribution, taken on two of these targets.
+  [`07-qmux-per-commit-attribution`](07-qmux-per-commit-attribution.md) attempts it on two duplex
+  targets and mostly answers *cannot say*; no socket identifier is attributed to any commit by any
+  run.
 - **It does not establish the small regressions as real.** Four of the six positive deltas are
   inside the worst control movement. They are reported because a result is not permitted to be
   quoted in one direction only, not because they are settled.

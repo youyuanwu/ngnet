@@ -9,15 +9,20 @@
 //!
 //! # Why the assertions are record counts
 //!
-//! This optimization is **not timed**, and that is a decision rather than an omission. Spec
-//! FR-038 requires the identifiers an effect can appear on to be named before it is measured,
-//! and the Phase 2 screen established that this one removes about one record per request with a
-//! body -- one write in two at 1 KiB and one in sixty-six at 1 MiB, against a run-to-run drift
-//! of 0.5% to 5% on the arms that could show it. A timing would therefore produce a number
-//! smaller than the noise it was taken in. FR-021 accepts a mechanism established by a count
-//! instead, and these are that count: they are properties of the code, and they fail if the
-//! packing stops happening. `docs/benchmarks/allocation-counts.md` is the same treatment
-//! applied to the HTTP/2 stack.
+//! These assertions are counts because a count is what establishes this change. Spec FR-021
+//! accepts a mechanism established by a count, and a count is a property of the code that holds
+//! on every machine, which a timing on one machine is not.
+//!
+//! A timing was *expected* to be pointless and turned out not to be, which is recorded here
+//! rather than quietly dropped. The Phase 2 screen put the saving at about one record per
+//! request with a body -- one write out of two at 1 KiB, **one out of six at 64 KiB**, and one
+//! out of sixty-six at 1 MiB -- and the argument for not timing it was built on the first and
+//! last of those three, against a run-to-run drift of 0.5% to 5%. The middle point is the one
+//! that does not fit that argument, and it is where
+//! `docs/benchmarks/data/xeon-8370c-azure/07-qmux-per-commit-attribution.md` later measured
+//! -7.7% against a control worst of 5.18% -- outside the band, in the noisiest step of seven,
+//! and marginal rather than settled. So: the counts below are the establishment, and the timing
+//! that does exist is weak evidence that this is worth more than it was predicted to be.
 //!
 //! # The one that is not a count
 //!
