@@ -2,7 +2,7 @@
 
 **Status: current.** The machine benchmarks are being collected on from 2026-08-16.
 
-**First run:** 2026-08-16 · **Last run:** 2026-08-16
+**First run:** 2026-08-16 · **Last run:** 2026-08-17
 
 ## Hardware and system
 
@@ -29,7 +29,11 @@ in every run.
 
 - **Pinning:** `taskset -c 3`, matching the legacy host's convention. Sibling thread 7 shares
   the physical core, so keep the machine otherwise idle.
-- **Otherwise idle?** To be recorded per run. Runs 01–03 had the machine to themselves.
+- **Otherwise idle?** To be recorded per run. Runs 01–03 had the machine to themselves, and
+  `04` records the same for its two passes. `05` and `06` do **not** state it, so it should not
+  be assumed of them: their control movements — 0.73% mean for `05`, 1.06% mean and 4.47% worst
+  for `06` — are the only evidence available about how quiet the host was, and they are the
+  right thing to size those runs' deltas against rather than the 1% figure below.
 - **Observed drift — the important number. About 1%.** Across 78 benchmarks run twice with no
   code change between, median |drift| was **0.90%**, mean 1.23%, and only one benchmark
   exceeded 5%. See [01-drift-baseline](01-drift-baseline.md) — that is the bar every result
@@ -80,6 +84,15 @@ Still outstanding, in the order they are worth doing:
    `transport_concurrent_throughput`.** This is the direct test of the mechanism the whole
    write-path finding rests on, and the one thing
    [02-first-survey](02-first-survey.md) could not settle from a standing survey.
-2. **Replicate the duplex 1 MiB arms**, the only place this host is noisy.
-3. Everything else listed under *What a new machine should reproduce* in
+2. **A cross-protocol run with the QMux arms in it.** Runs `04` to `06` all contain those arms
+   and none of them compares one to an HTTP/2 arm, because each is a paired build comparison in
+   which the HTTP/2 arms are controls. The open question that needs it is whether the QMux-to-
+   HTTP/2 ratio still grows with concurrency over a socket now that the write count no longer
+   does; `docs/qmux-h3/pending-work.md` carries the lead and what would settle it. This is
+   worth doing before item 3, because it is the only outstanding run that can close an entry
+   rather than confirm one.
+3. **Replicate the duplex 1 MiB arms**, the only place this host is noisy — and note that `04`
+   sharpens this: `body_throughput/ngnet-qmux-h3/1048576` drifts **10.42%**, the worst
+   identifier in the suite, so the QMux arm needs this more than the others do.
+4. Everything else listed under *What a new machine should reproduce* in
    [`../../findings/`](../../findings/).

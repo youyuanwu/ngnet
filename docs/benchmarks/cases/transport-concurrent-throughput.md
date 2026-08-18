@@ -41,8 +41,9 @@ pair are timed adjacently.
 The single-threaded runtime here is not a matter of taste: the QMux join hangs at high
 concurrency on a multi-worker runtime, which is why the duplex family's
 [`concurrent_throughput_multi_thread`](concurrent-throughput.md) group carries no QMux arm at
-all. Nothing in this file uses a multi-worker runtime, so nothing here is affected; the defect
-is recorded on [`../../qmux-h3/pending-work.md`](../../qmux-h3/pending-work.md).
+all — that page records why the reason for the omission has since shifted while the omission
+stands. Nothing in this file uses a multi-worker runtime, so nothing here is affected; the
+defect is recorded on [`../../qmux-h3/pending-work.md`](../../qmux-h3/pending-work.md).
 
 ## Reading it
 
@@ -58,17 +59,30 @@ varies two axes and is attributable to neither.
   [`transport_serial_latency`](transport-serial-latency.md), and a ratio that *grows* from
   there to N=64 is the interesting reading, because it says the difference scales with
   in-flight streams rather than with exchanges.
-- **This is the case where the QMux write path is most exposed.** The finding that gave this
-  group its 2.3× spread was about syscalls per pass, and the QMux join offers one `IoSlice`
-  per write to its writer — the exact pattern that finding identified as expensive with a
-  kernel in the way and invisible without one. If the cross-protocol ratio here exceeds the
-  duplex family's at the same `N`, that write path is the first place to look;
-  [`../controls.md`](../controls.md) records the confound with its direction, and it is
-  disclosed rather than controlled.
+- **This is the case where the QMux write path was most exposed, and it is the case that has
+  moved most.** The finding that gave this group its 2.3× spread was about syscalls per pass,
+  and the QMux join used to offer one `IoSlice` per write to its writer — the exact pattern that
+  finding identified as expensive with a kernel in the way and invisible without one. It no
+  longer does, and the two families answered differently at the same parameters: this group's
+  QMux arm gained 8.5% at N=64 and 7.1% at N=8 while the duplex
+  [`concurrent_throughput`](concurrent-throughput.md) arm *lost* 1.8% and 2.1%
+  ([`../findings/qmux-write-path.md`](../findings/qmux-write-path.md)). That sign flip is the
+  clearest thing this pair of groups has produced, and it is what the group exists for. If the
+  cross-protocol ratio here still exceeds the duplex family's at the same `N`, the write path is
+  no longer the first place to look — the record count and the pump's fixed offer bound are, and
+  [`../../qmux-h3/pending-work.md`](../../qmux-h3/pending-work.md) carries both.
+  [`../controls.md`](../controls.md) records what is left of the confound with its direction,
+  and it is disclosed rather than controlled.
 - On one core, throughput does not multiply with `N`; see
   [`../interpreting.md`](../interpreting.md).
 
 ## Where its numbers are
 
-Recorded runs are indexed in [`../data/README.md`](../data/README.md). **No recorded run
-contains a QMux arm**; every run filed there predates it.
+Recorded runs are indexed in [`../data/README.md`](../data/README.md). Three now contain a QMux
+arm — [`04-qmux-drift-baseline`](../data/xeon-8370c-azure/04-qmux-drift-baseline.md),
+[`05-qmux-delivery-aliasing`](../data/xeon-8370c-azure/05-qmux-delivery-aliasing.md) and
+[`06-qmux-write-path`](../data/xeon-8370c-azure/06-qmux-write-path.md) — and all three are
+paired comparisons of one QMux build against another, not of the QMux arm against an HTTP/2 one.
+**No recorded run computes a cross-protocol ratio for this group under drift controls**, so the
+readings above that turn on a ratio are still unmeasured; the HTTP/2 arms appear in those
+sessions only as unchanged controls.

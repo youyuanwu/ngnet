@@ -8,8 +8,12 @@
 The QMux stack was built to be correct and never made fast. It alternated strictly between
 producing one protocol record and writing that one record, so a driver turn moving a megabyte made
 sixty-five trips through the byte stream and one carrying sixty-four small streams made seventy,
-each averaging twenty-one bytes. This is what changing that was worth, what it cost, and the one
-change that was made, measured and thrown away.
+totalling 1,922 bytes — about twenty-seven bytes a write. Sixty-four of those seventy are the
+exchanges themselves and carry 1,342 bytes between them, twenty-one bytes each; the remaining six
+are the connection preamble and setup, which are larger. The two averages are quoted here with
+their denominators because they are easy to confuse and only the second is the quantity a
+per-call cost is paid on. This is what changing that was worth, what it cost, and the one change
+that was made, measured and thrown away.
 
 ## What was expected, and why it was half wrong
 
@@ -99,6 +103,51 @@ become a time reduction. The first was
 *growth* rather than allocation count. The lesson is the same one from a different angle, and it
 is why this suite treats a count and a timing as different kinds of claim: a count is a property
 of the code and true on every machine, and it is not evidence about time.
+
+## What a new machine should reproduce
+
+The percentages above belong to `xeon-8370c-azure` and to one pair of builds. On new hardware
+the claim is falsifiable in this shape, and the ordering matters more than any single number:
+
+1. **The counts, exactly, on any machine.** These are properties of the code, not of the host.
+   The *after* halves are asserted by tests in this tree and a machine that does not reproduce
+   them has a different build, not a different result: 3/10/66 writes per driver turn at
+   concurrency 1/8/64 with an empty body and the same 3/10/66 at 64 KiB, 16/108/848 at 1 MiB,
+   and zero bytes copied through the framer for a send of any size. They are asserted by
+   `tests/ngnet-qmux-h3-tests/tests/concurrent_driver_writes.rs` and
+   `crates/ngnet-qmux/tests/io_writes.rs`. The credit figures are a partial exception and are
+   worth stating as such: `tests/ngnet-qmux-h3-tests/tests/credit_batching.rs` asserts a
+   *relation* — that a run of window reports becomes strictly fewer and at most half as many
+   extensions — rather than the exact 31 applications and 10 connection extensions observed for
+   eight concurrent downloads, because an exact count there would pin the harness's scheduling
+   rather than the batching. Reproduce the relation; treat the two numbers as an observation.
+   The *before* halves — 7/14/70, 12/54/390,
+   72/534/4230, 1,049,226 bytes copied, 42 credit applications and 21 extensions — cannot be
+   re-taken from this tree, because the code that produced them is gone; they were measured by
+   the same counters at `524fa54` and are recorded in the commits that removed them and in
+   `.paw/work/qmux-h3-perf/Phase2Screen.md`. Treat them as a record rather than as something to
+   verify.
+2. **The sign flip on concurrency, before any magnitude.** `transport_concurrent_throughput`'s
+   QMux arm improves at N=8 and N=64 and the duplex `concurrent_throughput` arm at the same
+   parameters does not. If both families move the same way, the mechanism claimed here is not
+   what is being measured, whatever the sizes are.
+3. **The ordering across the body sweep, which is the reverse of the HTTP/2 finding's.** The
+   gain grows with payload — largest at 1 MiB, smaller at 64 KiB, smaller again at 1 KiB, and
+   negative with an empty body. [`write-path-and-gathering.md`](write-path-and-gathering.md)
+   predicts the opposite ordering for a write-side change, and the reason the two differ is
+   that this change also removed a per-record copy, which the HTTP/2 one did not. A new host
+   that reproduces the HTTP/2 ordering here is measuring coalescing alone.
+4. **The empty-body and serial-latency arms moving the wrong way, by a few percent.** They
+   should be slightly worse, not neutral: there is no payload to amortise the buffer's
+   bookkeeping over. A host on which they improve has something else going on.
+5. **The drift controls first.** Before any of the above is read, the 46 unchanged identifiers
+   in the session must move less than the effects being claimed —
+   [`04`](../data/xeon-8370c-azure/04-qmux-drift-baseline.md) is what that looks like on this
+   host, and `body_throughput/ngnet-qmux-h3/1048576` drifts far more than any other identifier
+   in the suite. Read the 64 KiB point in preference to it wherever both are available.
+
+The single most valuable run to repeat is the concurrency pair in step 2, because it is the only
+one where the mechanism predicts two different signs and so cannot be satisfied by accident.
 
 ## What this does not establish
 

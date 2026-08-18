@@ -46,22 +46,33 @@ Two separately named groups run the same sweep, and **they do not carry the same
 
 This is not the reason [`shared_body`](shared-body.md) has none, and the two must not be filed
 together. There, no counterpart mechanism exists to measure. Here the mechanism exists, the arm
-was written, and it does not work: **the QMux join hangs at high concurrency on a multi-worker
-runtime.** Measured with the flow-control windows and the stream allowance raised out of the
-way, concurrency 64 wedged on roughly three attempts in four at both two and four workers,
-typically after about 55 of the 64 requests had completed. Concurrency 1 and 8 complete on
-every runtime, a current-thread runtime completes at every point, and loopback TCP is clean
-throughout — so the sibling group above and every `transport_*` target are unaffected.
+was written, and it was left out because **the QMux join hangs at high concurrency on a
+multi-worker runtime.** Measured with the flow-control windows and the stream allowance raised
+out of the way, concurrency 64 wedged on roughly three attempts in four at both two and four
+workers, typically after about 55 of the 64 requests had completed. Concurrency 1 and 8 complete
+on every runtime, and a current-thread runtime completes at every point — so the sibling group
+above and every `transport_*` target are unaffected.
 
-**Intermittence is what makes the omission necessary rather than merely tidy.** An arm that
-hung every time would be caught by whoever added it. One that hangs three times in four is a CI
-job that occasionally never returns, and `cargo bench -- --test` imposes no timeout that would
-turn that into a failure.
+**The reason for the omission has since shifted, and the arm should still not be added.** The
+write-path work screened the defect and drove it deliberately: the benchmark fixtures themselves
+completed 1,520 attempts out of 1,520, across both substrates and every worker count, because
+`response_for` sets a `content-type` header on the response and that header takes the failure
+rate from 100% to 0%. So the fixture this group would use does not hang, and the original
+objection — an arm that occasionally never returns, under a `cargo bench -- --test` that imposes
+no timeout to turn that into a failure — no longer applies on the evidence.
+
+What replaces it has nothing to do with the defect. This is a **duplex** group, so it cannot
+show a syscall saving; a QMux arm here would report the userspace bookkeeping its
+single-threaded sibling already reports, plus the scheduling noise the group exists to display.
+Adding an arm that sits one response header away from a deterministic wedge, to measure
+something another arm measures more cleanly, is a bad trade. Anyone who wants it anyway should
+read the fixture's header first.
 
 The defect is recorded rather than fixed — fixing the join is outside this work's scope — on
-[`../../qmux-h3/pending-work.md`](../../qmux-h3/pending-work.md). That record is what makes the
-omission traceable to a known defect rather than indistinguishable from an oversight, and it is
-what should be read before anyone adds the arm back.
+[`../../qmux-h3/pending-work.md`](../../qmux-h3/pending-work.md), which also carries what the
+screen found, including a correction to the claim that loopback TCP is clean throughout. That
+record is what makes the omission traceable to a known defect rather than indistinguishable from
+an oversight, and it is what should be read before anyone adds the arm back.
 
 ## Reading it
 
@@ -78,8 +89,13 @@ what should be read before anyone adds the arm back.
 - This case was **blind to the effect that dominated the socket family**: a per-block drain
   costs nothing without a kernel. That is the clearest single illustration of what the duplex
   deletes; see [`../findings/write-path-and-gathering.md`](../findings/write-path-and-gathering.md).
-  The same caution applies to the QMux arm, whose own write path issues one write per `IoSlice`
-  ([`../controls.md`](../controls.md)) — a cost the duplex family largely hides.
+  The same caution used to apply to the QMux arm, whose write path issued one write per
+  `IoSlice`. It no longer does: records now accumulate in a bounded buffer and leave together,
+  and this group shows what that is worth without a kernel — which is *nothing*, and slightly
+  worse than nothing. Its socket sibling gained 8.5% at N=64 from the same change while this
+  group's arm lost 1.8%
+  ([`../findings/qmux-write-path.md`](../findings/qmux-write-path.md)), which is the same
+  blindness pointing the other way: the bookkeeping is visible here and what it buys is not.
 
 ## Where its numbers are
 

@@ -45,8 +45,12 @@ use ngnet_qmux::io::testing::WriteLog;
 /// How many round-robin passes before a run is declared broken.
 ///
 /// Reached only by a run that is woken on every pass and never finishes, which the stall
-/// detector below cannot see. Generous enough for a multi-megabyte transfer moving one record
-/// per turn, which is what the unoptimized connection does and what these tests measure.
+/// detector below cannot see. The bound was sized for a multi-megabyte transfer moving one
+/// record per turn, which is what the connection did before write coalescing. It now moves up
+/// to `OUTBOUND_CEILING`'s worth per turn, so the bound is several times looser than anything
+/// these tests need — left where it is deliberately, because a limit that only ever fires on a
+/// livelock should be far from the workload rather than near it, and lowering it would trade a
+/// diagnostic for nothing.
 const MAX_PASSES: usize = 2_000_000;
 
 /// A waker that remembers it was fired.

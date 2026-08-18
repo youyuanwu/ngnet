@@ -685,9 +685,11 @@ impl<S: AsyncByteStream, C: Clock> QuicConnection for QmuxConnection<S, C> {
 
     /// Records the extension; the layer below is told at the next interaction with it.
     ///
-    /// The HTTP/3 driver forwards these one at a time and twice per delivery -- see
-    /// [`PendingCredit`] for the count, for why holding a run of them is safe, and for what
-    /// was rejected in its place. The audit FR-037 asked for came back "not coalesced", and
+    /// The HTTP/3 driver forwards these one at a time and twice per delivery -- see the
+    /// `PendingCredit` type in this module for the count, for why holding a run of them is safe,
+    /// and for what was rejected in its place. It is private, so this is a prose reference
+    /// rather than a link: the batching is an implementation detail of this seam and nothing a
+    /// caller can name. The audit FR-037 asked for came back "not coalesced", and
     /// this is where they are coalesced instead: `ngnet-h3` is shared with the QUIC stack,
     /// and a change made at this seam leaves it untouched.
     fn extend_credit(&mut self, stream: Option<H3StreamId>, bytes: u64) -> Result<()> {

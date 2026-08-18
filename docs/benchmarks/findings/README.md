@@ -20,6 +20,16 @@ the current one. The third has: it was re-measured on `xeon-8370c-azure` in
 verdict and **overturned the completion one** — it had failed on a misbehaving control arm
 rather than on its own delta.
 
+The fourth was established on `xeon-8370c-azure` and has never been anywhere else, which puts
+it in the opposite position to the first two: its percentages are the current host's, and it is
+the legacy host that would be the re-measurement. It also rests on a different kind of evidence
+from the other three. Where they compare arms within one session, it compares two *builds* of
+one arm, paired and interleaved, with the other arms present only as unchanged controls — so
+its deltas are not cross-protocol ratios and must not be read as any. The half of it that
+travels furthest is not a percentage at all: the write, copy and credit counts are properties
+of the code and identical on every machine, and the timings say what those counts were worth on
+this one.
+
 That the legacy figures have not been reproduced does not make them wrong — each rests on
 paired deltas against drift controls measured in the same session, which is the part that
 travels between machines — but it does mean **the percentages are that host's, not this

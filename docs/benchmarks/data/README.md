@@ -10,7 +10,7 @@ what the run does and does not establish.
 | Machine | Status | Runs |
 | --- | --- | --- |
 | [`legacy-dev-host`](legacy-dev-host/) | **Retired, unavailable.** Every measurement taken before 2026-08-16. Noisy: unchanged control arms drifted 5–15% within a session. | 4 |
-| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current. Intel Xeon Platinum 8370C, 8 vCPU, Linux 6.17 on Azure. Quiet: **~1%** between identical passes. | 3 |
+| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current. Intel Xeon Platinum 8370C, 8 vCPU, Linux 6.17 on Azure. Quiet: **~1%** between identical passes. | 6 |
 
 **Absolute figures from different machines must never be tabulated together.** Nothing here
 is normalised for CPU model, kernel or io_uring implementation, and those are exactly the
@@ -35,7 +35,10 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 
 **No run recorded here compares `ngnet-qmux-h3` against anything.** Runs `01` to `03` predate the
 cross-protocol arms entirely; `04` covers them but is a drift measurement, so its QMux figures are
-the inputs to a variation calculation and not a comparison with the HTTP/2 arms beside them. The
+the inputs to a variation calculation and not a comparison with the HTTP/2 arms beside them; and
+`05` and `06` are paired comparisons of one QMux build against another, in which the HTTP/2 arms
+appear only as unchanged controls. A delta in either of those is a statement about a change to
+the QMux stack and about nothing else. The
 HTTP/2 figures in `01` to `03` are still current — nothing about those arms changed when the QMux
 ones were added, by design ([`../controls.md`](../controls.md)) — but a reader looking for a
 cross-protocol number will not find one here, and should not infer one from the absence.

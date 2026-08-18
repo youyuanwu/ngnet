@@ -54,9 +54,15 @@ outer loop and the arms are the inner one.
   cost per exchange is amortised over a growing payload, so the QMux arm's ratio against
   `ngnet-h2` should fall as the sweep climbs, and the 0 B point should look like
   [`serial-latency`](serial-latency.md). A ratio that *grows* with body size would be a per-byte
-  effect and would need a mechanism — the candidates being the record-size difference, the
-  join's one-write-per-`IoSlice` offer, and the copies below it, all set out with their
-  directions in [`../controls.md`](../controls.md).
+  effect and would need a mechanism. There were three candidates: the record-size difference,
+  the join's one-write-per-`IoSlice` offer, and the copies below it. Two have since been
+  removed and one measured — coalescing and direct serialisation took the write count and the
+  outbound copy out, worth −30.3% at 1 MiB on this group
+  ([`../findings/qmux-write-path.md`](../findings/qmux-write-path.md)), and the remaining
+  inbound copy was measured by removing it and found to cost nothing worth having
+  ([`../data/xeon-8370c-azure/05-qmux-delivery-aliasing.md`](../data/xeon-8370c-azure/05-qmux-delivery-aliasing.md)).
+  The record-size difference is what is left, and it is the one to reach for first now.
+  [`../controls.md`](../controls.md) sets out each with its direction.
 - The 1 MiB point is historically **the noisiest in the suite**. Treat a single-digit
   percentage move there as neutral unless the drift controls in the same session were quiet.
 - For the same sweep with a socket in the way, see
