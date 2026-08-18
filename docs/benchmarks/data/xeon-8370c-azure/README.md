@@ -78,6 +78,7 @@ submodules. [`../../running.md`](../../running.md) states the requirement in ful
 | [05-qmux-delivery-aliasing](05-qmux-delivery-aliasing.md) | 2026-08-17 | `223960d` against `9f97334` | A two-orders-of-magnitude allocation cut that was **2.5–4.8% slower** — reverted |
 | [06-qmux-write-path](06-qmux-write-path.md) | 2026-08-17 | `524fa54` against `a54ea43` | The write-path set end to end — **−30% at 1 MiB**, −8.5% at concurrency 64 on a socket |
 | [07-qmux-per-commit-attribution](07-qmux-per-commit-attribution.md) | 2026-08-17 | seven commits, each against its predecessor | Coalescing is **−21.7%** at 1 MiB; four of the six are inside their step's controls — duplex only |
+| [08-qmux-against-h2](08-qmux-against-h2.md) | 2026-08-18 | `c525aa1` | **QMux against HTTP/2**, five passes — fixed +19–34 µs per exchange, **0.86×** per byte over a socket |
 
 Still outstanding, in the order they are worth doing:
 
@@ -85,13 +86,16 @@ Still outstanding, in the order they are worth doing:
    `transport_concurrent_throughput`.** This is the direct test of the mechanism the whole
    write-path finding rests on, and the one thing
    [02-first-survey](02-first-survey.md) could not settle from a standing survey.
-2. **A cross-protocol run with the QMux arms in it.** Runs `04` to `06` all contain those arms
-   and none of them compares one to an HTTP/2 arm, because each is a paired build comparison in
-   which the HTTP/2 arms are controls. The open question that needs it is whether the QMux-to-
-   HTTP/2 ratio still grows with concurrency over a socket now that the write count no longer
-   does; `docs/qmux-h3/pending-work.md` carries the lead and what would settle it. This is
-   worth doing before item 3, because it is the only outstanding run that can close an entry
-   rather than confirm one.
+2. **A write count per megabyte for both stacks.** [`08`](08-qmux-against-h2.md) established
+   that QMux moves bulk bytes over a socket for 61% of what HTTP/2's kernel path costs, which is
+   arithmetic on measured numbers with no mechanism attached. Writes per megabyte is the obvious
+   candidate and both stacks already have the instrumentation, so this is cheap. It has taken
+   over from the cross-protocol run as the item most likely to close an entry rather than
+   confirm one. *(The cross-protocol run itself is done: it is [`08`](08-qmux-against-h2.md). It
+   answered the concurrency question in the unwelcome direction — the ratio is still worse over
+   a socket than over a duplex, 3.12× against 2.33×, even though the write count no longer grows
+   with concurrency, so the lead in `docs/qmux-h3/pending-work.md` survives its own leading
+   suspect being removed.)*
 3. **Replicate the duplex 1 MiB arms**, the only place this host is noisy — and note that `04`
    sharpens this: `body_throughput/ngnet-qmux-h3/1048576` drifts **10.42%**, the worst
    identifier in the suite, so the QMux arm needs this more than the others do.

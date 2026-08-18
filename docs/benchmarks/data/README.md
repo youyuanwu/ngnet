@@ -33,16 +33,18 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [05-qmux-delivery-aliasing](xeon-8370c-azure/05-qmux-delivery-aliasing.md) | xeon-8370c-azure | 2026-08-17 | Aliasing deliveries instead of copying them — **slower, and reverted** | [the QMux write path](../findings/qmux-write-path.md) |
 | [06-qmux-write-path](xeon-8370c-azure/06-qmux-write-path.md) | xeon-8370c-azure | 2026-08-17 | The QMux write-path work end to end — **−30% on bodies, −8.5% on socket concurrency** | [the QMux write path](../findings/qmux-write-path.md) |
 | [07-qmux-per-commit-attribution](xeon-8370c-azure/07-qmux-per-commit-attribution.md) | xeon-8370c-azure | 2026-08-17 | Which change produced the gain — **coalescing**, and the rest not resolved | [the QMux write path](../findings/qmux-write-path.md) |
+| [08-qmux-against-h2](xeon-8370c-azure/08-qmux-against-h2.md) | xeon-8370c-azure | 2026-08-18 | **QMux against HTTP/2** — a fixed +19–34 µs per exchange, and 0.86× per byte over a socket | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
 
-**No run recorded here compares `ngnet-qmux-h3` against anything.** Runs `01` to `03` predate the
-cross-protocol arms entirely; `04` covers them but is a drift measurement, so its QMux figures are
-the inputs to a variation calculation and not a comparison with the HTTP/2 arms beside them; and
-`05` and `06` are paired comparisons of one QMux build against another, in which the HTTP/2 arms
-appear only as unchanged controls. A delta in either of those is a statement about a change to
-the QMux stack and about nothing else. The
-HTTP/2 figures in `01` to `03` are still current — nothing about those arms changed when the QMux
-ones were added, by design ([`../controls.md`](../controls.md)) — but a reader looking for a
-cross-protocol number will not find one here, and should not infer one from the absence.
+**The cross-protocol comparison is [`08`](xeon-8370c-azure/08-qmux-against-h2.md), and it is the
+only run here that is one.** That sentence replaces a standing note saying no such run existed.
+Everything before it is a different kind of measurement and none of it should be read as a
+comparison between the two stacks: `01` to `03` predate the cross-protocol arms entirely; `04`
+covers them but is a drift measurement, so its QMux figures are the inputs to a variation
+calculation; and `05` to `07` are paired comparisons of one QMux build against another, in which
+the HTTP/2 arms appear only as unchanged controls. A delta in any of those is a statement about a
+change to the QMux stack and about nothing else. The HTTP/2 figures in `01` to `03` remain current
+— nothing about those arms changed when the QMux ones were added, by design
+([`../controls.md`](../controls.md)).
 
 What `04` does give a reader is the bar: the socket QMux arm varies by **0.67%** on average and
 the duplex one by **1.55%**, and `body_throughput/ngnet-qmux-h3/1048576` alone varies by

@@ -371,11 +371,39 @@ replaced rather than something worse.
 
 ## Something scales with in-flight streams on a real socket
 
-This is a lead, not a finding, and the numbers behind it are **not measurements**: they come
-from unpinned, short-sample exploratory runs taken while the benchmark arms were being built,
-on a shared virtual machine, with no drift controls and no replication. They are not filed
-under `docs/benchmarks/data/` and must not be quoted as results. What they are good for is
-saying which point is worth measuring properly.
+**Now measured, still unexplained, and its leading suspect has been eliminated.** This began as a
+lead from unpinned exploratory runs, and that provenance is kept below because the sequence
+matters. It is no longer the evidence:
+[`08-qmux-against-h2`](../benchmarks/data/xeon-8370c-azure/08-qmux-against-h2.md) measured it
+properly, over five pinned passes with the ratio formed inside each pass.
+
+What it found. Every workload in the suite has a *smaller* QMux-to-HTTP/2 ratio with a kernel in
+the path than without one — a body at 1 MiB goes from 1.34× on a duplex to 0.89× on a socket —
+**except concurrency, which goes the other way**: 2.33× on a duplex against **3.12×** on a socket
+at sixty-four streams, and 2.48× against **3.14×** at eight. Five passes out of five, at both
+concurrencies, with per-pass ranges under 0.06×. So the shape the exploratory runs suggested is
+real, and it is the only place in the suite where adding a kernel makes QMux's position worse.
+
+What it eliminates. The leading suspect was one write per offered `IoSlice`. That mechanism is
+gone — a fragmented offer is now one vectored push into as few records as the size allows, and
+the write count per driver turn no longer grows with the streams in flight — and **the inversion
+survived its removal**. The candidate that produced this entry is therefore not the cause, or not
+the only one.
+
+What is left. The two remaining candidates named when this entry was written are untouched: QMux
+produces more records for the same payload than HTTP/2 produces frames, since a record caps at
+16382 bytes against a 16384-byte frame payload; and the pump's fixed sixty-four-offer yield may
+interact with sixty-four concurrent streams in a way worth not dismissing. A third is now
+available: [`08`](../benchmarks/data/xeon-8370c-azure/08-qmux-against-h2.md) implies QMux's
+kernel-path cost per megabyte is 61% of HTTP/2's, which is a *favourable* asymmetry on the body
+axis and might be an unfavourable one on the concurrency axis if it comes from writing fewer,
+larger chunks. **What would settle it:** a write count per pass and per megabyte for both arms at
+each concurrency — both stacks already have the instrumentation, and neither has been asked.
+
+The original provenance note, kept because a lead's history is part of it: the numbers that
+produced this entry came from unpinned, short-sample exploratory runs taken while the benchmark
+arms were being built, with no drift controls and no replication. They were never filed under
+`docs/benchmarks/data/` and must still not be quoted as results.
 
 Across the suite the QMux arm's cost relative to its HTTP/2 counterpart behaved like a fixed
 per-exchange overhead: largest with an empty body, smallest at 1 MiB, and smaller with a
