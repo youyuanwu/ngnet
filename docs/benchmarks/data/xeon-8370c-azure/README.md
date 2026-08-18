@@ -72,6 +72,7 @@ submodules. [`../../running.md`](../../running.md) states the requirement in ful
 | [03-shared-body](03-shared-body.md) | 2026-08-16 | `e75118e` | Handing bodies over, five replicates — **settled the compio verdict** |
 | [04-qmux-drift-baseline](04-qmux-drift-baseline.md) | 2026-08-17 | `524fa54` | Drift for the QMux arms, which `01` predates — socket **0.67%**, duplex **1.55%** |
 | [05-qmux-delivery-aliasing](05-qmux-delivery-aliasing.md) | 2026-08-17 | `223960d` against `9f97334` | A two-orders-of-magnitude allocation cut that was **2.5–4.8% slower** — reverted |
+| [06-qmux-write-path](06-qmux-write-path.md) | 2026-08-17 | `524fa54` against `a54ea43` | The write-path set end to end — **−30% at 1 MiB**, −8.5% at concurrency 64 on a socket |
 
 Still outstanding, in the order they are worth doing:
 
