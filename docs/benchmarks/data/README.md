@@ -30,6 +30,7 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [02-first-survey](xeon-8370c-azure/02-first-survey.md) | xeon-8370c-azure | 2026-08-16 | Where the arms stand here, against the findings' predictions, and against hyper | [write path](../findings/write-path-and-gathering.md) |
 | [03-shared-body](xeon-8370c-azure/03-shared-body.md) | xeon-8370c-azure | 2026-08-16 | Handing bodies over, re-measured — compio verdict overturned | [handing bodies over](../findings/handing-bodies-over.md) |
 | [04-qmux-drift-baseline](xeon-8370c-azure/04-qmux-drift-baseline.md) | xeon-8370c-azure | 2026-08-17 | What an unchanged **QMux** arm does run to run — the bar the QMux work is measured against | — |
+| [05-qmux-delivery-aliasing](xeon-8370c-azure/05-qmux-delivery-aliasing.md) | xeon-8370c-azure | 2026-08-17 | Aliasing deliveries instead of copying them — **slower, and reverted** | — |
 
 **No run recorded here compares `ngnet-qmux-h3` against anything.** Runs `01` to `03` predate the
 cross-protocol arms entirely; `04` covers them but is a drift measurement, so its QMux figures are

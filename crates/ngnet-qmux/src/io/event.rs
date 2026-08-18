@@ -13,48 +13,17 @@
 //! the events to the caller in the order they happened. A caller who wants to extend a window
 //! the instant data arrives therefore can, which is exactly what a handler cannot do.
 //!
-//! # Delivered data, and how it stopped being a copy
+//! # Owned data, and what it costs
 //!
-//! [`Event::StreamData`] carries a [`StreamBytes`], which owns its bytes without necessarily
-//! having copied them. The handler receives a borrow that is valid only for the duration of
-//! dwnx's callback -- it points into the buffer dwnx is parsing -- so carrying *the borrow* out
-//! to a caller polled later is not possible. It used to be carried out as a copy, one memcpy
-//! per delivery.
+//! [`Event::StreamData`] owns its bytes. The handler receives a borrow that is valid only for
+//! the duration of dwnx's callback -- it points into the record buffer dwnx is parsing -- so
+//! carrying it out to a caller who is polled later is not possible without copying it. The
+//! alternative would be to invoke a caller-supplied callback from inside the handler, which is
+//! the design the state machine already offers and which this layer exists to be an
+//! alternative to.
 //!
-//! What removed the copy is that the buffer dwnx is parsing is this connection's own read
-//! buffer (`deps/dwnx/lib/dwnx_conn.c:1631-1636`), so the bytes are already in memory this
-//! crate owns and a reference count can outlive a borrow where the borrow cannot. See
-//! [`super::delivery`] for the view type and for the threshold below which a delivery is still
-//! copied, which is what bounds the memory a held delivery pins.
-//!
-//! # How the handler reaches the buffer, when it cannot reach the connection
-//!
-//! The handler is `'static` and has no way to name the connection -- that is a deliberate
-//! design property with compile-fail cases enforcing it (`crate::compile_fail`), and it is why
-//! the delivery was copied in the first place. So it cannot ask the connection which buffer the
-//! bytes came from.
-//!
-//! What it can do is hold, alongside the queue it already holds, the reference-counted handle
-//! for the buffer currently being parsed. The read side puts it there immediately before
-//! feeding the state machine and takes it away immediately after, and in between the handler
-//! has everything it needs: the handle, and a borrow whose address says where inside it the
-//! bytes lie. Neither is a connection handle -- there is no operation on either that reaches
-//! the connection -- so the property the compile-fail cases pin is untouched, and it is checked
-//! rather than argued: those cases still fail to compile, for the reasons they name.
-//!
-//! Whether the borrow really lies inside that buffer is **checked, not assumed**. dwnx delivers
-//! stream payload straight out of the buffer it was handed, but an implementation detail that
-//! changed underneath should cost a copy rather than produce wrong bytes, so a slice whose
-//! address falls outside the buffer is copied out. The addresses are compared and never
-//! dereferenced.
-//!
-//! The rejected alternative is the HTTP/2 stack's, which is the same idea one step later: its
-//! handler records *where* a chunk lay as an offset and a length, and the driver resolves those
-//! into views once the call has returned (`crates/ngnet-h2/src/http/driver.rs`). It needs no
-//! shared handle at all, and it was not copied because of where the delivery type sits in each
-//! crate. There, the unresolved form is an internal event the caller never sees; here it would
-//! be a publicly delivered [`StreamBytes`] with a resolution step that could be missed, and a
-//! missed one is an empty delivery rather than a failure.
+//! The copy is one memcpy per delivery, bounded by the record size, and it is recorded as an
+//! acknowledged cost rather than an oversight.
 //!
 //! # Why the queue is a `Mutex` when nothing here is threaded
 //!
@@ -69,10 +38,9 @@
 //! that asymmetry is not an inconsistency.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::handlers::StreamLimitKind;
-use crate::io::delivery::{ALIAS_THRESHOLD, StreamBytes};
 use crate::params::TransportParams;
 use crate::stream::StreamId;
 
@@ -96,13 +64,8 @@ pub enum Event {
         /// reassembling into a sparse buffer should not have to keep the count itself, and a
         /// caller that does keep it can assert against this.
         offset: u64,
-        /// The bytes.
-        ///
-        /// A view of the connection's read buffer where the delivery is large enough to be
-        /// worth holding one, and an allocation of its own where it is not. Either way the
-        /// bytes are the caller's for as long as it wants them, and either way they are the
-        /// bytes the peer sent; see [`StreamBytes`].
-        data: StreamBytes,
+        /// The bytes, copied out of the record dwnx was parsing.
+        data: Vec<u8>,
         /// Whether these bytes end the stream.
         ///
         /// May be set on an empty `data`: a peer that finishes a stream having already sent
@@ -188,26 +151,7 @@ pub enum Event {
 /// nothing in this layer is threaded.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventQueue {
-    shared: Arc<Mutex<Shared>>,
-}
-
-/// What the queue and the handlers share.
-///
-/// The events, and the buffer the state machine is parsing right now. The second is what lets
-/// [`EventQueue::deliver`] hand out a view instead of a copy; see the
-/// [module documentation](self) for why it lives here rather than being reached for through the
-/// connection.
-#[derive(Debug, Default)]
-struct Shared {
-    queue: VecDeque<Event>,
-    /// The read buffer being fed to the state machine, between [`EventQueue::begin_read`] and
-    /// [`EventQueue::end_read`], and [`None`] at every other instant.
-    ///
-    /// Held for the duration of one `Conn::read` and no longer. A handle left here would keep
-    /// the buffer's strong count above one for ever, and the connection reuses a buffer exactly
-    /// when that count comes back to one -- so the connection would allocate a fresh buffer on
-    /// every read and the pool would never reclaim anything.
-    reading: Option<Arc<Vec<u8>>>,
+    queue: Arc<Mutex<VecDeque<Event>>>,
 }
 
 impl EventQueue {
@@ -216,83 +160,26 @@ impl EventQueue {
         Self::default()
     }
 
-    /// The shared state.
+    /// Appends an event, from a handler.
     ///
     /// A poisoned lock is recovered from rather than propagated. Poisoning requires a panic
     /// while the lock was held, and the only code that holds it is this file and the pump --
     /// but a panic inside a handler aborts the process anyway, since it would otherwise unwind
     /// through C. Panicking here in response would replace one connection's event with a
     /// second panic and no additional information.
-    fn lock(&self) -> MutexGuard<'_, Shared> {
-        self.shared.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Appends an event, from a handler.
     pub(crate) fn push(&self, event: Event) {
-        self.lock().queue.push_back(event);
-    }
-
-    /// Appends a data delivery, from the read handler.
-    ///
-    /// Separate from [`EventQueue::push`] because it is the one event whose payload depends on
-    /// what the connection is doing at the instant the handler runs, and because putting the
-    /// address arithmetic in one place is what keeps it checkable.
-    pub(crate) fn deliver(&self, stream_id: StreamId, offset: u64, data: &[u8], fin: bool) {
-        let mut shared = self.lock();
-        let bytes = shared.view(data);
-        shared.queue.push_back(Event::StreamData {
-            stream_id,
-            offset,
-            data: bytes,
-            fin,
-        });
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(event);
     }
 
     /// Takes the oldest event, if there is one.
     pub(crate) fn pop(&self) -> Option<Event> {
-        self.lock().queue.pop_front()
-    }
-
-    /// Names the buffer about to be fed to the state machine.
-    pub(crate) fn begin_read(&self, buffer: &Arc<Vec<u8>>) {
-        self.lock().reading = Some(Arc::clone(buffer));
-    }
-
-    /// Forgets it again, releasing the connection's claim on that buffer.
-    pub(crate) fn end_read(&self) {
-        self.lock().reading = None;
-    }
-}
-
-impl Shared {
-    /// The delivery to hand out for `data`.
-    ///
-    /// A view of the buffer being parsed when `data` is a range of it and is long enough to be
-    /// worth holding one; a copy otherwise. The three ways it can be a copy are all ordinary
-    /// rather than exceptional, and none of them is wrong: a short delivery is copied because
-    /// the pinning bound requires it, a delivery arriving outside a read is copied because there
-    /// is no buffer to alias, and a delivery whose bytes are not in the buffer at all is copied
-    /// because they are still the right bytes and this is not the place to insist on where they
-    /// came from.
-    fn view(&self, data: &[u8]) -> StreamBytes {
-        if data.len() < ALIAS_THRESHOLD {
-            return StreamBytes::copied(data);
-        }
-        let Some(buffer) = &self.reading else {
-            return StreamBytes::copied(data);
-        };
-
-        // Addresses, compared and never dereferenced. Two live allocations cannot overlap, so a
-        // slice whose start lies inside this buffer and whose end does not run past it is a
-        // range of this buffer and of nothing else.
-        let base = buffer.as_ptr() as usize;
-        let start = data.as_ptr() as usize;
-        let Some(offset) = start.checked_sub(base) else {
-            return StreamBytes::copied(data);
-        };
-
-        StreamBytes::aliased(Arc::clone(buffer), offset, data.len())
-            .unwrap_or_else(|| StreamBytes::copied(data))
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
     }
 }
 
@@ -313,13 +200,13 @@ mod tests {
         queue.push(Event::StreamData {
             stream_id: stream(0),
             offset: 0,
-            data: StreamBytes::from(b"first".to_vec()),
+            data: b"first".to_vec(),
             fin: false,
         });
         queue.push(Event::StreamData {
             stream_id: stream(0),
             offset: 5,
-            data: StreamBytes::new(),
+            data: Vec::new(),
             fin: true,
         });
 
@@ -364,75 +251,5 @@ mod tests {
     fn the_queue_is_sendable() {
         fn require_send<T: Send>(_: &T) {}
         require_send(&EventQueue::new());
-    }
-
-    fn read_buffer() -> Arc<Vec<u8>> {
-        Arc::new((0..u8::MAX).cycle().take(4096).collect())
-    }
-
-    /// A delivery out of the buffer being parsed is a view of it, not a copy.
-    #[test]
-    fn a_long_delivery_from_the_buffer_being_read_is_aliased() {
-        let queue = EventQueue::new();
-        let buffer = read_buffer();
-        queue.begin_read(&buffer);
-        queue.deliver(stream(0), 0, &buffer[128..128 + ALIAS_THRESHOLD], false);
-        queue.end_read();
-
-        let Some(Event::StreamData { data, .. }) = queue.pop() else {
-            panic!("a delivery");
-        };
-        assert!(data.is_aliased(), "the delivery should be a view");
-        assert_eq!(&data[..], &buffer[128..128 + ALIAS_THRESHOLD]);
-    }
-
-    /// Three ways a delivery is copied instead, each of which must still deliver the right
-    /// bytes: too short to be worth pinning a buffer for, no read in progress, and bytes that
-    /// are not in the buffer at all.
-    #[test]
-    fn a_delivery_that_cannot_or_should_not_alias_is_copied_and_still_correct() {
-        let queue = EventQueue::new();
-        let buffer = read_buffer();
-        let elsewhere: Vec<u8> = (0..ALIAS_THRESHOLD as u64).map(|byte| byte as u8).collect();
-
-        queue.begin_read(&buffer);
-        queue.deliver(stream(0), 0, &buffer[0..ALIAS_THRESHOLD - 1], false);
-        queue.deliver(stream(0), 1, &elsewhere, false);
-        queue.end_read();
-        queue.deliver(stream(0), 2, &buffer[0..ALIAS_THRESHOLD], false);
-
-        let expected: [&[u8]; 3] = [
-            &buffer[0..ALIAS_THRESHOLD - 1],
-            &elsewhere,
-            &buffer[0..ALIAS_THRESHOLD],
-        ];
-        for (offset, bytes) in expected.iter().enumerate() {
-            let Some(Event::StreamData { data, .. }) = queue.pop() else {
-                panic!("a delivery");
-            };
-            assert!(
-                !data.is_aliased(),
-                "delivery {offset} should have been copied"
-            );
-            assert_eq!(&data[..], *bytes, "delivery {offset}");
-        }
-    }
-
-    /// The handle is released when the read ends, which is what lets the buffer be read into
-    /// again. A queue that kept it would make every read allocate.
-    #[test]
-    fn the_buffer_handle_is_given_back_when_the_read_ends() {
-        let queue = EventQueue::new();
-        let mut buffer = read_buffer();
-        queue.begin_read(&buffer);
-        assert!(
-            Arc::get_mut(&mut buffer).is_none(),
-            "the queue holds the buffer while the state machine is being fed"
-        );
-        queue.end_read();
-        assert!(
-            Arc::get_mut(&mut buffer).is_some(),
-            "and lets go of it afterwards"
-        );
     }
 }

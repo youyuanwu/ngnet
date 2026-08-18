@@ -540,46 +540,6 @@ and read-ahead would be limited by nothing at all.
 An idle connection therefore arms nothing: no outbound bytes means no write offered, one read
 registers the byte stream's own waker, and there is no timer here to fire in the meantime.
 
-### A delivery is a view of the read buffer, not a copy of it
-
-`Event::StreamData` carries a `StreamBytes`: a reference-counted handle on the connection's read
-buffer plus a range within it (`src/io/delivery.rs`). It used to carry a `Vec<u8>` filled by
-copying, one memcpy per delivery, because the handler receives a borrow valid only for the
-duration of dwnx's callback. What made the copy removable is not a change to that borrow but a
-fact about what it points at: dwnx delivers stream payload straight out of the buffer it was
-handed (`deps/dwnx/lib/dwnx_conn.c:1631-1636`), which is memory this crate owns, and a reference
-count can outlive a call where a borrow cannot.
-
-The handler cannot ask which buffer, because a handler cannot reach the connection — the
-property the section above records, with compile-fail cases enforcing it, and the original
-reason the delivery was copied. It holds the answer instead: alongside the event queue it
-already held, a cell containing the reference-counted handle for the buffer being parsed, which
-the read side sets immediately before `Conn::read` and clears immediately after. Nothing in that
-cell is a connection handle and no operation on it reaches a connection, so the compile-fail
-cases are untouched and still fail for the reasons they name. Whether the borrow really lies
-inside that buffer is *checked* by comparing addresses — never by dereferencing one — and a
-slice that falls outside is copied out, so an upstream change to where dwnx delivers from costs
-a copy rather than producing wrong bytes.
-
-Reclamation is the strong count reaching one. A connection reads into a buffer again only when
-every view of it has been dropped; while a caller holds one, the connection takes another rather
-than waiting. Waiting was the rejected alternative and it is a stall: a caller is entitled to
-hold delivered data indefinitely, and read-ahead — which is what actually bounds memory here —
-is accounted in bytes delivered against bytes credited and says nothing about whether the caller
-still holds them. Retired buffers are watched for reuse, at most `READ_POOL_LIMIT` of them, and
-one that falls off that list is not leaked: it is simply not reused, and is freed with its last
-view.
-
-What bounds the memory a single held delivery can pin is not the pool but a threshold. A delivery
-shorter than `ALIAS_THRESHOLD` is copied into an allocation of its own, so the largest ratio of
-region pinned to bytes carried is one read buffer over that threshold — sixteen, with the
-constants as they stand, and `delivery.rs` asserts the arithmetic rather than asking to be
-believed. Without it the bound would be nominal: one retained byte would pin 16382, an
-amplification of thousands, and "bounded per connection" is not a bound when a caller may hold
-any number of deliveries. The threshold is set low deliberately, biased toward aliasing more
-rather than less, because the failure it guards against is a caller that keeps one small
-delivery for a long time and that is the rarer shape than a caller streaming a body.
-
 ### One runtime, named only when asked
 
 `src/io/tokio.rs`, behind the off-by-default `tokio` feature, is the only place this crate names
@@ -612,9 +572,8 @@ What remains maps one-to-one onto the C API: `conn` for lifecycle and the read p
 `callbacks` and `handlers` for the event bridge, `write` and `stream_io` for the outbound and
 stream operations, and `error`, `params`, `settings`, `stream`, `time` and `ccerr` for the
 value types. The layer adds `io/conn` for ownership and the pump, `io/stream` and `io/clock`
-for the seams, `io/framing` and `io/close` for the two jobs dwnx cannot do, `io/delivery` for
-the bytes an event carries, `io/event`, `io/scheduling`, `io/error`, `io/testing` and — behind
-its feature — `io/tokio`.
+for the seams, `io/framing` and `io/close` for the two jobs dwnx cannot do, `io/event`,
+`io/scheduling`, `io/error`, `io/testing` and — behind its feature — `io/tokio`.
 
 Module files are flat here as everywhere in this crate: `io.rs` with submodules in `io/`, never
 `io/mod.rs`. The rule is not cosmetic. The structural test that reads `lib.rs`'s `unsafe`

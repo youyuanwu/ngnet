@@ -16,26 +16,17 @@
 //!
 //! # What is measured
 //!
-//! `Event::StreamData` carries a `StreamBytes`, which is a reference-counted view of the
-//! connection's read buffer rather than a copy of it. It used to be a `Vec<u8>` filled by
-//! `data.to_vec()`: dwnx hands the read handler a slice pointing into the buffer it is parsing,
-//! valid only for the duration of the call, and the copy was what made the bytes outlive it. So
-//! every delivery cost at least one allocation and the bytes of every delivery were allocated
-//! afresh. This file asserted exactly that, on FR-027's instruction to pin the figure before
-//! anything tried to remove it; the assertions below are the inversion, and SC-014 is the
-//! criterion they express.
+//! `Event::StreamData` carries a `Vec<u8>`, filled by `data.to_vec()` in the read handler in
+//! `crates/ngnet-qmux/src/io/conn.rs`. dwnx hands that handler a slice pointing into the record
+//! it is parsing, valid only for the duration of the call, so the copy is what makes the bytes
+//! outlive it. Every delivery therefore costs at least one allocation, and the bytes of every
+//! delivery are allocated afresh.
 //!
-//! # Two working modes, measured separately
-//!
-//! SC-014 names the **steady state**: a caller that drops each delivery before the next
-//! arrives. There the connection reads into the same buffer for its whole life, and a delivery
-//! costs no storage proportional to itself at all.
-//!
-//! The other mode is a caller that lets the connection read far ahead of it. Deliveries from
-//! several reads are then alive at once, the connection cannot reuse the buffer it has, and it
-//! takes another rather than waiting -- which FR-016 requires, since waiting would be the stall
-//! it forbids. That mode is measured too, and what is asserted of it is that it stays bounded,
-//! because it is the mode where an unbounded pool would show.
+//! FR-027 asks for that to be pinned before anything tries to remove it. Phase 7 (delivery
+//! aliasing) is the phase expected to break the assertions below, and SC-025 is the criterion
+//! it is judged against: a delivery that hands out a reference-counted slice of a buffer the
+//! layer already owns allocates nothing per delivery, and the count stops growing with the
+//! payload.
 //!
 //! # The direction of the bias
 //!
@@ -47,13 +38,6 @@
 //! one is the difference between two payload sizes: a receive path that allocated per delivery
 //! shows a difference proportional to the extra deliveries, and one that does not shows a
 //! difference near zero however much fixed overhead sits in the window.
-//!
-//! That bias now runs *against* the assertions rather than with them. When the claim was "at
-//! least one allocation per delivery", counting the surrounding path made the claim easier;
-//! now the claim is that receiving costs nearly nothing per delivery, and every allocation the
-//! window catches that has nothing to do with deliveries makes it harder. A pass is therefore
-//! worth more than it was, and the thresholds below are stated with room for the overhead
-//! rather than at zero, because zero is not what an honest window here can show.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -123,36 +107,20 @@ struct Cost {
     bytes: usize,
 }
 
-/// Runs `body` with counting armed on this thread, adding to whatever is already tallied.
-///
-/// Separate from [`measured`] because a steady-state run has to open and close the window many
-/// times -- once around each of the caller's turns -- while the tally runs across all of them.
-fn armed<R>(body: impl FnOnce() -> R) -> R {
+/// Runs `body` with counting armed on this thread.
+fn measured<R>(body: impl FnOnce() -> R) -> (R, Cost) {
+    ALLOCATIONS.with(|count| count.set(0));
+    BYTES.with(|bytes| bytes.set(0));
     COUNTING.with(|counting| counting.set(true));
     let out = body();
     COUNTING.with(|counting| counting.set(false));
-    out
-}
-
-/// Forgets what has been tallied so far.
-fn reset() {
-    ALLOCATIONS.with(|count| count.set(0));
-    BYTES.with(|bytes| bytes.set(0));
-}
-
-/// What has been tallied since the last [`reset`].
-fn tally() -> Cost {
-    Cost {
-        allocations: ALLOCATIONS.with(Cell::get),
-        bytes: BYTES.with(Cell::get),
-    }
-}
-
-/// Runs `body` with counting armed on this thread.
-fn measured<R>(body: impl FnOnce() -> R) -> (R, Cost) {
-    reset();
-    let out = armed(body);
-    (out, tally())
+    (
+        out,
+        Cost {
+            allocations: ALLOCATIONS.with(Cell::get),
+            bytes: BYTES.with(Cell::get),
+        },
+    )
 }
 
 /// A waker that remembers it was fired.
@@ -280,26 +248,12 @@ struct Drained {
 /// as they are read. What the window counts is therefore the receive path's own allocation and
 /// nothing the test added to it.
 fn drain(server: &mut Connection<TestByteStream, TestClock>, bytes: usize) -> Drained {
-    let mut drained = Drained::default();
-    drain_into(server, &mut drained, bytes);
-    drained
-}
-
-/// As [`drain`], but adding to a running tally and to a running target.
-///
-/// The steady-state runs need this shape: they hand the server one chunk at a time and read it
-/// out before the next arrives, so each turn's target is the total sent so far rather than a
-/// fresh figure.
-fn drain_into(
-    server: &mut Connection<TestByteStream, TestClock>,
-    drained: &mut Drained,
-    bytes: usize,
-) {
     let waker = Waker::from(Arc::new(Flag::default()));
     let mut cx = Context::from_waker(&waker);
+    let mut drained = Drained::default();
     for _ in 0..MAX_POLLS {
         if drained.bytes >= bytes {
-            return;
+            return drained;
         }
         match server.poll_next_event(&mut cx) {
             Poll::Ready(Ok(Event::StreamData { data, .. })) => {
@@ -315,69 +269,6 @@ fn drain_into(
         "the server delivered {} of {bytes} bytes and then stopped",
         drained.bytes
     );
-}
-
-/// One record's worth, near enough.
-///
-/// The steady state SC-014 names is a caller that drops each delivery before the next arrives,
-/// so the client is made to hand over about a record at a time and the server is read out
-/// between each. Under the read-ahead default the connection would otherwise swallow the whole
-/// payload on its first pass and the caller would never be in step with it -- which is a real
-/// working mode, measured separately below as the backlog case, but it is not this one.
-const CHUNK: usize = 8 * 1024;
-
-/// Sends `payload` a chunk at a time, reading the server out between chunks.
-///
-/// Only the server's turns are inside the counting window. The client's writing is outside it
-/// for the reason the whole-payload harness gives: what is being measured is what receiving
-/// costs, and a window containing the sender measures the pair.
-fn receive_in_step(payload: usize) -> (Drained, Cost) {
-    let waker = Waker::from(Arc::new(Flag::default()));
-    let (mut client, mut server) = connected(&waker);
-
-    let stream = {
-        let mut opening = core::pin::pin!(core::future::poll_fn(|cx| client.poll_open_bidi(cx)));
-        now_or_never(opening.as_mut(), &waker).expect("a stream")
-    };
-
-    let payload: Vec<u8> = (0..payload).map(|index| (index % 251) as u8).collect();
-    let mut drained = Drained::default();
-    let mut sent = 0;
-    let mut base = 0;
-    let mut warmed = false;
-    while sent < payload.len() {
-        // The client is given its turn before it writes: the server's turn produced window
-        // extensions and acknowledgements, and a client that never read them stops writing
-        // long before the payload is done.
-        {
-            let mut cx = Context::from_waker(&waker);
-            for _ in 0..8 {
-                let _ = client.poll_pump(&mut cx);
-            }
-        }
-        let end = (sent + CHUNK).min(payload.len());
-        send(&mut client, stream, &payload[sent..end]);
-        sent = end;
-        armed(|| drain_into(&mut server, &mut drained, sent - base));
-
-        // The first turn is thrown away. It carries everything a connection pays once -- the
-        // read buffer itself, dwnx's first-record book-keeping, the queue's initial growth --
-        // and counting it would report those as a per-delivery cost that a longer run would
-        // then dilute, which is a measurement that changes with the length of the run.
-        if !warmed {
-            reset();
-            drained = Drained::default();
-            base = sent;
-            warmed = true;
-        }
-    }
-
-    assert_eq!(
-        drained.bytes,
-        payload.len() - CHUNK.min(payload.len()),
-        "the server did not receive what the client sent after the warm-up turn"
-    );
-    (drained, tally())
 }
 
 /// Sends `payload` bytes on a fresh connection pair and measures what receiving them costs.
@@ -406,162 +297,68 @@ fn receive(payload: usize) -> (Drained, Cost) {
 }
 
 #[test]
-fn a_delivery_costs_no_storage_of_its_own() {
-    let (small, small_cost) = receive_in_step(SMALL);
-    let (large, large_cost) = receive_in_step(LARGE);
+fn today_every_delivery_costs_an_allocation() {
+    let (small, small_cost) = receive(SMALL);
+    let (large, large_cost) = receive(LARGE);
 
     assert!(
         small.deliveries > 1 && large.deliveries > small.deliveries,
-        "the larger payload should arrive in more deliveries than the smaller one; {} and {} \
-         say the workload is not what this test assumes",
+        "the larger payload should arrive in more deliveries than the smaller one, because a \
+         delivery carries at most one record's payload; {} and {} say the workload is not what \
+         this test assumes",
         small.deliveries,
         large.deliveries
     );
 
-    // The load-bearing one, and the inversion of what this file asserted before delivery
-    // aliasing. The receive path used to copy each delivery into fresh storage, so the bytes
-    // allocated across a window grew with the bytes delivered in it; now a delivery is a view
-    // of a buffer the connection already had, and the two are unrelated. Stated as a
-    // difference between two payload sizes so that the fixed cost of standing a connection up
-    // -- which this window also contains, and which over-attributes -- cancels out.
-    let extra_delivered = large.bytes - small.bytes;
-    let extra_bytes = large_cost.bytes.saturating_sub(small_cost.bytes);
     assert!(
-        extra_bytes * 8 < extra_delivered,
-        "{extra_delivered} more bytes delivered cost {extra_bytes} more bytes allocated ({} for \
-         {} against {} for {}). Delivery aliasing is supposed to have made these two figures \
-         unrelated, and a difference this close to the payload says the deliveries are being \
-         copied into storage of their own again",
-        large_cost.bytes,
-        large.bytes,
-        small_cost.bytes,
-        small.bytes
+        small_cost.allocations >= small.deliveries,
+        "receiving {SMALL} bytes took {} deliveries and {} allocations. Today's receive path \
+         copies each delivery out of dwnx's parse buffer with `data.to_vec()`, so it cannot \
+         cost fewer allocations than deliveries. Phase 7 (delivery aliasing) is expected to \
+         break this",
+        small.deliveries,
+        small_cost.allocations
     );
 
-    // And in the units the reader will want: a delivery here is about `CHUNK` bytes, and what
-    // receiving one costs is a small constant that has nothing to do with that figure.
-    //
-    // Asked of the larger run only, and the reason is the bias this file's header describes.
-    // The window contains everything a connection pays once as well as everything it pays per
-    // delivery -- the framer's retention reaching its full size is the largest of them -- and
-    // dividing by seven deliveries charges the whole of that to those seven. Thirty-one
-    // deliveries dilute it to where the figure means what it says. The difference between the
-    // two runs, asserted above, is the form of this claim that does not need the dilution.
-    let per_delivery = large_cost.bytes / large.deliveries;
     assert!(
-        per_delivery < CHUNK / 8,
-        "the larger payload allocated {per_delivery} bytes per delivery for deliveries \
-         averaging {} bytes, which is not a per-delivery cost independent of the payload",
-        large.bytes / large.deliveries
-    );
-
-    // The allocation count moves the same way, and it is the weaker statement of the two: the
-    // window contains a connection's whole receive path, so what it can say is that the count
-    // is no longer *two* per delivery -- one for the copy and one for everything else -- which
-    // is what it measured before. The ceiling is one and a half per delivery rather than one,
-    // because the receive path's own fixed costs are inside the window and a run of this length
-    // does not fully dilute them.
-    assert!(
-        large_cost.allocations * 2 < large.deliveries * 3,
-        "receiving {} bytes in {} deliveries took {} allocations. Before delivery aliasing this \
-         was two per delivery, because each delivery was copied out on top of everything else \
-         the receive path does",
-        large.bytes,
+        large_cost.allocations >= large.deliveries,
+        "receiving {LARGE} bytes took {} deliveries and {} allocations, for the same reason as \
+         above",
         large.deliveries,
         large_cost.allocations
     );
-}
 
-#[test]
-fn a_caller_that_falls_behind_pays_in_buffers_rather_than_in_copies() {
-    // The other working mode, and the honest half of the result. A caller that lets the
-    // connection read far ahead of it holds deliveries from several read buffers at once, so
-    // the connection cannot reuse the one it has and takes another -- an allocation per read
-    // rather than per delivery, of a read buffer rather than of a payload copy.
-    //
-    // This is deliberate and is what FR-016 asks for: the alternative, waiting for the caller
-    // to let go before reading again, is the stall the requirement forbids. What is asserted
-    // here is that the mode stays *bounded* -- the bytes allocated stay within a small factor
-    // of the bytes delivered, rather than growing without limit as a pool that never reclaimed
-    // would.
-    let (drained, cost) = receive(LARGE);
+    // The load-bearing one. Everything the window counts besides the per-delivery copy is
+    // roughly the same in both runs -- the read buffer is allocated once and reused, dwnx's
+    // book-keeping is per connection, and the event queue's growth is amortised -- so the
+    // difference between the two counts is what the extra deliveries cost. A receive path that
+    // handed out a slice of a buffer it already owned would show a difference near zero here
+    // however large the fixed overhead was, which is what makes this the assertion Phase 7
+    // has to change.
+    let extra_deliveries = large.deliveries - small.deliveries;
+    let extra_allocations = large_cost
+        .allocations
+        .saturating_sub(small_cost.allocations);
     assert!(
-        cost.bytes < drained.bytes * 2,
-        "receiving {} bytes with the caller behind allocated {} bytes, which is more than the \
-         read buffers that backlog can account for",
-        drained.bytes,
-        cost.bytes
-    );
-}
-
-#[test]
-fn a_caller_that_holds_every_delivery_receives_what_was_sent() {
-    // SC-015. The deliveries are kept, not dropped, right across the run: under aliasing they
-    // are views of buffers the connection would otherwise be reading into again, so a
-    // reclamation rule that let one go too early would show up here as bytes that changed
-    // after they were handed over. They are checked at the end rather than as they arrive,
-    // which is what makes that visible.
-    let waker = Waker::from(Arc::new(Flag::default()));
-    let (mut client, mut server) = connected(&waker);
-
-    let stream = {
-        let mut opening = core::pin::pin!(core::future::poll_fn(|cx| client.poll_open_bidi(cx)));
-        now_or_never(opening.as_mut(), &waker).expect("a stream")
-    };
-
-    let payload: Vec<u8> = (0..LARGE).map(|index| (index % 251) as u8).collect();
-    send(&mut client, stream, &payload);
-
-    let mut held = Vec::new();
-    let mut cx = Context::from_waker(&waker);
-    let mut received = 0usize;
-    for _ in 0..MAX_POLLS {
-        if received >= payload.len() {
-            break;
-        }
-        match server.poll_next_event(&mut cx) {
-            Poll::Ready(Ok(Event::StreamData { data, .. })) => {
-                received += data.len();
-                // Returned as the bytes arrive, while the data itself is kept. FR-016 says
-                // that combination must not stop the connection reading, and a run that
-                // stalled here would exhaust `MAX_POLLS` rather than finish.
-                server
-                    .extend_connection_credit(data.len() as u64)
-                    .expect("credit");
-                held.push(data);
-            }
-            Poll::Ready(Ok(_)) => {}
-            Poll::Ready(Err(error)) => panic!("the server connection failed: {error}"),
-            Poll::Pending => {}
-        }
-    }
-
-    // The pool's ceiling, checked while every delivery of the run is still held -- which is
-    // the only state in which it could be exceeded. `READ_POOL_LIMIT` in
-    // `crates/ngnet-qmux/src/io/conn.rs` is eight, plus the one being read into. A pool that
-    // grew with the number of held deliveries rather than stopping here would be the
-    // unbounded-retention failure FR-016 forbids, and it would not show in the byte counts
-    // above, because those buffers are held by the caller's own deliveries either way.
-    #[cfg(debug_assertions)]
-    assert!(
-        server.read_buffers() <= 9,
-        "the connection is watching {} read buffers while the caller holds {} deliveries, past \
-         the ceiling the pool is supposed to stop at",
-        server.read_buffers(),
-        held.len()
+        extra_allocations >= extra_deliveries,
+        "{extra_deliveries} more deliveries cost only {extra_allocations} more allocations \
+         ({} for {} deliveries against {} for {}), so receiving is no longer paying an \
+         allocation per delivery",
+        large_cost.allocations,
+        large.deliveries,
+        small_cost.allocations,
+        small.deliveries
     );
 
-    let rejoined: Vec<u8> = held.iter().flat_map(|data| data.iter().copied()).collect();
-    assert_eq!(
-        rejoined.len(),
-        payload.len(),
-        "the caller held {} bytes of a {}-byte payload",
-        rejoined.len(),
-        payload.len()
-    );
+    // The bytes tell the same story in the units SC-025 is stated in: today the payload is
+    // copied into fresh storage, so the difference in bytes allocated is at least the
+    // difference in bytes delivered.
+    let extra_bytes = large_cost.bytes.saturating_sub(small_cost.bytes);
     assert!(
-        rejoined == payload,
-        "the bytes a caller held across the whole run are not the bytes that were sent"
+        extra_bytes >= large.bytes - small.bytes,
+        "{} more bytes delivered cost only {extra_bytes} more bytes allocated, so the deliveries \
+         are no longer being copied into storage of their own",
+        large.bytes - small.bytes
     );
 }
 

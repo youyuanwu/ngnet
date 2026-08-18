@@ -139,38 +139,28 @@ caller holding a `QmuxConnection` cannot reach it.
 **What would settle it:** deciding whether accessors belong on this crate's type. The QUIC join
 has the same gap for the same reason, and both should be answered together.
 
-## Body bytes are copied twice before this crate sees them
+## Body bytes are copied once before this crate sees them, and that one was measured
 
-The heading records what this cost when it was written. Neither copy is paid on the ordinary
-path any more, and the heading stays because the gaps that caused them have not moved.
+The heading used to say twice. Inbound, the QMux layer copied every record's payload into the
+framer's retention *and* copied each delivery into an owned `Vec` for its event. The first is
+gone for a record that arrives whole, which is nearly all of them; the second is still paid.
+This crate turns the delivered `Vec` into `Bytes` by taking the allocation over, so it adds
+nothing to either. Outbound, `StreamSource::write_next` lends buffers that are invalid once the
+closure returns, so the bytes are copied into the record being built — one copy, and the reason
+`RETAINS_BUFFERS` is `false`.
 
-**The framer's copy.** The QMux layer used to copy every record's payload into the framer's
-retention so that a completed record could be scanned for a connection close. A record that
-arrives whole is now scanned where it lies; what is still copied is a record spread over several
-reads, which has nothing contiguous to scan, and the one close a connection latches.
+Both are consequences of gaps in dwnx rather than of anything decided here; see
+`docs/qmux/pending-work.md`, which records what would remove each.
 
-**The delivery copy.** Each delivery used to be copied into an owned `Vec` for its event, which
-this crate turned into `Bytes` by taking the allocation over — so it added nothing then and adds
-nothing now. A delivery is now a refcounted view of the QMux read buffer, and this crate carries
-it whole into `Bytes::from_owner` rather than taking an allocation over. Both forms are a move
-or a refcount bump; neither is a memcpy, which is the property this crate has to keep and the
-reason the conversion is a named function with the reasoning beside it rather than a
-`Bytes::copy_from_slice` that would compile and be correct and be wrong.
-
-Outbound, `StreamSource::write_next` lends buffers that are invalid once the closure returns, so
-the bytes are copied into the record being built — one copy, and the reason `RETAINS_BUFFERS` is
-`false`.
-
-Both inbound copies were consequences of gaps in dwnx rather than of anything decided here; see
-`docs/qmux/pending-work.md`, which records what would remove each and what each still costs.
-
-**What would settle it, for the time rather than the count:** the counts are now measured —
-`RecordFramer::copied_bytes` for the first and the allocation harness in
-`tests/ngnet-qmux-h3-tests/tests/allocations.rs` for the second — and both report what their
-removal claims. What is still missing is what that is worth in time. The suite runs this stack
-end to end — `docs/benchmarks/` — but an end-to-end figure cannot separate two memcpys from
-framing, QPACK, the record layer and the pump. A profile of the 1 MiB body point is what would
-turn this into a number.
+**It is no longer unmeasured, and the answer was not the expected one.** The entry used to ask
+for a build with the inbound copy removed. That build exists: deliveries became reference-counted
+views into a pooled read buffer, per-delivery allocation fell from 8,216 bytes to 24 — and it was
+slower at every payload size but one, by two to five percent against controls that moved under
+one. It was reverted.
+[`05-qmux-delivery-aliasing`](../benchmarks/data/xeon-8370c-azure/05-qmux-delivery-aliasing.md)
+has the figures and the mechanism. So the remaining question is not "what does this copy cost" but "why does removing it
+not pay", and the leading answer is that a pooled buffer's bookkeeping and the copy a short
+delivery still needs are together larger than one allocation of the size being avoided.
 
 ## A multi-slice offer is one write, and one run of records — settled
 
