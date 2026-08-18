@@ -2,7 +2,7 @@
 
 **Status: current.** The machine benchmarks are being collected on from 2026-08-16.
 
-**First run:** 2026-08-16 · **Last run:** 2026-08-16
+**First run:** 2026-08-16 · **Last run:** 2026-08-17
 
 ## Hardware and system
 
@@ -29,7 +29,11 @@ in every run.
 
 - **Pinning:** `taskset -c 3`, matching the legacy host's convention. Sibling thread 7 shares
   the physical core, so keep the machine otherwise idle.
-- **Otherwise idle?** To be recorded per run. Runs 01–03 had the machine to themselves.
+- **Otherwise idle?** To be recorded per run. Runs 01–03 had the machine to themselves, and
+  `04` records the same for its two passes. `05` and `06` do **not** state it, so it should not
+  be assumed of them: their control movements — 0.73% mean for `05`, 1.06% mean and 4.47% worst
+  for `06` — are the only evidence available about how quiet the host was, and they are the
+  right thing to size those runs' deltas against rather than the 1% figure below.
 - **Observed drift — the important number. About 1%.** Across 78 benchmarks run twice with no
   code change between, median |drift| was **0.90%**, mean 1.23%, and only one benchmark
   exceeded 5%. See [01-drift-baseline](01-drift-baseline.md) — that is the bar every result
@@ -70,6 +74,11 @@ submodules. [`../../running.md`](../../running.md) states the requirement in ful
 | [01-drift-baseline](01-drift-baseline.md) | 2026-08-16 | `e75118e` | Two identical passes: what an unchanged arm does here — **~1%** |
 | [02-first-survey](02-first-survey.md) | 2026-08-16 | `e75118e` | Where the arms stand, which legacy conclusions carried over, and where this stack beats hyper |
 | [03-shared-body](03-shared-body.md) | 2026-08-16 | `e75118e` | Handing bodies over, five replicates — **settled the compio verdict** |
+| [04-qmux-drift-baseline](04-qmux-drift-baseline.md) | 2026-08-17 | `524fa54` | Drift for the QMux arms, which `01` predates — socket **0.67%**, duplex **1.55%** |
+| [05-qmux-delivery-aliasing](05-qmux-delivery-aliasing.md) | 2026-08-17 | `223960d` against `9f97334` | A two-orders-of-magnitude allocation cut that was **2.5–4.8% slower** — reverted |
+| [06-qmux-write-path](06-qmux-write-path.md) | 2026-08-17 | `524fa54` against `a54ea43` | The write-path set end to end — **−30% at 1 MiB**, −8.5% at concurrency 64 on a socket |
+| [07-qmux-per-commit-attribution](07-qmux-per-commit-attribution.md) | 2026-08-17 | seven commits, each against its predecessor | Coalescing is **−21.7%** at 1 MiB; four of the six are inside their step's controls — duplex only |
+| [08-qmux-against-h2](08-qmux-against-h2.md) | 2026-08-18 | `c525aa1` | **QMux against HTTP/2**, five passes — fixed +19–34 µs per exchange, **0.86×** per byte over a socket |
 
 Still outstanding, in the order they are worth doing:
 
@@ -77,6 +86,18 @@ Still outstanding, in the order they are worth doing:
    `transport_concurrent_throughput`.** This is the direct test of the mechanism the whole
    write-path finding rests on, and the one thing
    [02-first-survey](02-first-survey.md) could not settle from a standing survey.
-2. **Replicate the duplex 1 MiB arms**, the only place this host is noisy.
-3. Everything else listed under *What a new machine should reproduce* in
+2. **A write count per megabyte for both stacks.** [`08`](08-qmux-against-h2.md) established
+   that QMux moves bulk bytes over a socket for 61% of what HTTP/2's kernel path costs, which is
+   arithmetic on measured numbers with no mechanism attached. Writes per megabyte is the obvious
+   candidate and both stacks already have the instrumentation, so this is cheap. It has taken
+   over from the cross-protocol run as the item most likely to close an entry rather than
+   confirm one. *(The cross-protocol run itself is done: it is [`08`](08-qmux-against-h2.md). It
+   answered the concurrency question in the unwelcome direction — the ratio is still worse over
+   a socket than over a duplex, 3.12× against 2.33×, even though the write count no longer grows
+   with concurrency, so the lead in `docs/qmux-h3/pending-work.md` survives its own leading
+   suspect being removed.)*
+3. **Replicate the duplex 1 MiB arms**, the only place this host is noisy — and note that `04`
+   sharpens this: `body_throughput/ngnet-qmux-h3/1048576` drifts **10.42%**, the worst
+   identifier in the suite, so the QMux arm needs this more than the others do.
+4. Everything else listed under *What a new machine should reproduce* in
    [`../../findings/`](../../findings/).

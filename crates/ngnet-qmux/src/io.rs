@@ -133,7 +133,7 @@ pub use clock::Clock;
 pub use close::{decode_close_frame, encode_close_record};
 pub use conn::{
     Config, Connection, DEFAULT_CONNECTION_DATA, DEFAULT_MAX_STREAMS, DEFAULT_READ_AHEAD,
-    DEFAULT_STREAM_DATA, StreamWrite,
+    DEFAULT_STREAM_DATA, OUTBOUND_CARRY, OUTBOUND_CEILING, StreamWrite,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use event::Event;

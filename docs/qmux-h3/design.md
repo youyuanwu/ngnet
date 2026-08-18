@@ -52,16 +52,28 @@ that is only read if something reads it. An implementation that moved bytes only
 streams open, which is waiting on the record. The same shape strands the window updates that
 would release a peer whose flow control is exhausted.
 
-The pump is also what a transmit pass does *between* offers rather than only after them. QMux
-permits one record outstanding at a time, so until the record an offer produced has reached the
-byte stream the next offer is refused. Skipping the intermediate pump would turn a large body
-into one record per wakeup.
+The pump is also what a transmit pass does *between* offers rather than only after them, and
+there the pump is deliberately a different one. It used to be the flushing pump, because QMux
+permitted one record outstanding at a time and refused the next offer until the last record had
+reached the byte stream; skipping it would have turned a large body into one record per wakeup.
+QMux now holds several records — see "Produce up to the ceiling, write once, then read" in
+`docs/qmux/design.md` — so the intermediate pump is `pump_buffered`: it still reads, and it still
+writes when the buffer has no room for another record, but it leaves what the pass has produced
+to accumulate. A flushing pump here would now buy nothing and cost a write per record, which is
+the whole of what the coalescing was for.
 
-And it is why the pump's answer is read rather than discarded. `try_write_stream` refuses every
-offer while a record is still outstanding, so a transmit pass that kept offering after the pump
-reported "not caught up" would collect a run of spurious `Blocked` verdicts and teach the
-HTTP/3 layer that its streams are stalled when only the socket is — taking them out of the
-running until something else happened to wake them.
+What flushes instead is the single pump *after* the loop, and that one is not optional. A pass
+returns to its driver, and no other call is obliged to come along and move what it left behind;
+a driver may not poll again until the peer says something, and the peer may be waiting for
+precisely those bytes. Every entry point of the layer below that a caller can stop polling after
+flushes for the same reason — the one exception is the buffered pump itself, whose caller is
+mid-pass and owes the flush at the end of it.
+
+And it is why the pump's answer is read rather than discarded. `try_write_stream` refuses an
+offer once the outbound buffer has no room for another record, so a transmit pass that kept
+offering after the pump reported "no room" would collect a run of spurious `Blocked` verdicts and
+teach the HTTP/3 layer that its streams are stalled when only the socket is — taking them out of
+the running until something else happened to wake them.
 
 ## Nothing here may park
 
@@ -75,16 +87,36 @@ The parking form has no answer to give a synchronous closure: it would have to b
 cannot, or truncate, which loses bytes. The non-parking form reports `Accepted(n)`, `Blocked` or
 `Closed` and returns, and those map onto the trait's own three outcomes directly.
 
-An offer may carry several `IoSlice`s. Vectored writes are deferred in the layer below, so this
-crate issues one write per slice and stops at the first that is not fully accepted — a short
-accept means the record filled or the peer's window did, and offering the next slice anyway
-would put the stream's bytes out of order. The end-of-stream marker rides on the final slice
-and only there, and QMux applies it only when it takes the whole of what it was offered, so a
-partial accept cannot end a stream early.
+An offer may carry several `IoSlice`s, and the whole list goes down in one call:
+`Connection::try_write_stream_vectored` in the layer below submits the fragments as one vector
+array, so they share records and a slice boundary costs nothing. That is the vectored *push*,
+which the layer below built; it is not a gathered write to the byte stream, which the layer
+below has settled against ever having (`docs/qmux/pending-work.md`). The two are easy to
+confuse and only one of them exists.
+
+Before that, this crate issued one write per slice and stopped at the first not fully accepted,
+which cost a record per slice. The stopping rule survives the change and now applies to the
+offer as a whole: a short accept means the peer's window is exhausted or the outbound buffer has
+reached its ceiling, and offering more of the same stream anyway would put its bytes out of
+order. It once meant a third
+thing, that the record had filled, and that reading is what made this break wrong for a while:
+the layer below took one record per call, so a large offer answered short with the buffer
+three-quarters empty and the stream was stood down over a record boundary. The distinction was
+settled where it is visible rather than compensated for here — `try_write_stream` fills records
+until a bound stops it, so a short accept means a bound. The end-of-stream marker is dwnx's
+to place: it applies the marker when the data one call handed it fits entirely, so the marker
+rides the record that takes the last byte of the whole offer and a partial accept cannot end a
+stream early. Nothing here computes which slice is the last one — an empty fragment is not
+submitted at all, so a trailing empty slice cannot take the marker away from the payload in
+front of it. An offer carrying no bytes *and* the marker is the one empty offer that must still
+reach the layer below, because it is the only way a stream that has finished writing is ended;
+the short-circuit for empty offers is conditioned on the marker's absence for that reason.
 
 A pass takes a bounded number of offers and then returns. A layer with an endless supply — a
 large body — could otherwise keep the pass from returning to the driver, which has a peer to
-attend to.
+attend to. The bound is on offers rather than on bytes, and each offer is now worth as many
+records as the outbound buffer will hold rather than one, so the cap is looser in bytes than it
+reads; the buffer's own ceiling is what bounds the bytes.
 
 ## The close nobody would otherwise write
 
@@ -175,6 +207,38 @@ absorbed. `extend_credit` discards it outright; `shutdown_stream` absorbs it onl
 layer below classifies it as an internal refusal, and any other failure ends the connection.
 Failing the connection over either would kill a healthy connection carrying every other
 exchange, every time one exchange was cancelled.
+
+## Window extensions are held for the length of a run
+
+The HTTP/3 driver reports flow-control credit one delivery at a time and twice over -- the
+stream's window and the connection's are separate, and it tells the transport about each
+separately. It does not accumulate them: within one transmit pass it can report a dozen times.
+Forwarding each report straight through made each one a call into the record layer that marked
+the connection as having something to produce, and each connection-level one also woke the
+read-ahead pump.
+
+So they are held here instead. A run accumulates one sum per stream and one for the connection,
+and is applied at the first interaction with the layer below that follows -- an event poll, a
+stream open, a transmit, a reset, a stop-sending, a close, or the tail. Holding is safe because
+a window extension is not a promise to the peer until it is written, and nothing between the
+report and the flush can observe the window it moves; sums rather than a list because the layer
+below takes a byte count and does not care how many reports it came from.
+
+The rule is "the next interaction of any kind" rather than "the transmit pass", and the
+difference matters: the driver can park between reporting credit and transmitting -- opening a
+request stream waits for capacity the peer has not granted -- and credit stranded behind that
+park is a window the peer is never told about while both ends wait for the other. A rule that
+named only the transmit pass would need a list of which other calls can park, and that list
+would have to stay right.
+
+The run is bounded. The per-stream sums are a `Vec` scanned linearly, which suits the single
+digits a pass delivers on and not hundreds; past that bound the run is applied early, so the
+worst case is what forwarding each report immediately used to cost rather than something worse.
+
+An extension for a stream that has since gone is discarded by the layer below, exactly as it was
+before the batching -- see the section above on refusals that are absorbed. Credit held when the
+connection ends is dropped rather than applied, because the layer below reports an ended
+connection as an error rather than ignoring the call.
 
 ## Orderly endings are events; failures are errors
 

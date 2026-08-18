@@ -172,6 +172,16 @@ explain any gap observed so far. It is recorded because a difference that is sma
 difference that is absent, and because a later reader hunting the mechanism behind a 1–2%
 body-throughput gap should find this before inventing one.
 
+**Its standing has risen since, without its size changing.** More units used to mean more
+*writes* as well as more framing work, because the QMux write path issued one write per record;
+that is gone. The whole set of six changes it belongs to was worth −30% at 1 MiB and −25.9% at
+64 KiB over a socket; how much of that is this one has not been measured on any socket arm
+([`findings/qmux-write-path.md`](findings/qmux-write-path.md)). So a per-byte mechanism that
+was previously one of two, and much the smaller, is now the only one of its kind left on the
+QMux side. It is still a fraction of a percent and still the wrong size to explain a visible
+gap; what has changed is that a reader who does find a per-byte effect in a body sweep has
+fewer places to look, and this is the first of them.
+
 Removing it is not available at a price a benchmark may pay. Raising the QMux record size needs
 an upstream change to dwnx. Lowering HTTP/2's `MAX_FRAME_SIZE` to 16382 would alter the HTTP/2
 arms, invalidating every measurement already recorded under [`data/`](data/) in order to remove

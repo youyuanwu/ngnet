@@ -15,6 +15,20 @@ over it. None is a defect in this crate, and each is something a future dwnx cou
 which point the compensation here becomes removable, which is why they are recorded rather than
 merely worked around.
 
+**What the write-path work learned about these eleven rows.** It bore on three, and it is worth
+saying which, because "a gap is still open" and "nobody has found out anything about it" are
+different states and only one of them is an invitation to go and look. The two close-related
+rows now have a *price* rather than a description: the missing serialiser costs the few dozen
+bytes of encoded close that `Connection::copied_record_bytes` still counts once per connection,
+and the missing accessor for a *received* close costs a copy that is now paid only on a record
+split across reads, because a record that arrives whole is scanned where it lies. The
+record-end row acquired a second reason to exist: the framer reads the length prefixes itself so
+that it can tell a clean ending from a truncated one, and that same bookkeeping is what lets the
+scan-in-place path know whether a whole record is present in the slice at hand — so an upstream
+accessor would close the first purpose and the fast path would have to keep the second. **About
+the remaining eight rows this work learned nothing**, and it did not look: none of them is on
+the write path, the receive path, or the buffer arrangement any of these changes touched.
+
 | Gap | What it costs, and what would settle it |
 | --- | --- |
 | **No way to serialise a connection close** | dwnx parses an incoming CONNECTION_CLOSE and reports it as `DWNX_ERR_DRAINING`, and it exposes `dwnx_ccerr` and its constructors for *describing* a close. There is no `dwnx_conn_write_connection_close` or equivalent, so the state machine can observe a peer's shutdown but cannot initiate one. The asynchronous layer therefore ships its own encoder in `src/io/close.rs`, and `tests/events.rs` builds a CONNECTION_CLOSE record by hand to test the receiving side. An upstream writer would make both removable: `Conn::close` would forward to it, and the layer would call that instead. |
@@ -34,50 +48,140 @@ merely worked around.
 Recorded here rather than in `design.md` because it is a consequence of the table above rather
 than a decision: close the gaps and the cost goes with them.
 
-Every inbound byte is copied twice inside this crate before a caller sees it. The framer
-retains the payload of the record currently arriving (`src/io/framing.rs`), because it cannot
-know whether that record carries a close until the record is complete and there is no way to
-ask dwnx afterwards. And each delivery is copied out of the record dwnx is parsing into an
-owned `Vec` for `Event::StreamData` (`src/io/event.rs`), because the handler's borrow points
-into that record buffer and is valid only for the duration of the callback.
+Inbound there were two copies. One is gone and one is still paid, and the gaps that caused both
+are still open.
 
-Neither copy is a choice. The first exists because dwnx exposes no accessor for a parsed close;
-give it one and the retention goes entirely. The second exists because handlers receive event
-values and cannot reach the connection — which is the deliberate design recorded in
-`design.md` — so the alternative is invoking a caller-supplied callback from inside the
-handler, which is what the sans-I/O API already offers and what the layer exists to be an
-alternative to.
+**The framer's retention is now paid only where it buys something.** It used to copy every
+record's payload, because a record has to be complete before it can be scanned for a close and
+dwnx offers no way to ask afterwards. A record whose bytes all arrive at once is now scanned
+where it lies and copied only if it turns out to carry a close; a record split across reads
+still accumulates, because there is nothing contiguous to scan. That is a narrowing rather than
+a closing: give dwnx an accessor for a parsed close and the retention goes entirely, split
+records included. `RecordFramer::copied_bytes` reports zero for a run of whole records, which is
+an assertion in a test rather than a claim here.
+
+**Each delivery is still copied** out of the record dwnx is parsing into an owned `Vec` for
+`Event::StreamData` (`src/io/event.rs`), because the handler's borrow points into that record
+buffer and is valid only for the duration of the callback. That copy is not a choice in the same
+sense as the first: handlers receive event values and cannot reach the connection, which is the
+deliberate design recorded in `design.md`, so the alternative is invoking a caller-supplied
+callback from inside the handler — which is what the sans-I/O API already offers and what this
+layer exists to be an alternative to.
+
+**Removing it was tried, measured, and reverted.** A build in which deliveries were
+reference-counted views into a pooled read buffer cut per-delivery allocation from 8,216 bytes
+to 24, and was *slower* on every payload size but one. The run is
+[`05-qmux-delivery-aliasing`](../benchmarks/data/xeon-8370c-azure/05-qmux-delivery-aliasing.md).
+The short version is that the pool's bookkeeping,
+the reference count and the copy-out that a small delivery still needs together cost more than
+the allocation they removed, which is a result worth having rather than a failure: it says this
+copy is not where the time goes, and the next person to look at it can start somewhere else.
 
 The HTTP/3 join adds none inbound. `ngnet-qmux-h3` turns that owned `Vec` into `Bytes` by
 taking the allocation over rather than copying it, and its outbound direction copies into the
 record being built exactly once — which is what `RETAINS_BUFFERS = false` means there.
 
-Outbound within this crate there is one more: a record is serialised into a scratch buffer and
-then copied into the outbound queue. That one is an artefact of `RecordWriter` borrowing both
-the connection and its destination buffer for the whole record, which is the borrow that makes
-the write path sound at all (see `design.md`), and it is bounded by one record.
+Outbound within this crate there is now none. A record used to be serialised into a scratch
+buffer and then copied into the outbound queue — one memcpy of up to 16382 bytes per record,
+about a megabyte of copying per megabyte sent — and it is not any more: `Conn::record` is handed
+a slice of the outbound buffer's own tail, so the bytes dwnx writes are already where the byte
+stream will be offered them. `RecordWriter` still borrows the connection and its destination for
+the whole record, which is the borrow that makes the write path sound at all (see `design.md`);
+what changed is which buffer the destination is a piece of. A test asserts the count rather than
+the prose: `Connection::copied_record_bytes` reports zero for a transfer of any size, and the one
+thing it still counts is the encoded connection close, which is a few dozen bytes once per
+connection and exists only because dwnx has no writer for a close — the first gap in the table
+above.
 
-These copies have still not been costed. The benchmark suite in `docs/benchmarks/` now runs
-`ngnet-qmux-h3` end to end over this layer, so the sentence that used to stand here — that
-there were no benchmarks — is no longer true; but an end-to-end figure attributes nothing to
-these copies in particular, since it also contains framing, QPACK, the record layer, the pump
-and the byte stream. All of the above therefore remains a description rather than a number,
-and it will stay one until something profiles the copies or measures a build with one of them
-removed.
+The removal was measured, not assumed: on this machine, a client sending a megabyte over a byte
+stream that accepts everything went from 1,049,226 bytes copied to 0, and construction went from
+15 allocations and 33,228 bytes to 14 and 16,846 — the scratch buffer was the difference. What
+it is *worth* in time is a separate question, and nothing here answers it: these are counts,
+identical on every machine, and any statement about timing has to come from a recorded run under
+`docs/benchmarks/`.
+
+**Both inbound copies have now been costed, and neither answer is the one the question was
+asked expecting.** This passage used to close by saying they were descriptions rather than
+numbers, and that they would stay so until something profiled them or measured a build with one
+of them removed. Both of those have happened. The framer's retention was removed for the case
+that matters — a record arriving whole — and the removal is a count, zero copied bytes over a
+run of whole records, asserted in `tests/io_framing.rs` rather than estimated. The delivery copy
+was removed in a build of its own and *timed*, which is the stronger test and the one that came
+back unfavourable: taking it out made the stack two to five percent slower on every payload size
+but one. So what remains unknown about these copies is not what they cost but why removing the
+second one costs more than paying it, and that question belongs to whoever designs a cheaper
+aliasing scheme rather than to this page. An end-to-end arm still attributes nothing to either
+copy on its own — a `body_throughput` figure contains framing, QPACK, the record layer, the pump
+and the byte stream as well — which is why both answers came from a paired build comparison and
+a count, and not from reading a single arm's absolute number.
 
 ## Things this increment does not do
 
 Deliberate omissions, each excluded to keep the work reviewable rather than because it is
 unwanted.
 
+**What the write-path work learned about these six rows.** Two moved and are rewritten in place
+— **Vectored writes**, which is now the record of an answer rather than of a gap, and
+**Benchmarks against QUIC**, whose flat "None" had stopped being true. About the other four —
+establishing a byte stream, serving an axum `Router`, interoperability testing and
+`dwnx_settings.log_write` — **this work learned nothing**, and none of them was touched or
+looked into: they are questions about what this crate does not attempt, and a change to how it
+writes what it already writes says nothing about any of them.
+
 | Gap | What it would need |
 | --- | --- |
 | **Establishing a byte stream** | The layer takes one already connected. There is no listener, no accept loop, no dialling and no TLS seam, and a test asserts the crate offers no way to make one. That is the scope decision the absence of an endpoint rests on — the operating system hands out one stream per peer, so a QMux "endpoint" is a TCP or unix listener the caller already has. What would settle it: nothing here; a caller who wants one uses `tokio::net` or its equivalent and hands the result over. |
 | **Serving an axum `Router` over QMux** | `ngnet-axum` serves a `Router` without hyper and is generic over a `Listener`, so an axum application over a QMux-carried connection is the obvious thing to want next. The fit is not immediate and that is the open question rather than the wiring: `Listener::Io` is bounded by `ServableTransport`, which `ngnet-axum` drives with `ngnet-h2` — so a QMux listener that produced accepted byte streams would get HTTP/2 over them, not HTTP/3 over QMux. What would settle it: deciding whether `ngnet-axum` grows an engine seam alongside its transport seam, or whether the join belongs in a crate of its own. |
-| **Vectored writes** | `dwnx_conn_writev_stream` takes a `dwnx_vec` array and the wrapper only uses the single-slice `dwnx_conn_write_stream` form. A `RecordWriter::push_vectored` taking `&[IoSlice]` would avoid a copy for callers whose payload is already fragmented, which the HTTP/3 join often is: `StreamSource::write_next` may offer several slices at once, and `ngnet-qmux-h3` issues one write per slice and stops at the first that is not fully taken. |
+| **Vectored writes** | *No longer a gap; the row is kept because the answer is worth more than its absence.* Two different things go by that name here, and they were settled differently. **Settled by building it: `RecordWriter::push_vectored`.** `dwnx_conn_writev_stream` takes a `dwnx_vec` array, and the wrapper now uses it: `RecordWriter::push_vectored` submits a caller's fragments as one array, and `Connection::try_write_stream_vectored` packs them into as few records as the maximum record size permits. The HTTP/3 join no longer issues a write per slice, so a record boundary no longer falls at every slice boundary. What it was worth is a count, not a time — one record and eight bytes of framing per request with a body — and why it is a count is recorded in `tests/ngnet-qmux-h3-tests/tests/fragmented_offers.rs`. The resumption rule is the part to be careful with and it is documented where it lives (`Fragments` in `src/io/conn.rs`): `*pdatalen` is one total across every vector, not a count per vector, so resuming means walking the array against a byte count and a short take routinely stops part-way through a fragment. **Settled by asking: gathering this connection's output to its byte stream.** The question was whether the output can ever be presented to the byte stream as more than one region, so that a stream able to write several buffers in one operation could be handed them. It cannot, so no gathering capability exists on `AsyncByteStream` — it has one `poll_write` taking one `&[u8]`, that is deliberate, and no test claims otherwise. See *Gathered output was asked about, and the answer is no* below for the two reasons and what would change them. |
 | **Interoperability testing** | Everything is tested against dwnx itself, in memory and over a loopback socket. Nothing has been run against another QMux implementation, and no other one is known to exist yet. |
-| **Benchmarks** | None. The interesting comparison is QMux-over-TLS-over-TCP against QUIC for the same workload, which is the draft's own motivating claim about computational cost. The layer and the HTTP/3 join make it measurable now; nothing has measured it. |
+| **Benchmarks against QUIC** | The row used to read "None", and the flat form of that is no longer true: `ngnet-qmux-h3` carries an arm in most of the suite under `docs/benchmarks/`, and one round of write-path work has been measured through it ([`findings/qmux-write-path.md`](../benchmarks/findings/qmux-write-path.md)). What is still absent is the comparison this row was written about — QMux-over-TLS-over-TCP against QUIC for the same workload, which is the draft's own motivating claim about computational cost. Nothing in the suite runs a QUIC arm at all, so the figures now on file compare QMux against HTTP/2 over a byte stream and against earlier builds of itself, and neither licenses a statement about the draft's claim. What would settle it: a QUIC arm in the same groups, which needs a QUIC stack that builds on the measurement machine — `docs/benchmarks/data/xeon-8370c-azure/README.md` records why that one does not. |
 | **`dwnx_settings.log_write`** | Left as a null function pointer. Bridging it to a Rust logging closure is straightforward and would be this crate's only callback that is not a protocol event. Not needed to speak the protocol. |
+
+## Gathered output was asked about, and the answer is no
+
+This is the recorded answer to a question that will otherwise be asked again: **can this
+connection's output ever be presented to its byte stream as more than one region?** It cannot,
+and there are two independent reasons. Either one alone would settle it; both hold, which is why
+no gathering capability was added rather than added and left unused. Going in, the expectation
+was that the answer would be negative — the bias is stated so that what follows can be read as
+the case *against* one's own conclusion having been looked for, which it was: both halves were
+checked against the code and against dwnx, and the checks are named below so that a later reader
+can redo them rather than trust them.
+
+**First: there is only ever one region.** Write coalescing chose to *stop early* rather than to
+compact or to wrap. Production appends at `filled` and stops when the tail cannot take another
+whole record (`Connection::room_for_record`); a partial accept advances `written` and leaves the
+space in front of it unreclaimed; `flush` offers the byte stream exactly `outbound[written..filled]`
+and resets both cursors when it drains. Nothing wraps, nothing compacts, and nothing else writes
+into the buffer. The output is therefore the single region `[written..filled]` in every reachable
+state, and a second region could only be introduced by adopting a ring buffer — that is, by
+building the two-region state in order to have something to gather. `design.md` rejects the ring
+on its own grounds, and this is the second reason not to want it.
+
+**Second: gathering would not save a copy here, which is where the HTTP/2 answer does not
+transfer.** Gathering pays for `ngnet-h2` because the regions it gathers include *caller-owned
+payload that the session never copies* — that is what `NGHTTP2_DATA_FLAG_NO_COPY` buys, and
+`docs/benchmarks/findings/write-path-and-gathering.md` measures what it is worth: a block at or
+above the threshold goes out as the second region of a two-region `writev`, never copied. QMux
+has no equivalent to buy. dwnx frames a payload *inside* the record: `dwnx_conn_write_stream`
+reaches `dwnx_conn_write_stream_frame`, which hands the caller's vectors to the frame encoder,
+and the encoder copies them into the record buffer (`deps/dwnx/lib/dwnx_frame.c:157`). The
+payload is in the record before the record is anything the byte stream could be shown, so the
+only copy gathering could avoid is one the record layer has already made and one that coalescing
+cannot avoid either. What coalescing *did* avoid — the staging copy between a scratch buffer and
+the outbound queue — is gone already, and its removal is counted above; gathering has nothing
+left to remove.
+
+**What would change this.** A ring buffer for the outbound queue, adopted for its own reasons
+rather than for gathering's, would produce a genuine two-region state and this answer would have
+to be retaken from the first half only, since the second half would still stand and would still
+say the gathering saves no copy. A dwnx that could write a record header describing payload it
+does not own — the shape `NGHTTP2_DATA_FLAG_NO_COPY` has, and one this crate cannot add from
+outside `deps/dwnx` — would retake the second half. Short of one of those two, the answer is
+settled, and the absence of `poll_write_vectored` on `AsyncByteStream` is a decision with a
+reason rather than an omission: a declaration that nothing could act on would be a surface
+without a behaviour.
+
 
 ## Deferred design decisions
 
@@ -90,13 +194,36 @@ practice, the way out is a context object exposing only the operations dwnx perm
 callback, with the write excluded. It is not built speculatively, because the simple form has
 not yet been shown to be insufficient.
 
+*What the write-path work learned about it, and it is the one deferred decision here that
+moved.* This restriction is the reason each delivery of stream data is copied into an owned
+allocation: the borrow dwnx offers a handler is valid only inside the callback, and a handler
+that could reach the connection is exactly what the design forbids. A build that escaped the
+lifetime without lifting the restriction — the handler captured a shared cell holding a
+reference-counted handle on the buffer being parsed, rather than the connection — was written
+and measured. It worked, cutting per-delivery allocation from 8,216 bytes to 24, and it was
+*slower* at every payload size but one
+([`05-qmux-delivery-aliasing`](../benchmarks/data/xeon-8370c-azure/05-qmux-delivery-aliasing.md)),
+so it was reverted. The bearing on this entry is narrow and worth stating exactly: it does not
+show that a limited context would be useless, because the build did not add one. It shows that
+the copy this restriction imposes is not where the time goes, so *performance* is no longer an
+argument for relaxing it, and an argument for a context object has to be made on ergonomics
+instead.
+
 **Panic behaviour.** A panic in a handler aborts the process, matching `ngnet-quic`'s
 documented convention. Containment is genuinely possible here in a way it is not there —
 every dwnx callback returns an `int`, so a caught panic could become
 `DWNX_ERR_CALLBACK_FAILURE` and be resumed once control returns to Rust. It is not done,
 because having the two crates in this workspace disagree about what a handler panic means
 would be worse than either choice on its own. If it changes, both should change together.
+**This work learned nothing about it**; nothing it changed reaches a handler's failure path.
 
 **Tracking upstream.** The submodule is pinned at the commit vendored with these crates.
 There is no policy yet for following dwnx, and the exhaustiveness checks in
 `invariants.md` are what will make a bump's consequences visible when there is one.
+**This work learned nothing about the policy question**, and left the submodule pointer and
+working tree untouched. It did read further into the vendored sources than anything here had
+before — the frame encoder's copy of a caller's vectors, the fixed two-byte record length and
+the assertion guarding it, and `dwnx_conn_write_stream`'s implementation as a one-element
+vectored call — and each of those readings is now load-bearing somewhere in `design.md` or in a
+test. That widens what a bump could break without changing the absence of a policy for
+noticing.
