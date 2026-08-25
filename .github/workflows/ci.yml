@@ -39,14 +39,14 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # No submodule work here: the correct set is not uniform across the three
           # vendored libraries, and encoding it in two places would guarantee they drift.
           # `just submodules` below is the single definition.
           submodules: false
 
-      - uses: extractions/setup-just@v2
+      - uses: extractions/setup-just@v4
 
       # nghttp2 and ngtcp2 want no nested submodules; nghttp3 needs exactly one of its own
       # (`lib/sfparse`, which is compiled into the library rather than into its tests).
