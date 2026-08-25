@@ -11,6 +11,6 @@
 #
 # rustup reads this file automatically, so `cargo test` in a clone uses it with no setup.
 [toolchain]
-channel = "1.97.1"
+channel = "1.98.0"
 components = ["clippy", "rustfmt"]
 profile = "minimal"
