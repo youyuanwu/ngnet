@@ -1236,7 +1236,9 @@ mod tests {
         // Each entry is six octets: a two-octet identifier and a four-octet value.
         let payload = &wire[CLIENT_MAGIC.len() + 9..];
         let entries: Vec<(u16, u32)> = payload
-            .chunks_exact(6)
+            .as_chunks::<6>()
+            .0
+            .iter()
             .map(|c| {
                 (
                     u16::from_be_bytes([c[0], c[1]]),
@@ -1297,7 +1299,9 @@ mod tests {
     fn settings_entries(wire: &[u8], skip_preface: bool) -> Vec<(u16, u32)> {
         let start = if skip_preface { CLIENT_MAGIC.len() } else { 0 } + 9;
         wire[start..]
-            .chunks_exact(6)
+            .as_chunks::<6>()
+            .0
+            .iter()
             .map(|c| {
                 (
                     u16::from_be_bytes([c[0], c[1]]),
