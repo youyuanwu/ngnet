@@ -2,6 +2,48 @@
 
 What is missing, and what would settle each.
 
+## Performance work, in priority order
+
+This is the implementation backlog produced by
+[`09-qmux-h2-mechanisms`](../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md).
+The order is measured payoff divided by implementation risk, not source order.
+
+1. **Replace `ngnet-h3`'s linear closed-stream lookup.** `Driver::close_stream` scans a
+   1024-entry tombstone `Vec` on every close after a connection reaches steady state. A
+   diagnostic that shortened the list reduced empty-exchange time by **11.7%** on a duplex and
+   **6.9%** on a socket, and reduced the 64-stream duplex arm by **19.9%**. Keep the tombstone
+   bound and insertion-order eviction, but make membership constant-time; do not ship the
+   diagnostic value of sixteen. This is shared HTTP/3 work rather than QMux-specific work, and
+   its full entry is in [`../h3/pending-work.md`](../h3/pending-work.md).
+2. **Decouple QMux flushing from the end of an HTTP/3 driver turn.** At concurrency `n`, QMux
+   issues `2n + 2` socket writes while HTTP/2 remains constant at two: 132 against 2 at 64
+   streams. The stream-ending batch boundary is required for correctness and must remain; the
+   opportunity is to carry buffered output across that boundary without risking a stall. This
+   is the largest remaining measured opportunity, but it changes the flush invariant and
+   therefore follows the contained tombstone fix. The explained lead and required guardrails
+   are recorded under
+   [the write-count entry](#something-scales-with-in-flight-streams-on-a-real-socket--it-is-the-write-count).
+3. **Reuse `ngnet-h3::Driver::apply_events` scratch storage.** Its owned event vector and the
+   `data` and `unheard` vectors allocated for each pass account for 2.39 microseconds, or 8.1%,
+   of a profiled empty exchange. Reuse buffers owned by the driver, while preserving the
+   control-plane-before-data ordering and same-batch reset handling.
+4. **Collapse the HTTP/3 driver's repeated shared-state probes.** The separate
+   `Shared::*_pending` and `take_*` checks account for about 1.35 microseconds, or 4.6%, of an
+   empty exchange. Investigate one combined readiness word or one collected action batch rather
+   than probing each category separately. Measure before retaining this change: unlike the first
+   two items, its mechanism is profiled but no implementation has been A/B tested.
+5. **Test HTTP/2 coalescing beyond one 16 KiB frame.** This is comparative work, not a QMux
+   defect. At a 1 MiB exchange HTTP/2 issues 189 writes and QMux issues 68; the measured HTTP/2
+   maximum is exactly 16 KiB while QMux can empty a 64 KiB buffer. A prototype must establish
+   whether coalescing frames recovers the kernel-path gap without regressing latency or
+   concurrency before it becomes an HTTP/2 change.
+
+Do **not** prioritize the 91 QMux transport read polls per empty exchange: suppressing redundant
+pumps bought only **1.3%**. The 16382-byte record payload and the fixed 64-offer yield were
+eliminated as causes of the concurrency inversion. Do not pursue allocation counts without a
+timing hypothesis—the delivery-aliasing experiment already showed that a large allocation
+reduction can be slower—and do not modify `deps/dwnx` as part of this backlog.
+
 ## Interoperability is proven against nothing
 
 Everything here runs against this workspace's own stack: `ngnet-h3` over `ngnet-qmux` over an
