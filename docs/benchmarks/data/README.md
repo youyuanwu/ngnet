@@ -35,6 +35,7 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [07-qmux-per-commit-attribution](xeon-8370c-azure/07-qmux-per-commit-attribution.md) | xeon-8370c-azure | 2026-08-17 | Which change produced the gain — **coalescing**, and the rest not resolved | [the QMux write path](../findings/qmux-write-path.md) |
 | [08-qmux-against-h2](xeon-8370c-azure/08-qmux-against-h2.md) | xeon-8370c-azure | 2026-08-18 | **QMux against HTTP/2** — a fixed +19–34 µs per exchange, and 0.86× per byte over a socket | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
 | [09-qmux-h2-mechanisms](xeon-8370c-azure/09-qmux-h2-mechanisms.md) | xeon-8370c-azure | 2026-08-27 | **Why** — writes per exchange, processor time by layer, and a linear scan in `ngnet-h3` | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
+| [10-h3-closed-stream-lookup](xeon-8370c-azure/10-h3-closed-stream-lookup.md) | xeon-8370c-azure | 2026-08-27 | Constant-time closed-stream lookup — **−13–18% duplex, −7–13% socket** | — |
 
 **The cross-protocol comparison is [`08`](xeon-8370c-azure/08-qmux-against-h2.md), and it is the
 only run here that is one.** That sentence replaces a standing note saying no such run existed.

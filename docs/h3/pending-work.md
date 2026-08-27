@@ -19,7 +19,7 @@ so the list cannot grow without end. Both are right. What was not considered is 
 is linear, so on any connection that has closed more than 1024 streams — which is every
 long-lived one — **every subsequent close scans 8 KiB of stream ids before doing anything**.
 
-What it costs, from
+What the original mechanism cost, from
 [`../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md`](../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md),
 measured by changing only that constant from 1024 to 16 and re-timing:
 
@@ -45,8 +45,12 @@ already applied, so a batch larger than the tombstone window cannot replay close
 after eviction. Unit tests cross the bound and compare both representations;
 `http_closed_streams` distinguishes retained from evicted late releases; and
 `closed_stream_membership_never_scans_eviction_order` pins both driver call sites to the hash
-index. The A/B above remains diagnostic evidence of the original mechanism, not a post-fix
-timing claim, and **16 is not a correct setting** — it would expire tombstones that still matter.
+index. The valid implementation was then measured directly in
+[`10-h3-closed-stream-lookup`](../benchmarks/data/xeon-8370c-azure/10-h3-closed-stream-lookup.md):
+**13–18% faster on the tested duplex arms and 7–13% faster on the socket arms**, with every
+effect larger than its matching HTTP/2 control movement. The earlier A/B remains diagnostic
+evidence of the original mechanism, and **16 is not a correct setting** — it would expire
+tombstones that still matter.
 
 The measurement was taken through the QMux join because that is the transport this host can
 build. Nothing in the entry is QMux-specific: `close_stream` is in `ngnet-h3`, so

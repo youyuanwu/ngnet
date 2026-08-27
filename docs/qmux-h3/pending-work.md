@@ -16,8 +16,10 @@ Item 1 is settled; item 2 is now the highest-priority open performance item.
    **6.9%** on a socket, and reduced the 64-stream duplex arm by **19.9%**. The fix kept the
    tombstone bound and insertion-order eviction, made membership constant-time, and did not ship
    the diagnostic value of sixteen. A synchronized hash index and FIFO queue now preserve the
-   1024-entry semantics without the scan. This is shared HTTP/3 work rather than QMux-specific
-   work, and its verified resolution is in
+   1024-entry semantics without the scan. The shipped implementation measures **13–18% faster
+   on the tested duplex arms and 7–13% faster on the socket arms** in
+   [`run 10`](../benchmarks/data/xeon-8370c-azure/10-h3-closed-stream-lookup.md). This is shared
+   HTTP/3 work rather than QMux-specific work, and its verified resolution is in
    [`../h3/pending-work.md`](../h3/pending-work.md#a-linear-scan-on-every-stream-close).
 2. **Decouple QMux flushing from the end of an HTTP/3 driver turn.** At concurrency `n`, QMux
    issues `2n + 2` socket writes while HTTP/2 remains constant at two: 132 against 2 at 64

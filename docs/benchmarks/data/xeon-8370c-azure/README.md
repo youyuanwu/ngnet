@@ -80,6 +80,7 @@ submodules. [`../../running.md`](../../running.md) states the requirement in ful
 | [07-qmux-per-commit-attribution](07-qmux-per-commit-attribution.md) | 2026-08-17 | seven commits, each against its predecessor | Coalescing is **−21.7%** at 1 MiB; four of the six are inside their step's controls — duplex only |
 | [08-qmux-against-h2](08-qmux-against-h2.md) | 2026-08-18 | `c525aa1` | **QMux against HTTP/2**, five passes — fixed +19–34 µs per exchange, **0.86×** per byte over a socket |
 | [09-qmux-h2-mechanisms](09-qmux-h2-mechanisms.md) | 2026-08-27 | `dc922be` | **Why**, by counting — 68 writes against 189 at 1 MiB, `2n + 2` against 2 at concurrency, and 45% of the fixed cost inside `ngnet-h3` |
+| [10-h3-closed-stream-lookup](10-h3-closed-stream-lookup.md) | 2026-08-27 | `6d13712` against `419a774` | Constant-time closed-stream lookup — **−13–18% duplex, −7–13% socket** |
 
 Still outstanding, in the order they are worth doing:
 
