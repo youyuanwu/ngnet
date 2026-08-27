@@ -8,13 +8,17 @@ This is the implementation backlog produced by
 [`09-qmux-h2-mechanisms`](../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md).
 The order is measured payoff divided by implementation risk, not source order.
 
-1. **Replace `ngnet-h3`'s linear closed-stream lookup.** `Driver::close_stream` scans a
+Item 1 is settled; item 2 is now the highest-priority open performance item.
+
+1. **Replace `ngnet-h3`'s linear closed-stream lookup — settled.** `Driver::close_stream` scanned a
    1024-entry tombstone `Vec` on every close after a connection reaches steady state. A
    diagnostic that shortened the list reduced empty-exchange time by **11.7%** on a duplex and
    **6.9%** on a socket, and reduced the 64-stream duplex arm by **19.9%**. Keep the tombstone
    bound and insertion-order eviction, but make membership constant-time; do not ship the
-   diagnostic value of sixteen. This is shared HTTP/3 work rather than QMux-specific work, and
-   its full entry is in [`../h3/pending-work.md`](../h3/pending-work.md).
+   diagnostic value of sixteen. A synchronized hash index and FIFO queue now preserve the
+   1024-entry semantics without the scan. This is shared HTTP/3 work rather than QMux-specific
+   work, and its verified resolution is in
+   [`../h3/pending-work.md`](../h3/pending-work.md#a-linear-scan-on-every-stream-close).
 2. **Decouple QMux flushing from the end of an HTTP/3 driver turn.** At concurrency `n`, QMux
    issues `2n + 2` socket writes while HTTP/2 remains constant at two: 132 against 2 at 64
    streams. The stream-ending batch boundary is required for correctness and must remain; the

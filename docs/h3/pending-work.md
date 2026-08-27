@@ -4,15 +4,16 @@ Known gaps, deferred decisions and things worth doing next for the `ngnet-h3` fa
 entry records the evidence that produced it and what would settle it, so a later reader can
 judge whether it still applies rather than re-deriving the argument.
 
-Everything here was deferred on its merits rather than left half-finished, with one exception,
-recorded first below because it is the only entry on this list that is a defect.
+Everything still pending here was deferred on its merits rather than left half-finished.
 
 The HTTP/2 family keeps its own list in [`../h2/pending-work.md`](../h2/pending-work.md).
 
-## A linear scan on every stream close
+## Resolved
 
-**Measured, reproduced, and not yet fixed.** `Driver::close_stream` in `src/http/driver.rs` opens
-with `self.closed.contains(&stream)` over a `Vec<StreamId>` held at `CLOSED_TOMBSTONES = 1024`.
+### A linear scan on every stream close
+
+**Resolved.** `Driver::close_stream` used to open with `self.closed.contains(&stream)` over a
+`Vec<StreamId>` held at `CLOSED_TOMBSTONES = 1024`.
 The tombstones exist to discard a late release for a stream already gone, and the bound is there
 so the list cannot grow without end. Both are right. What was not considered is that `contains`
 is linear, so on any connection that has closed more than 1024 streams — which is every
@@ -36,18 +37,19 @@ at 2048 amortises the drain while lengthening the average scan by half; both arm
 proportion — 30.73 µs and 1318.26 µs. A cost that tracks the length of the scanned list is the
 scan.
 
-**What would settle the fix:** membership in constant time while eviction stays in insertion
-order — a `HashSet<StreamId>` beside the existing `Vec` used as the eviction queue, or a
-`VecDeque` with a watermark exploiting the fact that stream ids are monotonic. Either keeps the
-bound and the semantics; only the lookup changes. The A/B above is a diagnostic and **16 is not a
-correct setting** — it would expire tombstones that still matter.
+**What settled it:** the driver now keeps membership in a `HashSet<StreamId>` and insertion order
+in a `VecDeque<StreamId>`, behind one component that inserts and evicts from both together.
+The bound remains 1024, duplicate closes remain no-ops, and the oldest distinct close is evicted
+first. Unit tests cross the bound and compare both representations; `http_closed_streams`
+distinguishes retained from evicted late releases; and
+`closed_stream_membership_never_scans_eviction_order` pins both driver call sites to the hash
+index. The A/B above remains diagnostic evidence of the original mechanism, not a post-fix
+timing claim, and **16 is not a correct setting** — it would expire tombstones that still matter.
 
 The measurement was taken through the QMux join because that is the transport this host can
 build. Nothing in the entry is QMux-specific: `close_stream` is in `ngnet-h3`, so
 `ngnet-quic-h3` should pay the same cost. That is an inference from shared source, not a
 measurement — see the same run's *What it does not*.
-
-## Resolved
 
 ### The asynchronous layer
 
