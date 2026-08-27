@@ -123,6 +123,42 @@ corrected; the reasoning is in [`controls.md`](controls.md).
 5. **Record the exclusion rule before looking at the numbers**, if there is one, and report
    how many replicates it excluded and what the result is without it.
 
+## Counting instead of timing
+
+Some questions are not about how long something takes but about how many times it happens, and
+those five rules are written for timings. A count of syscalls or of calls to a function is an
+integer, reproducible run to run, and it does not compete with session drift — so rule 2
+(interleave) and rule 3 (carry controls) have nothing to bite on. Rules 1, 4 and 5 still apply.
+
+Two rules replace them:
+
+- **Take every count at two iteration counts and subtract**, `(c(3N) - c(N)) / 2N`. Connection
+  setup, warm-up and process teardown then cancel exactly rather than being amortised until they
+  look small.
+- **Check the instrument against the suite before trusting it.** A driver that does not reproduce
+  Criterion's numbers for the same arm is measuring something else.
+
+The instrument is `tests/ngnet-bench/examples/probe.rs`, which exists because Criterion's process
+carries every arm at once and a profiler cannot be pointed at one of them. It establishes a single
+fixture and runs a single workload in a loop:
+
+```sh
+cargo build --example probe -p ngnet-bench --release
+
+# arm      = h2-duplex | h2-socket | qmux-duplex | qmux-socket
+# workload = body <bytes> | concurrent <streams>
+taskset -c 3 ./target/release/examples/probe qmux-socket body 1048576 300
+
+# what it is for
+strace -c -f  ./target/release/examples/probe qmux-socket body 1048576 300
+perf record -F 4000 -g -- ./target/release/examples/probe qmux-duplex body 0 150000
+```
+
+It prints `PROBE-READY` on stderr once the connection is established and warmed, so a trace can be
+started against a steady state. It is not a benchmark and its wall-clock output is not a result;
+[`data/xeon-8370c-azure/09-qmux-h2-mechanisms.md`](data/xeon-8370c-azure/09-qmux-h2-mechanisms.md)
+is what it produced and how far it was checked.
+
 ## Recording a run
 
 Criterion's own output under `target/criterion/` is not committed: it is per-machine, it is
