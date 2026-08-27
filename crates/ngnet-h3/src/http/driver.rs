@@ -36,6 +36,7 @@
 
 use core::future::poll_fn;
 use core::task::Poll;
+use std::collections::{HashSet, VecDeque};
 use std::io::IoSlice;
 use std::sync::Arc;
 
@@ -59,6 +60,47 @@ use crate::stream::StreamId;
 /// need not outlive the transport's own accounting for it. This is generous enough that it
 /// never expires one that matters and small enough that the list cannot grow without bound.
 const CLOSED_TOMBSTONES: usize = 1024;
+
+/// Recently closed streams, indexed for membership and ordered for bounded eviction.
+///
+/// `members` and `order` contain exactly the same identifiers after every operation.
+/// Keeping insertion and eviction here makes it impossible for a caller to update only one
+/// half of that invariant.
+struct ClosedStreams {
+    members: HashSet<StreamId>,
+    order: VecDeque<StreamId>,
+}
+
+impl ClosedStreams {
+    fn new() -> Self {
+        Self {
+            members: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn contains(&self, stream: StreamId) -> bool {
+        self.members.contains(&stream)
+    }
+
+    /// Records a distinct close and says whether its side effects should run.
+    fn insert(&mut self, stream: StreamId) -> bool {
+        if !self.members.insert(stream) {
+            return false;
+        }
+
+        self.order.push_back(stream);
+        while self.order.len() > CLOSED_TOMBSTONES {
+            let oldest = self
+                .order
+                .pop_front()
+                .expect("an over-capacity closed-stream queue is not empty");
+            let removed = self.members.remove(&oldest);
+            debug_assert!(removed, "closed-stream membership and order diverged");
+        }
+        true
+    }
+}
 
 /// `H3_REQUEST_CANCELLED`, the code an abandoned exchange carries.
 pub(crate) const REQUEST_CANCELLED: u64 = 0x10c;
@@ -153,6 +195,9 @@ impl<R: Role> DriverGuard<R> {
         }
     }
 }
+
+#[cfg(test)]
+include!("driver/closed_streams.rs");
 
 impl<R: Role> Drop for DriverGuard<R> {
     fn drop(&mut self) {
@@ -298,7 +343,7 @@ pub(crate) struct Driver<Q> {
     /// one per exchange for the life of the connection would turn ordinary traffic into an
     /// unbounded allocation, so the oldest are dropped once there are more than a
     /// connection could plausibly have in flight.
-    closed: Vec<StreamId>,
+    closed: ClosedStreams,
     /// Streams blocked by congestion, reused across passes to avoid reallocating.
     blocked: Vec<StreamId>,
     /// Unidirectional streams opened so far, kept across a `Pending`.
@@ -341,7 +386,7 @@ impl<Q: QuicConnection> Driver<Q> {
             shared,
             registry,
             config,
-            closed: Vec::new(),
+            closed: ClosedStreams::new(),
             blocked: Vec::new(),
             opened: Vec::new(),
             pushback: None,
@@ -575,7 +620,7 @@ impl<Q: QuicConnection> Driver<Q> {
         if bytes == 0 {
             return Ok(());
         }
-        if self.closed.contains(&stream) {
+        if self.closed.contains(stream) {
             // Closing already released this stream's buffers. Reporting acknowledgement
             // afterwards would claim more was acknowledged than was ever written, which the
             // state machine rejects — correctly, since that is exactly the shape of an
@@ -657,12 +702,8 @@ impl<Q: QuicConnection> Driver<Q> {
         closed: crate::handlers::StreamClosed,
         role: &mut R,
     ) -> Result<()> {
-        if self.closed.contains(&stream) {
+        if !self.closed.insert(stream) {
             return Ok(());
-        }
-        self.closed.push(stream);
-        if self.closed.len() > CLOSED_TOMBSTONES {
-            self.closed.drain(..self.closed.len() - CLOSED_TOMBSTONES);
         }
         self.conn
             .close_stream_with(stream, closed, &mut self.events)

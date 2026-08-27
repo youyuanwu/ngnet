@@ -511,6 +511,93 @@ fn the_async_layer_brings_no_runtime() {
     );
 }
 
+fn closed_order_violations(source: &str) -> Vec<&str> {
+    source
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            if line.contains("self.order[") || line.contains("&self.order") {
+                return true;
+            }
+            let Some(after) = line.split("self.order.").nth(1) else {
+                return false;
+            };
+            let method = after.split('(').next().unwrap_or(after);
+            !matches!(method, "push_back" | "pop_front" | "len")
+        })
+        .collect()
+}
+
+#[test]
+fn closed_stream_membership_never_scans_eviction_order() {
+    let path = crate_root().join("src/http/driver.rs");
+    let source = std::fs::read_to_string(&path).expect("reading the HTTP driver");
+    let stripped = strip_comments_and_literals(&source);
+    let production = stripped.as_str();
+
+    for required in [
+        "struct ClosedStreams",
+        "members: HashSet<StreamId>",
+        "order: VecDeque<StreamId>",
+        "self.members.contains(&stream)",
+        "self.closed.contains(stream)",
+        "self.closed.insert(stream)",
+    ] {
+        assert!(
+            production.contains(required),
+            "the closed-stream membership scan has gone stale; `{required}` was not found"
+        );
+    }
+
+    let uses: Vec<&str> = production
+        .lines()
+        .filter(|line| line.contains("self.closed."))
+        .collect();
+    assert!(
+        uses.len() >= 2,
+        "no closed-stream membership sites were found"
+    );
+    assert!(
+        uses.iter()
+            .all(|line| line.contains(".contains(") || line.contains(".insert(")),
+        "a closed-stream site bypasses the indexed component: {uses:#?}"
+    );
+
+    let release = production
+        .split("fn apply_release")
+        .nth(1)
+        .and_then(|rest| rest.split("fn fail_stream").next())
+        .expect("finding apply_release");
+    assert!(
+        release.contains("self.closed.contains(stream)")
+            && !release.contains("self.closed.insert(stream)"),
+        "apply_release must query, not mutate, closed-stream membership"
+    );
+
+    let close = production
+        .split("fn close_stream")
+        .nth(1)
+        .and_then(|rest| rest.split("pub(crate) fn dispatch").next())
+        .expect("finding close_stream");
+    assert!(
+        close.contains("if !self.closed.insert(stream)")
+            && !close.contains("self.closed.contains(stream)"),
+        "close_stream must use the self-guarding insertion result"
+    );
+
+    let violations = closed_order_violations(production);
+    assert!(
+        violations.is_empty(),
+        "closed-stream membership must not inspect eviction order: {violations:#?}"
+    );
+}
+
+#[test]
+fn the_closed_stream_scanner_catches_an_order_lookup() {
+    let violation = "if self.order.contains(&stream) { return; }";
+    assert_eq!(closed_order_violations(violation), [violation]);
+}
+
 #[test]
 fn the_async_layer_grants_itself_no_unsafe_allowance() {
     // A different claim from containing no `unsafe`, and the one that guards it. The
