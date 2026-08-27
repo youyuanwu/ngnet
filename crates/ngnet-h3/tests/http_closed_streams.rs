@@ -50,6 +50,11 @@ fn retained_closed_stream_discards_a_late_release() {
         pump_driver(&mut driver).is_none(),
         "a retained tombstone did not discard its late release"
     );
+    assert_eq!(
+        controls.pending_events(),
+        0,
+        "the retained-release assertion ran before its events were consumed"
+    );
 
     let _request = handle.send_request(
         http::Request::builder()
@@ -85,6 +90,11 @@ fn evicted_closed_stream_uses_the_non_tombstoned_release_path() {
     });
 
     let outcome = pump_driver(&mut driver).expect("the evicted release should end the connection");
+    assert_eq!(
+        controls.pending_events(),
+        0,
+        "the evicted-release assertion ran before its events were consumed"
+    );
     let error = outcome.expect_err("the non-tombstoned release unexpectedly succeeded");
     assert_eq!(error.kind(), ErrorKind::Stream);
     assert!(

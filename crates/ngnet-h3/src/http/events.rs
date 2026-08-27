@@ -124,6 +124,28 @@ impl Events {
         self.observed.push(Observation::Closed { stream, closed });
     }
 
+    /// Discards close observations produced by one driver-initiated state-machine close.
+    ///
+    /// The driver has already applied that close and its side effects. Leaving the callback's
+    /// observation queued would replay the same close later, after a sufficiently large batch
+    /// may already have evicted its bounded late-release tombstone.
+    pub(crate) fn discard_closed_since(&mut self, checkpoint: usize, stream: StreamId) {
+        let mut index = checkpoint;
+        while index < self.observed.len() {
+            if matches!(
+                self.observed[index],
+                Observation::Closed {
+                    stream: observed,
+                    ..
+                } if observed == stream
+            ) {
+                self.observed.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
     /// Records a graceful shutdown.
     pub(crate) fn push_shutdown(&mut self, shutdown: Shutdown) {
         self.observed.push(Observation::Shutdown(shutdown));

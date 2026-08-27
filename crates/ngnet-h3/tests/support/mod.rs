@@ -679,6 +679,11 @@ impl StubControls {
         self.0.borrow_mut().events.push_back(event);
     }
 
+    /// How many test-supplied events the driver has not consumed yet.
+    pub fn pending_events(&self) -> usize {
+        self.0.borrow().events.len()
+    }
+
     /// Opens no more than this many bidirectional streams, as a peer at its limit would.
     ///
     /// Further requests for one answer [`Poll::Pending`] and never resolve, which is exactly

@@ -1,5 +1,18 @@
+use super::*;
+
 fn stream(index: usize) -> StreamId {
     StreamId::new((index as i64) * 4).expect("a request stream id")
+}
+
+fn assert_synchronized(closed: &ClosedStreams) {
+    let ordered: HashSet<StreamId> = closed.order.iter().copied().collect();
+    assert_eq!(
+        ordered.len(),
+        closed.order.len(),
+        "the queue has duplicates"
+    );
+    assert_eq!(ordered, closed.members);
+    assert!(closed.order.len() <= CLOSED_TOMBSTONES);
 }
 
 #[test]
@@ -25,15 +38,14 @@ fn closed_streams_duplicate_insertions_do_not_change_order() {
         assert!(!closed.insert(stream(fill - 1)));
         assert_eq!(closed.order, before);
         assert_eq!(closed.members.len(), fill);
+        assert_synchronized(&closed);
 
         assert!(closed.insert(stream(fill)));
-        assert_eq!(closed.members.len(), closed.order.len());
-        assert!(
-            closed
-                .order
-                .iter()
-                .all(|stream| closed.members.contains(stream))
-        );
+        assert_synchronized(&closed);
+        if fill == CLOSED_TOMBSTONES {
+            assert_eq!(closed.order.front(), Some(&stream(1)));
+            assert!(!closed.members.contains(&stream(0)));
+        }
     }
 }
 
@@ -56,14 +68,7 @@ fn closed_streams_membership_and_order_stay_synchronized() {
     let mut closed = ClosedStreams::new();
     for index in 0..(CLOSED_TOMBSTONES * 3) {
         assert!(closed.insert(stream(index)));
-        assert!(closed.order.len() <= CLOSED_TOMBSTONES);
-        assert_eq!(closed.members.len(), closed.order.len());
-        assert!(
-            closed
-                .order
-                .iter()
-                .all(|stream| closed.members.contains(stream))
-        );
+        assert_synchronized(&closed);
     }
 
     for index in 0..(CLOSED_TOMBSTONES * 2) {
@@ -141,12 +146,10 @@ fn closed_streams_duplicate_close_notifies_the_role_only_once() {
     driver
         .close_stream(stream, crate::handlers::StreamClosed::clean(), &mut role)
         .expect("first close");
-    let observed = driver.events.drain();
     assert!(
-        !observed.is_empty(),
-        "state-machine close recorded no close observation"
+        driver.events.is_empty(),
+        "a driver-initiated close observation was left queued for replay"
     );
-    dispatch(&mut driver, &mut role, observed).expect("dispatching the recorded close");
     driver
         .close_stream(stream, crate::handlers::StreamClosed::clean(), &mut role)
         .expect("duplicate close");
@@ -154,4 +157,44 @@ fn closed_streams_duplicate_close_notifies_the_role_only_once() {
     assert_eq!(role.closes, 1);
     assert_eq!(driver.closed.order.len(), 1);
     assert_eq!(driver.closed.members.len(), 1);
+}
+
+#[test]
+fn closed_streams_large_close_batch_does_not_replay_evicted_observations() {
+    let (backend, _peer, _knobs) = crate::http::testing::loopback();
+    let config = Config::default();
+    let shared = Arc::new(Shared::new());
+    let registry = Arc::new(Registry::new());
+    let mut conn =
+        build_conn(CoreRole::Client, &config, &shared).expect("building a test connection");
+    conn.bind_control_stream(StreamId::new(2).expect("control stream"))
+        .expect("binding control stream");
+    conn.bind_qpack_streams(
+        StreamId::new(6).expect("encoder stream"),
+        StreamId::new(10).expect("decoder stream"),
+    )
+    .expect("binding qpack streams");
+    let field = crate::Header::new(":method", "GET").expect("a request field");
+    for index in 0..=CLOSED_TOMBSTONES {
+        conn.submit_request(stream(index), core::slice::from_ref(&field), None)
+            .expect("submitting a test request");
+    }
+
+    let mut driver = Driver::new(backend, conn, shared, registry, config);
+    let mut role = CountingRole::default();
+    for index in 0..=CLOSED_TOMBSTONES {
+        driver
+            .close_stream(
+                stream(index),
+                crate::handlers::StreamClosed::clean(),
+                &mut role,
+            )
+            .expect("closing a test stream");
+    }
+
+    assert!(driver.events.is_empty());
+    assert_eq!(role.closes, CLOSED_TOMBSTONES + 1);
+    assert_synchronized(&driver.closed);
+    assert!(!driver.closed.contains(stream(0)));
+    assert!(driver.closed.contains(stream(CLOSED_TOMBSTONES)));
 }

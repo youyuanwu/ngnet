@@ -197,7 +197,8 @@ impl<R: Role> DriverGuard<R> {
 }
 
 #[cfg(test)]
-include!("driver/closed_streams.rs");
+#[path = "driver/closed_streams.rs"]
+mod closed_streams;
 
 impl<R: Role> Drop for DriverGuard<R> {
     fn drop(&mut self) {
@@ -705,9 +706,18 @@ impl<Q: QuicConnection> Driver<Q> {
         if !self.closed.insert(stream) {
             return Ok(());
         }
-        self.conn
+        let event_checkpoint = self.events.observed.len();
+        if self
+            .conn
             .close_stream_with(stream, closed, &mut self.events)
-            .ok();
+            .is_ok()
+        {
+            // `close_stream_with` fires the state-machine close callback. This close has
+            // already been applied here, so do not queue its observation for a second pass:
+            // a large transport batch can evict the bounded release tombstone before the
+            // driver gets round to dispatching those observations.
+            self.events.discard_closed_since(event_checkpoint, stream);
+        }
         if let Some(entry) = self.registry.remove(stream) {
             entry.incoming.finish();
             if let Some(slot) = &entry.slot

@@ -511,21 +511,22 @@ fn the_async_layer_brings_no_runtime() {
     );
 }
 
-fn closed_order_violations(source: &str) -> Vec<&str> {
-    source
-        .lines()
-        .filter(|line| {
-            let line = line.trim();
-            if line.contains("self.order[") || line.contains("&self.order") {
-                return true;
-            }
-            let Some(after) = line.split("self.order.").nth(1) else {
-                return false;
-            };
-            let method = after.split('(').next().unwrap_or(after);
-            !matches!(method, "push_back" | "pop_front" | "len")
-        })
-        .collect()
+fn closed_order_violations(source: &str) -> Vec<String> {
+    let compact: String = source.split_whitespace().collect();
+    let mut violations = Vec::new();
+    if compact.contains("self.closed.order") {
+        violations.push("driver bypasses the closed-stream component API".to_owned());
+    }
+    for use_site in compact.split("self.order.").skip(1) {
+        let method = use_site.split('(').next().unwrap_or(use_site);
+        if !matches!(method, "push_back" | "pop_front" | "len") {
+            violations.push(format!("order queue uses `{method}`"));
+        }
+    }
+    if compact.contains("self.order[") || compact.contains("&self.order") {
+        violations.push("order queue is indexed or iterated directly".to_owned());
+    }
+    violations
 }
 
 #[test]
@@ -553,10 +554,7 @@ fn closed_stream_membership_never_scans_eviction_order() {
         .lines()
         .filter(|line| line.contains("self.closed."))
         .collect();
-    assert!(
-        uses.len() >= 2,
-        "no closed-stream membership sites were found"
-    );
+    assert_eq!(uses.len(), 2, "the closed-stream membership sites changed");
     assert!(
         uses.iter()
             .all(|line| line.contains(".contains(") || line.contains(".insert(")),
@@ -595,7 +593,13 @@ fn closed_stream_membership_never_scans_eviction_order() {
 #[test]
 fn the_closed_stream_scanner_catches_an_order_lookup() {
     let violation = "if self.order.contains(&stream) { return; }";
-    assert_eq!(closed_order_violations(violation), [violation]);
+    assert!(!closed_order_violations(violation).is_empty());
+
+    let driver_bypass = "if self.closed.order.contains(&stream) { return; }";
+    assert!(!closed_order_violations(driver_bypass).is_empty());
+
+    let wrapped = "self\n    .order\n    .iter()\n    .any(|entry| *entry == stream)";
+    assert!(!closed_order_violations(wrapped).is_empty());
 }
 
 #[test]

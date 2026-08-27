@@ -13,9 +13,9 @@ Item 1 is settled; item 2 is now the highest-priority open performance item.
 1. **Replace `ngnet-h3`'s linear closed-stream lookup — settled.** `Driver::close_stream` scanned a
    1024-entry tombstone `Vec` on every close after a connection reaches steady state. A
    diagnostic that shortened the list reduced empty-exchange time by **11.7%** on a duplex and
-   **6.9%** on a socket, and reduced the 64-stream duplex arm by **19.9%**. Keep the tombstone
-   bound and insertion-order eviction, but make membership constant-time; do not ship the
-   diagnostic value of sixteen. A synchronized hash index and FIFO queue now preserve the
+   **6.9%** on a socket, and reduced the 64-stream duplex arm by **19.9%**. The fix kept the
+   tombstone bound and insertion-order eviction, made membership constant-time, and did not ship
+   the diagnostic value of sixteen. A synchronized hash index and FIFO queue now preserve the
    1024-entry semantics without the scan. This is shared HTTP/3 work rather than QMux-specific
    work, and its verified resolution is in
    [`../h3/pending-work.md`](../h3/pending-work.md#a-linear-scan-on-every-stream-close).
