@@ -134,6 +134,32 @@ fn closed_streams_duplicate_close_notifies_the_role_only_once() {
     )
     .expect("binding qpack streams");
     conn.submit_request(
+        stream(1),
+        &[crate::Header::new(":method", "GET").expect("a request field")],
+        None,
+    )
+    .expect("submitting a positive-control request");
+    let mut positive_events = Events::default();
+    conn.close_stream_with(
+        stream(1),
+        crate::handlers::StreamClosed::clean(),
+        &mut positive_events,
+    )
+    .expect("closing the positive-control stream");
+    assert!(
+        positive_events
+            .drain()
+            .into_iter()
+            .any(|observation| matches!(
+                observation,
+                Observation::Closed {
+                    stream: observed,
+                    ..
+                } if observed == stream(1)
+            )),
+        "the test connection did not record its state-machine close callback"
+    );
+    conn.submit_request(
         stream(0),
         &[crate::Header::new(":method", "GET").expect("a request field")],
         None,

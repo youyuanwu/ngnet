@@ -271,4 +271,34 @@ mod tests {
         assert_eq!(observed.len(), 1);
         assert!(matches!(observed[0], Observation::Closed { .. }));
     }
+
+    #[test]
+    fn discarding_one_close_preserves_other_observations() {
+        let mut events = Events::default();
+        let target = StreamId::new(0).expect("a stream");
+        let other = StreamId::new(4).expect("a stream");
+
+        events.push_closed(target, StreamClosed::clean());
+        let checkpoint = events.observed.len();
+        events.push_end(target);
+        events.push_closed(other, StreamClosed::clean());
+        events.push_closed(target, StreamClosed::clean());
+
+        events.discard_closed_since(checkpoint, target);
+
+        let observed = events.drain();
+        assert_eq!(observed.len(), 3);
+        assert!(matches!(
+            observed[0],
+            Observation::Closed { stream, .. } if stream == target
+        ));
+        assert!(matches!(
+            observed[1],
+            Observation::End { stream } if stream == target
+        ));
+        assert!(matches!(
+            observed[2],
+            Observation::Closed { stream, .. } if stream == other
+        ));
+    }
 }

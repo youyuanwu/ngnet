@@ -40,8 +40,10 @@ scan.
 **What settled it:** the driver now keeps membership in a `HashSet<StreamId>` and insertion order
 in a `VecDeque<StreamId>`, behind one component that inserts and evicts from both together.
 The bound remains 1024, duplicate closes remain no-ops, and the oldest distinct close is evicted
-first. Unit tests cross the bound and compare both representations; `http_closed_streams`
-distinguishes retained from evicted late releases; and
+first. The driver also discards the state machine's callback observation for a close it has
+already applied, so a batch larger than the tombstone window cannot replay close side effects
+after eviction. Unit tests cross the bound and compare both representations;
+`http_closed_streams` distinguishes retained from evicted late releases; and
 `closed_stream_membership_never_scans_eviction_order` pins both driver call sites to the hash
 index. The A/B above remains diagnostic evidence of the original mechanism, not a post-fix
 timing claim, and **16 is not a correct setting** — it would expire tombstones that still matter.
