@@ -290,20 +290,103 @@ validates and advertises `max_idle_timeout` and then never acts on it, and has n
 expiry API of any kind. A clock that could wait would imply an enforcement this stack does not
 perform.
 
-### Flush, then produce, then read
+### Produce up to the ceiling, write once, then read
 
-The pump's order is the whole design, and the obvious alternative — produce everything the
-state machine owes, then write it out — is wrong twice over.
+The pump's order is the whole design. It used to be *flush, produce one record, flush*, so that
+a record was produced only into an empty outbound buffer and at most one record was ever
+outstanding. That rule was overturned deliberately, because it cost one write — one syscall, on
+a real transport — per 16382-byte record, and a driver turn that produces sixty records paid
+sixty of them where one would have carried the same bytes. What replaced it is: produce while
+the buffer has room for another whole record, write what has accumulated, then read.
 
-A record is produced only into an *empty* outbound buffer. So the previous record has
-necessarily reached the byte stream in full before the next one exists, and at most one record
-is ever outstanding. That bounds what a slow peer can make this side hold to a single record —
-16382 bytes — rather than to however much the caller has queued behind it. Producing first
-would bound outbound memory by the backlog instead, which is the first thing wrong with it. The
-second is that records would then have to be interleaved correctly on the way out, and a record
-interleaved with the tail of its predecessor is not a record the peer can parse. Having only
-one record's worth of bytes in flight also makes a partial accept impossible to get wrong:
-there is exactly one place to resume from.
+The old rule was defended by three arguments, and the replacement has to answer all three.
+
+*Bounded memory.* One record outstanding bounded what a slow peer could make this side hold to
+16382 bytes. The bound is now stated rather than implied: `OUTBOUND_CEILING` in
+`crates/ngnet-qmux/src/io/conn.rs` is the memory the outbound buffer may occupy, and a record is
+begun only while the buffer still has a whole record's room beneath it. The bound is still a
+constant and still independent of what the caller has queued — it is simply a larger constant,
+chosen so that the guaranteed carry beneath it is 64 KiB. Producing everything the state machine
+owes and *then* writing, which is the alternative the old passage rejected, remains rejected for
+exactly the reason it gave: that bounds outbound memory by the backlog.
+
+The reserve has one relaxation, and it is enforced the same way the reserve itself is. A record
+whose contents are already known to be small — the last few bytes of an offer a call has been
+filling records for — is given a *shortened* destination rather than a full record's worth, so
+it cannot exceed the space that is actually free. Without it, an offer that came to a few dozen
+bytes more than the reserve allowed answered short, and those bytes then travelled alone in a
+write of their own at the end of the pass: one extra write per stream, which at concurrency 64
+cost more than multi-record production had gained. The rejected alternative was to predict the
+record's size from the payload plus a framing allowance, which is an assertion about dwnx's
+varint encoding rather than about the buffer, and wrong in the direction that overruns the
+ceiling.
+
+*Correct interleaving.* A record interleaved with the tail of its predecessor is not a record the
+peer can parse. Nothing interleaves: each record is appended to the buffer whole, in the order it
+was produced, and no record begins before its predecessor is complete. That is a weaker property
+than "one record outstanding", and it is implied by it — which is why the old rule was sufficient
+and is not necessary. The buffer is a byte queue, not a set of records, and the write side never
+reorders it.
+
+*Exactly one place to resume from.* A partial accept resumes from `written`, which is a single
+byte cursor into the buffer and was one before this change too. What is new is that `written` may
+now come to rest *inside* a record rather than only at a record boundary, because a write that
+carried three records and a half stops mid-record. Nothing above the cursor cares: the buffer is
+bytes, the resume point is the cursor, and the next write offers the same buffer from it.
+
+The free space a partial accept leaves at the *front* of the buffer is not reclaimed. Production
+stops when the tail cannot take another whole record, even though compacting the unwritten
+remainder to the front would make room. Compaction was rejected because it is a memcpy of the
+unwritten remainder on every partial accept, paid on exactly the path that is already struggling;
+a ring buffer was rejected because two regions would leave the output in two pieces and every
+consumer of it would have to handle both. That argument no longer has a gathering write to weigh
+against it: whether the output could be presented as more than one region was asked and answered
+no, and the reasons are recorded in `pending-work.md` — the ring is the only thing that would
+produce a second region, and gathering would save no copy even if it did. A buffer that
+stays full means the peer is not keeping up, and the right answer to that is to stop producing,
+which is what stopping early does.
+
+### A record is serialised where it will be sent from
+
+There is no staging buffer on the write path. `Conn::record` is handed a slice of the outbound
+buffer itself, so the bytes dwnx writes are already in the place the byte stream will be offered
+them. What that removes is one memcpy of up to 16382 bytes per record — about a megabyte of
+copying per megabyte sent — and `Connection::copied_record_bytes` is what says it is gone, rather
+than this paragraph.
+
+The arrangement it needs is a buffer held at *full length* with a fill cursor beside it, and the
+reason is a rule rather than a preference: `crates/ngnet-qmux/tests/invariants.rs` forbids
+`unsafe` anywhere under `src/io/`, and a `Vec`'s spare capacity cannot be handed out as a
+`&mut [u8]` without it. Zeroing on growth is the safe form of the same thing; it is paid once per
+connection per step of growth, where the copy it replaces was paid once per record. The buffer's
+length therefore stops being how much it holds — `filled` is — and every emptiness test, bound
+and slice in the layer is stated over the cursor. Growth is to exactly what a record needs rather
+than by doubling, because a doubling growth would put the capacity above `OUTBOUND_CEILING` while
+the queue obeyed it, and the ceiling is a promise about memory rather than about a cursor.
+
+**The slice handed to the record writer is exactly one record wide, and never the whole tail.**
+That is the part that would corrupt the wire in silence rather than fail. dwnx does not cap a
+record on the write path: it initialises the record with whatever destination it is given, bounds
+a payload only by what is left of that destination, and then writes the record's length as a
+fixed two-byte varint whose encoder asserts the value is below 16384 and, where that assertion is
+compiled out, truncates it to sixteen bits. As this workspace builds dwnx the assertion survives
+in both profiles — checked by making the mistake deliberately, in debug and in release, and
+finding an abort both times — but a dwnx built with assertions off would produce a record whose
+declared length is nothing like its real one and a peer that has lost framing from that byte
+onward. `Conn::record`'s contract refuses an over-long buffer nowhere, so the layer refuses it,
+and `tests/io_writes.rs` asserts the property on the wire where neither build's behaviour is
+assumed.
+
+The rule is "never more than one maximum record" and deliberately not "always exactly one": the
+relaxation above still hands a *shorter* slice to a record continuing an offer, which is safe in
+the only direction that matters, since a record can only be smaller than its length prefix can
+describe.
+
+What decides that the tail is too short is arithmetic on the cursors, done before a record is
+begun — not `Record::BufferTooSmall`, which fires only below three bytes and arrives as a record
+of zero bytes with a "packed" verdict, which the write side reads as "the state machine has
+nothing queued". A connection with output to send would stop producing it and nothing would say
+so.
 
 Reading comes last, and the order *within* the read matters as much. The bytes go to the framer
 first and to `Conn::read` second, and only then is the outcome acted on. dwnx reports
@@ -353,6 +436,29 @@ worth hearing. A close is terminal, so latching costs one record and loses nothi
 one record in progress plus one latched close — under 32 KiB, whatever the peer does, since dwnx
 overwrites any configured maximum with 16382.
 
+What is retained, though, is now narrower than that bound suggests, and the ordinary case
+retains nothing. A record whose declared length is entirely present in the slice `consume` was
+handed is **scanned where it lies**: the bytes are already contiguous in the connection's read
+buffer, the decoder wants nothing but a contiguous payload, and copying them into a buffer of
+the framer's own to look at them is a second copy of every record bought for the one record in a
+connection's life that carries a close. The copy is paid only where it buys something — a record
+spread over several reads, which has nothing contiguous to scan and must be reassembled before
+it can be looked at at all — and once more for a close found in place, which has to be copied
+because latching it means holding it after `consume` has returned. The rejected alternative was
+scanning each fragment as it arrives and keeping no buffer at all: it loses a close cut across
+two reads, silently, which is the same failure mode as the window.
+
+Three conditions gate the scan-in-place path, and `src/io/framing.rs` states them where they are
+applied. The retention buffer must be empty *and* the slice must hold the whole declared
+remainder — either alone admits the tail of a half-arrived record being scanned as though it
+were a whole one. What is scanned is exactly the declared length's worth and never the rest of
+the slice, because the decoder takes a payload with its length prefix already stripped and would
+otherwise walk into the next record and assemble a close out of its fields. The third, that no
+close has been latched, is defensive: it keeps "the retention buffer is empty" meaning "this
+record has not started" rather than depending on a check made elsewhere.
+`io_framing.rs` fails on each of the first two if it is removed, and
+`RecordFramer::copied_bytes` reports zero for a run of records that arrive whole.
+
 The decoder scans frames rather than assuming the close is first, because
 `dwnx_record_reader_reset` returns to the frame-type state while bytes remain in the record: a
 close may legally follow other frames. And the test that matters feeds an encoded close to a
@@ -370,6 +476,36 @@ returns. It exists because the HTTP/3 transport abstraction offers its outbound 
 *synchronous* closure — handed a stream, some slices, and a verdict to return — with no
 `Context` anywhere in reach. A layer that could only park would have nothing legal to do inside
 it, and discovering that at the join would have meant changing this API after the fact.
+
+One call fills **as many records as the buffer will hold**, and that is a property the caller
+above depends on rather than an optimization it cannot see. A short answer from this form means
+a bound was reached — the peer's window is shut, or the buffer is at its ceiling — and never
+that a record filled. The distinction is invisible from above: the HTTP/3 layer is told a count
+and nothing else, and it reads a short count as congestion and stands the stream down for the
+rest of its pass. While a call took one record, every large offer answered short, so a stream
+with a megabyte to send moved sixteen kilobytes of it per pass however much room the buffer had;
+a 2 MiB upload cost 130 writes where the carry accounts for 32. The alternative — leaving the
+decision above, by re-offering after a short accept — was rejected because the layer above
+cannot tell a filled record from a shut window, and re-offering into a shut window spins.
+
+`try_write_stream_vectored` is the same call taking the payload in fragments, and it is the one
+the HTTP/3 join uses: `StreamSource::write_next` lends a stream's pending output as a list, and
+the fragments go into records together rather than one apiece. `try_write_stream` is written as
+its one-fragment case rather than kept as a loop of its own, and so are `pack` and
+`RecordWriter::push`. That is deliberate. The part that is easy to get wrong is the resumption
+— dwnx reports `*pdatalen` as one total across every vector, not a count per vector, and a
+short take routinely stops part-way through a fragment — and a walk that resumed at the wrong
+place would send some bytes twice and others never while reporting a count that agreed with
+itself. There is one walk (`Fragments`) rather than two, because a second one is a second thing
+to get wrong silently. The rejected alternative was a pair of parallel loops, single-slice and
+vectored, which reads more simply and duplicates exactly the part that has no safety net.
+
+The end-of-stream marker follows from that rather than being placed: dwnx applies it when the
+data one call handed it fits entirely, so a push that had to leave fragments behind — a list
+longer than the sixteen-entry array one push submits — must not carry it, and the loop
+suppresses it in that case only. Empty fragments are never submitted, so a trailing empty
+fragment cannot take the marker away from the payload before it, and no index has to be
+computed to avoid it.
 
 Both split a payload across records and across available credit rather than truncating, and both
 report what they took even when they then refuse: a count dropped because the verdict was a

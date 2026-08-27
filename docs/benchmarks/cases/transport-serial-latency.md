@@ -69,11 +69,23 @@ extra layer shows most; see [`serial-latency`](serial-latency.md) for the same a
 a kernel, and [`../README.md`](../README.md) for what the resulting gap does and does not
 license. What is worth watching is the *relationship* between the two families' ratios: a
 socket ratio close to the duplex ratio says the cost is CPU in the protocol layers, and a
-socket ratio noticeably larger says something about the syscall pattern differs too — the QMux
-join offers one `IoSlice` at a time to its writer, and [`../controls.md`](../controls.md) gives
-that confound its direction.
+socket ratio noticeably larger says something about the syscall pattern differs too. That
+reading used to name a specific suspect — the QMux join offered one `IoSlice` at a time to its
+writer — and the suspect is gone: records now accumulate in a bounded buffer and a pass writes
+once. [`../controls.md`](../controls.md) still gives the residual confound its direction, and
+what is left of it here is small, because this case has no payload for a coalesced write to
+carry: this arm moved +4.0% across the whole write-path change set, which is outside this arm's
+own 1.41% drift figure and is not attributed to any one of the six
+([`../findings/qmux-write-path.md`](../findings/qmux-write-path.md)), the wrong way, which is
+what a bounded buffer's bookkeeping costs when there is nothing to amortise it over.
 
 ## Where its numbers are
 
-Recorded runs are indexed in [`../data/README.md`](../data/README.md). **No recorded run
-contains a QMux arm**; every run filed there predates it.
+Recorded runs are indexed in [`../data/README.md`](../data/README.md). Three now contain a QMux
+arm — [`04-qmux-drift-baseline`](../data/xeon-8370c-azure/04-qmux-drift-baseline.md),
+[`05-qmux-delivery-aliasing`](../data/xeon-8370c-azure/05-qmux-delivery-aliasing.md) and
+[`06-qmux-write-path`](../data/xeon-8370c-azure/06-qmux-write-path.md) — and all three are
+paired comparisons of one QMux build against another, not of the QMux arm against an HTTP/2 one.
+**No recorded run computes a cross-protocol ratio for this group under drift controls**, so the
+readings above that turn on a ratio are still unmeasured; the HTTP/2 arms appear in those
+sessions only as unchanged controls.

@@ -10,7 +10,7 @@ what the run does and does not establish.
 | Machine | Status | Runs |
 | --- | --- | --- |
 | [`legacy-dev-host`](legacy-dev-host/) | **Retired, unavailable.** Every measurement taken before 2026-08-16. Noisy: unchanged control arms drifted 5–15% within a session. | 4 |
-| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current. Intel Xeon Platinum 8370C, 8 vCPU, Linux 6.17 on Azure. Quiet: **~1%** between identical passes. | 3 |
+| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current. Intel Xeon Platinum 8370C, 8 vCPU, Linux 6.17 on Azure. Quiet: **~1%** between identical passes. | 6 |
 
 **Absolute figures from different machines must never be tabulated together.** Nothing here
 is normalised for CPU model, kernel or io_uring implementation, and those are exactly the
@@ -29,12 +29,27 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [01-drift-baseline](xeon-8370c-azure/01-drift-baseline.md) | xeon-8370c-azure | 2026-08-16 | Two identical passes: the drift bar on this host | — |
 | [02-first-survey](xeon-8370c-azure/02-first-survey.md) | xeon-8370c-azure | 2026-08-16 | Where the arms stand here, against the findings' predictions, and against hyper | [write path](../findings/write-path-and-gathering.md) |
 | [03-shared-body](xeon-8370c-azure/03-shared-body.md) | xeon-8370c-azure | 2026-08-16 | Handing bodies over, re-measured — compio verdict overturned | [handing bodies over](../findings/handing-bodies-over.md) |
+| [04-qmux-drift-baseline](xeon-8370c-azure/04-qmux-drift-baseline.md) | xeon-8370c-azure | 2026-08-17 | What an unchanged **QMux** arm does run to run — the bar the QMux work is measured against | — |
+| [05-qmux-delivery-aliasing](xeon-8370c-azure/05-qmux-delivery-aliasing.md) | xeon-8370c-azure | 2026-08-17 | Aliasing deliveries instead of copying them — **slower, and reverted** | [the QMux write path](../findings/qmux-write-path.md) |
+| [06-qmux-write-path](xeon-8370c-azure/06-qmux-write-path.md) | xeon-8370c-azure | 2026-08-17 | The QMux write-path work end to end — **−30% on bodies, −8.5% on socket concurrency** | [the QMux write path](../findings/qmux-write-path.md) |
+| [07-qmux-per-commit-attribution](xeon-8370c-azure/07-qmux-per-commit-attribution.md) | xeon-8370c-azure | 2026-08-17 | Which change produced the gain — **coalescing**, and the rest not resolved | [the QMux write path](../findings/qmux-write-path.md) |
+| [08-qmux-against-h2](xeon-8370c-azure/08-qmux-against-h2.md) | xeon-8370c-azure | 2026-08-18 | **QMux against HTTP/2** — a fixed +19–34 µs per exchange, and 0.86× per byte over a socket | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
 
-**No run recorded here contains an `ngnet-qmux-h3` arm.** Every run above predates the
-cross-protocol arms, and none has been re-taken since. The HTTP/2 figures in them are still
-current — nothing about those arms changed when the QMux ones were added, by design
-([`../controls.md`](../controls.md)) — but a reader looking for a cross-protocol number will
-not find one here, and should not infer one from the absence.
+**The cross-protocol comparison is [`08`](xeon-8370c-azure/08-qmux-against-h2.md), and it is the
+only run here that is one.** That sentence replaces a standing note saying no such run existed.
+Everything before it is a different kind of measurement and none of it should be read as a
+comparison between the two stacks: `01` to `03` predate the cross-protocol arms entirely; `04`
+covers them but is a drift measurement, so its QMux figures are the inputs to a variation
+calculation; and `05` to `07` are paired comparisons of one QMux build against another, in which
+the HTTP/2 arms appear only as unchanged controls. A delta in any of those is a statement about a
+change to the QMux stack and about nothing else. The HTTP/2 figures in `01` to `03` remain current
+— nothing about those arms changed when the QMux ones were added, by design
+([`../controls.md`](../controls.md)).
+
+What `04` does give a reader is the bar: the socket QMux arm varies by **0.67%** on average and
+the duplex one by **1.55%**, and `body_throughput/ngnet-qmux-h3/1048576` alone varies by
+**10.42%**, which makes it the noisiest identifier in the suite and a poor place to look for a
+small effect.
 
 ## Adding a run
 

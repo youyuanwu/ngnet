@@ -20,7 +20,7 @@ use std::task::Wake;
 use ngnet_h3::ErrorCode;
 use ngnet_h3::StreamId;
 use ngnet_h3::http::{QuicConnection, QuicEvent, StreamSource, WriteOutcome};
-use ngnet_qmux::io::testing::{TestByteStream, TestClock, stream_pair};
+use ngnet_qmux::io::testing::{TestByteStream, TestClock, WriteLog, stream_pair};
 use ngnet_qmux_h3::QmuxConnection;
 
 type Endpoint = QmuxConnection<TestByteStream, TestClock>;
@@ -56,17 +56,29 @@ struct Pair {
     /// bytes: a test that opened a stream or pushed a payload would otherwise have thrown
     /// away the events that arrived while it was doing so.
     seen: (Vec<QuicEvent>, Vec<QuicEvent>),
+    /// What the client's byte stream was asked to write.
+    ///
+    /// The instrument for "this offer produced no record". Nothing else at this level can
+    /// tell an offer that produced nothing from one that produced a record nobody looked at:
+    /// both leave the peer with no data event, and only one of them costs a record on the
+    /// wire. Cleared by the test that measures, because the transport-parameter announcement
+    /// and any stream opening happened before its window began.
+    log: WriteLog,
 }
 
 impl Pair {
     fn new() -> Self {
         let (client_io, server_io) = stream_pair();
         let clock = TestClock::new();
+        // Taken before the connection is built: a connection takes its byte stream by value
+        // and never gives it back, and construction already schedules an announcement.
+        let log = client_io.write_log();
         Self {
             client: QmuxConnection::client(client_io, clock.clone()).expect("a client"),
             server: QmuxConnection::server(server_io, clock).expect("a server"),
             flag: Arc::new(Woken::default()),
             seen: (Vec::new(), Vec::new()),
+            log,
         }
     }
 
@@ -145,7 +157,7 @@ impl Pair {
     }
 
     /// Offers what `source` has, once.
-    fn transmit(&mut self, of: Side, source: &mut Offer) {
+    fn transmit(&mut self, of: Side, source: &mut impl Drivable) {
         let (waker, _) = self.context();
         let mut cx = Context::from_waker(&waker);
         let end = match of {
@@ -231,12 +243,27 @@ impl StreamSource for Offer {
     }
 }
 
+/// A stream source a test can drive to exhaustion.
+///
+/// [`StreamSource`] says whether there may be more *now*; a test needs to know whether there
+/// is anything left at all, which is the source's own business and not the transport's.
+trait Drivable: StreamSource {
+    /// Whether everything the source held has been offered and taken.
+    fn drained(&self) -> bool;
+}
+
+impl Drivable for Offer {
+    fn drained(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
 /// Pushes everything a source holds through, pumping between passes.
-fn send_all(pair: &mut Pair, of: Side, source: &mut Offer) {
+fn send_all(pair: &mut Pair, of: Side, source: &mut impl Drivable) {
     for _ in 0..64 {
         pair.transmit(of, source);
         pair.settle();
-        if source.pending.is_empty() {
+        if source.drained() {
             return;
         }
     }
@@ -562,5 +589,294 @@ fn a_peer_that_closes_is_an_event_and_not_a_failure() {
             .iter()
             .any(|event| matches!(event, QuicEvent::Closed { .. })),
         "the ending must surface as a close: {server:?}",
+    );
+}
+
+/// A stream source that lends its payload in several fragments, as the driver's own does.
+///
+/// [`Offer`] lends one slice, which is the shape almost every test here wants. This one exists
+/// for the shape the HTTP/3 layer actually produces: `StreamSource::write_next` hands over a
+/// stream's pending output as a *list* -- a request's encoded headers and the first of its
+/// body, most often -- and what those fragments cost is the whole of Spec FR-010.
+struct Fragmented {
+    stream: StreamId,
+    /// What is still to be lent, as separate fragments.
+    fragments: Vec<Vec<u8>>,
+    fin: bool,
+    finished: bool,
+    /// How many times the source was asked for something.
+    ///
+    /// The count Spec SC-009 is stated over: the claim is that a multi-fragment offer becomes
+    /// as few records as the record size allows, and the first thing that has to be true for
+    /// that is that the whole list goes down in one call.
+    calls: usize,
+    accepted: Vec<(StreamId, u64)>,
+    /// Whether to overwrite the fragments as soon as the call that lent them returns.
+    ///
+    /// Spec SC-010. A source is entitled to do this: `RETAINS_BUFFERS` is false, which is a
+    /// promise that a write copies what it takes before it returns.
+    scrub: bool,
+}
+
+impl Fragmented {
+    fn new(stream: StreamId, fragments: &[&[u8]], fin: bool) -> Self {
+        Self {
+            stream,
+            fragments: fragments.iter().map(|f| f.to_vec()).collect(),
+            fin,
+            finished: false,
+            calls: 0,
+            accepted: Vec::new(),
+            scrub: false,
+        }
+    }
+
+    fn scrubbing(mut self) -> Self {
+        self.scrub = true;
+        self
+    }
+
+    fn total(&self) -> u64 {
+        self.accepted.iter().map(|(_, bytes)| bytes).sum()
+    }
+
+    /// Drops the first `taken` bytes of the list, across fragments.
+    fn consume(&mut self, mut taken: usize) {
+        while taken > 0 {
+            let Some(front) = self.fragments.first_mut() else {
+                panic!("more bytes were taken than were lent");
+            };
+            let step = taken.min(front.len());
+            front.drain(..step);
+            taken -= step;
+            if front.is_empty() {
+                self.fragments.remove(0);
+            }
+        }
+    }
+}
+
+impl Drivable for Fragmented {
+    fn drained(&self) -> bool {
+        self.finished
+    }
+}
+
+impl StreamSource for Fragmented {
+    fn write_next(
+        &mut self,
+        write: &mut dyn FnMut(StreamId, &[IoSlice<'_>], bool) -> WriteOutcome,
+    ) -> bool {
+        if self.finished {
+            return false;
+        }
+        self.calls += 1;
+        let outcome = {
+            let slices: Vec<IoSlice<'_>> = self.fragments.iter().map(|f| IoSlice::new(f)).collect();
+            write(self.stream, &slices, self.fin)
+        };
+        match outcome {
+            WriteOutcome::Accepted(taken) => {
+                if taken > 0 {
+                    self.accepted.push((self.stream, taken as u64));
+                }
+                self.consume(taken);
+                if self.scrub {
+                    // The lender reclaims what it lent, the instant the call returns and long
+                    // before the bytes reach the byte stream. Anything that kept the pointers
+                    // rather than the bytes puts this on the wire.
+                    for fragment in &mut self.fragments {
+                        fragment.fill(0xff);
+                    }
+                }
+                let empty = self.fragments.iter().all(Vec::is_empty);
+                if empty {
+                    self.finished = true;
+                }
+                true
+            }
+            WriteOutcome::Blocked => false,
+            WriteOutcome::Gone => {
+                self.finished = true;
+                true
+            }
+        }
+    }
+}
+
+/// Spec SC-009. A list of fragments goes down in one call and is taken whole.
+///
+/// The property the vectored write exists for, stated where the HTTP/3 layer can see it. Each
+/// fragment used to be a call of its own -- the join looped over the slices -- and a call is
+/// where a record begins, so a three-fragment offer cost three records however small they
+/// were. Now the list is one call, and what it costs on the wire is pinned in
+/// `crates/ngnet-qmux/tests/io_vectored.rs` and `tests/ngnet-qmux-h3-tests/tests/fragmented_offers.rs`.
+///
+/// The release accounting is asserted alongside, because that is what the change could have
+/// broken quietly: the count returned to the source is a total across the fragments, and a
+/// release derived from anywhere else would agree with it on the easy cases and not on these.
+#[test]
+fn a_list_of_fragments_is_offered_once_and_taken_whole() {
+    let mut pair = Pair::new();
+    let stream = pair.open(Side::Client, true);
+
+    let fragments: [&[u8]; 3] = [b"the headers, ", b"then the body, ", b"then a little more"];
+    let expected: Vec<u8> = fragments.concat();
+    let mut source = Fragmented::new(stream, &fragments, false);
+    send_all(&mut pair, Side::Client, &mut source);
+    pair.settle();
+
+    assert_eq!(
+        source.calls, 1,
+        "the three fragments took {} calls, so the join is still writing one slice at a time \
+         and every fragment boundary is still a record boundary",
+        source.calls
+    );
+    assert_eq!(
+        source.total(),
+        expected.len() as u64,
+        "the offer was not taken whole"
+    );
+    assert_eq!(
+        data_on(pair.seen(Side::Server), stream),
+        expected,
+        "the peer received the fragments in some other order, or received some of them twice \
+         -- which is what a resumption walking the list against a total gets wrong, and what \
+         nothing above this layer would notice"
+    );
+    let released: u64 = pair
+        .seen(Side::Client)
+        .iter()
+        .filter_map(|event| match event {
+            QuicEvent::Released {
+                stream: id, bytes, ..
+            } if *id == stream => Some(*bytes),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(
+        released,
+        expected.len() as u64,
+        "the bytes released do not match the bytes accepted; the release and the count the \
+         source was given have stopped coming from the same total"
+    );
+}
+
+/// Spec SC-010. A source may reclaim its fragments as soon as the call returns.
+///
+/// `ngnet-qmux-h3` declares `RETAINS_BUFFERS = false`, which tells the HTTP/3 layer the bytes
+/// are its own again the moment a write returns. dwnx copies each vector into the record
+/// during the call and retains only the destination buffer, so the declaration holds for the
+/// vectored form as well -- but it holds by inspection of C, and this is the check that the
+/// inspection was right.
+#[test]
+fn a_source_may_invalidate_its_fragments_once_the_write_returns() {
+    let mut pair = Pair::new();
+    let stream = pair.open(Side::Client, true);
+
+    let fragments: [&[u8]; 4] = [b"first ", b"second ", b"third ", b"fourth"];
+    let expected: Vec<u8> = fragments.concat();
+    let mut source = Fragmented::new(stream, &fragments, false).scrubbing();
+    send_all(&mut pair, Side::Client, &mut source);
+    pair.settle();
+
+    assert_eq!(
+        data_on(pair.seen(Side::Server), stream),
+        expected,
+        "the peer received something other than what was lent, so a fragment was read after \
+         the call that lent it had returned"
+    );
+}
+
+/// Spec SC-033. An offer with nothing in it produces a record only for its end-of-stream.
+///
+/// Three offers that a caller cannot tell apart and the transport must. Two carry no bytes and
+/// no marker, and must cost nothing at all -- no record, and no refusal either, because a
+/// refusal has the driver stand the stream down and offer the same nothing again on its next
+/// pass. The third carries no bytes and a marker, and must produce its record: it is the only
+/// way a stream that has finished writing is ever ended, and a peer that never receives it
+/// waits out an idle timeout for a body it already has.
+///
+/// This is why the short-circuit in `crates/ngnet-qmux-h3/src/transmit.rs` is conditioned on
+/// the *absence* of the marker rather than on the offer being empty.
+#[test]
+fn an_empty_offer_costs_a_record_only_when_it_carries_the_end_of_stream() {
+    for fragments in [&[][..], &[&b""[..], &b""[..]][..]] {
+        let mut pair = Pair::new();
+        let stream = pair.open(Side::Client, true);
+        pair.settle();
+        pair.log.clear();
+
+        let mut source = Fragmented::new(stream, fragments, false);
+        pair.transmit(Side::Client, &mut source);
+
+        assert_eq!(
+            source.total(),
+            0,
+            "an offer with no bytes in it reported bytes taken"
+        );
+        assert_eq!(
+            pair.log.writes(),
+            0,
+            "an offer of {} empty fragments and no end-of-stream produced {:?} on the wire, so \
+             a record was built to carry nothing",
+            fragments.len(),
+            pair.log.lengths()
+        );
+    }
+
+    let mut pair = Pair::new();
+    let stream = pair.open(Side::Client, true);
+    pair.settle();
+    pair.log.clear();
+
+    let mut source = Fragmented::new(stream, &[b"", b""], true);
+    send_all(&mut pair, Side::Client, &mut source);
+    pair.settle();
+
+    assert!(
+        pair.log.writes() > 0,
+        "an end-of-stream marker on an otherwise empty offer produced nothing on the wire"
+    );
+    assert!(
+        pair.seen(Side::Server).iter().any(|event| matches!(
+            event,
+            QuicEvent::Data { stream: id, bytes, fin: true } if *id == stream && bytes.is_empty()
+        )),
+        "the stream never ended at the peer: {:?}",
+        pair.seen(Side::Server)
+    );
+}
+
+/// A trailing empty fragment does not take the end-of-stream marker away from the payload.
+///
+/// The hazard the per-slice loop had to work around by hand. With a call per slice the marker
+/// rode the *last* slice, so a trailing empty one had to be found and skipped, or the marker
+/// went out on an offer of nothing while the payload before it was still being written. There
+/// is no index to compute now -- an empty fragment is not submitted at all, and dwnx applies
+/// the marker to the record that takes the last byte -- and this is the guard on that
+/// reasoning still holding.
+#[test]
+fn a_trailing_empty_fragment_does_not_take_the_end_of_stream_marker() {
+    let mut pair = Pair::new();
+    let stream = pair.open(Side::Client, true);
+
+    let mut source = Fragmented::new(stream, &[b"a body", b""], true);
+    send_all(&mut pair, Side::Client, &mut source);
+    pair.settle();
+
+    let server = pair.seen(Side::Server);
+    assert_eq!(
+        data_on(server, stream),
+        b"a body",
+        "the payload did not arrive whole"
+    );
+    assert!(
+        server.iter().any(|event| matches!(
+            event,
+            QuicEvent::Data { stream: id, fin: true, .. } if *id == stream
+        )),
+        "the stream never ended, so the marker went somewhere other than the record that took \
+         the last byte: {server:?}"
     );
 }

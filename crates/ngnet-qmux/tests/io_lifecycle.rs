@@ -19,16 +19,18 @@
 
 mod io_harness;
 
+use std::cell::Cell;
 use std::error::Error as _;
+use std::future::poll_fn;
 use std::task::Poll;
 
 use io_harness::{
-    announcement_record, close, connected_pair, drain_to_ending, drain_written, exchange,
-    next_event, open_bidi, poll_once, run_pair, write_all,
+    announcement_record, close, connected_pair, drain_to_ending, drain_written, exchange, flush,
+    next_event, open_bidi, peer_writes, poll_once, run, run_pair, write_all,
 };
 use ngnet_qmux::io::testing::{Fault, TestClock, stream_pair};
 use ngnet_qmux::io::{AsyncByteStream, Config, Connection, ErrorKind, Event, encode_close_record};
-use ngnet_qmux::{CloseKind, CloseReason, Role, StreamId, Timestamp};
+use ngnet_qmux::{CloseKind, CloseReason, Role, Shutdown, StreamId, Timestamp};
 
 /// A byte stream that fails is a connection that fails, and it says so as a byte-stream fault.
 #[test]
@@ -210,6 +212,86 @@ fn a_local_close_is_observed_by_the_peer() {
     assert_eq!(close.error_code(), 0x9001);
     assert_eq!(close.frame_type(), reason.frame_type());
     assert_eq!(close.reason(), b"the application is finished");
+}
+
+/// An ending still emits the reset it had queued (Spec SC-005).
+///
+/// The frames that explain an ending are queued *inside the state machine* rather than in the
+/// outbound buffer: `shutdown_stream` takes no context and writes nothing, so a RESET_STREAM
+/// exists only as an intention until something produces a record for it. Closing without
+/// producing would therefore leave a peer with a stream that simply stopped and no reason for
+/// it, which is why `poll_close` drains through `drain_pending` rather than flushing what
+/// happens to be there.
+///
+/// Coalescing makes this worth restating rather than merely keeping. The path that used to
+/// flush after every record now accumulates, so "what is already in the buffer" and "what the
+/// connection owes" have come further apart, and the ending is where that difference is fatal:
+/// there is no later pass to carry it.
+///
+/// Nothing flushes between the shutdown and the close, deliberately. A flush there would test
+/// the flush.
+#[test]
+fn an_ending_still_emits_the_reset_it_had_queued() {
+    const CODE: u64 = 0x4242;
+    let (mut client, mut server) = connected_pair(Config::new());
+    let reason = CloseReason::application(0x9002, b"finished, and one stream failed");
+
+    let (_, observed) = run_pair(
+        async {
+            let stream = open_bidi(&mut client).await.expect("opening a stream");
+            write_all(&mut client, stream, b"before the reset", false)
+                .await
+                .expect("writing");
+            client
+                .shutdown_stream(stream, Shutdown::Write, CODE)
+                .expect("resetting the write side");
+            client
+                .shutdown_stream(stream, Shutdown::Read, CODE)
+                .expect("asking the peer to stop sending");
+            close(&mut client, &reason).await.expect("closing");
+        },
+        async {
+            let mut reset = None;
+            let mut stop = None;
+            loop {
+                match next_event(&mut server).await {
+                    Ok(Event::StreamReset {
+                        stream_id,
+                        app_error_code,
+                        ..
+                    }) => reset = Some((stream_id, app_error_code)),
+                    Ok(Event::StopSending {
+                        stream_id,
+                        app_error_code,
+                    }) => stop = Some((stream_id, app_error_code)),
+                    Ok(_) => {}
+                    Err(error) => return (reset, stop, error),
+                }
+            }
+        },
+    );
+
+    let (reset, stop, error) = observed;
+    let (reset_stream, reset_code) = reset.expect(
+        "the ending was reported with no reset before it: the RESET_STREAM queued in the state \
+         machine was never produced, so the peer's stream stopped without an explanation",
+    );
+    let (stop_stream, stop_code) =
+        stop.expect("the STOP_SENDING queued alongside the reset never reached the peer either");
+    assert_eq!(
+        reset_code, CODE,
+        "the application's reason survived the trip"
+    );
+    assert_eq!(stop_code, CODE, "and so did the one on the stop-sending");
+    assert_eq!(
+        reset_stream, stop_stream,
+        "both frames name the stream the caller shut down"
+    );
+    assert_eq!(
+        error.kind(),
+        ErrorKind::PeerClosed,
+        "the close still arrived after the frames that explain it"
+    );
 }
 
 /// A peer that disappears without closing is an ending, and is not blamed for a violation.
@@ -394,32 +476,109 @@ fn an_ended_connection_reports_the_same_ending_again() {
     );
 }
 
-/// A connection still flushes what it is given even when the peer is slow to read.
+/// Several records reach a slow peer whole, unduplicated and in order (Spec SC-002).
+///
+/// This test used to pin a stronger rule than the layer now keeps. While a record was produced
+/// only into an empty outbound buffer, a partial accept could stop only *between* records, and
+/// one record written a byte at a time was the whole of the case. Coalescing overturned that
+/// deliberately -- see `docs/qmux/design.md`, "Produce up to the ceiling, write once, then
+/// read" -- so a write is now offered several records at once and a partial accept can stop
+/// anywhere, including in the middle of a length prefix. That is a state the old arrangement
+/// made unreachable, and it is the one this test now exists to reach.
+///
+/// The transport is as hostile as this harness can make it and hostile in two independent ways,
+/// because the two catch different bugs. One byte accepted per call makes every accept partial,
+/// which catches a resume that assumes a write took everything it was offered. A pipe that
+/// holds only a few hundred bytes until the far end reads makes the write stop and be resumed
+/// *across* calls, which catches a resume point that is recomputed rather than remembered --
+/// the failure the single `written` cursor exists to prevent.
+///
+/// The expected bytes are the same workload over a generous byte stream rather than a recorded
+/// literal: what is being asserted is that the shape of the writes does not change the octets,
+/// and a literal would additionally pin the transport-parameter encoding, which is not this
+/// test's claim.
 #[test]
 fn a_backed_up_transport_does_not_lose_a_record() {
+    /// Several records' worth, so the failure has somewhere to hide: one record cannot be
+    /// duplicated over its neighbour, and cannot be delivered out of order.
+    const PAYLOAD: usize = 50_000;
+    /// Not a divisor of anything: a pipe whose bound fell on a record boundary would leave the
+    /// mid-record case untested by accident.
+    const PIPE: usize = 700;
+
+    let data: Vec<u8> = (0..PAYLOAD).map(|i| (i % 251) as u8).collect();
+    let expected = written_over_a_generous_stream(&data);
+
     let (near, far) = stream_pair();
-    // A byte stream that accepts one byte per call is the least generous transport a
-    // connection can be handed, and a record that survives it survives any of them.
     near.set_write_cap(Some(1));
+    near.set_capacity(Some(PIPE));
     let mut conn =
         Connection::client(near, TestClock::new(), Config::new()).expect("constructing a client");
-
     let mut far = far;
-    let expected = announcement_record(Role::Client);
+    peer_writes(&mut far, &announcement_record(Role::Server));
 
-    let mut written = Vec::new();
-    for _ in 0..expected.len() * 4 {
-        let _ = poll_once(|cx| conn.poll_pump(cx));
-        written.extend_from_slice(&drain_written(&mut far));
-        if written.len() >= expected.len() {
-            break;
+    let sending_done = Cell::new(false);
+    let sender = async {
+        let stream = open_bidi(&mut conn).await.expect("opening a stream");
+        write_all(&mut conn, stream, &data, true)
+            .await
+            .expect("writing the payload");
+        flush(&mut conn).await.expect("flushing the payload");
+        sending_done.set(true);
+    };
+    let consumer = async {
+        let mut received = Vec::new();
+        let mut buffer = [0u8; 64];
+        loop {
+            let taken = poll_fn(|cx| match far.poll_read(cx, &mut buffer) {
+                Poll::Pending if sending_done.get() => Poll::Ready(0),
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(outcome) => Poll::Ready(outcome.expect("the byte stream failed")),
+            })
+            .await;
+            if taken == 0 {
+                return received;
+            }
+            received.extend_from_slice(&buffer[..taken]);
         }
-    }
+    };
+
+    let (_, received) = run_pair(sender, consumer);
 
     assert_eq!(
-        written, expected,
-        "the announcement arrived whole and unduplicated despite being written one byte per call"
+        received.len(),
+        expected.len(),
+        "the slow transport received {} bytes where the generous one received {}: a partial \
+         accept either lost bytes or sent some of them twice",
+        received.len(),
+        expected.len()
     );
+    assert_eq!(
+        received, expected,
+        "the octets differ from the same workload over a generous byte stream, so a write that \
+         stopped part way through a record was resumed at the wrong offset"
+    );
+}
+
+/// The same payload over a byte stream that accepts everything, for comparison.
+///
+/// Deliberately not a second implementation of the encoding: it is the *same* connection code
+/// over a byte stream with nothing in its way, which is what makes the comparison a statement
+/// about the writes rather than about the framing.
+fn written_over_a_generous_stream(data: &[u8]) -> Vec<u8> {
+    let (near, far) = stream_pair();
+    let mut conn =
+        Connection::client(near, TestClock::new(), Config::new()).expect("constructing a client");
+    let mut far = far;
+    peer_writes(&mut far, &announcement_record(Role::Server));
+    run(async {
+        let stream = open_bidi(&mut conn).await.expect("opening a stream");
+        write_all(&mut conn, stream, data, true)
+            .await
+            .expect("writing the payload");
+        flush(&mut conn).await.expect("flushing the payload");
+    });
+    drain_written(&mut far)
 }
 
 /// Finishing without a close still shuts the write side down.

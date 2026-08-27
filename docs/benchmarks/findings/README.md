@@ -9,6 +9,8 @@ once it has survived its drift controls; the measurements it rests on stay in
 | [Write path and gathering](write-path-and-gathering.md) | The arms separated on **write syscalls per pass**, not on the I/O model. Gathering closed the gap: −52.2% at N=8, −58.9% at N=64. |
 | [Reusing the coalescing buffer](coalescing-buffer-reuse.md) | About 4–7% for the completion transport, from not rebuilding the coalescing buffer every pass. |
 | [Handing bodies over](handing-bodies-over.md) | `NGHTTP2_DATA_FLAG_NO_COPY` is worth −24% to −31% at 1 MiB on the readiness transport, and a small but real gain on the completion one. |
+| [The QMux write path](qmux-write-path.md) | Six changes to the QMux write and read paths, together worth **−30% on bodies** and **−8.5% on socket concurrency**, costing a few percent where there is no payload to amortise them. The same parameter moves the *other* way over a duplex, which is the evidence that the mechanism is the syscall count. Coalescing is the only change attributed to a share of the gain; the rest are not resolved individually. A seventh cut allocation a hundredfold, was slower, and was reverted. |
+| [QMux against HTTP/2](qmux-against-h2.md) | The first cross-protocol comparison. QMux costs a fixed **+19 µs** (duplex) or **+34 µs** (socket) per exchange, and **1.31×** per byte in processor terms — but **0.86×** per byte over a real socket, so it overtakes HTTP/2 between 64 KiB and 1 MiB. Concurrency over a socket is its worst case at 3.1×. |
 
 ## Where each finding stands
 
@@ -18,6 +20,16 @@ the current one. The third has: it was re-measured on `xeon-8370c-azure` in
 [`03-shared-body`](../data/xeon-8370c-azure/03-shared-body.md), which confirmed the readiness
 verdict and **overturned the completion one** — it had failed on a misbehaving control arm
 rather than on its own delta.
+
+The fourth was established on `xeon-8370c-azure` and has never been anywhere else, which puts
+it in the opposite position to the first two: its percentages are the current host's, and it is
+the legacy host that would be the re-measurement. It also rests on a different kind of evidence
+from the other three. Where they compare arms within one session, it compares two *builds* of
+one arm, paired and interleaved, with the other arms present only as unchanged controls — so
+its deltas are not cross-protocol ratios and must not be read as any. The half of it that
+travels furthest is not a percentage at all: the write, copy and credit counts are properties
+of the code and identical on every machine, and the timings say what those counts were worth on
+this one.
 
 That the legacy figures have not been reproduced does not make them wrong — each rests on
 paired deltas against drift controls measured in the same session, which is the part that

@@ -20,6 +20,13 @@ Each is named with its direction, because a number without its bias is not evide
   readiness transport, and honestly below the drift bar on the completion transport, because
   the completion push path already coalesced a pass into one write, so there was never a
   syscall to save there, only the copy.
+  <br><br>
+  This entry is about the three HTTP/2-family transports and nothing else, and it stayed that
+  way on purpose while the QMux arms went through the same exercise: the QMux arms have their
+  own counterpart, measured separately and against their own controls, and it is in the
+  cross-protocol section below rather than folded in here. Folding the two together would have
+  put a figure taken on `ngnet-h2-tokio` beside one taken on `ngnet-qmux-h3-tokio` as though
+  they shared a session, which is the one thing this page exists to stop.
 - **Loopback, not a network interface.** No real network latency, no device interrupts, no
   driver work — precisely the costs io_uring exists to amortise. This **biases against
   compio**; a real NIC would be expected to widen its lead rather than narrow it. Nothing
@@ -103,31 +110,54 @@ what remained after that was done.
   meets one that has carried none, which **biases towards the QMux arms** by an amount that is
   not measurable across thousands of iterations. Do not delete the warm-up as redundant — it is
   redundant only for as long as the warm-up phase is left at its default.
-- **One implementation, never optimised.** `ngnet-qmux-h3` had no benchmark before this suite
-  and no measurement has been acted on since; the join is known to write one `IoSlice` at a
-  time and to copy inbound bodies twice below it, both recorded on
-  [`../qmux-h3/pending-work.md`](../qmux-h3/pending-work.md) and neither addressed. This
-  **biases against the QMux arms** and is contingent rather than structural, which is the whole
-  reason a cross-protocol figure licenses a statement about these two stacks today and not
-  about the two protocols.
-- **A multi-slice offer is written one slice at a time.** Named separately from the point above
-  because it is the same *kind* of effect as the write-path asymmetry at the top of this page,
-  and that one turned out to account for an entire 2.3× spread. `ngnet-h2`'s tokio transport
-  emits one `writev` per driver pass; the QMux join issues one write per `IoSlice` and stops at
-  the first not fully accepted, and the layer below refuses a second production while a record
-  is outstanding — so a fragmented offer costs one record and one pump pass per slice. This
-  **biases against the QMux arms, and biases them more on the socket family than on the duplex
-  family**, because that is where a write is a syscall. It is the first thing to test against
-  if a socket-family gap is ever found to exceed its duplex counterpart.
-- **Buffering: one record outstanding, against a 1 MiB pipe.** A QMux connection holds two
-  16382-byte buffers and permits at most one record outstanding at a time, where the duplex
-  family's in-memory pipe is 1 MiB deep and the HTTP/2 arm may fill it. The pipe is sized so
-  that it is not the bottleneck for the HTTP/2 arms; for the QMux arms the record discipline is
-  the bottleneck long before the pipe is. This **biases against the QMux arms on the duplex
-  family** and is a harness-visible consequence of the protocol's own design rather than a
-  choice the harness made — the pipe's capacity is equal for both arms, and equalising the
-  *effect* would mean shrinking the pipe until it constrained the HTTP/2 arm too, which would
-  change arms whose measurements are already recorded.
+- **One implementation, optimised once.** `ngnet-qmux-h3` had no benchmark before this suite,
+  and when the arms were first added no measurement had ever been acted on. One round has been
+  acted on since, and it is recorded in
+  [`findings/qmux-write-path.md`](findings/qmux-write-path.md): a driver turn's records are
+  coalesced into one write, a record is serialised where it will be sent from rather than
+  through a staging copy, a record that arrives whole is scanned where it lies rather than
+  copied to be looked inside, a fragmented offer becomes one record rather than one per
+  fragment, and flow-control extensions are held for the length of a run. That changes the
+  **size** of this confound and not its direction, and the size did not change uniformly — which
+  is why the entry is rewritten rather than deleted. The body points moved a long way in the
+  QMux arms' favour (−30% at 1 MiB on both families, −25.9% at 64 KiB over a socket) and the
+  socket concurrency points with them (−8.5% at 64, −7.1% at 8); the arms with no payload to
+  amortise a per-pass cost over moved the other way by a few percent, most of it inside that
+  session's own control band. What is left still **biases against the QMux arms**: every
+  delivery of received data is still copied into an owned allocation, every transmit pass still
+  owes its driver a forced write however little it produced, and nothing beneath the HTTP
+  framing has had a second round. It remains contingent rather than structural, which is the
+  whole reason a cross-protocol figure licenses a statement about these two stacks today and
+  not about the two protocols.
+- **A multi-slice offer used to start a record per slice — removed, and the row is kept for the
+  same reason the write-path asymmetry at the top of this page is.** It was named separately
+  from the point above because it was the same *kind* of effect as that one, and that one
+  turned out to account for an entire 2.3× spread. What it was: the QMux join issued one write
+  per `IoSlice` and stopped at the first not fully accepted, and the layer below began a fresh
+  record for each, so a fragmented offer cost a record boundary per slice — and, before write
+  coalescing, a pump pass per slice as well, because a second production was refused while a
+  record was outstanding. Both halves are gone. The join now submits the whole list in one
+  vectored push and the records leave together, so what a slice boundary costs on the wire is
+  nothing and what a driver turn costs the kernel is one write rather than one per record. The
+  residual asymmetry against `ngnet-h2`'s tokio transport, which emits one `writev` per pass, is
+  therefore no longer a write count but the copy dwnx makes when it frames a payload into a
+  record — a copy `NGHTTP2_DATA_FLAG_NO_COPY` has no counterpart for here, for reasons recorded
+  on [`../qmux/pending-work.md`](../qmux/pending-work.md). This **biases against the QMux arms
+  on both families, and no longer biases the socket family more than the duplex one**, which is
+  the part a reader hunting a socket-family gap needs: the mechanism this row used to name is
+  the first thing to *stop* testing against.
+- **Buffering: an 80 KiB outbound ceiling, against a 1 MiB pipe.** A QMux connection accumulates
+  records up to `OUTBOUND_CEILING` — a 64 KiB guaranteed carry plus one record's reserve — and
+  writes what it has, where the duplex family's in-memory pipe is 1 MiB deep and the HTTP/2 arm
+  may fill it. The figure in this entry used to be one 16382-byte record, which is what the
+  arms recorded before write coalescing ran against; the ceiling is roughly five times that and
+  the bias is correspondingly smaller, not gone. The pipe is sized so that it is not the
+  bottleneck for the HTTP/2 arms; for the QMux arms the ceiling is still the bottleneck first.
+  This **biases against the QMux arms on the duplex family** and is a harness-visible consequence
+  of a bound the transport chose rather than a choice the harness made — the pipe's capacity is
+  equal for both arms, and equalising the *effect* would mean shrinking the pipe until it
+  constrained the HTTP/2 arm too, which would change arms whose measurements are already
+  recorded.
 
 Controlled rather than merely disclosed, on the cross-protocol pair specifically: both arms run
 on a single-worker runtime with drivers on plain `tokio::spawn` — the QMux join imposes no

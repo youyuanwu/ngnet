@@ -14,6 +14,11 @@ nothing to interoperate *with* — the gap is real and it is not closable by eff
 **What would settle it:** a second QMux implementation appearing, or dwnx's own example client
 and server being driven against this stack. The latter is possible today and has not been done.
 
+*The write-path work learned nothing about this.* It changed record boundaries, write
+boundaries and the timing of window extensions — all of them things a conforming peer must
+already tolerate, and none of them a reason to expect a different answer from an
+interoperability run that has never been attempted.
+
 ## There is no structural test suite
 
 `ngnet-quic-h3` ships `tests/invariants.rs`, which reads its own source and asserts that
@@ -25,6 +30,13 @@ as resting on the compiler or on review instead.
 **What would settle it:** the same suite, with the forbidden names adjusted — `TcpStream` is a
 plausible thing for a QMux-adjacent crate to acquire by accident in a way it is not for a QUIC
 one, so the list is not a copy.
+
+*The write-path work learned nothing about this.* It added tests, several of them, but all of
+them are behavioural — write counts, copy counts, allocation counts, credit applications — and
+a behavioural test says nothing about whether the crate's shape is what it claims to be. If
+anything the case for the suite is a little stronger than it was, because the work introduced
+two new public constants and three new public methods, which is more surface for a manifest or
+a module-shape assertion to have opinions about.
 
 ## The connection is configurable, but not adjustable once it is up
 
@@ -53,6 +65,14 @@ Two smaller gaps remain here:
 **What would settle the remainder:** accessors, which the observability entry covers, and a
 decision about whether the two configurations should be validated jointly at construction
 rather than separately by the layers that consume them.
+
+*The write-path work learned nothing about post-construction adjustment*, and it is worth
+saying why not, because it added two constants that look like configuration and are not.
+`OUTBOUND_CARRY` and `OUTBOUND_CEILING` are compile-time constants rather than `Config` fields,
+deliberately: they describe a buffer the layer manages on the caller's behalf and never hands
+out, so a caller has nothing to do with the numbers except read them to size its own
+expectations. Making them configurable would add two more values that cannot be adjusted once
+the connection is up, which is the very complaint this entry records.
 
 ## The stream allowance is never extended, and a connection stops at its initial budget
 
@@ -93,6 +113,16 @@ opens `max_streams_bidi + 1` streams and asserts the last one either succeeds or
 error is the thing that is missing either way; today it would hang, which is why it has to be
 written with a timeout.
 
+*The write-path work learned nothing about this.* It ran the suite repeatedly against the
+`1 << 40` harness workaround and never approached the budget, which is what the workaround is
+for, so no run it took bears on what happens at the boundary. It did not touch
+`extend_stream_limit`, and its one change to credit — batching window extensions for the length
+of a run — is deliberately about the *flow-control* windows and not about the stream allowance:
+those are separate budgets with separate frames, and the batching code path never calls the
+stream-limit extension at all. The defect was screened against FR-033 before any optimisation
+was attempted and was found not to block the measurements this work needed, which is why it was
+left exactly as it is.
+
 ## The join hangs at high concurrency on a multi-worker runtime
 
 With sixty-four requests issued together on one connection and a tokio runtime with more than
@@ -100,7 +130,7 @@ one worker thread, the join wedges: **roughly three attempts in four never compl
 two and four workers, typically after about fifty-five of the sixty-four requests have
 finished. The remaining futures never resolve, no error is produced, and nothing closes.
 
-What narrows it:
+What narrowed it when it was first recorded:
 
 - Concurrency 1 and 8 complete on every runtime tried.
 - A `current_thread` runtime completes at every concurrency tried, including 64.
@@ -111,23 +141,71 @@ What narrows it:
 
 That combination points at the pump's wakeup handling rather than at protocol state: something
 that is a lost wakeup when two threads race and is not reachable when the same work is
-serialised on one. It has not been narrowed further, and nothing here has been changed to
-address it.
+serialised on one. Nothing here has been changed to address it.
 
-**This is why one benchmark group has no QMux arm.** The suite's
-`concurrent_throughput_multi_thread` group runs the same sweep as its single-threaded sibling
-on a four-worker runtime; the QMux arm was written, and it was left out because it hangs. Its
-intermittence is what makes that necessary rather than merely tidy — an arm that failed every
-time would be obvious, whereas one that hangs three times in four is a CI job that
-occasionally never returns, and `cargo bench -- --test` has no timeout that would turn that
-into a failure. `docs/benchmarks/cases/concurrent-throughput.md` records the omission and
-points here. Every other group in the suite carries a QMux arm except the two shared-body
-groups, whose absence has an unrelated cause and must not be filed with this one.
+### What the write-path work found, without fixing it
 
-**What would settle it:** a reduced reproduction — the smallest number of concurrent streams
-and worker threads that still hangs — and then the wakeup path under it. A timeout-guarded
-test at concurrency 64 on a multi-worker runtime is the regression test, and it would fail
-today, which is why it is described here rather than committed.
+Before any optimisation was attempted, the defect was screened under FR-033 — the rule that a
+known defect is only worked on if it blocks a measurement — and screening it meant driving it
+deliberately. The reproduction was a throwaway test under `tests/ngnet-bench/tests/`, every wait
+bounded by a five-second timeout, deleted after the runs; the numbers below are recorded in
+`.paw/work/qmux-h3-perf/Phase2Screen.md` and a reader who wants them again has to write the
+harness again. They are counts from a bounded fixture, not timings from the benchmark suite, and
+they carry none of `docs/benchmarks/controls.md`'s guarantees.
+
+Four things changed about what is known, and one of them corrects a claim above.
+
+- **The benchmark fixtures do not hang, at all.** `NgnetQmuxH3` and `NgnetQmuxH3Socket`, exactly
+  as the arms use them, completed **1,520 out of 1,520 attempts** — 760 in a debug build and the
+  same table again in release — across duplex and loopback TCP, `current_thread` and two and
+  four workers, at concurrencies 1, 8 and 64. Against a recorded rate of three failures in four
+  that is not a weaker sample of the same phenomenon; it is a different answer, and the reason
+  is the next point.
+- **A single response header decides it.** With the fixture unrolled so the response is built
+  without its `content-type` header, the same workload wedges at **100%**, not 75%. Adding the
+  header takes it back to 0% at every point tried up to 128 streams. `response_for` in
+  `tests/ngnet-bench/src/lib.rs` sets that header, which is why the arms are clean: they are not
+  avoiding the defect by design, they are one header away from it, and anyone editing that
+  fixture should know that.
+- **The threshold is exact, and the shortfall is linear.** Sixty-three concurrent streams is
+  clean; sixty-four hangs. Between 64 and 96 streams the number of response heads that arrive is
+  `126 − N`, so the shortfall grows at two exchanges per additional stream. The server side is
+  not where it stops: every one of the 65 handlers ran to completion and returned a response, and
+  the missing exchanges are clients waiting for a head whose response already exists. At N = 128
+  it stopped one short, which does not fit that line and is not explained.
+- **"Loopback TCP is clean throughout" is wrong, and is corrected here rather than deleted
+  above** so that the change of state is visible. In a *release* build, four workers at N = 64
+  without the header hung once in four attempts, reaching 49 of 64. Debug loopback runs were
+  clean. The substrate changes the rate, not the outcome.
+- **It is not the sixty-four-offer yield**, which is the coincidence the in-flight-streams entry
+  below flags as worth not ignoring. `MAX_OFFERS` was temporarily set to 32 and the threshold
+  stayed at 64 concurrent streams, with 30, 31, 32, 33, 34, 40 and 48 all clean; the constant was
+  restored and the tree left unmodified. That suspect can be struck off.
+
+Requiring more than one worker thread is confirmed: `current_thread` and a multi-thread runtime
+with a single worker are both clean at every point tried. Nothing was narrowed beyond this and
+nothing was changed, as the screen required.
+
+**This is why one benchmark group has no QMux arm** — and the reason has now shifted. The
+suite's `concurrent_throughput_multi_thread` group runs the same sweep as its single-threaded
+sibling on a four-worker runtime; the QMux arm was written, and it was left out because it hung.
+On the evidence above the fixture it would use does *not* hang, so the group is now technically
+addable, and it should still not be added — for a reason that has nothing to do with this
+defect. It is a **duplex** group, so it cannot show a syscall saving; the arm's value would be
+the userspace bookkeeping its single-threaded sibling already reports, plus the scheduling noise
+the group exists to display. Adding an arm that sits one response header away from a
+deterministic wedge, to measure something another arm measures more cleanly, is a bad trade.
+`docs/benchmarks/cases/concurrent-throughput.md` records the omission and points here. Every
+other group in the suite carries a QMux arm except the two shared-body groups, whose absence has
+an unrelated cause and must not be filed with this one.
+
+**What would settle it:** the reduced reproduction now exists in outline — sixty-four streams,
+two workers, no `content-type` on the response — so what is left is the wakeup path under it,
+and an explanation for why one response header moves the outcome from certain to impossible.
+That header changes the size and the count of the records a response occupies, which is the
+first place to look. A timeout-guarded test at concurrency 64 on a multi-worker runtime with the
+header omitted is the regression test, and it would fail today, which is why it is described
+here rather than committed.
 
 ## The connection is not observable
 
@@ -139,45 +217,193 @@ caller holding a `QmuxConnection` cannot reach it.
 **What would settle it:** deciding whether accessors belong on this crate's type. The QUIC join
 has the same gap for the same reason, and both should be answered together.
 
-## Body bytes are copied twice before this crate sees them
+*The write-path work learned nothing about the design question, and made the gap slightly
+wider.* It added counters — `Connection::copied_record_bytes`, `RecordFramer::copied_bytes`, and
+a group of write-log and credit accessors in `ngnet_qmux::io::testing` — so there is now more
+state a caller might reasonably want to see, and the ones under `testing` are `#[doc(hidden)]`
+and exist to let a test assert a count, not to be an observability interface. Reading them as
+one would be a mistake: they are shaped for assertions and their names, arity and existence are
+not covered by any stability claim.
 
-Inbound, the QMux layer copies every record's payload into the framer's retention and copies
-each delivery into an owned `Vec` for its event. This crate then turns that `Vec` into `Bytes`
-by taking the allocation over, so it adds nothing. Outbound, `StreamSource::write_next` lends
-buffers that are invalid once the closure returns, so the bytes are copied into the record
-being built — one copy, and the reason `RETAINS_BUFFERS` is `false`.
+## Body bytes are copied once before this crate sees them, and that one was measured
 
-Both inbound copies are consequences of gaps in dwnx rather than of anything decided here; see
+The heading used to say twice. Inbound, the QMux layer copied every record's payload into the
+framer's retention *and* copied each delivery into an owned `Vec` for its event. The first is
+gone for a record that arrives whole, which is nearly all of them; the second is still paid.
+This crate turns the delivered `Vec` into `Bytes` by taking the allocation over, so it adds
+nothing to either. Outbound, `StreamSource::write_next` lends buffers that are invalid once the
+closure returns, so the bytes are copied into the record being built — one copy, and the reason
+`RETAINS_BUFFERS` is `false`.
+
+Both are consequences of gaps in dwnx rather than of anything decided here; see
 `docs/qmux/pending-work.md`, which records what would remove each.
 
-**What would settle it:** measurement that isolates the copies. The suite now runs this stack
-end to end — `docs/benchmarks/` — so there are benchmarks where there were none, but none of
-them attributes anything to these copies specifically. An end-to-end figure cannot separate two
-memcpys from framing, QPACK, the record layer and the pump. A profile of the 1 MiB body point,
-or an arm built with the inbound copy removed, is what would turn this into a number.
+**It is no longer unmeasured, and the answer was not the expected one.** The entry used to ask
+for a build with the inbound copy removed. That build exists: deliveries became reference-counted
+views into a pooled read buffer, per-delivery allocation fell from 8,216 bytes to 24 — and it was
+slower at every payload size but one, by two to five percent against controls that moved under
+one. It was reverted.
+[`05-qmux-delivery-aliasing`](../benchmarks/data/xeon-8370c-azure/05-qmux-delivery-aliasing.md)
+has the figures and the mechanism. So the remaining question is not "what does this copy cost" but "why does removing it
+not pay", and the leading answer is that a pooled buffer's bookkeeping and the copy a short
+delivery still needs are together larger than one allocation of the size being avoided.
 
-## A multi-slice offer is written one slice at a time
+## A multi-slice offer is one write, and one run of records — settled
 
-`StreamSource::write_next` may hand over several `IoSlice`s at once. The layer below has no
-vectored write — `RecordWriter::push_vectored` is listed in `docs/qmux/pending-work.md` — so
-this crate issues one write per slice and stops at the first that is not fully accepted.
+`StreamSource::write_next` may hand over several `IoSlice`s at once, and this crate now submits
+the whole list in one call: `Connection::try_write_stream_vectored` in the layer below, over
+`RecordWriter::push_vectored` and `dwnx_conn_writev_stream`. The fragments share records, so a
+slice boundary is no longer a record boundary and a request's headers ride inside the body's
+first record instead of occupying an undersized one of their own.
 
-In practice that means one slice per offer, not one record holding all of them. The layer below
-refuses a second production while a record is still outstanding, so the write of the second
-slice answers `Blocked`, the loop breaks, and the offer reports the count the first slice
-produced. A fragmented offer therefore takes one record and one pass through the pump per
-slice, where a vectored push would have packed them into a single record. Correct, and more
-records than the payload requires.
+**What it used to be.** One `try_write_stream` per slice, stopping at the first not fully
+accepted, and a call begins a fresh record however few bytes the slice holds — so at least one
+record per slice. Before write coalescing it was worse still: the layer below refused a second
+production while a record was outstanding, so the second slice answered `Blocked`, the loop
+broke, and the offer reported only what the first slice had produced — one record *and one write
+and one pass through the pump* per slice. Coalescing removed the write and the pass; this
+removes the record.
 
-There is now a symptom that may or may not belong to this, recorded in the next entry.
+**What it was worth, and why that is a count rather than a time.** Measured on a 64 KiB POST
+against an otherwise identical body-less request, end to end through this stack
+(`tests/ngnet-qmux-h3-tests/tests/fragmented_offers.rs`):
+
+| | before | after |
+| --- | --- | --- |
+| records in the write carrying the request | 6 | 5 |
+| bytes the body cost over a body-less request | 65 587 | 65 579 |
+| writes the client's byte stream saw | 3 | 3 |
+
+One record and its eight bytes of framing — a two-byte record length prefix and dwnx's STREAM
+frame header — per request with a body. The write count does not move, because coalescing had
+already merged those records into one write; that is the honest shape of the result and not a
+disappointment, since the record is what a fragment boundary cost once the write had stopped
+costing anything.
+
+**The establishment is a count, and the prediction that a timing would say nothing was wrong.**
+FR-021 accepts a mechanism established by a count, and the record and byte counts are that. The
+argument originally made here — that a timed comparison would report a number inside its own
+noise — quoted the Phase 2 screen's saving as one write in two at 1 KiB and one in sixty-six at
+1 MiB, and omitted the screen's middle point, **one write out of six at 64 KiB**, which is around
+seventeen percent and does not sit inside a 0.5%-to-5% band. A timing does exist:
+[`07-qmux-per-commit-attribution`](../benchmarks/data/xeon-8370c-azure/07-qmux-per-commit-attribution.md)
+reports **−7.7% at 64 KiB against a control worst of 5.18%** — outside the band, in the noisiest
+step of seven, and marginal rather than settled. It deserves a run of its own before it is quoted
+as a figure. The counts stay the establishment; the correction is kept because an argument built
+by leaving out the inconvenient point is the kind that should be visible afterwards.
+
+**The part that is delicate, recorded because it is silent when it is wrong.** A vectored push
+reports `*pdatalen` as **one total across every vector**, not a count per vector, so resuming
+after a short take means walking the array against a byte count — and a short take routinely
+stops part-way through a fragment rather than between two. A walk that assumed whole fragments
+were taken would send some bytes twice and others never, and would report a count that agreed
+with itself; nothing above this layer could notice. The walk lives in one place, `Fragments` in
+`crates/ngnet-qmux/src/io/conn.rs`, and the single-slice write is expressed as its degenerate
+case rather than kept as a second loop. Its guard is
+`a_take_that_stops_inside_a_fragment_resumes_inside_it` in
+`crates/ngnet-qmux/tests/io_vectored.rs`.
+
+## Window extensions are batched here, because the HTTP/3 layer does not batch them — settled
+
+The question Spec FR-037 asks is whether flow-control extensions and the read-ahead wakeups they
+cause are *already* coalesced within one transmit pass. `CodeResearch.md` left it open, having
+not read the HTTP/3 driver's credit path. It has now been read, and the answer is **no**.
+
+**The evidence.** `Driver::extend` in `crates/ngnet-h3/src/http/driver.rs` makes two
+`extend_credit` calls for the same bytes — the stream's window and the connection's, which are
+separate and neither implies the other — and it is reached from three places inside a single
+pass: once per `QuicEvent::Data` the driver applied, via `Driver::read`; once per stream whose
+QPACK-deferred credit was released; and once per credit entry the caller returned by reading.
+Nothing between those sites accumulates, and every one of them used to become an
+`extend_stream_credit` or `extend_connection_credit` call on the connection below, each of which
+marks the connection as having something to produce and each connection-level one of which also
+wakes the read-ahead pump. Read rather than assumed: the reading is pinned by a count, in
+`tests/ngnet-qmux-h3-tests/tests/credit_batching.rs`, so a driver that starts coalescing fails a
+test that names this finding rather than silently invalidating it.
+
+**What was done.** Batched at this seam. `Inner::defer_credit` accumulates a run — one sum per
+stream, one for the connection — and `Inner::flush_credit` applies it at the first interaction
+with the layer below that follows: `poll_event`, `poll_open_uni`, `poll_open_bi`,
+`poll_transmit`, `reset`, `stop_sending`, `close`, and the tail's `poll_finish`.
+
+**Why here and not in `ngnet-h3`.** `ngnet-h3` is shared with the QUIC stack, which cannot be
+fully built on this host — so a change there could not have been verified against the other
+consumer of the trait it changes. This seam is QMux-only, and the bias of that choice is stated
+plainly: it fixes the cost for this transport and leaves it in place for the other one.
+
+**The rejected alternative.** Flushing only in `poll_transmit`, which is the largest batch
+available and the one place a pass demonstrably ends. Rejected because the driver's loop can
+park between reporting credit and transmitting — `poll_open_bi` waits for stream capacity the
+peer has not granted — and credit stranded behind that park is a window the peer is never told
+about while both ends wait for the other. The rule adopted instead is that a run ends at the
+*next interaction of any kind*, which needs no list of which interactions can park.
+
+**What it is worth, by count.** Eight concurrent 64 KiB downloads, measured end to end
+(`credit_batching.rs`):
+
+| | before | after |
+| --- | --- | --- |
+| `extend_credit` calls the driver made | 42 | 42 |
+| extensions applied to the QMux connection | 42 | 31 |
+| connection-window extensions, and so read-ahead wakeups | 21 | 10 |
+
+The "before" column needs no stashed build: every call was forwarded straight through, so the
+driver's call count *is* what the connection below used to see. The stream half of the total
+does not move here — each stream that delivers in a pass needs its own stream-window extension
+either way, and these bodies deliver at most once per stream per run — so the whole of the
+saving is the shared connection window, which is also the one that fires the pump's waker.
+
+**No timing was taken, and that is a decision**, on the same grounds as the vectored-write
+entry above: FR-021 accepts a mechanism established by a count where no benchmark identifier can
+resolve it, and eleven fewer calls into a state machine per eight-stream exchange is not
+something an end-to-end arm can separate from its own drift.
+
+**Bias in the measurement, stated.** The harness stops at the completed exchange rather than at
+a closed connection, so credit still held when the run ends is never applied. That flatters the
+"after" figure by at most one flush — one connection extension — which is inside the margin the
+test asserts.
+
+**What is bounded, and what happens at the bound.** The per-stream run is a `Vec` scanned
+linearly, which is right for the single-digit stream counts a pass delivers on and wrong for
+hundreds. `MAX_PENDING_STREAMS` (sixty-four, the driver's own per-pass offer bound) applies the
+run early rather than letting the scan grow, so the worst case is exactly the behaviour this
+replaced rather than something worse.
 
 ## Something scales with in-flight streams on a real socket
 
-This is a lead, not a finding, and the numbers behind it are **not measurements**: they come
-from unpinned, short-sample exploratory runs taken while the benchmark arms were being built,
-on a shared virtual machine, with no drift controls and no replication. They are not filed
-under `docs/benchmarks/data/` and must not be quoted as results. What they are good for is
-saying which point is worth measuring properly.
+**Now measured, still unexplained, and its leading suspect has been eliminated.** This began as a
+lead from unpinned exploratory runs, and that provenance is kept below because the sequence
+matters. It is no longer the evidence:
+[`08-qmux-against-h2`](../benchmarks/data/xeon-8370c-azure/08-qmux-against-h2.md) measured it
+properly, over five pinned passes with the ratio formed inside each pass.
+
+What it found. Every workload in the suite has a *smaller* QMux-to-HTTP/2 ratio with a kernel in
+the path than without one — a body at 1 MiB goes from 1.34× on a duplex to 0.89× on a socket —
+**except concurrency, which goes the other way**: 2.33× on a duplex against **3.12×** on a socket
+at sixty-four streams, and 2.48× against **3.14×** at eight. Five passes out of five, at both
+concurrencies, with per-pass ranges under 0.06×. So the shape the exploratory runs suggested is
+real, and it is the only place in the suite where adding a kernel makes QMux's position worse.
+
+What it eliminates. The leading suspect was one write per offered `IoSlice`. That mechanism is
+gone — a fragmented offer is now one vectored push into as few records as the size allows, and
+the write count per driver turn no longer grows with the streams in flight — and **the inversion
+survived its removal**. The candidate that produced this entry is therefore not the cause, or not
+the only one.
+
+What is left. The two remaining candidates named when this entry was written are untouched: QMux
+produces more records for the same payload than HTTP/2 produces frames, since a record caps at
+16382 bytes against a 16384-byte frame payload; and the pump's fixed sixty-four-offer yield may
+interact with sixty-four concurrent streams in a way worth not dismissing. A third is now
+available: [`08`](../benchmarks/data/xeon-8370c-azure/08-qmux-against-h2.md) implies QMux's
+kernel-path cost per megabyte is 61% of HTTP/2's, which is a *favourable* asymmetry on the body
+axis and might be an unfavourable one on the concurrency axis if it comes from writing fewer,
+larger chunks. **What would settle it:** a write count per pass and per megabyte for both arms at
+each concurrency — both stacks already have the instrumentation, and neither has been asked.
+
+The original provenance note, kept because a lead's history is part of it: the numbers that
+produced this entry came from unpinned, short-sample exploratory runs taken while the benchmark
+arms were being built, with no drift controls and no replication. They were never filed under
+`docs/benchmarks/data/` and must still not be quoted as results.
 
 Across the suite the QMux arm's cost relative to its HTTP/2 counterpart behaved like a fixed
 per-exchange overhead: largest with an empty body, smallest at 1 MiB, and smaller with a
@@ -188,35 +414,125 @@ the same parameter, and it was worse than the same arm's own empty-body ratio. E
 got relatively better as more work was added; that point got worse.
 
 A fixed cost per exchange cannot produce that. Something that scales with the number of streams
-in flight can, and the entry above is the obvious candidate: one write per `IoSlice`, stopping
-at the first not fully accepted, costs nothing without a kernel and costs a syscall each with
-one. That is the same mechanism the HTTP/2 write-path finding turned on
+in flight can, and the entry above was the obvious candidate: one write per `IoSlice`, stopping
+at the first not fully accepted, cost nothing without a kernel and cost a syscall each with
+one. **That mechanism is gone** — the entry above is settled — which makes this lead weaker
+rather than stronger: its obvious explanation has been removed, and a shape that survives a
+pinned run now needs another one. That is the same mechanism the HTTP/2 write-path finding turned on
 (`docs/benchmarks/findings/write-path-and-gathering.md`), which is a reason to suspect it and
-not evidence that it is the cause here.
+not evidence that it is the cause here. It is not the same *fix*: the HTTP/2 finding was won by
+gathering a driver pass into one `writev`, and the layer below has since established that its
+output is a single region with nothing to gather and no copy for gathering to avoid
+(`docs/qmux/pending-work.md`). What would reduce the write count here is fewer records for the
+same payload — the vectored push above, now built — not a gathering byte stream.
 
 Two other candidates have not been ruled out: the record layer produces more records for the
 same payload than HTTP/2 produces frames, since QMux's maximum record is 16382 bytes against
 HTTP/2's 16384-byte payload; and the pump's fixed sixty-four-offer yield may interact with
-sixty-four concurrent streams in a way that is not a coincidence worth ignoring.
+sixty-four concurrent streams in a way that is not a coincidence worth ignoring. The hang entry
+above reports that setting `MAX_OFFERS` to 32 did not move the hang's threshold, and that
+strikes the constant off as a cause of *the hang* only — it was a wedge-or-not experiment on an
+unrolled fixture, not a timed run, so it says nothing about whether the constant costs anything
+at concurrency 64, and it must not be borrowed to close this candidate.
 
-**What would settle it:** a pinned, replicated run of
-`transport_concurrent_throughput` and `concurrent_throughput` across the full 1/8/64 sweep with
-drift controls, recorded under `docs/benchmarks/data/` as a run — followed, if the shape holds,
-by a syscall count per pass for the QMux arm at each concurrency. If the count grows with `N`
-where the HTTP/2 arm's does not, the vectored-write entry above is the fix and this entry
-closes with it.
+**What run 06 established, and what it did not.** The suspected mechanism was removed and the
+result was measured under controls
+([`06-qmux-write-path`](../benchmarks/data/xeon-8370c-azure/06-qmux-write-path.md)). At the
+anomalous point — `transport_concurrent_throughput/ngnet-qmux-h3-tokio/64`, the socket arm — the
+build got **8.5% faster**, and its concurrency-8 sibling 7.1% faster. At the *same* parameters
+the duplex arms went the other way, 1.8% and 2.1% *slower*. That sign flip is the load-bearing
+observation: it is one session, one machine, one pair of builds, and the two families differ in
+exactly one thing, whether a write reaches a kernel. Drift cannot produce it — the two socket
+identifiers drift −0.22% and −0.50% under
+[`04-qmux-drift-baseline`](../benchmarks/data/xeon-8370c-azure/04-qmux-drift-baseline.md), and
+the session's 46 unchanged controls moved 1.06% on average and 4.47% at worst. So a cost that
+scaled with streams in flight and was paid only with a socket in the way did exist, it was the
+write count, and it is now smaller: seventy writes per driver turn at concurrency 64 became
+sixty-six with an empty body and, with a body, 390 became 66 at 64 KiB.
+
+**The lead is narrowed, not closed, and the reason is precise.** What run 06 compares is one
+build of the QMux arm against another. What this entry is about is a *ratio* — the QMux arm
+against its HTTP/2 counterpart — and no run under `docs/benchmarks/data/` computes that ratio
+under controls for either family, because the sessions that produced these figures were paired
+build comparisons and cross-protocol arms in a paired session carry the drift of two protocols
+rather than one. So it remains unknown whether the shape that prompted this entry survives at
+all. What is known is that its obvious cause has been removed and that removing it moved the
+anomalous point substantially and in the predicted direction, which is the strongest thing a
+lead can have short of being measured.
+
+**What would settle it:** a pinned, replicated run of `transport_concurrent_throughput` and
+`concurrent_throughput` across the full 1/8/64 sweep with drift controls, recorded under
+`docs/benchmarks/data/` as a run, comparing the QMux and HTTP/2 arms in the same session — that
+is the ratio, and it has still never been taken. If the shape is gone, this entry closes and the
+cause was the write count. If it holds, the next step is a syscall count per pass for the QMux
+arm at each concurrency: a count that still grows with `N` after coalescing would place the
+cause in the record count or the offer bound rather than in the write path, and the two
+candidates above are then the places to look.
 
 ## The transmit pass yields on a fixed count
 
 A pass takes at most sixty-four offers and then returns, so a layer with an endless supply
-cannot keep it from returning to the driver. Sixty-four accepted offers is on the order of a
-megabyte, which is a guess rather than a measurement: too low costs wakeups on a large body,
-too high delays the events the driver has to attend to.
+cannot keep it from returning to the driver. Sixty-four accepted offers used to be on the order
+of a megabyte, which was a guess rather than a measurement: too low costs wakeups on a large
+body, too high delays the events the driver has to attend to. Multi-record production loosened
+that reading — an offer is now worth as many records as the outbound buffer will hold, so the
+cap bounds offers rather than bytes and what bounds the bytes is the buffer's ceiling. The
+constant is unchanged, and the trade it encodes is now less about bytes than about how many
+different streams a pass will visit.
+
+**The write-path work did not answer this, and did not try.** No run it took varies the
+constant, so nothing on file says what sixty-four costs or saves. Two things about it did
+change, and neither is an answer. The reading changed, as described above: the same number now
+bounds a different quantity, so a figure taken against the old build would not transfer even if
+one existed. And a second constant now sits beside it — `MAX_PENDING_STREAMS` in the credit
+batching, deliberately given the same value of sixty-four *because* it is the driver's per-pass
+offer bound, which means a future experiment that changes `MAX_OFFERS` has to decide whether to
+move that one with it or hold it fixed and measure the two separately. The one experiment that
+did move `MAX_OFFERS`, recorded in the hang entry above, set it to 32 to see whether a wedge
+still occurred; it was not timed, and it establishes nothing about cost.
 
 **What would settle it:** a benchmark showing which end of that trade actually costs anything.
 The suite added in `docs/benchmarks/` does not, because it holds the count fixed at sixty-four
 in every arm; what it would take is the same sweep run against two builds differing only in
 that constant.
+
+## Each request is submitted in a driver pass of its own, and every pass owes its driver a write
+
+Coalescing removed nearly every write from a payload-carrying workload and left the empty-body
+concurrency arms almost untouched: at concurrency 64 the count went from seventy writes per
+driver turn to sixty-six, which is a four-write saving where the same concurrency carrying
+64 KiB bodies fell from 390 writes to 66, a saving of 83%. The cause is not in the write path,
+and the four writes that did disappear say where it is — they are the connection preamble, which
+genuinely did have several records to merge, and not the requests.
+
+The requests do not merge because each is submitted in a driver pass of its own, and a pass that
+ends must flush before it returns: a caller may stop polling after any public entry point, so
+bytes left in the buffer at that moment might never be written. Sixty-four submissions therefore
+cost at least sixty-four writes however well the buffer coalesces. The screen in
+`.paw/work/qmux-h3-perf/Phase2Screen.md` predicted a collapse here and was wrong for an
+instructive reason: its model merged every write within a harness *turn*, and a turn is one poll
+of the connection future and contains many passes. That made it an upper bound rather than a
+prediction, and the distance between the bound and the outcome is exactly the per-pass forced
+write.
+
+This residual is worth naming rather than filing under noise, because "coalescing saved most
+of the writes" is true of a body and false of a request burst, and the two are easy to conflate. It is
+measured by `tests/ngnet-qmux-h3-tests/tests/concurrent_driver_writes.rs`, whose module
+documentation records the same reasoning beside the assertions.
+
+**What it would take to reduce it:** submitting several requests in one driver pass, so that
+their records share a forced flush. That is a change to how a caller drives the join rather than
+to this crate — the join has no way to know that a caller is about to submit sixty-three more
+requests, and inventing one means either a batching entry point or deferring the forced flush
+past the point where it is safe. The second is not available: the flush exists precisely because
+the caller may stop, and a layer cannot tell "stopped" from "about to call again". A batching
+entry point is available and has not been designed, and it should not be until something
+establishes that sixty-four small writes at connection start cost enough to be worth a wider
+API. Nothing on file does.
+
+**What would settle it:** a run holding everything else fixed and varying only whether requests
+are submitted individually or in one pass. The suite cannot show this today, because every arm
+submits individually; the fixture change is small and the measurement is the work.
 
 ## No datagrams, no WebTransport, no priority
 
@@ -227,6 +543,13 @@ HTTP/3 priority scheme is unreachable from here.
 
 See both families' pending-work documents.
 
+*The write-path work learned nothing about any of the three.* Datagrams and priority are absent
+from the traits below this crate, so nothing it changed about how records are written or how
+credit is timed could bear on them. It is worth noting one thing it did *not* foreclose:
+`ngnet_qmux::VectoredWriteRequest` and `push_vectored` let one record carry several caller
+fragments, which is a mechanism a datagram or WebTransport path would plausibly want, and it is
+public rather than internal. That is availability, not evidence.
+
 ## Nothing serves an axum router over this
 
 `ngnet-axum` serves an axum `Router` without hyper, and doing the same over a QMux-carried
@@ -235,3 +558,6 @@ rather than here, because the accept side belongs there — this crate takes a b
 is already established and has no opinion about where it came from — and because the shape is
 not settled: `ngnet-axum`'s `Listener` seam produces transports it drives with `ngnet-h2`, so
 implementing one for QMux would serve HTTP/2, not this.
+
+*The write-path work learned nothing about this.* It is a question about an accept seam and a
+router, and nothing about record production, buffer arrangement or credit timing touches either.

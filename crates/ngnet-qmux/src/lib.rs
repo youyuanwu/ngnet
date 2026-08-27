@@ -110,7 +110,7 @@ pub use settings::Settings;
 pub use stream::{Directionality, Initiator, StreamId};
 pub use stream_io::{OpenOutcome, Shutdown};
 pub use time::{Duration, Timestamp};
-pub use write::{Push, Record, RecordWriter, WriteRequest};
+pub use write::{Push, Record, RecordWriter, VectoredWriteRequest, WriteRequest};
 
 /// The raw FFI bindings this crate is built on.
 ///

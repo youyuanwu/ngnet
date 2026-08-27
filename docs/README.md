@@ -65,8 +65,12 @@ is nothing to demultiplex. Establishing that stream — connecting, listening, a
 TLS on it — stays with the caller.
 
 Nothing has been tested against another QMux implementation. There are benchmarks now —
-`ngnet-qmux-h3` carries an arm in most of the suite under [`benchmarks/`](benchmarks/) — but
-they measure the HTTP/3 join end to end and attribute nothing to this layer specifically.
+`ngnet-qmux-h3` carries an arm in most of the suite under [`benchmarks/`](benchmarks/). They
+measure the HTTP/3 join end to end, so no single arm attributes a cost to this layer in
+isolation; what they can do, and now have done, is compare one build of it against another
+under the suite's controls, which is what
+[`benchmarks/findings/qmux-write-path.md`](benchmarks/findings/qmux-write-path.md) records for
+the write path.
 
 ## HTTP/3 over QMux — [`qmux-h3/`](qmux-h3/)
 
