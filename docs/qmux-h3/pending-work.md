@@ -8,9 +8,8 @@ This is the implementation backlog produced by
 [`09-qmux-h2-mechanisms`](../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md).
 The order is measured payoff divided by implementation risk, not source order.
 
-Items 1 and 2 are settled; item 3 is closed without implementation after reprofiling. Item 4 is
-the highest-priority open performance item, confirmed by a current differential profile and a
-controlled diagnostic.
+Items 1, 2 and 4 are settled; item 3 is closed without implementation after reprofiling. Item 5
+is the highest-priority open performance item.
 
 1. **Replace `ngnet-h3`'s linear closed-stream lookup — settled.** `Driver::close_stream` scanned a
    1024-entry tombstone `Vec` on every close after a connection reaches steady state. A
@@ -48,15 +47,15 @@ controlled diagnostic.
    inclusive bound of at most 2.28%, only a strict subset of which reuse could remove. The
    profile-first gate therefore rejected implementation before a prototype was created; see
    [`run 12`](../benchmarks/data/xeon-8370c-azure/12-apply-events-reprofile.md).
-4. **Remove the duplicate QMux pump in `QmuxConnection::poll_event`.** The join pumps once at
-   the start of `poll_event`, then, when no translated event is already held, `fill()` calls
-   `Connection::poll_next_event_buffered`, which pumps again. Current exact counts show 96
-   transport reads per empty QMux/H3 exchange against HTTP/2's seven. A one-line diagnostic
-   that leaves exactly one pump on either branch removes 23 reads and measures **5.4% faster
-   duplex serial and 3.7% faster socket serial**, with unchanged controls; socket concurrency
-   improves 1.5–1.7%. Implement it with progress, wake-registration, queued-release, event-order,
-   flush, and close/error-tail tests rather than landing the diagnostic alone. See
-   [`run 13`](../benchmarks/data/xeon-8370c-azure/13-qmux-h3-current-bottlenecks.md).
+4. **Remove the duplicate QMux pump in `QmuxConnection::poll_event` — settled.** The production
+   branch now pumps explicitly only when a release or translated event is already queued;
+   otherwise `fill()` performs the one initial lower poll. Deterministic tests pin the queued
+   release, held event, direct empty, terminal-error and pending-wake paths. Exact empty-exchange
+   counts reproduce the diagnostic: reads fall **96 → 73**, pumps **93 → 70**, waker clones
+   **94 → 71** and drops **90 → 67**, while 30 event polls and 14 transmit passes are unchanged.
+   Controlled timing is **5.26% faster duplex serial and 2.37% faster socket serial** beyond
+   matching controls and spread; duplex concurrency 64 and socket concurrency 1 also clear those
+   bars. See [`run 14`](../benchmarks/data/xeon-8370c-azure/14-qmux-h3-one-pump.md).
 5. **Collapse the HTTP/3 driver's repeated shared-state probes.** The fresh profile counts 155
    named `Shared` take/pending/readiness calls per empty QMux/H3 exchange. They account for
    2.71 microseconds / 10.9% of QMux/H3 CPU, but analogous HTTP/2 methods already account for

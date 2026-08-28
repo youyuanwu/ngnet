@@ -582,7 +582,11 @@ What remains maps one-to-one onto the C API: `conn` for lifecycle and the read p
 stream operations, and `error`, `params`, `settings`, `stream`, `time` and `ccerr` for the
 value types. The layer adds `io/conn` for ownership and the pump, `io/stream` and `io/clock`
 for the seams, `io/framing` and `io/close` for the two jobs dwnx cannot do, `io/event`,
-`io/scheduling`, `io/error`, `io/testing` and — behind its feature — `io/tokio`.
+`io/scheduling`, `io/error`, `io/testing` and — behind its feature — `io/tokio`. The hidden
+testing stream exposes separate read and write logs because a pending read and four coalesced
+writes leave no count recoverable from the bytes eventually delivered; debug builds likewise
+expose pump entries for structural cross-crate tests without putting that counter in release
+benchmarks.
 
 Module files are flat here as everywhere in this crate: `io.rs` with submodules in `io/`, never
 `io/mod.rs`. The rule is not cosmetic. The structural test that reads `lib.rs`'s `unsafe`
