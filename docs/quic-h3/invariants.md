@@ -19,6 +19,14 @@ on a runtime it does not name.
 
 Checked by name: `thread`, `process`, `UdpSocket`, `TcpStream`.
 
+## The suspension flush is explicit and immediate
+
+The required `QuicConnection::poll_flush` implementation returns ready because this adapter
+hands datagrams to the endpoint while pumping and retains no byte-stream output. There is no
+default fallback in the trait, so omitting the implementation is a compile error. This change
+was statically audited on the measurement host, whose OpenSSL 3.0.13 is older than the 3.5
+required by `ngnet-quic-sys`; CI must compile the adapter before merge.
+
 ## Module files are flat
 
 `src/foo.rs`, never `src/foo/mod.rs` — the same rule the sibling crates keep. A nested module

@@ -299,6 +299,15 @@ a real transport — per 16382-byte record, and a driver turn that produces sixt
 sixty of them where one would have carried the same bytes. What replaced it is: produce while
 the buffer has room for another whole record, write what has accumulated, then read.
 
+There are forced and buffered forms of the operations that drive this order. The ordinary
+public event/open/pump methods are forced: a standalone caller may stop after any one of them,
+so they do not return ready with live output waiting for an unspecified future call. Their
+buffered counterparts are for a caller that owns a larger scheduling turn and can prove it will
+either continue driving or execute a forced operation before suspending. They write only for
+capacity and carry an explicit documented flush obligation. HTTP/3 over QMux is that caller; its
+driver discharges the obligation at every actual task suspension rather than at every internal
+protocol pass.
+
 The old rule was defended by three arguments, and the replacement has to answer all three.
 
 *Bounded memory.* One record outstanding bounded what a slow peer could make this side hold to

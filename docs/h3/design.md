@@ -268,6 +268,14 @@ written down, where a comment can be copied along with an adapter's shape and le
 The two implementations in this repository declare it differently and reach the same answer
 by different routes, which is the useful thing to be able to see at a glance.
 
+**Suspension is an explicit transport boundary.** `poll_flush` is called immediately before
+the driver can return `Pending` for transport work: while binding, while opening a request
+stream, on transmit backpressure, and in the idle event poll. This is not an instruction to
+flush after every internal driver pass. A transport whose output is already handed to its
+endpoint returns ready immediately; a byte-stream transport may retain bounded records across
+productive passes and use this call to drain them or register its write wake. Errors are
+explicit, and a ready result may not leave progress dependent on an unrelated future wakeup.
+
 **The clock is the backend's.** nghttp3 wants a timestamp on every read and the core will not
 invent one — that is what keeps `std::time` out of it. A transport necessarily has a runtime
 and therefore a clock; ngtcp2 exposes `ngtcp2_conn_get_timestamp` for exactly this.

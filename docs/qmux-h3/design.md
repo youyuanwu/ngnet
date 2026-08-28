@@ -62,12 +62,26 @@ writes when the buffer has no room for another record, but it leaves what the pa
 to accumulate. A flushing pump here would now buy nothing and cost a write per record, which is
 the whole of what the coalescing was for.
 
-What flushes instead is the single pump *after* the loop, and that one is not optional. A pass
-returns to its driver, and no other call is obliged to come along and move what it left behind;
-a driver may not poll again until the peer says something, and the peer may be waiting for
-precisely those bytes. Every entry point of the layer below that a caller can stop polling after
-flushes for the same reason — the one exception is the buffered pump itself, whose caller is
-mid-pass and owes the flush at the end of it.
+What flushes instead is the driver's explicit suspension operation. A productive internal pass
+is not itself a point where the connection future stops being polled: the driver can process an
+event-batch boundary and immediately begin another pass in the same executor poll. Flushing at
+each pass throws away that scheduling information and turns every stream ending into a byte
+stream write.
+
+`QuicConnection::poll_flush` carries the missing information. The HTTP/3 driver invokes it
+immediately before each of its four real transport suspension sites: binding a unidirectional
+stream, opening a bidirectional stream, transmit backpressure, and the idle event poll. QMux
+then applies deferred credit, produces pending records, and either drains them or returns
+`Pending` with the byte stream's write wake registered. A newly discovered ending self-wakes
+once so the operation that was interrupted can observe it; an already latched ending does not
+keep waking and spin.
+
+Capacity pressure remains a forced write inside productive work, and close and finish remain
+independent finalisation boundaries. A broken byte stream returns its explicit error and the
+bounded buffer is released when the ended connection is dropped; an orderly EOF can still run
+the finish tail and deliver already produced output. Dropping the outer connection future
+before its tail is cancellation: ownership of the bounded buffer is destroyed, and delivery is
+deliberately not promised. No timer or unrelated future event is part of the progress argument.
 
 And it is why the pump's answer is read rather than discarded. `try_write_stream` refuses an
 offer once the outbound buffer has no room for another record, so a transmit pass that kept
