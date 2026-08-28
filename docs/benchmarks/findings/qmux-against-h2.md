@@ -39,6 +39,9 @@ The cross-protocol arms were added so this question could be asked, and then it 
 several increments: every run before run 08 compared a build against another build. Run 08 was
 the first to compare the two stacks.
 
+Every section below reports runs `08` and `09` on the pre-migration host state. Their mechanism
+explanations still hold; their ratios are superseded by the current table above.
+
 ## The answer is two numbers, not one
 
 A single "QMux is N× slower" is the wrong shape, because the cost divides cleanly into a fixed

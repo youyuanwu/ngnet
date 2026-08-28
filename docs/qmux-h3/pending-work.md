@@ -8,8 +8,8 @@ This is the implementation backlog produced by
 [`09-qmux-h2-mechanisms`](../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md).
 The order is measured payoff divided by implementation risk, not source order.
 
-Items 1, 2, 4, 5, 6 and 8 are settled; item 3 is closed without implementation after
-reprofiling.
+Items 1, 2, 4, 5, 6, 8, 9 and 10 are settled; item 3 is closed without implementation after
+reprofiling. Item 7 is the only open performance item.
 
 1. **Replace `ngnet-h3`'s linear closed-stream lookup — settled.** `Driver::close_stream` scanned a
    1024-entry tombstone `Vec` on every close after a connection reaches steady state. A
@@ -66,7 +66,8 @@ reprofiling.
    rather than the count alone, retains the change; see
    [`run 15`](../benchmarks/data/xeon-8370c-azure/15-qmux-h3-shared-snapshot.md).
 6. **Design a cheaper ownership path for delivered record data — closed after refreshed
-   structural accounting.** The post-PR-45 baseline is 710 allocator calls at 1 MiB. Each
+   structural accounting.** The post-PR-45 baseline is 710 allocator calls at 1 MiB against
+   HTTP/2's 194.5, refreshed from the 818-versus-205 counts that opened this item. Each
    exchange has 193 productive reads, 162 callback copies and 162 first-`Bytes` promotions;
    158 of 160 H3 body views cover their whole parent. A safe non-pooled read/record owner needs
    at least 193 owner allocations plus 162 `Bytes` control blocks, replacing only 324 current
