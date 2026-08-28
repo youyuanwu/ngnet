@@ -17,6 +17,8 @@
 //! that parameter for no benefit.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Waker;
@@ -57,6 +59,55 @@ pub(crate) enum TransportAction {
     StopSending { stream: StreamId, code: ErrorCode },
 }
 
+/// Work transferred from handles and callbacks to one driver pass.
+///
+/// The driver owns and reuses this storage. A drain is destructive: once work is here, an
+/// error later in the pass drops it with the driver rather than replaying a partially applied
+/// side effect.
+pub(crate) struct SharedWork {
+    pub(crate) ready: Vec<StreamId>,
+    pub(crate) resets: Vec<(StreamId, ErrorCode)>,
+    pub(crate) credit: Vec<(StreamId, u64)>,
+    pub(crate) actions: Vec<TransportAction>,
+    pub(crate) shutdown: bool,
+}
+
+impl SharedWork {
+    pub(crate) fn new() -> Self {
+        Self {
+            ready: Vec::new(),
+            resets: Vec::new(),
+            credit: Vec::new(),
+            actions: Vec::new(),
+            shutdown: false,
+        }
+    }
+
+    /// Bounds storage retained after an unusually large pass, with hysteresis to avoid churn.
+    pub(crate) fn bound_retained_capacity(&mut self) {
+        const RETAINED: usize = 1024;
+        const SHRINK_ABOVE: usize = 2048;
+
+        fn bound<T>(items: &mut Vec<T>) {
+            if items.capacity() > SHRINK_ABOVE {
+                items.shrink_to(RETAINED);
+            }
+        }
+        bound(&mut self.ready);
+        bound(&mut self.resets);
+        bound(&mut self.credit);
+        bound(&mut self.actions);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ready.is_empty()
+            && self.resets.is_empty()
+            && self.credit.is_empty()
+            && self.actions.is_empty()
+            && !self.shutdown
+    }
+}
+
 /// The mutable state a handle and a driver share.
 pub(crate) struct Shared {
     inner: Mutex<Inner>,
@@ -65,6 +116,17 @@ pub(crate) struct Shared {
     /// driver.
     gone: AtomicBool,
     refusing: AtomicBool,
+    #[cfg(test)]
+    operations: SharedOperations,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SharedOperations {
+    drain: AtomicUsize,
+    idle: AtomicUsize,
+    completion: AtomicUsize,
+    refresh: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -89,16 +151,21 @@ impl Shared {
             inner: Mutex::new(Inner::default()),
             gone: AtomicBool::new(false),
             refusing: AtomicBool::new(false),
+            #[cfg(test)]
+            operations: SharedOperations::default(),
         }
     }
 
-    /// Records where to wake the driver from.
-    pub(crate) fn refresh_driver(&self, waker: &Waker) {
+    /// Records the driver's waker and coherently rechecks whether shared work is pending.
+    pub(crate) fn refresh_driver_and_work_pending(&self, waker: &Waker) -> bool {
+        #[cfg(test)]
+        self.operations.refresh.fetch_add(1, Ordering::Relaxed);
         let mut inner = lock(&self.inner);
         match &inner.driver {
             Some(existing) if existing.will_wake(waker) => {}
             _ => inner.driver = Some(waker.clone()),
         }
+        Self::inner_has_work(&inner)
     }
 
     /// Wakes the driver, if it is parked.
@@ -124,14 +191,6 @@ impl Shared {
         true
     }
 
-    pub(crate) fn take_ready(&self, into: &mut Vec<StreamId>) {
-        into.append(&mut lock(&self.inner).ready);
-    }
-
-    pub(crate) fn ready_len(&self) -> usize {
-        lock(&self.inner).ready.len()
-    }
-
     /// Asks for a stream to be abandoned.
     pub(crate) fn reset(&self, stream: StreamId, code: ErrorCode) {
         let mut inner = lock(&self.inner);
@@ -140,38 +199,14 @@ impl Shared {
         }
     }
 
-    pub(crate) fn take_resets(&self, into: &mut Vec<(StreamId, ErrorCode)>) {
-        into.append(&mut lock(&self.inner).resets);
-    }
-
-    pub(crate) fn resets_pending(&self) -> bool {
-        !lock(&self.inner).resets.is_empty()
-    }
-
     /// Records receive credit a caller has consumed.
     pub(crate) fn credit(&self, stream: StreamId, bytes: u64) {
         *lock(&self.inner).credit.entry(stream).or_default() += bytes;
     }
 
-    pub(crate) fn take_credit(&self, into: &mut Vec<(StreamId, u64)>) {
-        into.extend(lock(&self.inner).credit.drain());
-    }
-
-    pub(crate) fn credit_pending(&self) -> bool {
-        !lock(&self.inner).credit.is_empty()
-    }
-
     /// Queues a transport action nghttp3 asked for.
     pub(crate) fn push_action(&self, action: TransportAction) {
         lock(&self.inner).actions.push(action);
-    }
-
-    pub(crate) fn take_actions(&self, into: &mut Vec<TransportAction>) {
-        into.append(&mut lock(&self.inner).actions);
-    }
-
-    pub(crate) fn actions_pending(&self) -> bool {
-        !lock(&self.inner).actions.is_empty()
     }
 
     /// Asks for a graceful shutdown.
@@ -180,12 +215,43 @@ impl Shared {
         self.refusing.store(true, Ordering::Release);
     }
 
-    pub(crate) fn take_shutdown(&self) -> bool {
-        core::mem::replace(&mut lock(&self.inner).shutdown, false)
+    /// Transfers all work present at this pass boundary under one lock.
+    pub(crate) fn drain_work(&self, into: &mut SharedWork) {
+        #[cfg(test)]
+        self.operations.drain.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(
+            into.is_empty(),
+            "the previous shared-work pass was not consumed"
+        );
+
+        let mut inner = lock(&self.inner);
+        into.ready.append(&mut inner.ready);
+        into.resets.append(&mut inner.resets);
+        into.credit.extend(inner.credit.drain());
+        into.actions.append(&mut inner.actions);
+        into.shutdown = core::mem::replace(&mut inner.shutdown, false);
     }
 
-    pub(crate) fn shutdown_pending(&self) -> bool {
-        lock(&self.inner).shutdown
+    /// Coherently checks shared work at an otherwise eligible idle decision.
+    pub(crate) fn work_pending_for_idle(&self) -> bool {
+        #[cfg(test)]
+        self.operations.idle.fetch_add(1, Ordering::Relaxed);
+        Self::inner_has_work(&lock(&self.inner))
+    }
+
+    /// Coherently checks shared work before normal connection completion.
+    pub(crate) fn work_pending_for_completion(&self) -> bool {
+        #[cfg(test)]
+        self.operations.completion.fetch_add(1, Ordering::Relaxed);
+        Self::inner_has_work(&lock(&self.inner))
+    }
+
+    fn inner_has_work(inner: &Inner) -> bool {
+        !inner.ready.is_empty()
+            || !inner.resets.is_empty()
+            || !inner.credit.is_empty()
+            || !inner.actions.is_empty()
+            || inner.shutdown
     }
 
     /// Marks the connection as refusing new exchanges.
@@ -205,6 +271,193 @@ impl Shared {
 
     pub(crate) fn is_gone(&self) -> bool {
         self.gone.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    use super::{Shared, SharedWork, TransportAction};
+    use crate::error::ErrorCode;
+    use crate::stream::StreamId;
+
+    fn stream(value: i64) -> StreamId {
+        StreamId::new(value).expect("a test stream")
+    }
+
+    fn code(value: u64) -> ErrorCode {
+        ErrorCode::new(value)
+    }
+
+    #[test]
+    fn one_drain_preserves_every_category_contract() {
+        let shared = Shared::new();
+        let first = stream(0);
+        let second = stream(4);
+
+        assert!(shared.mark_ready(first));
+        assert!(shared.mark_ready(second));
+        assert!(!shared.mark_ready(first), "ready entries are de-duplicated");
+        shared.reset(first, code(1));
+        shared.reset(second, code(2));
+        shared.reset(first, code(3));
+        shared.credit(first, 5);
+        shared.credit(first, 7);
+        shared.push_action(TransportAction::Reset {
+            stream: first,
+            code: code(4),
+        });
+        shared.push_action(TransportAction::StopSending {
+            stream: second,
+            code: code(5),
+        });
+        shared.request_shutdown();
+
+        let mut work = SharedWork::new();
+        shared.drain_work(&mut work);
+
+        assert_eq!(work.ready, vec![first, second]);
+        assert_eq!(work.resets, vec![(first, code(1)), (second, code(2))]);
+        assert_eq!(work.credit, vec![(first, 12)]);
+        assert_eq!(
+            work.actions,
+            vec![
+                TransportAction::Reset {
+                    stream: first,
+                    code: code(4),
+                },
+                TransportAction::StopSending {
+                    stream: second,
+                    code: code(5),
+                },
+            ]
+        );
+        assert!(work.shutdown);
+        assert!(!shared.work_pending_for_idle());
+    }
+
+    #[test]
+    fn work_arriving_after_a_drain_belongs_to_the_next_snapshot() {
+        let shared = Shared::new();
+        let first = stream(0);
+        let second = stream(4);
+        shared.mark_ready(first);
+        shared.request_shutdown();
+
+        let mut current = SharedWork::new();
+        shared.drain_work(&mut current);
+        shared.mark_ready(second);
+        shared.credit(second, 9);
+        shared.request_shutdown();
+
+        assert_eq!(current.ready, vec![first]);
+        assert!(current.shutdown);
+        assert!(shared.work_pending_for_completion());
+
+        current.ready.clear();
+        current.shutdown = false;
+        let mut next = SharedWork::new();
+        shared.drain_work(&mut next);
+        assert_eq!(next.ready, vec![second]);
+        assert_eq!(next.credit, vec![(second, 9)]);
+        assert!(next.shutdown);
+
+        let mut after = SharedWork::new();
+        shared.drain_work(&mut after);
+        assert!(!after.shutdown, "shutdown is consumed exactly once");
+    }
+
+    #[test]
+    fn a_drained_batch_is_not_replayed_after_processing_stops() {
+        let shared = Shared::new();
+        shared.credit(stream(0), 10);
+        shared.request_shutdown();
+
+        let mut owned = SharedWork::new();
+        shared.drain_work(&mut owned);
+        drop(owned);
+
+        assert!(
+            !shared.work_pending_for_completion(),
+            "destructively drained work belongs to the failed driver pass"
+        );
+    }
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn registration_and_readiness_have_no_lost_wakeup_window() {
+        let shared = Shared::new();
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+
+        shared.mark_ready(stream(0));
+        assert!(
+            shared.refresh_driver_and_work_pending(&waker),
+            "work queued before registration is found by the under-lock recheck"
+        );
+        let mut work = SharedWork::new();
+        shared.drain_work(&mut work);
+        work.ready.clear();
+
+        assert!(!shared.refresh_driver_and_work_pending(&waker));
+        shared.mark_ready(stream(4));
+        shared.wake_driver();
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            1,
+            "work queued after registration wakes the parked driver"
+        );
+    }
+
+    #[test]
+    fn operation_classes_are_consolidated_once_per_call_site() {
+        let shared = Shared::new();
+        let mut work = SharedWork::new();
+        let waker = Waker::noop();
+
+        shared.drain_work(&mut work);
+        assert!(!shared.work_pending_for_idle());
+        assert!(!shared.work_pending_for_completion());
+        assert!(!shared.refresh_driver_and_work_pending(waker));
+
+        assert_eq!(shared.operations.drain.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.operations.idle.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.operations.completion.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.operations.refresh.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn scratch_capacity_uses_the_retention_hysteresis() {
+        let mut work = SharedWork::new();
+        work.ready.reserve_exact(3000);
+        work.resets.reserve_exact(3000);
+        work.credit.reserve_exact(3000);
+        work.actions.reserve_exact(3000);
+        work.bound_retained_capacity();
+        assert!(work.ready.capacity() <= 1024);
+        assert!(work.resets.capacity() <= 1024);
+        assert!(work.credit.capacity() <= 1024);
+        assert!(work.actions.capacity() <= 1024);
+
+        work.ready.reserve_exact(1500);
+        let ordinary = work.ready.capacity();
+        work.bound_retained_capacity();
+        assert_eq!(
+            work.ready.capacity(),
+            ordinary,
+            "ordinary bursts below the high-water mark do not churn"
+        );
     }
 }
 
