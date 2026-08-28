@@ -98,7 +98,7 @@ impl Role for CountingRole {
         _conn: &mut Conn<Events>,
         _events: &mut Events,
         _stream: StreamId,
-        _fields: &[crate::http::head::ReceivedField],
+        _fields: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<()> {
         Ok(())
     }

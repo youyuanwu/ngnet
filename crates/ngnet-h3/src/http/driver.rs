@@ -46,7 +46,6 @@ use super::config::Config;
 use super::error::{Error, ErrorKind, Result};
 use super::events::{Events, Observation};
 use super::head;
-use super::head::ReceivedField;
 use super::quic::{QuicConnection, QuicEvent, StreamSource, WriteOutcome};
 use super::shared::{Registry, Shared, SharedWork, TransportAction};
 use crate::conn::{Conn, ConnBuilder, Role as CoreRole};
@@ -153,7 +152,7 @@ pub(crate) trait Role {
         conn: &mut Conn<Events>,
         events: &mut Events,
         stream: StreamId,
-        fields: &[ReceivedField],
+        fields: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<()>;
 
     /// The state machine has finished with a stream.
@@ -774,7 +773,7 @@ pub(crate) fn dispatch<Q: QuicConnection, R: Role>(
                     result?;
                 }
                 FieldSection::Trailers => {
-                    let trailers = head::received_trailers(&fields)?;
+                    let trailers = head::trailers(&fields)?;
                     if let Some(incoming) = driver.registry.incoming(stream) {
                         incoming.set_trailers(trailers);
                     }

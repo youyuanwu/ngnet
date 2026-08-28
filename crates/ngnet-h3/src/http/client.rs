@@ -294,7 +294,7 @@ where
                     continue;
                 }
             };
-            let nva = fields.nva()?;
+            let views = fields.views()?;
 
             let ending = Arc::new(std::sync::Mutex::new(None));
             let has_body = !body.is_end_stream();
@@ -313,7 +313,7 @@ where
             // looked at -- must settle the caller's future rather than escape as a
             // connection error. The command has already been popped, so nothing else will
             // ever settle it, and a future nobody settles is a hang.
-            if let Err(error) = conn.submit_request_nva(stream, &nva, source) {
+            if let Err(error) = conn.submit_request(stream, &views, source) {
                 let refused = error.is_fatal();
                 command.slot.fail(if refused {
                     Error::from(error)
@@ -360,9 +360,9 @@ where
         _conn: &mut Conn<Events>,
         _events: &mut Events,
         stream: StreamId,
-        fields: &[head::ReceivedField],
+        fields: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<()> {
-        let head = head::received_response_head(fields)?;
+        let head = head::response_head(fields)?;
         // An informational response is not the answer. Settling on one would resolve the
         // caller's future and then leave a second head arriving on a stream it believes is
         // finished.
@@ -414,7 +414,7 @@ impl<B> ClientRole<B> {
                     // Submitted here rather than by the body, which is pulled from inside an
                     // FFI call and cannot reach the connection.
                     let fields = head::trailer_fields(&trailers)?;
-                    conn.submit_trailers_nva(*stream, &fields.nva()?)?;
+                    conn.submit_trailers(*stream, &fields.views()?)?;
                 }
                 Ending::Failed => {
                     // One caller's body failing takes down one exchange. Reporting it to the

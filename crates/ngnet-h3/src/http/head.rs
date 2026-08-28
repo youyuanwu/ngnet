@@ -32,80 +32,6 @@
 
 use super::error::{Error, ErrorKind, Result};
 use crate::Header;
-use ngnet_h3_sys as sys;
-
-const INLINE_NAME: usize = 32;
-const INLINE_VALUE: usize = 128;
-
-/// One received field with bounded inline storage and a heap fallback.
-#[derive(Debug)]
-pub(crate) struct ReceivedField {
-    name: SmallBytes<INLINE_NAME>,
-    value: SmallBytes<INLINE_VALUE>,
-}
-
-impl ReceivedField {
-    pub(crate) fn new(name: &[u8], value: &[u8]) -> Self {
-        Self {
-            name: SmallBytes::new(name),
-            value: SmallBytes::new(value),
-        }
-    }
-
-    fn name(&self) -> &[u8] {
-        self.name.as_ref()
-    }
-
-    pub(crate) fn value(&self) -> &[u8] {
-        self.value.as_ref()
-    }
-}
-
-#[derive(Debug)]
-enum SmallBytes<const N: usize> {
-    Inline { len: u8, bytes: [u8; N] },
-    Heap(Box<[u8]>),
-}
-
-impl<const N: usize> SmallBytes<N> {
-    fn new(value: &[u8]) -> Self {
-        if value.len() <= N {
-            let mut bytes = [0; N];
-            bytes[..value.len()].copy_from_slice(value);
-            Self::Inline {
-                len: value.len() as u8,
-                bytes,
-            }
-        } else {
-            Self::Heap(value.into())
-        }
-    }
-}
-
-impl<const N: usize> AsRef<[u8]> for SmallBytes<N> {
-    fn as_ref(&self) -> &[u8] {
-        match self {
-            Self::Inline { len, bytes } => &bytes[..usize::from(*len)],
-            Self::Heap(bytes) => bytes,
-        }
-    }
-}
-
-trait FieldRef {
-    fn parts(&self) -> (&[u8], &[u8]);
-}
-
-impl FieldRef for ReceivedField {
-    fn parts(&self) -> (&[u8], &[u8]) {
-        (self.name(), self.value())
-    }
-}
-
-impl FieldRef for (Vec<u8>, Vec<u8>) {
-    fn parts(&self) -> (&[u8], &[u8]) {
-        (&self.0, &self.1)
-    }
-}
 
 /// Field names HTTP/3 forbids outright.
 ///
@@ -132,12 +58,6 @@ pub(crate) struct OwnedFields {
 }
 
 impl OwnedFields {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            fields: Vec::with_capacity(capacity),
-        }
-    }
-
     fn push(&mut self, name: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
         self.fields.push((name.into(), value.into()));
     }
@@ -157,36 +77,6 @@ impl OwnedFields {
                         error,
                     )
                 })
-            })
-            .collect()
-    }
-
-    pub(crate) fn validate(&self) -> Result<()> {
-        for (name, value) in &self.fields {
-            Header::new(name, value).map_err(|error| {
-                Error::with_source(
-                    ErrorKind::Protocol,
-                    "this head is not a valid HTTP/3 field section",
-                    error,
-                )
-            })?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn nva(&self) -> Result<Vec<sys::nghttp3_nv>> {
-        self.fields
-            .iter()
-            .map(|(name, value)| {
-                Header::new(name, value)
-                    .map(|field| field.as_nv())
-                    .map_err(|error| {
-                        Error::with_source(
-                            ErrorKind::Protocol,
-                            "this head is not a valid HTTP/3 field section",
-                            error,
-                        )
-                    })
             })
             .collect()
     }
@@ -232,7 +122,7 @@ pub(crate) fn request_fields(parts: &http::request::Parts) -> Result<OwnedFields
         ));
     }
 
-    let mut fields = OwnedFields::with_capacity(parts.headers.len() + 4);
+    let mut fields = OwnedFields::default();
     fields.push(":method", parts.method.as_str());
 
     // Unlike the HTTP/2 crate beside this one, both schemes are carried. The default when
@@ -293,7 +183,7 @@ pub(crate) fn request_fields(parts: &http::request::Parts) -> Result<OwnedFields
 
     // Validated before anything is submitted, so a rejected head never half-touches the
     // connection and the error names the caller's mistake rather than a native return code.
-    fields.validate()?;
+    fields.views()?;
     Ok(fields)
 }
 
@@ -301,7 +191,7 @@ pub(crate) fn request_fields(parts: &http::request::Parts) -> Result<OwnedFields
 ///
 /// A response carries exactly one pseudo-header, `:status`, and it must come first.
 pub(crate) fn response_fields(parts: &http::response::Parts) -> Result<OwnedFields> {
-    let mut fields = OwnedFields::with_capacity(parts.headers.len() + 1);
+    let mut fields = OwnedFields::default();
     fields.push(":status", parts.status.as_str());
 
     for (name, value) in &parts.headers {
@@ -318,7 +208,7 @@ pub(crate) fn response_fields(parts: &http::response::Parts) -> Result<OwnedFiel
         fields.push(name, value.as_bytes());
     }
 
-    fields.validate()?;
+    fields.views()?;
     Ok(fields)
 }
 
@@ -329,14 +219,6 @@ pub(crate) fn response_fields(parts: &http::response::Parts) -> Result<OwnedFiel
 /// does, and rejecting a head that cannot make one is the other half of it — a request
 /// missing a pseudo-header is malformed, not merely inconvenient.
 pub(crate) fn request_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Request<()>> {
-    request_head_from(fields)
-}
-
-pub(crate) fn received_request_head(fields: &[ReceivedField]) -> Result<http::Request<()>> {
-    request_head_from(fields)
-}
-
-fn request_head_from<F: FieldRef>(fields: &[F]) -> Result<http::Request<()>> {
     let mut builder = http::Request::builder();
     let mut method = None;
     let mut scheme = None;
@@ -345,15 +227,14 @@ fn request_head_from<F: FieldRef>(fields: &[F]) -> Result<http::Request<()>> {
     let mut host = None;
     let mut seen_field = false;
 
-    for field in fields {
-        let (name, value) = field.parts();
+    for (name, value) in fields {
         if name.first() == Some(&b':') {
             if seen_field {
                 return Err(protocol(
                     "a request must send its pseudo-headers before any other field",
                 ));
             }
-            let slot = match name {
+            let slot = match name.as_slice() {
                 b":method" => &mut method,
                 b":scheme" => &mut scheme,
                 b":authority" => &mut authority,
@@ -375,7 +256,7 @@ fn request_head_from<F: FieldRef>(fields: &[F]) -> Result<http::Request<()>> {
                     "a request carries each pseudo-header at most once",
                 ));
             }
-            *slot = Some(value.to_vec());
+            *slot = Some(value.clone());
             continue;
         }
 
@@ -389,7 +270,7 @@ fn request_head_from<F: FieldRef>(fields: &[F]) -> Result<http::Request<()>> {
         // This rule is protocol-agnostic: RFC 9114 inherits it from HTTP semantics, not
         // from anything HTTP/2-specific.
         if name.eq_ignore_ascii_case(b"host") {
-            host = Some(value.to_vec());
+            host = Some(value.clone());
             continue;
         }
         let name = http::HeaderName::from_bytes(name)
@@ -494,21 +375,12 @@ fn request_head_from<F: FieldRef>(fields: &[F]) -> Result<http::Request<()>> {
 /// The section arrives as a flat list because that is how it is delivered field by field;
 /// `:status` is extracted and everything else becomes an ordinary field.
 pub(crate) fn response_head(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::Response<()>> {
-    response_head_from(fields)
-}
-
-pub(crate) fn received_response_head(fields: &[ReceivedField]) -> Result<http::Response<()>> {
-    response_head_from(fields)
-}
-
-fn response_head_from<F: FieldRef>(fields: &[F]) -> Result<http::Response<()>> {
     let mut builder = http::Response::builder();
     let mut status = None;
 
-    for field in fields {
-        let (name, value) = field.parts();
+    for (name, value) in fields {
         if name.first() == Some(&b':') {
-            if name != b":status" {
+            if name.as_slice() != b":status" {
                 return Err(protocol("a response carries no pseudo-header but :status"));
             }
             if status.is_some() {
@@ -566,7 +438,7 @@ pub(crate) fn is_informational(status: http::StatusCode) -> bool {
 /// the connection-specific names HTTP/3 forbids are forbidden here too. A caller who set one
 /// is told rather than having it quietly dropped.
 pub(crate) fn trailer_fields(trailers: &http::HeaderMap) -> Result<OwnedFields> {
-    let mut fields = OwnedFields::with_capacity(trailers.len());
+    let mut fields = OwnedFields::default();
 
     for (name, value) in trailers {
         let name = name.as_str();
@@ -578,7 +450,7 @@ pub(crate) fn trailer_fields(trailers: &http::HeaderMap) -> Result<OwnedFields> 
         fields.push(name, value.as_bytes());
     }
 
-    fields.validate()?;
+    fields.views()?;
     Ok(fields)
 }
 
@@ -587,18 +459,9 @@ pub(crate) fn trailer_fields(trailers: &http::HeaderMap) -> Result<OwnedFields> 
 /// Trailers are ordinary fields only: a pseudo-header after a message has begun is
 /// malformed, and RFC 9114 §4.3 says so explicitly.
 pub(crate) fn trailers(fields: &[(Vec<u8>, Vec<u8>)]) -> Result<http::HeaderMap> {
-    trailers_from(fields)
-}
-
-pub(crate) fn received_trailers(fields: &[ReceivedField]) -> Result<http::HeaderMap> {
-    trailers_from(fields)
-}
-
-fn trailers_from<F: FieldRef>(fields: &[F]) -> Result<http::HeaderMap> {
     let mut map = http::HeaderMap::with_capacity(fields.len());
 
-    for field in fields {
-        let (name, value) = field.parts();
+    for (name, value) in fields {
         if name.first() == Some(&b':') {
             return Err(protocol(
                 "a trailing field section carries no pseudo-headers",
@@ -853,18 +716,6 @@ mod tests {
         assert_eq!(head.uri().path(), "/things");
         assert_eq!(head.uri().query(), Some("q=1"));
         assert_eq!(head.headers().get("accept").unwrap(), "text/plain");
-    }
-
-    #[test]
-    fn received_fields_keep_small_values_inline_and_large_values_owned() {
-        let small = ReceivedField::new(b"x-short", b"value");
-        assert!(matches!(small.name, SmallBytes::Inline { .. }));
-        assert!(matches!(small.value, SmallBytes::Inline { .. }));
-
-        let large_value = vec![b'x'; INLINE_VALUE + 1];
-        let large = ReceivedField::new(b"x-large", &large_value);
-        assert!(matches!(large.value, SmallBytes::Heap(_)));
-        assert_eq!(large.value(), large_value);
     }
 
     #[test]
