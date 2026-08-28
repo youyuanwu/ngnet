@@ -183,9 +183,14 @@ fn a_local_close_is_observed_by_the_peer() {
             // peer ever sees and the ordering claim -- queued records leave before the close
             // -- is not being tested at all.
             let stream = open_bidi(&mut client).await.expect("opening a stream");
-            write_all(&mut client, stream, b"before the close", true)
-                .await
-                .expect("writing");
+            assert!(matches!(
+                client.try_write_stream(stream, b"before the close", true),
+                Ok(ngnet_qmux::io::StreamWrite::Accepted(16))
+            ));
+            assert!(
+                client.queued_output() > 0,
+                "the close must begin with a retained record to test ordering"
+            );
             close(&mut client, &reason).await.expect("closing");
         },
         async {
@@ -599,11 +604,13 @@ fn finishing_without_a_close_shuts_the_write_side_down() {
     let mut conn =
         Connection::client(near, TestClock::new(), Config::new()).expect("constructing a client");
 
-    // Nothing has been pumped, deliberately. An ending has to *produce* what the state
-    // machine has queued and not merely flush what is already in the buffer: a reset or a
-    // stop-sending issued just before the end lives inside the state machine until a
-    // production pass turns it into a record, and an ending that skipped that would drop
-    // exactly the frames explaining why it is ending.
+    let buffered = poll_once(|cx| conn.poll_pump_buffered(cx));
+    assert!(matches!(buffered, Poll::Ready(Ok(()))));
+    assert!(
+        conn.queued_output() > 0,
+        "the finish must start with retained output to exercise its flush obligation"
+    );
+
     let finished = poll_once(|cx| conn.poll_finish(cx));
     assert!(
         matches!(finished, Poll::Ready(Ok(()))),
@@ -625,4 +632,48 @@ fn finishing_without_a_close_shuts_the_write_side_down() {
         announced > 0,
         "finishing flushed nothing, so the transport parameters never left the buffer"
     );
+}
+
+#[test]
+fn an_orderly_inbound_end_does_not_strand_retained_output() {
+    let (near, mut far) = stream_pair();
+    let mut conn =
+        Connection::client(near, TestClock::new(), Config::new()).expect("constructing a client");
+
+    assert!(matches!(
+        poll_once(|cx| conn.poll_pump_buffered(cx)),
+        Poll::Ready(Ok(()))
+    ));
+    assert!(conn.queued_output() > 0);
+    assert!(matches!(
+        poll_once(|cx| far.poll_shutdown(cx)),
+        Poll::Ready(Ok(()))
+    ));
+
+    let ending = match poll_once(|cx| conn.poll_next_event_buffered(cx)) {
+        Poll::Ready(Err(error)) => error,
+        other => panic!("the peer's orderly end was not reported: {other:?}"),
+    };
+    assert_eq!(ending.kind(), ErrorKind::EndOfStream);
+    assert!(
+        conn.queued_output() > 0,
+        "the buffered form unexpectedly forced output while reporting EOF"
+    );
+
+    assert!(matches!(
+        poll_once(|cx| conn.poll_finish(cx)),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(conn.queued_output(), 0);
+
+    let mut received = 0usize;
+    let mut buffer = [0_u8; 512];
+    loop {
+        match poll_once(|cx| far.poll_read(cx, &mut buffer)) {
+            Poll::Ready(Ok(0)) => break,
+            Poll::Ready(Ok(read)) => received += read,
+            other => panic!("the peer should receive the retained output and EOF: {other:?}"),
+        }
+    }
+    assert!(received > 0, "the retained announcement was discarded");
 }

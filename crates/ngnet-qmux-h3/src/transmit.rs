@@ -31,9 +31,10 @@ const MAX_OFFERS: usize = 64;
 /// record had reached the byte stream; that rule is gone, and a flushing pump here would now
 /// buy nothing while costing a write per record.
 ///
-/// After the loop it is [`pump::pump`], which writes everything. That is the pass's obligation
-/// to its driver: whatever the offers produced is on the byte stream by the time this returns,
-/// because no other call is obliged to come along and move it.
+/// After the loop it remains [`pump::pump_buffered`]. The driver may start another productive
+/// pass in the same poll, so those records can coalesce with its output. The separate
+/// `QuicConnection::poll_flush` suspension hook is what writes everything before the task can
+/// park; capacity pressure still writes here to make room.
 pub(crate) fn drain<S: AsyncByteStream, C: Clock, Src: StreamSource>(
     inner: &mut Inner<S, C>,
     cx: &mut Context<'_>,
