@@ -9,8 +9,8 @@ This is the implementation backlog produced by
 The order is measured payoff divided by implementation risk, not source order.
 
 Items 1 and 2 are settled; item 3 is closed without implementation after reprofiling. Item 4 is
-the highest-priority open performance item, but its run-09 attribution must also be refreshed
-before implementation.
+the highest-priority open performance item, confirmed by a current differential profile and a
+controlled diagnostic.
 
 1. **Replace `ngnet-h3`'s linear closed-stream lookup — settled.** `Driver::close_stream` scanned a
    1024-entry tombstone `Vec` on every close after a connection reaches steady state. A
@@ -48,13 +48,28 @@ before implementation.
    inclusive bound of at most 2.28%, only a strict subset of which reuse could remove. The
    profile-first gate therefore rejected implementation before a prototype was created; see
    [`run 12`](../benchmarks/data/xeon-8370c-azure/12-apply-events-reprofile.md).
-4. **Collapse the HTTP/3 driver's repeated shared-state probes.** Run 09 historically attributed
-   about 1.35 microseconds, or 4.6% of an empty exchange, to the separate `Shared::*_pending` and
-   `take_*` checks. Reprofile before designing this item; run 12 demonstrates that run-09
-   absolute and proportional attributions are not current after items 1 and 2. If the hotspot
-   remains, investigate one combined readiness word or one collected action batch rather than
-   probing each category separately, and measure before retaining it.
-5. **Test HTTP/2 coalescing beyond one 16 KiB frame.** This is comparative work, not a QMux
+4. **Remove the duplicate QMux pump in `QmuxConnection::poll_event`.** The join pumps once at
+   the start of `poll_event`, then, when no translated event is already held, `fill()` calls
+   `Connection::poll_next_event_buffered`, which pumps again. Current exact counts show 96
+   transport reads per empty QMux/H3 exchange against HTTP/2's seven. A one-line diagnostic
+   that leaves exactly one pump on either branch removes 23 reads and measures **5.4% faster
+   duplex serial and 3.7% faster socket serial**, with unchanged controls; socket concurrency
+   improves 1.5–1.7%. Implement it with progress, wake-registration, queued-release, event-order,
+   flush, and close/error-tail tests rather than landing the diagnostic alone. See
+   [`run 13`](../benchmarks/data/xeon-8370c-azure/13-qmux-h3-current-bottlenecks.md).
+5. **Collapse the HTTP/3 driver's repeated shared-state probes.** The fresh profile counts 155
+   named `Shared` take/pending/readiness calls per empty QMux/H3 exchange. They account for
+   2.71 microseconds / 10.9% of QMux/H3 CPU, but analogous HTTP/2 methods already account for
+   1.16 microseconds / 10.4%, so they are secondary rather than the main cross-stack
+   differential. After item 4, investigate one combined drain/readiness snapshot under the
+   existing single mutex and measure before retaining it.
+6. **Design a cheaper ownership path for delivered record data.** At 1 MiB, QMux/H3 performs
+   818 allocator calls against HTTP/2's 205, and 83% of QMux/H3 malloc stacks belong to the
+   per-record delivery ownership path. The known pooled-reference design cut allocations but
+   was 2.5–4.8% slower, so do not repeat it. Any new design must remove the owned event
+   allocation without pool bookkeeping or long-lived large-buffer pinning, and must win a
+   timed A/B.
+7. **Test HTTP/2 coalescing beyond one 16 KiB frame.** This is comparative work, not a QMux
    defect. At a 1 MiB exchange HTTP/2 issues 189 writes and QMux issues 68; the measured HTTP/2
    maximum is exactly 16 KiB while QMux can empty a 64 KiB buffer. A prototype must establish
    whether coalescing frames recovers the kernel-path gap without regressing latency or
