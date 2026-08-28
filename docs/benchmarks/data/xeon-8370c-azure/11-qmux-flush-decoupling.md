@@ -74,8 +74,9 @@ two-point subtraction removes both. HTTP/2 used `writev`; QMux used `sendto`; `s
 and the other protocol's write primitive were zero throughout.
 
 Run 09 summarised the old linear shape as `2n + 2`. The 64-stream observation here is about
-two writes above that idealised formula because the runtime occasionally slices a batch; the
-per-stream term, rather than an exact intercept, is the defect this run tests.
+two writes above that idealised formula. That small offset is scheduling-dependent, but this
+aggregate syscall probe does not isolate its source; the per-stream term, rather than an exact
+intercept, is the defect this run tests.
 
 | Revision | arm | streams | `c(1000)` | `c(3000)` | writes per batch |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -93,8 +94,9 @@ per-stream term, rather than an exact intercept, is the defect this run tests.
 | after | QMux `sendto` | 64 | 3058 | 9161 | 3.052 |
 
 The after-side values satisfy all three pre-registered limits:
-`w(8) <= w(1) + 2`, `w(64) <= w(1) + 4`, and `w(64) <= 12`. The small fractional increase is
-occasional scheduler slicing across 1,000 batches, not a per-stream term. The deterministic
+`w(8) <= w(1) + 2`, `w(64) <= w(1) + 4`, and `w(64) <= 12`. The small fractional increase is consistent with occasional scheduler slicing across 1,000
+batches, though the aggregate probe does not attribute individual extra calls. It is not a
+per-stream term. The deterministic
 in-memory regression counts both endpoints and obtains exactly 5 writes at 1, 8, and 64. The
 socket probe counts the process's socket syscalls after setup and obtains approximately 3; the
 fixed offset differs, but both instruments now have a constant concurrency shape and both
