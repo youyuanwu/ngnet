@@ -199,6 +199,9 @@ impl<R: Role> DriverGuard<R> {
 #[cfg(test)]
 #[path = "driver/closed_streams.rs"]
 mod closed_streams;
+#[cfg(test)]
+#[path = "driver/shared_snapshot.rs"]
+mod shared_snapshot_tests;
 
 impl<R: Role> Drop for DriverGuard<R> {
     fn drop(&mut self) {

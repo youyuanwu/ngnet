@@ -40,7 +40,7 @@ resets, returned credit, transport actions, and graceful shutdown. They already 
 mutex because they are consumed at the same pass boundary. The driver transfers all five into
 reused driver-owned scratch with one acquisition, releases the lock, then processes them in the
 established credit, action, reset, ready, shutdown order. No shared lock spans a call into
-nghttp3, a transport, a body, or a waker.
+nghttp3, a transport, or a body, and no waker is invoked while the lock is held.
 
 The transfer is a scheduling and ownership boundary. Work queued after it belongs to the next
 pass, so processing an early category cannot pull a later category across the boundary. If a

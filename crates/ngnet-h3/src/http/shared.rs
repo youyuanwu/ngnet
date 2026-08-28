@@ -254,6 +254,16 @@ impl Shared {
             || inner.shutdown
     }
 
+    #[cfg(test)]
+    pub(crate) fn operation_counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.operations.drain.load(Ordering::Relaxed),
+            self.operations.idle.load(Ordering::Relaxed),
+            self.operations.completion.load(Ordering::Relaxed),
+            self.operations.refresh.load(Ordering::Relaxed),
+        )
+    }
+
     /// Marks the connection as refusing new exchanges.
     pub(crate) fn set_refusing(&self) {
         self.refusing.store(true, Ordering::Release);
@@ -418,23 +428,6 @@ mod tests {
             1,
             "work queued after registration wakes the parked driver"
         );
-    }
-
-    #[test]
-    fn operation_classes_are_consolidated_once_per_call_site() {
-        let shared = Shared::new();
-        let mut work = SharedWork::new();
-        let waker = Waker::noop();
-
-        shared.drain_work(&mut work);
-        assert!(!shared.work_pending_for_idle());
-        assert!(!shared.work_pending_for_completion());
-        assert!(!shared.refresh_driver_and_work_pending(waker));
-
-        assert_eq!(shared.operations.drain.load(Ordering::Relaxed), 1);
-        assert_eq!(shared.operations.idle.load(Ordering::Relaxed), 1);
-        assert_eq!(shared.operations.completion.load(Ordering::Relaxed), 1);
-        assert_eq!(shared.operations.refresh.load(Ordering::Relaxed), 1);
     }
 
     #[test]

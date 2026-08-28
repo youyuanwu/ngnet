@@ -85,7 +85,7 @@ The bulk arms show no regression but remain guards rather than optimization clai
 
 The retained final is faster on every target. Socket concurrency 64 does not clear the 2% floor
 or final-side spread and is unclaimed. Both bulk arms remain regression guards; the duplex guard
-also does not exceed its matching control movement.
+does not clear the pre-registered 10.42% historical within-host drift for that identifier.
 
 ## Exact-revision binaries
 
