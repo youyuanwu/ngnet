@@ -179,6 +179,42 @@ fn an_empty_event_poll_uses_one_pump_and_one_transport_read() {
     );
 }
 
+/// An open uses the lower operation's pump rather than duplicating it in the join.
+#[cfg(debug_assertions)]
+#[test]
+fn a_ready_open_uses_two_pumps() {
+    let mut pair = Pair::new();
+    pair.settle();
+    pair.reads.0.clear();
+    let pumps = pair.client.pump_calls();
+    let (waker, _) = pair.context();
+    let mut cx = Context::from_waker(&waker);
+
+    let stream = match pair.client.poll_open_bi(&mut cx) {
+        Poll::Ready(Ok(stream)) => stream,
+        other => panic!("the ready open did not complete: {other:?}"),
+    };
+    assert_eq!(
+        pair.client.pump_calls() - pumps,
+        2,
+        "a ready open needs the lower open pump and the post-open production pump"
+    );
+    assert_eq!(
+        pair.reads.0.reads(),
+        2,
+        "each retained open pump must still reach and register a transport read"
+    );
+
+    let mut source = Offer::one(stream, b"opened stream", false);
+    pair.transmit(Side::Client, &mut source);
+    pair.settle();
+    assert_eq!(
+        data_on(pair.seen(Side::Server), stream),
+        b"opened stream",
+        "removing the duplicate pre-pump must not strand the opened stream"
+    );
+}
+
 /// A pair of endpoints that deliver to each other.
 struct Pair {
     client: Endpoint,
@@ -403,6 +439,121 @@ impl StreamSource for Offer {
             }
         }
     }
+}
+
+/// Small offers need no transport pump between the event pass and suspension flush.
+#[cfg(debug_assertions)]
+#[test]
+fn several_small_offers_share_one_entry_pump() {
+    let mut pair = Pair::new();
+    let streams: Vec<_> = (0..4).map(|_| pair.open(Side::Client, true)).collect();
+    pair.settle();
+
+    let mut source = Offer::new(
+        streams
+            .iter()
+            .copied()
+            .map(|stream| (stream, b"small offer".to_vec(), false))
+            .collect(),
+    );
+    pair.reads.0.clear();
+    let pumps = pair.client.pump_calls();
+    pair.transmit(Side::Client, &mut source);
+
+    assert!(source.drained(), "every small offer should fit in one pass");
+    assert_eq!(
+        pair.client.pump_calls() - pumps,
+        0,
+        "offers that leave record room must not re-pump the event pass's state"
+    );
+    assert_eq!(
+        pair.reads.0.reads(),
+        0,
+        "the event pass's read registration remains live until the suspension flush"
+    );
+
+    pair.settle();
+    for stream in streams {
+        assert_eq!(
+            data_on(pair.seen(Side::Server), stream),
+            b"small offer",
+            "an offer was reordered or stranded when its per-offer pump was removed"
+        );
+    }
+}
+
+/// A byte-stream failure racing the offer loop is latched by the suspension flush.
+#[cfg(debug_assertions)]
+#[test]
+fn a_terminal_between_offers_is_reported_after_accepted_releases() {
+    struct FaultBetweenOffers {
+        inner: Offer,
+        fault: FaultControl,
+        calls: usize,
+    }
+
+    impl StreamSource for FaultBetweenOffers {
+        fn write_next(
+            &mut self,
+            write: &mut dyn FnMut(StreamId, &[IoSlice<'_>], bool) -> WriteOutcome,
+        ) -> bool {
+            if self.calls == 1 {
+                self.fault.inject(Fault::Broken);
+            }
+            self.calls += 1;
+            self.inner.write_next(write)
+        }
+    }
+
+    impl Drivable for FaultBetweenOffers {
+        fn drained(&self) -> bool {
+            self.inner.drained()
+        }
+    }
+
+    let mut pair = Pair::new();
+    let first = pair.open(Side::Client, true);
+    let second = pair.open(Side::Client, true);
+    pair.settle();
+    let mut source = FaultBetweenOffers {
+        inner: Offer::new(vec![
+            (first, b"before failure".to_vec(), false),
+            (second, b"after failure".to_vec(), false),
+        ]),
+        fault: pair.faults.0.clone(),
+        calls: 0,
+    };
+
+    pair.transmit(Side::Client, &mut source);
+    assert!(
+        source.drained(),
+        "the injected failure must occur between two accepted offers"
+    );
+
+    let (waker, flag) = pair.context();
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        pair.client.poll_flush(&mut cx).is_ready(),
+        "the mandatory suspension flush must discover the raced byte-stream failure"
+    );
+
+    let mut releases = 0;
+    for _ in 0..8 {
+        match pair.client.poll_event(&mut cx) {
+            Poll::Ready(Ok(QuicEvent::Released { .. })) => releases += 1,
+            Poll::Ready(Ok(_)) => {}
+            Poll::Ready(Err(_)) => {
+                assert_eq!(
+                    releases, 2,
+                    "accepted buffers must be released before the terminal error"
+                );
+                return;
+            }
+            Poll::Pending if flag.take() => {}
+            Poll::Pending => panic!("the raced terminal error was not scheduled"),
+        }
+    }
+    panic!("the raced terminal error was not reported");
 }
 
 /// A stream source a test can drive to exhaustion.

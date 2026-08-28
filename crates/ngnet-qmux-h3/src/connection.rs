@@ -377,10 +377,9 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
         // capacity the peer has not granted -- and credit stranded behind a park is a window
         // the peer is never told about while both ends wait for the other.
         self.flush_credit();
-        pump::pump_buffered(self, cx);
-        if self.ending.is_some() {
-            return Poll::Ready(Err(self.ended()));
-        }
+        // The lower open operation begins with the same buffered pump. Doing one here as well
+        // reads and writes the identical state twice before anything between the calls can
+        // change it.
         let opened = if bidi {
             self.conn.poll_open_bidi_buffered(cx)
         } else {

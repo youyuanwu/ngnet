@@ -4,7 +4,8 @@ use core::task::Context;
 
 use ngnet_h3::StreamId as H3StreamId;
 use ngnet_h3::http::{StreamSource, WriteOutcome};
-use ngnet_qmux::io::{AsyncByteStream, Clock, Error as LayerError, StreamWrite};
+use ngnet_qmux::DEFAULT_MAX_RECORD_SIZE;
+use ngnet_qmux::io::{AsyncByteStream, Clock, Error as LayerError, OUTBOUND_CEILING, StreamWrite};
 
 use crate::connection::Inner;
 use crate::event::qmux_stream;
@@ -21,20 +22,14 @@ const MAX_OFFERS: usize = 64;
 
 /// Pulls from the HTTP/3 layer while the connection can carry more.
 ///
-/// The connection is pumped *between* offers rather than only at the end, and the two pumps
-/// are deliberately different operations.
+/// The connection is pumped only when another offer would exceed its bounded output room.
 ///
-/// Between offers it is [`pump::pump_buffered`]: it lets the connection read, and lets it write
-/// when its output buffer has no room for another record, but leaves what a pass has produced
-/// to accumulate. That is what turns a run of offers into a run of records in one write. It
-/// used to be a flushing pump, because the layer below refused the next offer until the last
-/// record had reached the byte stream; that rule is gone, and a flushing pump here would now
-/// buy nothing while costing a write per record.
-///
-/// After the loop it remains [`pump::pump_buffered`]. The driver may start another productive
-/// pass in the same poll, so those records can coalesce with its output. The separate
-/// `QuicConnection::poll_flush` suspension hook is what writes everything before the task can
-/// park; capacity pressure still writes here to make room.
+/// The event pass before transmit has already pumped and registered the transport read. A
+/// pump before every offer would poll the same pending read while neither this task nor the
+/// source can make inbound bytes appear. The loop instead compares the lower connection's
+/// bounded output against the room one record requires and calls [`pump::pump_buffered`] only
+/// to make room. Records otherwise accumulate until the separate `QuicConnection::poll_flush`
+/// suspension hook writes everything and registers the read again before the task can park.
 pub(crate) fn drain<S: AsyncByteStream, C: Clock, Src: StreamSource>(
     inner: &mut Inner<S, C>,
     cx: &mut Context<'_>,
@@ -45,7 +40,16 @@ pub(crate) fn drain<S: AsyncByteStream, C: Clock, Src: StreamSource>(
         // further record: offering into a buffer with no room collects nothing but
         // `Blocked`, which would tell the layer its streams are stalled when only the socket
         // is, and take them out of the running until something else woke them.
-        if !pump::pump_buffered(inner, cx) {
+        //
+        // The event pass immediately before this one and the suspension flush immediately
+        // after it own transport progress. This loop needs a pump only when a large preceding
+        // offer consumed the remaining output room within the pass. The constants are the
+        // exact predicate used by the lower connection's `room_for_record`; testing it here
+        // prevents a buffer-full refusal from being reported as peer flow-control
+        // backpressure.
+        if inner.conn.queued_output() + DEFAULT_MAX_RECORD_SIZE as usize > OUTBOUND_CEILING
+            && !pump::pump_buffered(inner, cx)
+        {
             break;
         }
 
@@ -126,8 +130,7 @@ pub(crate) fn drain<S: AsyncByteStream, C: Clock, Src: StreamSource>(
         }
     }
 
-    // Keep a sub-ceiling tail across the driver's internal passes. The driver calls the
-    // transport's explicit flush operation before its connection future can suspend, and a
-    // full buffer still writes here to make room.
-    pump::pump_buffered(inner, cx);
+    // Keep a sub-ceiling tail across the driver's internal passes. The event poll has already
+    // registered the read wake; the driver's explicit suspension hook flushes the tail and
+    // registers again before a real park, and capacity pressure still writes above.
 }
