@@ -667,6 +667,25 @@ impl<S: AsyncByteStream, C: Clock> QuicConnection for QmuxConnection<S, C> {
         })
     }
 
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        self.with(|inner| {
+            inner.flush_credit();
+            let ended_before = inner.has_ended();
+            if pump::pump(inner, cx) {
+                return Poll::Ready(Ok(()));
+            }
+            if inner.has_ended() {
+                // The operation which parked will report this ending in its existing shape.
+                // Only a newly discovered ending needs a wake; repeating it would spin.
+                if !ended_before {
+                    cx.waker().wake_by_ref();
+                }
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Pending
+        })
+    }
+
     fn poll_open_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<H3StreamId>> {
         self.with(|inner| inner.poll_open(cx, false))
     }

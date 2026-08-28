@@ -564,6 +564,10 @@ impl<Q: QuicConnection> QuicConnection for Recorder<Q> {
         inner.poll_transmit(cx, &mut recording)
     }
 
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_flush(cx)
+    }
+
     fn poll_open_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<StreamId, Self::Error>> {
         self.inner.poll_open_uni(cx)
     }
@@ -733,6 +737,10 @@ impl QuicConnection for Stub {
         while source.write_next(&mut |_stream, slices, _fin| {
             WriteOutcome::Accepted(slices.iter().map(|slice| slice.len()).sum())
         }) {}
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 

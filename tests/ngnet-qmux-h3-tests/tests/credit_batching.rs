@@ -170,6 +170,12 @@ impl<S: AsyncByteStream, C: Clock> QuicConnection for Counting<QmuxConnection<S,
         outcome
     }
 
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let outcome = self.inner.poll_flush(cx);
+        self.sync();
+        outcome
+    }
+
     fn poll_open_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<StreamId, Self::Error>> {
         let opened = self.inner.poll_open_uni(cx);
         self.sync();

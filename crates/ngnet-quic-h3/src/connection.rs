@@ -3,13 +3,13 @@
 use core::net::SocketAddr;
 use core::task::{Context, Poll, Waker};
 
-use ngnet_h3::http::{QuicConnection, QuicEvent, StreamSource};
 use ngnet_h3::StreamId as H3StreamId;
+use ngnet_h3::http::{QuicConnection, QuicEvent, StreamSource};
 use ngnet_h3::{ErrorCode, Timestamp as H3Timestamp};
 use ngnet_quic::endpoint::{DetachedConnection, Endpoint, Observed};
 use ngnet_quic::{
-    ApplicationErrorCode, Directionality, ErrorKind as QuicErrorKind, Initiator, Role, StreamId,
-    Timestamp, Session,
+    ApplicationErrorCode, Directionality, ErrorKind as QuicErrorKind, Initiator, Role, Session,
+    StreamId, Timestamp,
 };
 
 use crate::error::{Error, ErrorKind, Result};
@@ -251,11 +251,7 @@ impl<S: Session> NgtcpConnection<S> {
     }
 
     /// Opens a stream, waiting rather than failing when the peer's limit is exhausted.
-    fn poll_open(
-        &mut self,
-        cx: &mut Context<'_>,
-        bidi: bool,
-    ) -> Poll<Result<H3StreamId>> {
+    fn poll_open(&mut self, cx: &mut Context<'_>, bidi: bool) -> Poll<Result<H3StreamId>> {
         if let Err(err) = pump::pump(&mut self.detached, &self.shared, &mut self.state, cx) {
             return Poll::Ready(Err(err));
         }
@@ -361,6 +357,12 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
         }
         transmit::drain(&mut self.detached, &self.shared, &mut self.state, source)?;
         let _ = pump::poll_timer(&self.detached, &mut self.state, cx);
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+        // `poll_transmit` stages every accepted write directly in ngtcp2. There is no
+        // join-owned output left for a later driver pass.
         Poll::Ready(Ok(()))
     }
 

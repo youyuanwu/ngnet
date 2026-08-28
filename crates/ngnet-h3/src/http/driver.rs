@@ -398,6 +398,21 @@ impl<Q: QuicConnection> Driver<Q> {
         }
     }
 
+    /// Preserves a transport operation's `Pending` after discharging buffered output.
+    ///
+    /// The operation which returned `Pending` already registered the wake for its own
+    /// readiness. A transport whose flush also parks registers the same task for write
+    /// readiness. Only a flush failure changes the pending operation's result.
+    fn flush_before_pending<T>(
+        backend: &mut Q,
+        cx: &mut core::task::Context<'_>,
+    ) -> Poll<Result<T>> {
+        match backend.poll_flush(cx) {
+            Poll::Ready(Err(error)) => Poll::Ready(Err(Self::transport(error))),
+            Poll::Ready(Ok(())) | Poll::Pending => Poll::Pending,
+        }
+    }
+
     /// Turns a backend failure into the layer's error type.
     fn transport(error: Q::Error) -> Error {
         Error::with_source(ErrorKind::Transport, "the QUIC backend failed", error)
@@ -807,7 +822,15 @@ where
 
     loop {
         // 0. Bind, once, before anything else can happen.
-        poll_fn(|cx| driver.poll_bind(cx)).await?;
+        poll_fn(|cx| {
+            let bound = driver.poll_bind(cx);
+            if bound.is_pending() {
+                Driver::<Q>::flush_before_pending(&mut driver.backend, cx)
+            } else {
+                bound
+            }
+        })
+        .await?;
 
         // 1-2. Transport events, control-plane first, then reads.
         let events = poll_fn(|cx| Poll::Ready(driver.take_events(cx))).await?;
@@ -892,9 +915,15 @@ where
         // Request streams are opened by the transport, one per queued request, before the
         // role can submit anything onto them.
         while guard.role.needs_stream() {
-            match poll_fn(|cx| driver.backend.poll_open_bi(cx)).await {
+            match poll_fn(|cx| match driver.backend.poll_open_bi(cx) {
+                Poll::Pending => Driver::<Q>::flush_before_pending(&mut driver.backend, cx),
+                Poll::Ready(Ok(stream)) => Poll::Ready(Ok(stream)),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(Driver::<Q>::transport(error))),
+            })
+            .await
+            {
                 Ok(stream) => guard.role.give_stream(stream),
-                Err(error) => return Err(Driver::<Q>::transport(error)),
+                Err(error) => return Err(error),
             }
         }
 
@@ -930,10 +959,15 @@ where
                 failure: None,
                 retried: false,
             };
-            let outcome = poll_fn(|cx| driver.backend.poll_transmit(cx, &mut offers)).await;
+            let outcome = poll_fn(|cx| match driver.backend.poll_transmit(cx, &mut offers) {
+                Poll::Pending => Driver::<Q>::flush_before_pending(&mut driver.backend, cx),
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(Driver::<Q>::transport(error))),
+            })
+            .await;
             let failure = offers.failure.take();
             match outcome {
-                Err(error) => Some(Driver::<Q>::transport(error)),
+                Err(error) => Some(error),
                 Ok(()) => failure,
             }
         };
@@ -999,7 +1033,13 @@ where
                 // no peek. So it is taken and kept for the next pass rather than dropped,
                 // which is the difference between a slow connection and a lost response.
                 match driver.backend.poll_event(cx) {
-                    Poll::Pending => Poll::Pending,
+                    Poll::Pending => match driver.backend.poll_flush(cx) {
+                        Poll::Ready(Err(error)) => {
+                            driver.pushback_error = Some(Driver::<Q>::transport(error));
+                            Poll::Ready(())
+                        }
+                        Poll::Ready(Ok(())) | Poll::Pending => Poll::Pending,
+                    },
                     Poll::Ready(Ok(event)) => {
                         driver.pushback = Some(event);
                         Poll::Ready(())

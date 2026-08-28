@@ -290,6 +290,23 @@ pub trait QuicConnection {
         source: &mut S,
     ) -> Poll<Result<(), Self::Error>>;
 
+    /// Flushes output retained by the transport before the connection task suspends.
+    ///
+    /// The driver calls this only after another transport operation has returned
+    /// [`Poll::Pending`] and the connection future is about to return `Pending` to its
+    /// executor. It is not an end-of-pass hook: transports may accumulate bounded output
+    /// across the driver's internal passes.
+    ///
+    /// [`Poll::Ready`] means the current output obligation has been discharged.
+    /// [`Poll::Pending`] means progress cannot be made now and this call registered `cx` to
+    /// be woken when it can. An implementation must not return an unwoken `Pending`.
+    ///
+    /// This operation introduces no new connection-ending channel. If flushing discovers
+    /// an ending that an existing operation reports, the transport must arrange one wake
+    /// for that pending operation to be polled again and preserve its existing result
+    /// semantics. An error returned here is specifically a failure of flushing.
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+
     /// Opens a unidirectional stream.
     ///
     /// The layer opens exactly three of these, at startup, for the HTTP/3 control stream and

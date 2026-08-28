@@ -349,6 +349,11 @@ impl QuicConnection for QuinnBackend {
         }
     }
 
+    fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Quinn copies accepted writes into its own send buffers.
+        Poll::Ready(Ok(()))
+    }
+
     fn poll_open_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<StreamId, Self::Error>> {
         // `open_uni` borrows the connection, so it cannot be held across polls without
         // self-reference. `quinn::Connection` is cheap to clone, so the future owns one.
