@@ -121,7 +121,11 @@ impl QuicConnection for Parking {
 
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Result<QuicEvent, Self::Error>> {
         self.note("event");
-        map_poll(self.inner.poll_event(cx))
+        let event = map_poll(self.inner.poll_event(cx));
+        if event.is_pending() {
+            *self.operation_waker.lock().expect("operation waker") = Some(cx.waker().clone());
+        }
+        event
     }
 
     fn poll_transmit<S: StreamSource>(
@@ -240,6 +244,7 @@ fn a_ready_flush_preserves_the_pending_operations_wake() {
         (Some(ParkAt::Bind), false),
         (Some(ParkAt::Open), true),
         (Some(ParkAt::Transmit), true),
+        (None, false),
     ] {
         let (backend, control) = Parking::new(park, Flush::Ready);
         let (handle, driver) = handshake::<_, Payload>(backend).expect("constructing a connection");
