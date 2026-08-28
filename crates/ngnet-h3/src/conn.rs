@@ -664,6 +664,16 @@ impl<C> Conn<C> {
         fields: &[Header<'_>],
         body: Option<Box<dyn BodySource>>,
     ) -> Result<()> {
+        let nva: Vec<sys::nghttp3_nv> = fields.iter().map(Header::as_nv).collect();
+        self.submit_request_nva(stream, &nva, body)
+    }
+
+    pub(crate) fn submit_request_nva(
+        &mut self,
+        stream: StreamId,
+        nva: &[sys::nghttp3_nv],
+        body: Option<Box<dyn BodySource>>,
+    ) -> Result<()> {
         self.check_usable()?;
         if self.role != Role::Client {
             return Err(Error::invalid_input(
@@ -681,7 +691,6 @@ impl<C> Conn<C> {
         self.require_bound()?;
         let reader = self.attach_body(stream, body)?;
 
-        let nva: Vec<sys::nghttp3_nv> = fields.iter().map(Header::as_nv).collect();
         // SAFETY: `raw` is live; the role, stream shape and binding state have all been
         // checked; the field array plus everything it points at outlives the call, which
         // is all nghttp3 needs because no no-copy flag is set; and the data reader is
@@ -719,6 +728,16 @@ impl<C> Conn<C> {
         fields: &[Header<'_>],
         body: Option<Box<dyn BodySource>>,
     ) -> Result<()> {
+        let nva: Vec<sys::nghttp3_nv> = fields.iter().map(Header::as_nv).collect();
+        self.submit_response_nva(stream, &nva, body)
+    }
+
+    pub(crate) fn submit_response_nva(
+        &mut self,
+        stream: StreamId,
+        nva: &[sys::nghttp3_nv],
+        body: Option<Box<dyn BodySource>>,
+    ) -> Result<()> {
         self.check_usable()?;
         if self.role != Role::Server {
             return Err(Error::invalid_input(
@@ -733,7 +752,6 @@ impl<C> Conn<C> {
         self.require_bound()?;
         let reader = self.attach_body(stream, body)?;
 
-        let nva: Vec<sys::nghttp3_nv> = fields.iter().map(Header::as_nv).collect();
         // SAFETY: as `submit_request`.
         let rv = unsafe {
             sys::nghttp3_conn_submit_response(
@@ -788,6 +806,15 @@ impl<C> Conn<C> {
 
     /// Submits a trailing field section, which ends the stream.
     pub fn submit_trailers(&mut self, stream: StreamId, fields: &[Header<'_>]) -> Result<()> {
+        let nva: Vec<sys::nghttp3_nv> = fields.iter().map(Header::as_nv).collect();
+        self.submit_trailers_nva(stream, &nva)
+    }
+
+    pub(crate) fn submit_trailers_nva(
+        &mut self,
+        stream: StreamId,
+        nva: &[sys::nghttp3_nv],
+    ) -> Result<()> {
         self.check_usable()?;
         // Without this, a connection-level stream would be accepted: nghttp3 registers the
         // control and QPACK streams in the same map, so `find_stream` succeeds for them and
@@ -801,7 +828,6 @@ impl<C> Conn<C> {
         }
         self.require_bound()?;
 
-        let nva: Vec<sys::nghttp3_nv> = fields.iter().map(Header::as_nv).collect();
         // SAFETY: as `submit_request`.
         let rv = unsafe {
             sys::nghttp3_conn_submit_trailers(self.raw, stream.get(), nva.as_ptr(), nva.len())

@@ -210,7 +210,7 @@ impl Role for DoneRole {
         _conn: &mut Conn<Events>,
         _events: &mut Events,
         _stream: StreamId,
-        _fields: &[(Vec<u8>, Vec<u8>)],
+        _fields: &[crate::http::head::ReceivedField],
     ) -> super::Result<()> {
         Ok(())
     }

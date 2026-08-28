@@ -237,7 +237,7 @@ where
                 )))
             };
 
-            conn.submit_response(stream, &fields.views()?, source)?;
+            conn.submit_response_nva(stream, &fields.nva()?, source)?;
             // Only a body that exists can report how it ended; recording a slot for one
             // that cannot would grow this list with every request ever answered.
             if has_body {
@@ -252,7 +252,7 @@ where
         conn: &mut Conn<Events>,
         _events: &mut Events,
         stream: StreamId,
-        fields: &[(Vec<u8>, Vec<u8>)],
+        fields: &[head::ReceivedField],
     ) -> Result<()> {
         // Refused rather than queued. A peer that opens more exchanges than this endpoint
         // will run concurrently must be told so, or the queue is an unbounded allocation a
@@ -263,7 +263,7 @@ where
             return Ok(());
         }
 
-        let head = match head::request_head(fields) {
+        let head = match head::received_request_head(fields) {
             Ok(head) => head,
             Err(_) => {
                 // The peer sent something HTTP/3 forbids. One exchange is refused; the
@@ -367,7 +367,7 @@ impl<H, F: Future, B> ServerRole<H, F, B> {
                 Ending::Clean => {}
                 Ending::Trailers(trailers) => {
                     let fields = head::trailer_fields(&trailers)?;
-                    conn.submit_trailers(*stream, &fields.views()?)?;
+                    conn.submit_trailers_nva(*stream, &fields.nva()?)?;
                 }
                 Ending::Failed => {
                     // A handler's body failed. One exchange is abandoned; every other one

@@ -10,6 +10,7 @@
 use bytes::Bytes;
 
 use crate::handlers::{FieldSection, PeerSettings, Shutdown, StreamClosed};
+use crate::http::head::ReceivedField;
 use crate::stream::StreamId;
 
 /// Something the state machine reported.
@@ -19,7 +20,7 @@ pub(crate) enum Observation {
     Head {
         stream: StreamId,
         section: FieldSection,
-        fields: Vec<(Vec<u8>, Vec<u8>)>,
+        fields: Vec<ReceivedField>,
     },
     /// Body bytes arrived.
     Data { stream: StreamId, bytes: Bytes },
@@ -40,7 +41,7 @@ pub(crate) enum Observation {
 #[derive(Default)]
 struct Partial {
     section: Option<FieldSection>,
-    fields: Vec<(Vec<u8>, Vec<u8>)>,
+    fields: Vec<ReceivedField>,
 }
 
 /// The driver's context, and the only thing the state machine's handlers can reach.
@@ -69,12 +70,15 @@ impl Events {
         let slot = self.slot(stream);
         slot.section = Some(section);
         slot.fields.clear();
+        if slot.fields.capacity() < 8 {
+            slot.fields.reserve(8 - slot.fields.capacity());
+        }
     }
 
     /// Records one field of the section in progress.
     pub(crate) fn push_field(&mut self, stream: StreamId, name: &[u8], value: &[u8]) {
         let slot = self.slot(stream);
-        slot.fields.push((name.to_vec(), value.to_vec()));
+        slot.fields.push(ReceivedField::new(name, value));
     }
 
     /// Completes a field section.
@@ -243,14 +247,14 @@ mod tests {
         match &observed[0] {
             Observation::Head { stream, fields, .. } => {
                 assert_eq!(*stream, b);
-                assert_eq!(fields[0].1, b"404");
+                assert_eq!(fields[0].value(), b"404");
             }
             other => panic!("expected b's head first, got {other:?}"),
         }
         match &observed[1] {
             Observation::Head { stream, fields, .. } => {
                 assert_eq!(*stream, a);
-                assert_eq!(fields[0].1, b"200");
+                assert_eq!(fields[0].value(), b"200");
             }
             other => panic!("expected a's head second, got {other:?}"),
         }
