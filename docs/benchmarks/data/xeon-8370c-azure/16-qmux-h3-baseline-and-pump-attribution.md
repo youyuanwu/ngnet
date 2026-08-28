@@ -109,6 +109,370 @@ Only three of 73 reads deliver bytes. Each of the 70 pumps terminates with one p
 older attribution of 56 pumps to `fill` conflicts with 23 measured queue pops and is not used for
 design; phase 2 of this run will append a monomorphisation/inlining-safe source split.
 
+## Corrected per-source pump split
+
+The count-only follow-up used a temporary release-visible atomic at every lower pump entry and
+every join call site. It changed no branch or state transition and was never used for elapsed
+timing. Both 100- and 300-exchange runs were exact multiples; applying the normal two-point
+subtraction produces:
+
+| Lower `Connection` entry | calls/exchange |
+| --- | ---: |
+| `poll_pump` (forced) | 5 |
+| `poll_pump_buffered` | 41 |
+| `poll_next_event_with` | 23 |
+| `poll_open` | 1 |
+| `poll_write_stream` | 0 |
+| **`pump` total** | **70** |
+
+The join-side source counters reconcile those same 70 calls without a residual:
+
+| Join source | pumps/exchange |
+| --- | ---: |
+| `Inner::fill` iterations | 23 |
+| queued release/event pre-pumps in `poll_event` | 7 |
+| `poll_open`: pre-pump + lower open pump + successful post-pump | 1 + 1 + 1 = 3 |
+| `transmit::drain`: pre-offer pumps + post-drain pumps | 18 + 14 = 32 |
+| forced `poll_flush` pumps | 5 |
+| **total / residual** | **70 / 0** |
+
+This corrects the provisional structural formula: it omitted the seven queued-event pre-pumps.
+The complete observed identity is
+`fill + queued-event + open-pre + lower-open + open-post + transmit-pre + transmit-post + forced`.
+No pump remains unattributed.
+
+The earlier **56 `fill` pumps** is superseded. Its release uprobe observed only one generic
+`pump_buffered` body and assigned the balance by subtraction despite inlining. The instrumented
+binary contains duplex and socket monomorphisations of both `pump_buffered` and
+`transmit::drain`; only the selected duplex instances execute in this arm. Even after probing
+every release symbol, two-point subtraction sees 9 `pump_buffered` entries versus the atomic
+count of 41 because 32 calls are inlined. It sees `transmit::drain = 14` and
+`EventQueue::pop = 23` exactly. Release-visible source atomics, which survive inlining, are
+therefore the primary split. An unoptimised debug-symbol build independently produced the same
+two-point values.
+
+### Pop and read/write identities
+
+| Identity | measured result |
+| --- | ---: |
+| `EventQueue::pop` / `Inner::fill` | 23 / 23 |
+| empty / non-empty pops | 16 / 7 |
+| `poll_read` / pump / productive dwnx reads | 73 / 70 / 3 |
+| `write_side` / pump / produce-pending trailing writes | 73 / 70 / 3 |
+
+Thus `poll_read − pump = dwnx_conn_read = 3` and
+`write_side − pump = produce_pending = 3`. Candidate A's largest local reducible source is the
+32-pump transmit drain, and `poll_open + transmit::drain = 35`, clearing the plan's threshold
+for investigating A2 first. Candidate D does have 16 empty pops, but all 23 pops are one-for-one
+with `fill` iterations: there is no independently repeated queue operation inside a fill.
+
+### Temporary-build identity and commands
+
+| Item | SHA-256 |
+| --- | --- |
+| inline compact instrumentation patch (`git diff --binary --unified=0`) | `e8e2a9b2b7bf43afdb7efb224d7de5b1c3a789a8df733f4d477ed72364a6c536` |
+| same patch with Git's default three context lines | `cc4592265648241ef731b16d025df1e573e0a164aa2a0c49262c536ba69bfa29` |
+| release `target/release/examples/probe` | `06849b90ca1ae9b437375fda46dc93181c350ae0e5a9c47a6f4915fef2ae7c57` |
+| debug `target/debug/examples/probe` | `7e927d27a42e0491e58ca97ee39499a435abc0c873d3014d2b965edc74fc52fb` |
+
+The patch was based on `364dbb2` plus documentation-only commit `0611b81`; production sources
+were byte-identical to `364dbb2`. It touched only
+`crates/ngnet-qmux/src/io{.rs,/conn.rs,/event.rs,/instrumentation.rs}`,
+`crates/ngnet-qmux-h3/src/{lib.rs,connection.rs,transmit.rs,instrumentation.rs}`, and
+`tests/ngnet-bench/examples/probe.rs`.
+
+Commands were:
+
+```text
+rustfmt --edition 2024 <the nine Rust paths above>
+cargo test -p ngnet-qmux -p ngnet-qmux-h3 -p ngnet-qmux-h3-tests
+cargo build --release -p ngnet-bench --example probe
+taskset -c 3 target/release/examples/probe qmux-duplex body 0 {100,300}
+nm -anC target/release/examples/probe
+sudo perf stat -e probe_probe:ng_pb,probe_probe:ng_drain,probe_probe:ng_pop -- \
+  taskset -c 3 target/release/examples/probe qmux-duplex body 0 {100,300}
+cargo build -p ngnet-bench --example probe
+taskset -c 3 target/debug/examples/probe qmux-duplex body 0 {100,300}
+```
+
+<details>
+<summary>Exact temporary instrumentation patch</summary>
+
+```diff
+diff --git a/crates/ngnet-qmux-h3/src/connection.rs b/crates/ngnet-qmux-h3/src/connection.rs
+index 102fb3d..50b932c 100644
+--- a/crates/ngnet-qmux-h3/src/connection.rs
++++ b/crates/ngnet-qmux-h3/src/connection.rs
+@@ -298,0 +299 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
++            crate::instrumentation::fill_iteration();
+@@ -321,0 +323 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
++            crate::instrumentation::event_queued();
+@@ -379,0 +382 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
++        crate::instrumentation::open_pre();
+@@ -392,0 +396 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
++                crate::instrumentation::open_post();
+@@ -694,0 +699 @@ impl<S: AsyncByteStream, C: Clock> QuicConnection for QmuxConnection<S, C> {
++            crate::instrumentation::forced();
+diff --git a/crates/ngnet-qmux-h3/src/instrumentation.rs b/crates/ngnet-qmux-h3/src/instrumentation.rs
+new file mode 100644
+index 0000000..65f4123
+--- /dev/null
++++ b/crates/ngnet-qmux-h3/src/instrumentation.rs
+@@ -0,0 +1,69 @@
++//! Temporary release-visible counters for run 16 pump-source reconciliation.
++
++use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
++
++macro_rules! counter {
++    ($static:ident, $function:ident) => {
++        static $static: AtomicU64 = AtomicU64::new(0);
++        pub(crate) fn $function() {
++            $static.fetch_add(1, Relaxed);
++        }
++    };
++}
++
++counter!(FILL_ITERATION, fill_iteration);
++counter!(EVENT_QUEUED, event_queued);
++counter!(OPEN_PRE, open_pre);
++counter!(OPEN_POST, open_post);
++counter!(TRANSMIT_PRE, transmit_pre);
++counter!(TRANSMIT_POST, transmit_post);
++counter!(FORCED, forced);
++
++/// One cumulative counter snapshot.
++#[derive(Clone, Copy, Debug)]
++pub struct Snapshot {
++    /// `Inner::fill` loop iterations.
++    pub fill_iteration: u64,
++    /// Buffered pumps before queued event/release delivery.
++    pub event_queued: u64,
++    /// Buffered pumps before lower-layer open.
++    pub open_pre: u64,
++    /// Buffered pumps after successful lower-layer open.
++    pub open_post: u64,
++    /// Buffered pumps before transmit offers.
++    pub transmit_pre: u64,
++    /// Buffered pumps after transmit drains.
++    pub transmit_post: u64,
++    /// Forced pumps before suspension.
++    pub forced: u64,
++}
++
++/// Captures all counters at one instant.
++#[must_use]
++pub fn snapshot() -> Snapshot {
++    Snapshot {
++        fill_iteration: FILL_ITERATION.load(Relaxed),
++        event_queued: EVENT_QUEUED.load(Relaxed),
++        open_pre: OPEN_PRE.load(Relaxed),
++        open_post: OPEN_POST.load(Relaxed),
++        transmit_pre: TRANSMIT_PRE.load(Relaxed),
++        transmit_post: TRANSMIT_POST.load(Relaxed),
++        forced: FORCED.load(Relaxed),
++    }
++}
++
++impl Snapshot {
++    /// Subtracts an earlier cumulative snapshot.
++    #[must_use]
++    pub fn since(self, before: Self) -> Self {
++        Self {
++            fill_iteration: self.fill_iteration - before.fill_iteration,
++            event_queued: self.event_queued - before.event_queued,
++            open_pre: self.open_pre - before.open_pre,
++            open_post: self.open_post - before.open_post,
++            transmit_pre: self.transmit_pre - before.transmit_pre,
++            transmit_post: self.transmit_post - before.transmit_post,
++            forced: self.forced - before.forced,
++        }
++    }
++}
+diff --git a/crates/ngnet-qmux-h3/src/lib.rs b/crates/ngnet-qmux-h3/src/lib.rs
+index b0b1b0e..7d9af90 100644
+--- a/crates/ngnet-qmux-h3/src/lib.rs
++++ b/crates/ngnet-qmux-h3/src/lib.rs
+@@ -76,0 +77,2 @@ mod event;
++#[doc(hidden)]
++pub mod instrumentation;
+diff --git a/crates/ngnet-qmux-h3/src/transmit.rs b/crates/ngnet-qmux-h3/src/transmit.rs
+index e25b1c0..67c4b1e 100644
+--- a/crates/ngnet-qmux-h3/src/transmit.rs
++++ b/crates/ngnet-qmux-h3/src/transmit.rs
+@@ -47,0 +48 @@ pub(crate) fn drain<S: AsyncByteStream, C: Clock, Src: StreamSource>(
++        crate::instrumentation::transmit_pre();
+@@ -131,0 +133 @@ pub(crate) fn drain<S: AsyncByteStream, C: Clock, Src: StreamSource>(
++    crate::instrumentation::transmit_post();
+diff --git a/crates/ngnet-qmux/src/io.rs b/crates/ngnet-qmux/src/io.rs
+index 967acbd..26ee63a 100644
+--- a/crates/ngnet-qmux/src/io.rs
++++ b/crates/ngnet-qmux/src/io.rs
+@@ -119,0 +120,2 @@ mod framing;
++#[doc(hidden)]
++pub mod instrumentation;
+diff --git a/crates/ngnet-qmux/src/io/conn.rs b/crates/ngnet-qmux/src/io/conn.rs
+index 6db6f57..2fa7738 100644
+--- a/crates/ngnet-qmux/src/io/conn.rs
++++ b/crates/ngnet-qmux/src/io/conn.rs
+@@ -836,0 +837 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
++        super::instrumentation::hit(super::instrumentation::Counter::POLL_PUMP);
+@@ -872,0 +874 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
++        super::instrumentation::hit(super::instrumentation::Counter::POLL_PUMP_BUFFERED);
+@@ -965,0 +968 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
++        super::instrumentation::hit(super::instrumentation::Counter::POLL_NEXT_EVENT);
+@@ -1035,0 +1039 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
++        super::instrumentation::hit(super::instrumentation::Counter::POLL_OPEN);
+@@ -1087,0 +1092 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
++        super::instrumentation::hit(super::instrumentation::Counter::POLL_WRITE_STREAM);
+@@ -1535,0 +1541 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
++        super::instrumentation::hit(super::instrumentation::Counter::PUMP);
+@@ -1546,0 +1553 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
++            super::instrumentation::hit(super::instrumentation::Counter::TRAILING_WRITE_SIDE);
+@@ -1563,0 +1571 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
++        super::instrumentation::hit(super::instrumentation::Counter::WRITE_SIDE);
+@@ -1727,0 +1736 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
++            super::instrumentation::hit(super::instrumentation::Counter::POLL_READ);
+@@ -1735,0 +1745 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
++            super::instrumentation::hit(super::instrumentation::Counter::PRODUCTIVE_READ);
+diff --git a/crates/ngnet-qmux/src/io/event.rs b/crates/ngnet-qmux/src/io/event.rs
+index 41df674..e849838 100644
+--- a/crates/ngnet-qmux/src/io/event.rs
++++ b/crates/ngnet-qmux/src/io/event.rs
+@@ -179 +179,3 @@ impl EventQueue {
+-        self.queue
++        super::instrumentation::hit(super::instrumentation::Counter::EVENT_POP);
++        let event = self
++            .queue
+@@ -182 +184,5 @@ impl EventQueue {
+-            .pop_front()
++            .pop_front();
++        if event.is_none() {
++            super::instrumentation::hit(super::instrumentation::Counter::EMPTY_EVENT_POP);
++        }
++        event
+diff --git a/crates/ngnet-qmux/src/io/instrumentation.rs b/crates/ngnet-qmux/src/io/instrumentation.rs
+new file mode 100644
+index 0000000..3ab5278
+--- /dev/null
++++ b/crates/ngnet-qmux/src/io/instrumentation.rs
+@@ -0,0 +1,94 @@
++//! Temporary release-visible counters for run 16 pump-source reconciliation.
++
++use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
++
++macro_rules! counters {
++    ($($name:ident),+ $(,)?) => {
++        $(static $name: AtomicU64 = AtomicU64::new(0);)+
++
++        pub(crate) fn hit(counter: Counter) {
++            match counter {
++                $(Counter::$name => { $name.fetch_add(1, Relaxed); })+
++            }
++        }
++
++        /// Captures all counters at one instant.
++        #[must_use]
++        pub fn snapshot() -> Snapshot {
++            Snapshot {
++                $($name: $name.load(Relaxed),)+
++            }
++        }
++    };
++}
++
++/// A source whose call count is being reconciled.
++#[allow(missing_docs, non_camel_case_types)]
++pub(crate) enum Counter {
++    POLL_PUMP,
++    POLL_PUMP_BUFFERED,
++    POLL_NEXT_EVENT,
++    POLL_OPEN,
++    POLL_WRITE_STREAM,
++    PUMP,
++    WRITE_SIDE,
++    TRAILING_WRITE_SIDE,
++    POLL_READ,
++    PRODUCTIVE_READ,
++    EVENT_POP,
++    EMPTY_EVENT_POP,
++}
++
++/// One cumulative counter snapshot.
++#[allow(missing_docs, non_snake_case)]
++#[derive(Clone, Copy, Debug)]
++pub struct Snapshot {
++    pub POLL_PUMP: u64,
++    pub POLL_PUMP_BUFFERED: u64,
++    pub POLL_NEXT_EVENT: u64,
++    pub POLL_OPEN: u64,
++    pub POLL_WRITE_STREAM: u64,
++    pub PUMP: u64,
++    pub WRITE_SIDE: u64,
++    pub TRAILING_WRITE_SIDE: u64,
++    pub POLL_READ: u64,
++    pub PRODUCTIVE_READ: u64,
++    pub EVENT_POP: u64,
++    pub EMPTY_EVENT_POP: u64,
++}
++
++counters!(
++    POLL_PUMP,
++    POLL_PUMP_BUFFERED,
++    POLL_NEXT_EVENT,
++    POLL_OPEN,
++    POLL_WRITE_STREAM,
++    PUMP,
++    WRITE_SIDE,
++    TRAILING_WRITE_SIDE,
++    POLL_READ,
++    PRODUCTIVE_READ,
++    EVENT_POP,
++    EMPTY_EVENT_POP,
++);
++
++impl Snapshot {
++    /// Subtracts an earlier cumulative snapshot.
++    #[must_use]
++    pub fn since(self, before: Self) -> Self {
++        Self {
++            POLL_PUMP: self.POLL_PUMP - before.POLL_PUMP,
++            POLL_PUMP_BUFFERED: self.POLL_PUMP_BUFFERED - before.POLL_PUMP_BUFFERED,
++            POLL_NEXT_EVENT: self.POLL_NEXT_EVENT - before.POLL_NEXT_EVENT,
++            POLL_OPEN: self.POLL_OPEN - before.POLL_OPEN,
++            POLL_WRITE_STREAM: self.POLL_WRITE_STREAM - before.POLL_WRITE_STREAM,
++            PUMP: self.PUMP - before.PUMP,
++            WRITE_SIDE: self.WRITE_SIDE - before.WRITE_SIDE,
++            TRAILING_WRITE_SIDE: self.TRAILING_WRITE_SIDE - before.TRAILING_WRITE_SIDE,
++            POLL_READ: self.POLL_READ - before.POLL_READ,
++            PRODUCTIVE_READ: self.PRODUCTIVE_READ - before.PRODUCTIVE_READ,
++            EVENT_POP: self.EVENT_POP - before.EVENT_POP,
++            EMPTY_EVENT_POP: self.EMPTY_EVENT_POP - before.EMPTY_EVENT_POP,
++        }
++    }
++}
+diff --git a/tests/ngnet-bench/examples/probe.rs b/tests/ngnet-bench/examples/probe.rs
+index c646bd6..f46259a 100644
+--- a/tests/ngnet-bench/examples/probe.rs
++++ b/tests/ngnet-bench/examples/probe.rs
+@@ -60,0 +61,2 @@ fn main() {
++        let qmux_before = ngnet_qmux::io::instrumentation::snapshot();
++        let join_before = ngnet_qmux_h3::instrumentation::snapshot();
+@@ -76,0 +79,8 @@ fn main() {
++        eprintln!(
++            "QMUX-INSTRUMENT {:?}",
++            ngnet_qmux::io::instrumentation::snapshot().since(qmux_before)
++        );
++        eprintln!(
++            "JOIN-INSTRUMENT {:?}",
++            ngnet_qmux_h3::instrumentation::snapshot().since(join_before)
++        );
+```
+
+</details>
+
+The instrumented focused suite passed. The temporary Rust patch and both instrumented binaries
+were then deleted, and all three uprobes were removed.
+
 At 1 MiB, QMux/H3 makes **710** allocator calls against H2's **194.5**. Two repeated 1-in-20
 `malloc` stack profiles attribute 37.9% to `RawVec::finish_grow`, 22.9% to
 `bytes::shallow_clone_vec`, and 22.1% to the QMux stream-data handler: **82.9%** under the
