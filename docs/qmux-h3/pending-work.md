@@ -8,7 +8,9 @@ This is the implementation backlog produced by
 [`09-qmux-h2-mechanisms`](../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md).
 The order is measured payoff divided by implementation risk, not source order.
 
-Items 1 and 2 are settled; item 3 is now the highest-priority open performance item.
+Items 1 and 2 are settled; item 3 is closed without implementation after reprofiling. Item 4 is
+the highest-priority open performance item, but its run-09 attribution must also be refreshed
+before implementation.
 
 1. **Replace `ngnet-h3`'s linear closed-stream lookup — settled.** `Driver::close_stream` scanned a
    1024-entry tombstone `Vec` on every close after a connection reaches steady state. A
@@ -31,15 +33,27 @@ Items 1 and 2 are settled; item 3 is now the highest-priority open performance i
    controlled evidence are recorded under
    [the write-count entry](#something-scales-with-in-flight-streams-on-a-real-socket--it-is-the-write-count)
    and in [`run 11`](../benchmarks/data/xeon-8370c-azure/11-qmux-flush-decoupling.md).
-3. **Reuse `ngnet-h3::Driver::apply_events` scratch storage.** Its owned event vector and the
-   `data` and `unheard` vectors allocated for each pass account for 2.39 microseconds, or 8.1%,
-   of a profiled empty exchange. Reuse buffers owned by the driver, while preserving the
-   control-plane-before-data ordering and same-batch reset handling.
-4. **Collapse the HTTP/3 driver's repeated shared-state probes.** The separate
-   `Shared::*_pending` and `take_*` checks account for about 1.35 microseconds, or 4.6%, of an
-   empty exchange. Investigate one combined readiness word or one collected action batch rather
-   than probing each category separately. Measure before retaining this change: unlike the first
-   two items, its mechanism is profiled but no implementation has been A/B tested.
+3. **Reuse `ngnet-h3::Driver::apply_events` scratch storage — closed without implementation.**
+   Run 09's 2.39 microseconds / 8.1% attribution became stale after items 1 and 2 landed. Fresh
+   profiling on their merged result, `700bfa6`, places inclusive `apply_events` across both roles at
+   **0.259 microseconds / 1.04–1.05% on a duplex** and
+   **0.268–0.280 microseconds / 0.74–0.78% on a socket** for an empty serial exchange.
+   Concurrency 64 is 0.300–0.303 microseconds per exchange / 1.86–1.89%. Run 09's 2.39
+   microseconds / 8.1% was a flat/self symbol bucket; the like-for-like fresh self costs are
+   lower still. Exact call-site uprobes
+   count twelve scratch-vector allocations per serial exchange, but the combined
+   `take_events` plus `apply_events` path is only 0.365–0.548 microseconds per serial exchange.
+   Reuse could remove only part of it and would put two-sweep ordering, same-batch reset replay,
+   early-error cleanup, payload ownership, and retained-capacity bounds at risk for a whole-path
+   inclusive bound of at most 2.28%, only a strict subset of which reuse could remove. The
+   profile-first gate therefore rejected implementation before a prototype was created; see
+   [`run 12`](../benchmarks/data/xeon-8370c-azure/12-apply-events-reprofile.md).
+4. **Collapse the HTTP/3 driver's repeated shared-state probes.** Run 09 historically attributed
+   about 1.35 microseconds, or 4.6% of an empty exchange, to the separate `Shared::*_pending` and
+   `take_*` checks. Reprofile before designing this item; run 12 demonstrates that run-09
+   absolute and proportional attributions are not current after items 1 and 2. If the hotspot
+   remains, investigate one combined readiness word or one collected action batch rather than
+   probing each category separately, and measure before retaining it.
 5. **Test HTTP/2 coalescing beyond one 16 KiB frame.** This is comparative work, not a QMux
    defect. At a 1 MiB exchange HTTP/2 issues 189 writes and QMux issues 68; the measured HTTP/2
    maximum is exactly 16 KiB while QMux can empty a 64 KiB buffer. A prototype must establish
