@@ -314,7 +314,13 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
         // interaction, without a list of which kinds count.
         self.flush_credit();
 
-        pump::pump_buffered(self, cx);
+        // Queued work still pumps first so a terminal discovered here remains latched
+        // behind that work. With no queued work, `fill` performs the one required pump
+        // through `poll_next_event_buffered`; pumping here as well would read the transport
+        // twice before checking the same lower event queue.
+        if !self.releases.is_empty() || self.next.is_some() {
+            pump::pump_buffered(self, cx);
+        }
 
         // Releases first. They belong to bytes the layer handed over earlier and hold its
         // buffers until they are delivered, so nothing is served by making them queue behind
@@ -606,6 +612,17 @@ impl<S: AsyncByteStream, C: Clock> QmuxConnection<S, C> {
     #[must_use]
     pub fn connection_credit_applications(&self) -> u64 {
         self.with(|inner| inner.connection_credit_applications)
+    }
+
+    /// How many times the lower QMux pump has been entered.
+    ///
+    /// Debug-only and doc-hidden like the lower counter it forwards. Tests that use it carry
+    /// the same gate, and release benchmarks therefore do not measure the instrument.
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    #[must_use]
+    pub fn pump_calls(&self) -> u64 {
+        self.with(|inner| inner.conn.pump_calls())
     }
 
     /// A second handle onto the same connection, for the tail to hold.

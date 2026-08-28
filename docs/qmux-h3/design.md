@@ -44,6 +44,14 @@ Every entry point begins by pumping: flushing what is queued, producing what the
 now owes, and reading what has arrived. That is the difference between working and deadlocking,
 not tidiness.
 
+`poll_event` has one refinement to that rule. If a release or translated event is already queued,
+it performs the pump explicitly before returning the queued work, preserving the rule that a newly
+discovered ending is latched behind it. If neither is queued, `fill` performs the initial pump
+through `poll_next_event_buffered`; pumping explicitly first would ask the same connection twice
+before inspecting the lower event queue. Lower events with no HTTP/3 translation may still make
+`fill` advance and pump again, so the invariant is one initial pump source per active branch
+decision, not one pump across an arbitrarily long filtering loop.
+
 The HTTP/3 driver's first action is to open three unidirectional streams, and it reaches
 nothing else until it has them. A QMux endpoint cannot open a stream before the peer's
 transport parameters arrive — every limit is zero until they do — and they arrive in a record
@@ -75,6 +83,12 @@ then applies deferred credit, produces pending records, and either drains them o
 `Pending` with the byte stream's write wake registered. A newly discovered ending self-wakes
 once so the operation that was interrupted can observe it; an already latched ending does not
 keep waking and spin.
+
+The driver above this join now also transfers its five handle/callback work categories through
+one coherent shared snapshot per pass. That is an `ngnet-h3` rule rather than a QMux-specific
+one, but QMux/H3 provides its controlled timing evidence: run 15 reduces matched shared-operation
+entries from 155 to 29 and improves duplex/socket serial by 7.59% / 5.68% against retained
+phase one.
 
 Capacity pressure remains a forced write inside productive work, and close and finish remain
 independent finalisation boundaries. A broken byte stream returns its explicit error and the

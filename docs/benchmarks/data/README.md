@@ -10,7 +10,7 @@ what the run does and does not establish.
 | Machine | Status | Runs |
 | --- | --- | --- |
 | [`legacy-dev-host`](legacy-dev-host/) | **Retired, unavailable.** Every measurement taken before 2026-08-16. Noisy: unchanged control arms drifted 5–15% within a session. | 4 |
-| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current VM; historical machine label and recorded spec are Intel Xeon Platinum 8370C. Run 12's `perf` header reported 8573C, but when Azure migrated the VM is unknown, so absolute figures across runs are not controlled. | 12 |
+| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current VM; historical machine label and recorded spec are Intel Xeon Platinum 8370C. Runs 12–15 report 8573C, but when Azure migrated the VM is unknown, so absolute figures across runs are not controlled. | 15 |
 
 **Absolute figures from different machines must never be tabulated together.** Nothing here
 is normalised for CPU model, kernel or io_uring implementation, and those are exactly the
@@ -38,6 +38,9 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [10-h3-closed-stream-lookup](xeon-8370c-azure/10-h3-closed-stream-lookup.md) | xeon-8370c-azure | 2026-08-27 | Constant-time closed-stream lookup — **−13–18% duplex, −7–13% socket** | — |
 | [11-qmux-flush-decoupling](xeon-8370c-azure/11-qmux-flush-decoupling.md) | xeon-8370c-azure | 2026-08-28 | Decouple event batches from suspension flushes — **8.9–24.6% faster socket concurrency** | — |
 | [12-apply-events-reprofile](xeon-8370c-azure/12-apply-events-reprofile.md) | xeon-8370c-azure | 2026-08-28 | Reprofile `apply_events` after runs 10 and 11 — **0.74–1.05% inclusive serial; no implementation** | — |
+| [13-qmux-h3-current-bottlenecks](xeon-8370c-azure/13-qmux-h3-current-bottlenecks.md) | xeon-8370c-azure | 2026-08-28 | Differential profile against HTTP/2 — **duplicate event-path pump is the next confirmed fix** | — |
+| [14-qmux-h3-one-pump](xeon-8370c-azure/14-qmux-h3-one-pump.md) | xeon-8370c-azure | 2026-08-28 | Production one-pump event rule — **96 → 73 reads; −5.26% duplex / −2.37% socket serial** | — |
+| [15-qmux-h3-shared-snapshot](xeon-8370c-azure/15-qmux-h3-shared-snapshot.md) | xeon-8370c-azure | 2026-08-28 | One coherent shared-work snapshot — **155 → 29 operations; −7.59% / −5.68% incremental serial** | — |
 
 **The cross-protocol comparison is [`08`](xeon-8370c-azure/08-qmux-against-h2.md), and it is the
 only run here that is one.** That sentence replaces a standing note saying no such run existed.

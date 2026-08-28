@@ -22,6 +22,8 @@ use ngnet_h3::StreamId;
 use ngnet_h3::http::{QuicConnection, QuicEvent, StreamSource, WriteOutcome};
 use ngnet_qmux::io::AsyncByteStream;
 use ngnet_qmux::io::testing::{Fault, TestByteStream, TestClock, WriteLog, stream_pair};
+#[cfg(debug_assertions)]
+use ngnet_qmux::io::testing::{FaultControl, ReadLog};
 use ngnet_qmux_h3::QmuxConnection;
 
 type Endpoint = QmuxConnection<TestByteStream, TestClock>;
@@ -100,6 +102,8 @@ fn a_flush_wakes_once_for_a_new_ending_and_never_spins_on_it() {
 fn a_suspension_flush_parks_on_backpressure_and_finishes_after_its_wake() {
     let (client_io, mut peer_io) = stream_pair();
     client_io.set_capacity(Some(1));
+    #[cfg(debug_assertions)]
+    let reads = client_io.read_log();
     let mut connection = QmuxConnection::client(client_io, TestClock::new()).expect("a client");
     let wakes = Arc::new(WakeCount::default());
     let waker = Waker::from(Arc::clone(&wakes));
@@ -107,7 +111,22 @@ fn a_suspension_flush_parks_on_backpressure_and_finishes_after_its_wake() {
 
     // The productive event poll may build the transport announcement, but it must leave the
     // sub-ceiling tail for the explicit suspension flush.
+    #[cfg(debug_assertions)]
+    let pumps = connection.pump_calls();
     assert!(connection.poll_event(&mut cx).is_pending());
+    #[cfg(debug_assertions)]
+    {
+        assert_eq!(
+            connection.pump_calls() - pumps,
+            1,
+            "write backpressure must not duplicate the initial event pump"
+        );
+        assert_eq!(
+            reads.reads(),
+            1,
+            "the write-blocked pump must still reach and register its pending read"
+        );
+    }
     assert!(
         connection.poll_flush(&mut cx).is_pending(),
         "a one-byte substrate cannot take the whole announcement"
@@ -136,6 +155,30 @@ fn a_suspension_flush_parks_on_backpressure_and_finishes_after_its_wake() {
     panic!("the short-accepting substrate never drained the buffered output");
 }
 
+/// One initial pump serves the empty event branch and leaves a real read wake behind.
+#[cfg(debug_assertions)]
+#[test]
+fn an_empty_event_poll_uses_one_pump_and_one_transport_read() {
+    let (client_io, mut peer_io) = stream_pair();
+    let reads = client_io.read_log();
+    let mut connection = QmuxConnection::client(client_io, TestClock::new()).expect("a client");
+    let flag = Arc::new(Woken::default());
+    let waker = Waker::from(Arc::clone(&flag));
+    let mut cx = Context::from_waker(&waker);
+
+    reads.clear();
+    let pumps = connection.pump_calls();
+    assert!(connection.poll_event(&mut cx).is_pending());
+    assert_eq!(connection.pump_calls() - pumps, 1);
+    assert_eq!(reads.reads(), 1);
+
+    assert!(peer_io.poll_write(&mut cx, b"\0").is_ready());
+    assert!(
+        flag.take(),
+        "the single pending read must register the event poll's waker"
+    );
+}
+
 /// A pair of endpoints that deliver to each other.
 struct Pair {
     client: Endpoint,
@@ -155,6 +198,10 @@ struct Pair {
     /// wire. Cleared by the test that measures, because the transport-parameter announcement
     /// and any stream opening happened before its window began.
     log: WriteLog,
+    #[cfg(debug_assertions)]
+    reads: (ReadLog, ReadLog),
+    #[cfg(debug_assertions)]
+    faults: (FaultControl, FaultControl),
 }
 
 impl Pair {
@@ -164,12 +211,20 @@ impl Pair {
         // Taken before the connection is built: a connection takes its byte stream by value
         // and never gives it back, and construction already schedules an announcement.
         let log = client_io.write_log();
+        #[cfg(debug_assertions)]
+        let reads = (client_io.read_log(), server_io.read_log());
+        #[cfg(debug_assertions)]
+        let faults = (client_io.fault_control(), server_io.fault_control());
         Self {
             client: QmuxConnection::client(client_io, clock.clone()).expect("a client"),
             server: QmuxConnection::server(server_io, clock).expect("a server"),
             flag: Arc::new(Woken::default()),
             seen: (Vec::new(), Vec::new()),
             log,
+            #[cfg(debug_assertions)]
+            reads,
+            #[cfg(debug_assertions)]
+            faults,
         }
     }
 
@@ -409,11 +464,21 @@ fn accepted(events: &[QuicEvent]) -> Vec<StreamId> {
 #[test]
 fn only_peer_opened_bidirectional_streams_are_announced() {
     let mut pair = Pair::new();
-    let uni = pair.open(Side::Client, false);
+    let first_uni = pair.open(Side::Client, false);
+    let second_uni = pair.open(Side::Client, false);
     let bidi = pair.open(Side::Client, true);
 
     let mut source = Offer::new(vec![
-        (uni, b"on the unidirectional stream".to_vec(), false),
+        (
+            first_uni,
+            b"on the first unidirectional stream".to_vec(),
+            false,
+        ),
+        (
+            second_uni,
+            b"on the second unidirectional stream".to_vec(),
+            false,
+        ),
         (bidi, b"on the bidirectional stream".to_vec(), false),
     ]);
     send_all(&mut pair, Side::Client, &mut source);
@@ -426,9 +491,14 @@ fn only_peer_opened_bidirectional_streams_are_announced() {
         "exactly the peer's bidirectional stream is announced",
     );
     assert_eq!(
-        data_on(server, uni),
-        b"on the unidirectional stream",
-        "the unidirectional stream surfaces through its data alone",
+        data_on(server, first_uni),
+        b"on the first unidirectional stream",
+        "the first untranslated stream-open event is filtered without stalling",
+    );
+    assert_eq!(
+        data_on(server, second_uni),
+        b"on the second unidirectional stream",
+        "filtering another untranslated event still progresses",
     );
     assert_eq!(
         data_on(server, bidi),
@@ -508,6 +578,10 @@ fn final_data_and_stream_close_are_separated_by_a_woken_boundary() {
             flag.take(),
             "the correctness boundary must schedule the batch which carries the close"
         );
+        #[cfg(debug_assertions)]
+        let pumps = pair.client.pump_calls();
+        #[cfg(debug_assertions)]
+        pair.reads.0.clear();
         assert!(matches!(
             pair.client.poll_event(&mut cx),
             Poll::Ready(Ok(QuicEvent::StreamClosed {
@@ -515,7 +589,80 @@ fn final_data_and_stream_close_are_separated_by_a_woken_boundary() {
                 ..
             })) if id == stream
         ));
+        #[cfg(debug_assertions)]
+        {
+            assert_eq!(
+                pair.client.pump_calls() - pumps,
+                1,
+                "a held translated event still performs exactly one initial pump"
+            );
+            assert_eq!(
+                pair.reads.0.reads(),
+                1,
+                "the held-event pump reaches the transport once"
+            );
+        }
     }
+}
+
+/// A queued release is served after one pump, including when that pump discovers an error.
+#[cfg(debug_assertions)]
+#[test]
+fn a_queued_release_uses_one_pump_and_precedes_a_new_terminal_error() {
+    let mut pair = Pair::new();
+    let first = pair.open(Side::Client, true);
+    let second = pair.open(Side::Client, true);
+    let mut source = Offer::new(vec![
+        (first, b"first queued release".to_vec(), false),
+        (second, b"second queued release".to_vec(), false),
+    ]);
+    pair.transmit(Side::Client, &mut source);
+    assert!(source.drained());
+
+    pair.faults.0.inject(Fault::Broken);
+    pair.reads.0.clear();
+    let pumps = pair.client.pump_calls();
+    let (waker, flag) = pair.context();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(matches!(
+        pair.client.poll_event(&mut cx),
+        Poll::Ready(Ok(QuicEvent::Released {
+            stream: id,
+            delivered: true,
+            ..
+        })) if id == first
+    ));
+    assert_eq!(
+        pair.client.pump_calls() - pumps,
+        1,
+        "queued releases must not skip or duplicate the initial pump"
+    );
+
+    let pumps = pair.client.pump_calls();
+    assert!(matches!(
+        pair.client.poll_event(&mut cx),
+        Poll::Ready(Ok(QuicEvent::Released {
+            stream: id,
+            delivered: true,
+            ..
+        })) if id == second
+    ));
+    assert_eq!(
+        pair.client.pump_calls() - pumps,
+        0,
+        "an already-latched ending makes the queued-work pump a no-op"
+    );
+
+    assert!(
+        pair.client.poll_event(&mut cx).is_pending(),
+        "the ending must start a batch after the queued release"
+    );
+    assert!(flag.take(), "the ending batch boundary must self-wake");
+    assert!(matches!(
+        pair.client.poll_event(&mut cx),
+        Poll::Ready(Err(_))
+    ));
 }
 
 /// SC-013. Every accepted byte is released exactly once.

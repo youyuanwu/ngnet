@@ -8,9 +8,8 @@ This is the implementation backlog produced by
 [`09-qmux-h2-mechanisms`](../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md).
 The order is measured payoff divided by implementation risk, not source order.
 
-Items 1 and 2 are settled; item 3 is closed without implementation after reprofiling. Item 4 is
-the highest-priority open performance item, but its run-09 attribution must also be refreshed
-before implementation.
+Items 1, 2, 4 and 5 are settled; item 3 is closed without implementation after reprofiling.
+Item 6 is the highest-priority open performance item.
 
 1. **Replace `ngnet-h3`'s linear closed-stream lookup — settled.** `Driver::close_stream` scanned a
    1024-entry tombstone `Vec` on every close after a connection reaches steady state. A
@@ -48,20 +47,38 @@ before implementation.
    inclusive bound of at most 2.28%, only a strict subset of which reuse could remove. The
    profile-first gate therefore rejected implementation before a prototype was created; see
    [`run 12`](../benchmarks/data/xeon-8370c-azure/12-apply-events-reprofile.md).
-4. **Collapse the HTTP/3 driver's repeated shared-state probes.** Run 09 historically attributed
-   about 1.35 microseconds, or 4.6% of an empty exchange, to the separate `Shared::*_pending` and
-   `take_*` checks. Reprofile before designing this item; run 12 demonstrates that run-09
-   absolute and proportional attributions are not current after items 1 and 2. If the hotspot
-   remains, investigate one combined readiness word or one collected action batch rather than
-   probing each category separately, and measure before retaining it.
-5. **Test HTTP/2 coalescing beyond one 16 KiB frame.** This is comparative work, not a QMux
+4. **Remove the duplicate QMux pump in `QmuxConnection::poll_event` — settled.** The production
+   branch now pumps explicitly only when a release or translated event is already queued;
+   otherwise `fill()` performs the one initial lower poll. Deterministic tests pin the queued
+   release, held event, direct empty, terminal-error and pending-wake paths. Exact empty-exchange
+   counts reproduce the diagnostic: reads fall **96 → 73**, pumps **93 → 70**, waker clones
+   **94 → 71** and drops **90 → 67**, while 30 event polls and 14 transmit passes are unchanged.
+   Controlled timing is **5.26% faster duplex serial and 2.37% faster socket serial** beyond
+   matching controls and spread; duplex concurrency 64 and socket concurrency 1 also clear those
+   bars. See [`run 14`](../benchmarks/data/xeon-8370c-azure/14-qmux-h3-one-pump.md).
+5. **Collapse the HTTP/3 driver's repeated shared-state probes — settled.** One pass now drains
+   ready, reset, credit, action and shutdown work under one lock, then processes it outside the
+   lock; idle, completion and under-waker checks each use one coherent predicate. Exact matched
+   count builds reduce the eleven old take/readiness/refresh entries from **155 → 29** per empty
+   exchange. Controlled phase-1-to-snapshot timing improves duplex/socket serial by
+   **7.59% / 5.68%** and both concurrency-1 targets by **7.86% / 6.29%**, beyond controls and
+   spread. Fresh base-to-final serial timing is **11.75% / 8.59%** faster. The timing gate,
+   rather than the count alone, retains the change; see
+   [`run 15`](../benchmarks/data/xeon-8370c-azure/15-qmux-h3-shared-snapshot.md).
+6. **Design a cheaper ownership path for delivered record data.** At 1 MiB, QMux/H3 performs
+   818 allocator calls against HTTP/2's 205, and 83% of QMux/H3 malloc stacks belong to the
+   per-record delivery ownership path. The known pooled-reference design cut allocations but
+   was 2.5–4.8% slower, so do not repeat it. Any new design must remove the owned event
+   allocation without pool bookkeeping or long-lived large-buffer pinning, and must win a
+   timed A/B.
+7. **Test HTTP/2 coalescing beyond one 16 KiB frame.** This is comparative work, not a QMux
    defect. At a 1 MiB exchange HTTP/2 issues 189 writes and QMux issues 68; the measured HTTP/2
    maximum is exactly 16 KiB while QMux can empty a 64 KiB buffer. A prototype must establish
    whether coalescing frames recovers the kernel-path gap without regressing latency or
    concurrency before it becomes an HTTP/2 change.
 
-Do **not** prioritize the 91 QMux transport read polls per empty exchange: suppressing redundant
-pumps bought only **1.3%**. The 16382-byte record payload and the fixed 64-offer yield were
+The duplicate-pump portion of the former 91-read observation is resolved in item 4; the remaining
+reads are not presumed redundant. The 16382-byte record payload and the fixed 64-offer yield were
 eliminated as causes of the concurrency inversion. Do not pursue allocation counts without a
 timing hypothesis—the delivery-aliasing experiment already showed that a large allocation
 reduction can be slower—and do not modify `deps/dwnx` as part of this backlog.

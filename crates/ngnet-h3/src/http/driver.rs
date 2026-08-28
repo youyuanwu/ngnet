@@ -47,7 +47,7 @@ use super::error::{Error, ErrorKind, Result};
 use super::events::{Events, Observation};
 use super::head;
 use super::quic::{QuicConnection, QuicEvent, StreamSource, WriteOutcome};
-use super::shared::{Registry, Shared, TransportAction};
+use super::shared::{Registry, Shared, SharedWork, TransportAction};
 use crate::conn::{Conn, ConnBuilder, Role as CoreRole};
 use crate::error::ErrorCode;
 use crate::handlers::{FieldSection, Shutdown};
@@ -199,6 +199,9 @@ impl<R: Role> DriverGuard<R> {
 #[cfg(test)]
 #[path = "driver/closed_streams.rs"]
 mod closed_streams;
+#[cfg(test)]
+#[path = "driver/shared_snapshot.rs"]
+mod shared_snapshot_tests;
 
 impl<R: Role> Drop for DriverGuard<R> {
     fn drop(&mut self) {
@@ -370,6 +373,8 @@ pub(crate) struct Driver<Q> {
     peer_gone: bool,
     /// The peer's limits, once it has stated them.
     peer_settings: Option<crate::handlers::PeerSettings>,
+    /// Handle and callback work, drained once and reused across driver passes.
+    shared_work: SharedWork,
 }
 
 impl<Q: QuicConnection> Driver<Q> {
@@ -395,6 +400,7 @@ impl<Q: QuicConnection> Driver<Q> {
             bound: false,
             peer_gone: false,
             peer_settings: None,
+            shared_work: SharedWork::new(),
         }
     }
 
@@ -815,11 +821,6 @@ where
     let shared = Arc::clone(&driver.shared);
     let registry = Arc::clone(&driver.registry);
 
-    let mut ready = Vec::new();
-    let mut resets = Vec::new();
-    let mut credit = Vec::new();
-    let mut actions = Vec::new();
-
     loop {
         // 0. Bind, once, before anything else can happen.
         poll_fn(|cx| {
@@ -844,6 +845,10 @@ where
         // lines down, in this same pass.
         guard.role.settle(&mut driver.conn)?;
 
+        // Everything present after settling belongs to this pass. Work queued while this
+        // snapshot is processed remains in Shared for the next pass.
+        shared.drain_work(&mut driver.shared_work);
+
         // 4. Credit that arrived late, for streams that were QPACK-blocked.
         let deferred = driver.conn.take_deferred_credit();
         for (stream, bytes) in deferred {
@@ -851,15 +856,14 @@ where
         }
 
         // Credit the caller returned by reading.
-        credit.clear();
-        shared.take_credit(&mut credit);
+        let mut credit = core::mem::take(&mut driver.shared_work.credit);
         for (stream, bytes) in credit.drain(..) {
             driver.extend(Some(stream), bytes)?;
         }
+        driver.shared_work.credit = credit;
 
         // 6. Actions the state machine asked the transport to take.
-        actions.clear();
-        shared.take_actions(&mut actions);
+        let mut actions = core::mem::take(&mut driver.shared_work.actions);
         for action in actions.drain(..) {
             match action {
                 TransportAction::Reset { stream, code } => {
@@ -876,11 +880,11 @@ where
                 }
             }
         }
+        driver.shared_work.actions = actions;
 
         // Resets a caller asked for, by dropping a response future or an unread body, and
         // resets owed by a body that failed.
-        resets.clear();
-        shared.take_resets(&mut resets);
+        let mut resets = core::mem::take(&mut driver.shared_work.resets);
         for (stream, code) in resets.drain(..) {
             driver.conn.shutdown_stream_read(stream).ok();
             // Every caller of this queue is abandoning its own send side, and saying so
@@ -900,17 +904,19 @@ where
                 .stop_sending(stream, code)
                 .map_err(Driver::<Q>::transport)?;
         }
+        driver.shared_work.resets = resets;
 
         // Bodies that deferred and have since been woken.
-        ready.clear();
-        shared.take_ready(&mut ready);
+        let mut ready = core::mem::take(&mut driver.shared_work.ready);
         for stream in ready.drain(..) {
             driver.conn.resume_stream(stream).ok();
         }
+        driver.shared_work.ready = ready;
 
-        if shared.take_shutdown() {
+        if core::mem::take(&mut driver.shared_work.shutdown) {
             driver.conn.shutdown().ok();
         }
+        driver.shared_work.bound_retained_capacity();
 
         // Request streams are opened by the transport, one per queued request, before the
         // role can submit anything onto them.
@@ -987,6 +993,9 @@ where
             return Ok(());
         }
         if guard.role.done() && registry.is_empty() {
+            if shared.work_pending_for_completion() {
+                continue;
+            }
             driver
                 .backend
                 .close(ErrorCode::new(NO_ERROR), b"")
@@ -996,13 +1005,9 @@ where
 
         let idle = !had_events
             && !guard.role.busy()
-            && shared.ready_len() == 0
-            && !shared.resets_pending()
-            && !shared.credit_pending()
-            && !shared.actions_pending()
-            && !shared.shutdown_pending()
             && driver.events.is_empty()
-            && !(guard.role.done() && registry.is_empty());
+            && !(guard.role.done() && registry.is_empty())
+            && !shared.work_pending_for_idle();
 
         if idle {
             // Being woken at all is the signal that a congested stream may be writable
@@ -1013,20 +1018,13 @@ where
             // is worth running.
             let mut parked = false;
             poll_fn(|cx| {
-                shared.refresh_driver(cx.waker());
                 if parked && !driver.blocked.is_empty() {
                     return Poll::Ready(());
                 }
                 parked = true;
                 // Re-checked under the waker: work may have arrived between the decision
                 // above and registering here, and missing it is a hang rather than a delay.
-                if shared.ready_len() > 0
-                    || shared.resets_pending()
-                    || shared.credit_pending()
-                    || shared.actions_pending()
-                    || shared.shutdown_pending()
-                    || guard.role.busy()
-                {
+                if shared.refresh_driver_and_work_pending(cx.waker()) || guard.role.busy() {
                     return Poll::Ready(());
                 }
                 // Asking the transport whether it has anything means taking it: there is

@@ -558,6 +558,12 @@ pub struct Connection<S: AsyncByteStream, C: Clock> {
     read_ahead: ReadAhead,
     closing: Option<Closing>,
     terminal: Option<Terminal>,
+    /// How many times the connection pump was entered.
+    ///
+    /// A debug-only structural instrument for cross-crate integration tests. Release
+    /// benchmarks use external uprobes so the hot path measured there carries no counter.
+    #[cfg(debug_assertions)]
+    pump_calls: u64,
 }
 
 /// How far a local close has got.
@@ -776,6 +782,8 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
             read_ahead: ReadAhead::new(config.read_ahead),
             closing: None,
             terminal: None,
+            #[cfg(debug_assertions)]
+            pump_calls: 0,
         })
     }
 
@@ -911,6 +919,17 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     #[must_use]
     pub fn copied_record_bytes(&self) -> usize {
         self.copied
+    }
+
+    /// How many times the connection pump has been entered.
+    ///
+    /// Gated with the tests that use it so release benchmarks do not measure the
+    /// instrument. It is a structural count, not a supported API.
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    #[must_use]
+    pub const fn pump_calls(&self) -> u64 {
+        self.pump_calls
     }
 
     /// The next thing that happened on the connection.
@@ -1514,6 +1533,10 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     /// connection?", and it decides whether produced output may wait for the rest of the turn
     /// or must leave now. See [`Flush`].
     fn pump(&mut self, cx: &mut Context<'_>, flush: Flush) -> Result<()> {
+        #[cfg(debug_assertions)]
+        {
+            self.pump_calls += 1;
+        }
         if let Some(terminal) = &self.terminal {
             return Err(terminal.error());
         }

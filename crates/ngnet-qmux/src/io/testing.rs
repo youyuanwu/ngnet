@@ -27,13 +27,14 @@
 //! are the harness's whole point rather than an optional extra, and [`Fault`] covers the two
 //! endings and the transient refusal.
 //!
-//! # Why the writes are counted
+//! # Why reads and writes are counted
 //!
 //! How many times a connection called [`AsyncByteStream::poll_write`] is not recoverable from
 //! the bytes that came out the other end: one call carrying four records and four calls
 //! carrying one each deliver the identical stream, and on a real socket the difference is
-//! three system calls. A test that wants to say "this pass wrote once" therefore has to be
-//! told, which is what [`TestByteStream::write_log`] is for.
+//! three system calls. The same is true of a read that returns pending: no delivered byte
+//! records that the connection reached for the transport. Tests that state either count use
+//! [`TestByteStream::write_log`] and [`TestByteStream::read_log`].
 //!
 //! The handle is separate from the stream and shared with it, because a connection takes its
 //! byte stream **by value** and never gives it back: a counter reachable only through the
@@ -148,6 +149,46 @@ pub struct WriteLog {
     entries: Rc<RefCell<Vec<usize>>>,
 }
 
+/// How many times a test byte stream's read side was polled.
+///
+/// Pending, ending, and failing reads are included: each is a real transport interaction
+/// whose waker/error semantics the connection had to observe.
+#[derive(Clone)]
+pub struct ReadLog {
+    entries: Rc<Cell<usize>>,
+}
+
+impl ReadLog {
+    /// How many read polls have occurred.
+    #[must_use]
+    pub fn reads(&self) -> usize {
+        self.entries.get()
+    }
+
+    /// Forgets every read poll recorded so far.
+    pub fn clear(&self) {
+        self.entries.set(0);
+    }
+}
+
+/// A handle that injects faults after a test stream has moved into a connection.
+#[derive(Clone)]
+pub struct FaultControl {
+    fault: Rc<Cell<Option<Fault>>>,
+}
+
+impl FaultControl {
+    /// Arranges for a condition on the next operation.
+    pub fn inject(&self, fault: Fault) {
+        self.fault.set(Some(fault));
+    }
+
+    /// Clears an injected condition.
+    pub fn clear(&self) {
+        self.fault.set(None);
+    }
+}
+
 impl WriteLog {
     /// How many writes have moved bytes.
     #[must_use]
@@ -187,7 +228,8 @@ pub struct TestByteStream {
     outbox: Rc<RefCell<Pipe>>,
     read_cap: Cell<Option<usize>>,
     write_cap: Cell<Option<usize>>,
-    fault: Cell<Option<Fault>>,
+    fault: Rc<Cell<Option<Fault>>>,
+    reads: Rc<Cell<usize>>,
     writes: Rc<RefCell<Vec<usize>>>,
 }
 
@@ -268,6 +310,22 @@ impl TestByteStream {
             entries: Rc::clone(&self.writes),
         }
     }
+
+    /// A handle onto this half's read-poll count.
+    #[must_use]
+    pub fn read_log(&self) -> ReadLog {
+        ReadLog {
+            entries: Rc::clone(&self.reads),
+        }
+    }
+
+    /// A handle for injecting faults after this stream moves into a connection.
+    #[must_use]
+    pub fn fault_control(&self) -> FaultControl {
+        FaultControl {
+            fault: Rc::clone(&self.fault),
+        }
+    }
 }
 
 impl AsyncByteStream for TestByteStream {
@@ -278,6 +336,7 @@ impl AsyncByteStream for TestByteStream {
         cx: &mut Context<'_>,
         buffer: &mut [u8],
     ) -> Poll<Result<usize, Self::Error>> {
+        self.reads.set(self.reads.get() + 1);
         match self.fault.get() {
             Some(Fault::Broken) => return Poll::Ready(Err(TestStreamError)),
             Some(Fault::Ended) => return Poll::Ready(Ok(0)),
@@ -374,7 +433,8 @@ pub fn stream_pair() -> (TestByteStream, TestByteStream) {
             outbox: Rc::clone(&to_right),
             read_cap: Cell::new(None),
             write_cap: Cell::new(None),
-            fault: Cell::new(None),
+            fault: Rc::new(Cell::new(None)),
+            reads: Rc::new(Cell::new(0)),
             writes: Rc::new(RefCell::new(Vec::new())),
         },
         TestByteStream {
@@ -382,7 +442,8 @@ pub fn stream_pair() -> (TestByteStream, TestByteStream) {
             outbox: to_left,
             read_cap: Cell::new(None),
             write_cap: Cell::new(None),
-            fault: Cell::new(None),
+            fault: Rc::new(Cell::new(None)),
+            reads: Rc::new(Cell::new(0)),
             writes: Rc::new(RefCell::new(Vec::new())),
         },
     )
@@ -545,6 +606,25 @@ mod tests {
 
         log.clear();
         assert_eq!(log.writes(), 0, "clearing forgets the window before it");
+    }
+
+    #[test]
+    fn the_read_log_counts_pending_successful_and_failing_polls() {
+        let (mut a, mut b) = stream_pair();
+        let log = a.read_log();
+        let mut buffer = [0_u8; 4];
+
+        assert!(poll_once(|cx| a.poll_read(cx, &mut buffer)).is_pending());
+        assert_eq!(log.reads(), 1);
+        assert!(poll_once(|cx| b.poll_write(cx, b"x")).is_ready());
+        assert!(poll_once(|cx| a.poll_read(cx, &mut buffer)).is_ready());
+        assert_eq!(log.reads(), 2);
+
+        a.inject(Fault::Broken);
+        assert!(poll_once(|cx| a.poll_read(cx, &mut buffer)).is_ready());
+        assert_eq!(log.reads(), 3);
+        log.clear();
+        assert_eq!(log.reads(), 0);
     }
 
     /// A refusal is the harness's own doing, so it is not charged to the connection.
