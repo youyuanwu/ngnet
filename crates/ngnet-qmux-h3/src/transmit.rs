@@ -125,10 +125,8 @@ pub(crate) fn drain<S: AsyncByteStream, C: Clock, Src: StreamSource>(
         }
     }
 
-    // Everything the pass produced is still sitting in the connection's outbound buffer, and
-    // no other call is obliged to come along and move it. This is the forced flush of the whole
-    // arrangement: the offers above left their records to accumulate on the promise that this
-    // line writes them, and a pass that returned without it would leave a driver waiting on a
-    // peer that had heard nothing.
-    pump::pump(inner, cx);
+    // Keep a sub-ceiling tail across the driver's internal passes. The driver calls the
+    // transport's explicit flush operation before its connection future can suspend, and a
+    // full buffer still writes here to make room.
+    pump::pump_buffered(inner, cx);
 }

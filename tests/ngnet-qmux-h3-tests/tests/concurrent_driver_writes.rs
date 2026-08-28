@@ -16,16 +16,13 @@
 //! concurrency, and it is answered by counting writes per turn as the number of open streams
 //! grows.
 //!
-//! # What is pinned now that coalescing has landed
+//! # What is pinned now that suspension is the flush boundary
 //!
-//! These assertions used to pin today's unoptimized behaviour and to name Phase 4 as the phase
-//! expected to break them. It did break two of them and it did not break the third, and the
-//! difference between those two outcomes is the finding this file now records.
-//!
-//! Coalescing merges the records produced within one *transmit pass*, because a pass must end
-//! with a forced write -- nothing else is obliged to come along and move what it produced
-//! (FR-003). So a point in this grid improves in proportion to how many records a pass has to
-//! merge:
+//! A transport pass is not a task suspension. The HTTP/3 driver may make many productive passes
+//! in one poll of its connection future, and QMux retains their records within its fixed output
+//! ceiling. The driver invokes `QuicConnection::poll_flush` before it actually returns
+//! `Pending`, so output is neither written once per internal pass nor left waiting for a call
+//! that may never happen.
 //!
 //! - **A multiplexed pass carrying bodies** offers stream after stream before it ends, and their
 //!   records leave together. This is where the gain is, and it is large: at concurrency 64 with
@@ -36,23 +33,13 @@
 //!
 //!   That second change is also what this file's multiplexed-pass ratio now guards from the
 //!   other side. A call that fills records to a *full-record* reserve
-//!   strands the last few dozen bytes of each body, and a pass ends with a forced write, so
-//!   those tails leave one write apiece: 130 writes at concurrency 64 with 64 KiB bodies,
-//!   worse than coalescing alone. The tail-fit clause in `Connection::room_for` is what this
-//!   ratio fails without.
-//! - **A pass carrying one empty-bodied request** has one small record in it and nothing to
-//!   merge. The empty-body arm therefore barely moves -- 70 writes to 66 at concurrency 64 --
-//!   and what did move is the connection preamble rather than the requests. The cause is not the
-//!   buffer: it is that each request is submitted in a driver pass of its own, and every pass
-//!   owes its driver a write.
-//!
-//! The plan expected the second of those to collapse too, from a model in
-//! `.paw/work/qmux-h3-perf/Phase2Screen.md` that merged every write within a harness *turn*.
-//! A turn is a poll of the connection future and contains many passes, so the model was an upper
-//! bound rather than a prediction, and the distance between them is exactly the per-pass forced
-//! write. Making that smaller is a question about how the driver batches submissions, not about
-//! what the transport does with what it is handed; it is recorded in
-//! `docs/qmux-h3/pending-work.md`.
+//!   strands the last few dozen bytes of each body. The tail-fit clause in
+//!   `Connection::room_for` is what this ratio fails without.
+//! - **Empty-bodied requests** are still submitted one per internal pass, but those small head
+//!   records now survive across passes and leave at the real suspension boundary. The hand-driven
+//!   client count is three at 1, 8 and 64 streams; the both-endpoint count is five at every point.
+//!   The absolute whole-run ceiling below catches a return to the pre-change 7, 14 and 72 shape,
+//!   including a server-only regression which a client log would miss.
 //!
 //! Run with `--nocapture` to see the table these figures were reported from; the numbers are
 //! printed rather than only asserted because the screen in
@@ -196,7 +183,10 @@ struct Point {
     per_turn: Vec<usize>,
     /// Every write's length, grouped by the turn that issued it.
     turn_lengths: Vec<Vec<usize>>,
+    /// Client writes, used by the per-turn coalescing assertions.
     total: usize,
+    /// Client and server writes across the complete hand-driven run.
+    whole_total: usize,
 }
 
 impl Point {
@@ -264,6 +254,7 @@ fn measure(concurrency: usize, body: usize) -> Point {
     // Taken before the stream is moved into the connection: the log is a handle to shared
     // state, and there is no way to reach the stream again once the connection owns it.
     let log = client_io.write_log();
+    let server_log = server_io.write_log();
     let clock = TestClock::new();
     let transport = windows();
     let http = HttpConfig::default();
@@ -319,7 +310,7 @@ fn measure(concurrency: usize, body: usize) -> Point {
         AllOf::new(exchanges).await
     };
 
-    let (echoed, turns) = Turns::drive(&log, connection, serving, exchange);
+    let (echoed, turns) = Turns::drive_both(&log, &server_log, connection, serving, exchange);
     assert_eq!(
         echoed.len(),
         concurrency,
@@ -346,12 +337,14 @@ fn measure(concurrency: usize, body: usize) -> Point {
         "the per-turn counts do not account for every write, so grouping them by turn would \
          misattribute one"
     );
+    let whole_total = turns.whole_total();
 
     Point {
         concurrency,
         per_turn: turns.writes,
         turn_lengths,
         total: turns.lengths.len(),
+        whole_total,
     }
 }
 
@@ -364,14 +357,15 @@ fn sweep(body: usize) -> Vec<Point> {
 
     println!("\nbody = {body} bytes");
     println!(
-        "{:>5} {:>8} {:>11} {:>7} {:>8} {:>9} {:>10} {:>10} {:>8}  writes per turn",
-        "N", "writes", "bytes", "small", "turns", "busiest", "c=64KiB", "c=256KiB", "c=inf"
+        "{:>5} {:>8} {:>8} {:>11} {:>7} {:>8} {:>9} {:>10} {:>10} {:>8}  writes per turn",
+        "N", "client", "both", "bytes", "small", "turns", "busiest", "c=64KiB", "c=256KiB", "c=inf"
     );
     for point in &points {
         println!(
-            "{:>5} {:>8} {:>11} {:>7} {:>8} {:>9} {:>10} {:>10} {:>8}  {:?}",
+            "{:>5} {:>8} {:>8} {:>11} {:>7} {:>8} {:>9} {:>10} {:>10} {:>8}  {:?}",
             point.concurrency,
             point.total,
+            point.whole_total,
             point.bytes(),
             point.small(),
             point.per_turn.len(),
@@ -497,50 +491,26 @@ fn a_multiplexed_pass_writes_far_less_often_than_it_produces_records() {
     }
 }
 
-/// An empty-bodied request still costs about one write, and the buffer is not what decides it.
+/// Empty exchanges stay within one fixed whole-connection write budget.
 ///
-/// The guard that did *not* invert, kept as a guard on a deficiency so that the day it does
-/// invert somebody has to come here and say why.
-///
-/// Each request is submitted in a driver pass of its own; the pass produces one small head
-/// record and then owes its driver a write, because FR-003 forbids leaving output waiting for a
-/// later pass that may never come. There is nothing in the buffer to merge it with. A larger
-/// ceiling would change nothing; what would change it is the driver submitting several requests
-/// before it transmits, which is above this layer.
+/// The client still submits one request per internal driver pass. Those passes no longer force
+/// the transport: the explicit suspension hook does, after the productive run has accumulated
+/// every request. Both endpoint logs are counted so a server-side per-response regression cannot
+/// hide behind a constant client result.
 #[test]
-fn an_empty_bodied_request_still_costs_about_a_write() {
+fn concurrent_empty_exchanges_do_not_add_a_write_per_stream() {
     let points = sweep(EMPTY);
-    let many = &points[points.len() - 1];
-    assert_eq!(
-        many.concurrency, 64,
-        "the last point must be the sixty-four-stream one"
-    );
-
-    assert!(
-        many.total >= many.concurrency,
-        "sixty-four empty-bodied requests cost {} writes, fewer than one each. That is better \
-         than this test expects and the improvement should be described here rather than \
-         passing unremarked: something has begun merging across passes, or the driver has begun \
-         submitting more than one request per pass. Writes per turn: {:?}",
-        many.total,
-        many.per_turn
-    );
-
-    assert!(
-        many.total < 2 * many.concurrency,
-        "sixty-four empty-bodied requests cost {} writes, which is more than the one per request \
-         their passes account for, so something is writing more than once per pass",
-        many.total
-    );
-
-    let single = &points[0];
-    assert!(
-        many.busiest() > 8 * single.busiest(),
-        "with empty bodies a turn's writes still track the streams in flight, because each \
-         stream is submitted in a pass of its own and each pass writes once: {} against {}. If \
-         this has stopped being true the per-pass cost has gone, and this file's account of why \
-         the empty arm barely moved is out of date",
-        many.busiest(),
-        single.busiest()
-    );
+    for point in &points {
+        let limit = if point.concurrency == 1 { 7 } else { 12 };
+        assert!(
+            point.whole_total <= limit,
+            "{} concurrent empty exchanges issued {} writes across both endpoints; the fixed \
+             budget is {limit}. The pre-change hand-driven counts were 7, 14 and 72 at 1, 8 and \
+             64 streams, so exceeding this budget means internal passes have started forcing \
+             output again. Client writes per turn: {:?}",
+            point.concurrency,
+            point.whole_total,
+            point.per_turn
+        );
+    }
 }

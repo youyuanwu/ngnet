@@ -56,15 +56,11 @@
 //! An *opportunistic* one offers it only when it can no longer take another record -- to make
 //! room, not to empty it.
 //!
-//! Every public entry point here ends with a forced flush, because the caller may stop polling
-//! the moment it returns and output held back for a pass that never comes is a stalled
-//! connection rather than a slow one. The single exception is
-//! [`poll_pump_buffered`](Connection::poll_pump_buffered), which exists for a caller that is
-//! *mid-turn* -- the HTTP/3 join offers this connection up to sixty-four times before
-//! returning to its driver, and pumps in between so the pass can move more than one record.
-//! Were that pump to flush, a driver turn would still pay one write per record and coalescing
-//! would achieve nothing while every test inside this file still passed. Its contract is that
-//! the caller ends its turn with [`poll_pump`](Connection::poll_pump) or an ending path.
+//! Public entry points force unless their name ends in `_buffered`. The buffered forms exist
+//! for a caller which can distinguish productive work from a task suspension: they retain
+//! output within the same ceiling and owe [`poll_pump`](Connection::poll_pump) before the task
+//! parks. The HTTP/3 join has that scheduling proof. A standalone caller does not and should
+//! use the forced forms.
 //!
 //! # What a partial accept leaves behind, and why nothing reclaims it
 //!
@@ -931,11 +927,24 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     ///
     /// Reports the connection's ending once the queue is empty.
     pub fn poll_next_event(&mut self, cx: &mut Context<'_>) -> Poll<Result<Event>> {
-        // Forced: a caller reading events may never write at all, and the window extensions
-        // and ping answers this pass produces are exactly what the peer is waiting for before
-        // it sends the next event. Accumulating those would be a connection that goes quiet in
-        // proportion to how well it is being read.
-        let pumped = self.pump(cx, Flush::Everything);
+        self.poll_next_event_with(cx, Flush::Everything)
+    }
+
+    /// Polls the next event while retaining sub-ceiling output.
+    ///
+    /// This is for a caller which can prove it will either keep driving the connection or
+    /// call [`Connection::poll_pump`] before its task suspends. It has the same event and
+    /// error semantics as [`Connection::poll_next_event`], but it writes only when the
+    /// outbound buffer needs room for another record.
+    ///
+    /// **The caller owes a forced flush.** A standalone event consumer should use
+    /// [`Connection::poll_next_event`] instead.
+    pub fn poll_next_event_buffered(&mut self, cx: &mut Context<'_>) -> Poll<Result<Event>> {
+        self.poll_next_event_with(cx, Flush::WhenFull)
+    }
+
+    fn poll_next_event_with(&mut self, cx: &mut Context<'_>, flush: Flush) -> Poll<Result<Event>> {
+        let pumped = self.pump(cx, flush);
         if let Some(event) = self.events.pop() {
             if let Event::StreamData { data, .. } = &event {
                 // Delivery is what read-ahead is measured in: from here the bytes are the
@@ -971,7 +980,7 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     /// Reports the connection's ending. Exhausted stream capacity is not an error: it is
     /// [`Poll::Pending`], because the peer may raise the limit at any time.
     pub fn poll_open_bidi(&mut self, cx: &mut Context<'_>) -> Poll<Result<StreamId>> {
-        self.poll_open(cx, OpenKind::Bidi)
+        self.poll_open(cx, OpenKind::Bidi, Flush::Everything)
     }
 
     /// Opens a unidirectional stream.
@@ -980,23 +989,32 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     ///
     /// As [`Connection::poll_open_bidi`].
     pub fn poll_open_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<StreamId>> {
-        self.poll_open(cx, OpenKind::Uni)
+        self.poll_open(cx, OpenKind::Uni, Flush::Everything)
     }
 
-    fn poll_open(&mut self, cx: &mut Context<'_>, kind: OpenKind) -> Poll<Result<StreamId>> {
-        // Forced, like every entry point a caller can stop polling after. The open itself
-        // queues a record rather than producing one, so what this flush carries is whatever was
-        // already waiting -- which is exactly the output a caller who now parks on the returned
-        // stream would otherwise strand.
-        //
-        // An opportunistic pump here was tried and reverted: it measured no fewer writes in
-        // any arm of the concurrency sweep, because a driver opens the streams a pass needs
-        // before it offers anything onto them, so the buffer it would have left unflushed is
-        // empty. What it did cost was the clean rule -- every entry point but
-        // `poll_pump_buffered` forces -- and a caller that opened a stream and then parked on
-        // something outside this connection would have stranded whatever an earlier
-        // `try_write_stream` or `extend_connection_credit` had queued.
-        if let Err(error) = self.pump(cx, Flush::Everything) {
+    /// Opens a bidirectional stream while retaining sub-ceiling output.
+    ///
+    /// The caller owes [`Connection::poll_pump`] before its task suspends. Use
+    /// [`Connection::poll_open_bidi`] without that scheduling proof.
+    pub fn poll_open_bidi_buffered(&mut self, cx: &mut Context<'_>) -> Poll<Result<StreamId>> {
+        self.poll_open(cx, OpenKind::Bidi, Flush::WhenFull)
+    }
+
+    /// Opens a unidirectional stream while retaining sub-ceiling output.
+    ///
+    /// The caller owes [`Connection::poll_pump`] before its task suspends. Use
+    /// [`Connection::poll_open_uni`] without that scheduling proof.
+    pub fn poll_open_uni_buffered(&mut self, cx: &mut Context<'_>) -> Poll<Result<StreamId>> {
+        self.poll_open(cx, OpenKind::Uni, Flush::WhenFull)
+    }
+
+    fn poll_open(
+        &mut self,
+        cx: &mut Context<'_>,
+        kind: OpenKind,
+        flush: Flush,
+    ) -> Poll<Result<StreamId>> {
+        if let Err(error) = self.pump(cx, flush) {
             return Poll::Ready(Err(error));
         }
 

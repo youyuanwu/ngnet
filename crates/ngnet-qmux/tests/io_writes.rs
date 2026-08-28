@@ -189,6 +189,48 @@ fn send_fixed_payload(
     drain_written(far)
 }
 
+#[test]
+fn buffered_event_and_open_calls_owe_one_forced_flush() {
+    let (mut conn, mut far, log) = client_with_peer(|_| {});
+    peer_writes(&mut far, &announcement_record(Role::Server));
+    let stream = run(async {
+        let stream = open_bidi(&mut conn).await.expect("opening a stream");
+        flush(&mut conn).await.expect("flushing setup");
+        stream
+    });
+    drain_written(&mut far);
+    let before = log.writes();
+
+    assert!(matches!(
+        conn.try_write_stream(stream, b"held", false),
+        Ok(StreamWrite::Accepted(4))
+    ));
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+
+    if let Poll::Ready(Err(error)) = conn.poll_next_event_buffered(&mut cx) {
+        panic!("buffered event poll failed: {error}");
+    }
+    assert!(
+        conn.poll_open_bidi_buffered(&mut cx).is_ready(),
+        "the peer's stream allowance should permit another open"
+    );
+    assert_eq!(
+        log.writes(),
+        before,
+        "buffered public calls must not empty a sub-ceiling tail"
+    );
+    assert!(conn.queued_output() > 0);
+
+    assert!(conn.poll_pump(&mut cx).is_ready());
+    assert_eq!(conn.queued_output(), 0);
+    assert_eq!(
+        log.writes(),
+        before + 1,
+        "the suspension flush should discharge the whole retained run"
+    );
+}
+
 /// A payload costs one write per guaranteed carry, not one per record (Spec SC-001).
 ///
 /// The two figures compared are the number of writes the byte stream saw and the number of

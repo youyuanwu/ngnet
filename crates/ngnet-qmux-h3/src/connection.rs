@@ -296,7 +296,7 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
     /// Pulls from the layer until there is an event to hand over, or nothing left to pull.
     fn fill(&mut self, cx: &mut Context<'_>) {
         while self.next.is_none() {
-            match self.conn.poll_next_event(cx) {
+            match self.conn.poll_next_event_buffered(cx) {
                 Poll::Ready(Ok(event)) => self.next = translate(event, self.local),
                 Poll::Ready(Err(error)) => {
                     self.end(&error);
@@ -314,7 +314,7 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
         // interaction, without a list of which kinds count.
         self.flush_credit();
 
-        pump::pump(self, cx);
+        pump::pump_buffered(self, cx);
 
         // Releases first. They belong to bytes the layer handed over earlier and hold its
         // buffers until they are delivered, so nothing is served by making them queue behind
@@ -371,24 +371,20 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
         // capacity the peer has not granted -- and credit stranded behind a park is a window
         // the peer is never told about while both ends wait for the other.
         self.flush_credit();
-        pump::pump(self, cx);
+        pump::pump_buffered(self, cx);
         if self.ending.is_some() {
             return Poll::Ready(Err(self.ended()));
         }
         let opened = if bidi {
-            self.conn.poll_open_bidi(cx)
+            self.conn.poll_open_bidi_buffered(cx)
         } else {
-            self.conn.poll_open_uni(cx)
+            self.conn.poll_open_uni_buffered(cx)
         };
         match opened {
-            // The open itself is only a record; pumping again is what puts it on the wire,
-            // and the peer will not answer on a stream it has not heard of. Forced rather than
-            // buffered, unlike the pumps between offers: a driver opens the streams a pass
-            // needs before it offers anything onto any of them, so there is nothing buffered
-            // here for a record to accumulate with, and the buffered form was measured across
-            // the concurrency sweep and saved no write anywhere.
+            // The open itself is only a record. Keep it with the request or control bytes the
+            // driver is about to offer; `poll_flush` writes it before any operation can park.
             Poll::Ready(Ok(id)) => {
-                pump::pump(self, cx);
+                pump::pump_buffered(self, cx);
                 Poll::Ready(Ok(stream_id(id)))
             }
             Poll::Ready(Err(error)) => {
