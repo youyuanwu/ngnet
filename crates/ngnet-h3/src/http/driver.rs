@@ -607,12 +607,13 @@ impl<Q: QuicConnection> Driver<Q> {
     /// Feeds received bytes to the state machine and extends receive credit.
     fn read(&mut self, stream: StreamId, bytes: Bytes, fin: bool) -> Result<()> {
         let now = self.backend.now();
-        // Lent for the duration of the call so delivery can take refcounted views of it.
-        self.events.set_inbound(Some(bytes.clone()));
+        // Callbacks retain checked ranges only. Once the FFI call returns, a unique parent can
+        // move into a whole-body observation without first becoming shared.
+        self.events.begin_inbound(&bytes);
         let credit = self
             .conn
             .read_stream(stream, &bytes, fin, now, &mut self.events);
-        self.events.set_inbound(None);
+        self.events.finish_inbound(bytes);
         let credit = credit?;
 
         self.extend(Some(stream), credit.bytes())?;
@@ -781,7 +782,7 @@ pub(crate) fn dispatch<Q: QuicConnection, R: Role>(
             },
             Observation::Data { stream, bytes } => {
                 if let Some(incoming) = driver.registry.incoming(stream) {
-                    incoming.push(bytes);
+                    incoming.push(bytes.into_ready());
                 }
             }
             Observation::End { stream } => {

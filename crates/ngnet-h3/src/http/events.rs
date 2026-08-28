@@ -8,6 +8,7 @@
 //! abort the process.
 
 use bytes::Bytes;
+use core::ops::Range;
 
 use crate::handlers::{FieldSection, PeerSettings, Shutdown, StreamClosed};
 use crate::stream::StreamId;
@@ -22,7 +23,10 @@ pub(crate) enum Observation {
         fields: Vec<(Vec<u8>, Vec<u8>)>,
     },
     /// Body bytes arrived.
-    Data { stream: StreamId, bytes: Bytes },
+    Data {
+        stream: StreamId,
+        bytes: InboundData,
+    },
     /// The peer will send nothing further on this stream.
     End { stream: StreamId },
     /// The state machine has finished with this stream.
@@ -34,6 +38,35 @@ pub(crate) enum Observation {
     Shutdown(Shutdown),
     /// The peer's settings arrived.
     Settings(PeerSettings),
+}
+
+/// Body storage while an nghttp3 callback is being turned into an observation.
+#[derive(Debug)]
+pub(crate) enum InboundData {
+    /// Storage independent of the transport input.
+    Ready(Bytes),
+    /// A checked range of the transport input, resolved after the FFI call returns.
+    Range(Range<usize>),
+}
+
+impl InboundData {
+    /// Takes storage after the driver has resolved every input range.
+    pub(crate) fn into_ready(self) -> Bytes {
+        match self {
+            Self::Ready(bytes) => bytes,
+            Self::Range(_) => {
+                unreachable!("the driver resolves callback ranges before dispatching them")
+            }
+        }
+    }
+}
+
+/// The input address range callbacks may refer to during one state-machine read.
+#[derive(Clone, Copy, Debug)]
+struct Inbound {
+    start: usize,
+    end: usize,
+    observed: usize,
 }
 
 /// A field section being accumulated.
@@ -55,13 +88,65 @@ pub(crate) struct Events {
     /// Set by the driver immediately before `read_stream` and cleared after. It is what
     /// makes copy-free delivery possible — and what makes the containment check necessary,
     /// because the bytes a handler receives are not always inside it.
-    inbound: Option<Bytes>,
+    inbound: Option<Inbound>,
 }
 
 impl Events {
-    /// Lends the driver's transport buffer for the duration of one read.
-    pub(crate) fn set_inbound(&mut self, bytes: Option<Bytes>) {
-        self.inbound = bytes;
+    /// Begins one read whose callbacks may refer to `bytes`.
+    pub(crate) fn begin_inbound(&mut self, bytes: &Bytes) {
+        debug_assert!(self.inbound.is_none());
+        self.inbound = Some(Inbound {
+            start: bytes.as_ptr() as usize,
+            end: bytes.as_ptr() as usize + bytes.len(),
+            observed: self.observed.len(),
+        });
+    }
+
+    /// Resolves checked callback ranges after the state-machine read has returned.
+    pub(crate) fn finish_inbound(&mut self, bytes: Bytes) {
+        let Some(inbound) = self.inbound.take() else {
+            return;
+        };
+        let ranges = self.observed[inbound.observed..]
+            .iter()
+            .filter(|observation| {
+                matches!(
+                    observation,
+                    Observation::Data {
+                        bytes: InboundData::Range(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        let mut parent = Some(bytes);
+
+        for observation in &mut self.observed[inbound.observed..] {
+            let Observation::Data { bytes: data, .. } = observation else {
+                continue;
+            };
+            if !matches!(data, InboundData::Range(_)) {
+                continue;
+            }
+            let InboundData::Range(range) =
+                core::mem::replace(data, InboundData::Ready(Bytes::new()))
+            else {
+                unreachable!("the range was checked immediately before replacement");
+            };
+            *data = InboundData::Ready(if ranges == 1 {
+                let parent = parent.take().expect("the one range has one parent");
+                if range.start == 0 && range.end == parent.len() {
+                    parent
+                } else {
+                    parent.slice(range)
+                }
+            } else {
+                parent
+                    .as_ref()
+                    .expect("multiple ranges retain their parent")
+                    .slice(range)
+            });
+        }
     }
 
     /// Begins a field section.
@@ -106,9 +191,13 @@ impl Events {
     /// So containment is checked rather than assumed, and a replayed chunk is copied. The
     /// common case — bytes arriving and being delivered straight away — still costs nothing.
     pub(crate) fn push_data(&mut self, stream: StreamId, chunk: &[u8]) {
-        let bytes = match &self.inbound {
-            Some(parent) => view_of(parent, chunk),
-            None => Bytes::copy_from_slice(chunk),
+        let bytes = if chunk.is_empty() {
+            InboundData::Ready(Bytes::new())
+        } else {
+            match self.inbound.and_then(|parent| range_of(parent, chunk)) {
+                Some(range) => InboundData::Range(range),
+                None => InboundData::Ready(Bytes::copy_from_slice(chunk)),
+            }
         };
         self.observed.push(Observation::Data { stream, bytes });
     }
@@ -180,20 +269,14 @@ impl Events {
 ///
 /// Address arithmetic only, no dereferencing: both slices are live for the duration of the
 /// call, and all this decides is whether one is a subrange of the other.
-fn view_of(parent: &Bytes, chunk: &[u8]) -> Bytes {
-    if chunk.is_empty() {
-        return Bytes::new();
-    }
-    let parent_start = parent.as_ptr() as usize;
-    let parent_end = parent_start + parent.len();
+fn range_of(parent: Inbound, chunk: &[u8]) -> Option<Range<usize>> {
     let chunk_start = chunk.as_ptr() as usize;
     let chunk_end = chunk_start + chunk.len();
 
-    if chunk_start >= parent_start && chunk_end <= parent_end {
-        parent.slice((chunk_start - parent_start)..(chunk_end - parent_start))
+    if chunk_start >= parent.start && chunk_end <= parent.end {
+        Some((chunk_start - parent.start)..(chunk_end - parent.start))
     } else {
-        // The replay path. Rare, and a copy is the price of never aborting.
-        Bytes::copy_from_slice(chunk)
+        None
     }
 }
 
@@ -201,12 +284,56 @@ fn view_of(parent: &Bytes, chunk: &[u8]) -> Bytes {
 mod tests {
     use super::*;
 
+    fn stream(id: i64) -> StreamId {
+        StreamId::new(id).expect("a stream")
+    }
+
     #[test]
-    fn a_chunk_inside_the_buffer_is_a_view_not_a_copy() {
+    fn one_whole_callback_moves_the_unique_parent() {
+        let parent = Bytes::from(b"hello world".to_vec());
+        let ptr = parent.as_ptr();
+        let mut events = Events::default();
+        events.begin_inbound(&parent);
+        events.push_data(stream(0), &parent);
+        events.finish_inbound(parent);
+        let Observation::Data { bytes, .. } = events.observed.pop().expect("an observation") else {
+            panic!("body data");
+        };
+        let bytes = bytes.into_ready();
+        assert_eq!(&bytes[..], b"hello world");
+        assert!(std::ptr::eq(bytes.as_ptr(), ptr));
+    }
+
+    #[test]
+    fn a_proper_range_is_resolved_after_the_read() {
         let parent = Bytes::from_static(b"hello world");
-        let view = view_of(&parent, &parent[6..]);
-        assert_eq!(&view[..], b"world");
-        assert!(std::ptr::eq(view.as_ptr(), parent[6..].as_ptr()));
+        let mut events = Events::default();
+        events.begin_inbound(&parent);
+        events.push_data(stream(0), &parent[6..]);
+        events.finish_inbound(parent);
+        let Observation::Data { bytes, .. } = events.observed.pop().expect("an observation") else {
+            panic!("body data");
+        };
+        assert_eq!(&bytes.into_ready()[..], b"world");
+    }
+
+    #[test]
+    fn multiple_ranges_keep_order_and_offsets() {
+        let parent = Bytes::from_static(b"hello world");
+        let mut events = Events::default();
+        events.begin_inbound(&parent);
+        events.push_data(stream(0), &parent[..5]);
+        events.push_data(stream(0), &parent[6..]);
+        events.finish_inbound(parent);
+        let mut observed = events.observed.into_iter();
+        let Observation::Data { bytes: first, .. } = observed.next().expect("first") else {
+            panic!("body data");
+        };
+        let Observation::Data { bytes: second, .. } = observed.next().expect("second") else {
+            panic!("body data");
+        };
+        assert_eq!(&first.into_ready()[..], b"hello");
+        assert_eq!(&second.into_ready()[..], b"world");
     }
 
     #[test]
@@ -215,14 +342,27 @@ mod tests {
         // from a state-machine handler crosses a C frame and aborts the process.
         let parent = Bytes::from_static(b"hello world");
         let foreign = b"entirely elsewhere".to_vec();
-        let copied = view_of(&parent, &foreign);
-        assert_eq!(&copied[..], b"entirely elsewhere");
+        let mut events = Events::default();
+        events.begin_inbound(&parent);
+        events.push_data(stream(0), &foreign);
+        events.finish_inbound(parent);
+        let Observation::Data { bytes, .. } = events.observed.pop().expect("an observation") else {
+            panic!("body data");
+        };
+        assert_eq!(&bytes.into_ready()[..], b"entirely elsewhere");
     }
 
     #[test]
     fn an_empty_chunk_is_handled_without_arithmetic_on_a_dangling_pointer() {
         let parent = Bytes::from_static(b"hello");
-        assert!(view_of(&parent, b"").is_empty());
+        let mut events = Events::default();
+        events.begin_inbound(&parent);
+        events.push_data(stream(0), b"");
+        events.finish_inbound(parent);
+        let Observation::Data { bytes, .. } = events.observed.pop().expect("an observation") else {
+            panic!("body data");
+        };
+        assert!(bytes.into_ready().is_empty());
     }
 
     #[test]
