@@ -10,7 +10,7 @@ what the run does and does not establish.
 | Machine | Status | Runs |
 | --- | --- | --- |
 | [`legacy-dev-host`](legacy-dev-host/) | **Retired, unavailable.** Every measurement taken before 2026-08-16. Noisy: unchanged control arms drifted 5–15% within a session. | 4 |
-| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current. Intel Xeon Platinum 8370C, 8 vCPU, Linux 6.17 on Azure. Quiet: **~1%** between identical passes. | 9 |
+| [`xeon-8370c-azure`](xeon-8370c-azure/) | Historical VM label. Runs 01–11 report Intel Xeon Platinum 8370C; run 12 observed a migrated Intel Xeon Platinum 8573C, so absolute figures across that boundary are not controlled. | 12 |
 
 **Absolute figures from different machines must never be tabulated together.** Nothing here
 is normalised for CPU model, kernel or io_uring implementation, and those are exactly the
@@ -36,6 +36,8 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [08-qmux-against-h2](xeon-8370c-azure/08-qmux-against-h2.md) | xeon-8370c-azure | 2026-08-18 | **QMux against HTTP/2** — a fixed +19–34 µs per exchange, and 0.86× per byte over a socket | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
 | [09-qmux-h2-mechanisms](xeon-8370c-azure/09-qmux-h2-mechanisms.md) | xeon-8370c-azure | 2026-08-27 | **Why** — writes per exchange, processor time by layer, and a linear scan in `ngnet-h3` | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
 | [10-h3-closed-stream-lookup](xeon-8370c-azure/10-h3-closed-stream-lookup.md) | xeon-8370c-azure | 2026-08-27 | Constant-time closed-stream lookup — **−13–18% duplex, −7–13% socket** | — |
+| [11-qmux-flush-decoupling](xeon-8370c-azure/11-qmux-flush-decoupling.md) | xeon-8370c-azure | 2026-08-28 | Decouple event batches from suspension flushes — **8.9–24.6% faster socket concurrency** | — |
+| [12-apply-events-reprofile](xeon-8370c-azure/12-apply-events-reprofile.md) | xeon-8370c-azure | 2026-08-28 | Reprofile `apply_events` after runs 10 and 11 — **0.74–1.05% serial, not 8.1%; no implementation** | — |
 
 **The cross-protocol comparison is [`08`](xeon-8370c-azure/08-qmux-against-h2.md), and it is the
 only run here that is one.** That sentence replaces a standing note saying no such run existed.

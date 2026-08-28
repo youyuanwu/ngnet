@@ -18,6 +18,11 @@
 | Frequency scaling | `performance` governor, `intel_pstate` with `no_turbo=0`. Turbo is **not** disabled, and a guest cannot pin the frequency, so some drift is expected. |
 | Rust toolchain | 1.97.1, from `rust-toolchain.toml` |
 
+> **Host migration note, run 12.** The `perf` header for run 12 reported an Intel Xeon Platinum
+> 8573C rather than the 8370C recorded above. The directory remains the historical VM label.
+> Run 12 uses within-run repetition for its current-revision verdict and does not treat absolute
+> differences from earlier runs as controlled hardware A/B measurements.
+
 **A shared virtual machine is not a benchmark rig.** Turbo cannot be disabled from inside the
 guest, the host's other tenants are invisible from here, and hyper-threading means a "pinned"
 core is half a physical one. Nothing on this host will produce trustworthy absolute figures;
@@ -82,6 +87,7 @@ submodules. [`../../running.md`](../../running.md) states the requirement in ful
 | [09-qmux-h2-mechanisms](09-qmux-h2-mechanisms.md) | 2026-08-27 | `dc922be` | **Why**, by counting — 68 writes against 189 at 1 MiB, `2n + 2` against 2 at concurrency, and 45% of the fixed cost inside `ngnet-h3` |
 | [10-h3-closed-stream-lookup](10-h3-closed-stream-lookup.md) | 2026-08-27 | `6d13712` against `419a774` | Constant-time closed-stream lookup — **−13–18% duplex, −7–13% socket** |
 | [11-qmux-flush-decoupling](11-qmux-flush-decoupling.md) | 2026-08-28 | `736b460` against `b6c76d6` | QMux concurrent socket writes collapse from `2n + 2` to **~3**, improving n=64 by **24.6%** without a serial-latency blocker |
+| [12-apply-events-reprofile](12-apply-events-reprofile.md) | 2026-08-28 | `700bfa6` | Fresh `apply_events` attribution is **0.74–1.05% serial, 1.86–1.89% at n=64**, not 8.1%; scratch reuse rejected before implementation |
 
 Still outstanding, in the order they are worth doing:
 
