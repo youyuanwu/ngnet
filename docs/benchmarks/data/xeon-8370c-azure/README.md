@@ -91,6 +91,8 @@ submodules. [`../../running.md`](../../running.md) states the requirement in ful
 | [13-qmux-h3-current-bottlenecks](13-qmux-h3-current-bottlenecks.md) | 2026-08-28 | `5477450` | Current bottlenecks — a duplicate event-path pump is **−5.4% duplex / −3.7% socket serial** in a diagnostic |
 | [14-qmux-h3-one-pump](14-qmux-h3-one-pump.md) | 2026-08-28 | `c6f1191` against `5477450` | Production one-pump rule — **96 → 73 reads; −5.26% duplex / −2.37% socket serial** |
 | [15-qmux-h3-shared-snapshot](15-qmux-h3-shared-snapshot.md) | 2026-08-28 | `0b6dcbd` against `c6f1191`, then `5477450` | Coherent shared work — **155 → 29 operations; −7.59% / −5.68% incremental serial** |
+| [16-qmux-h3-baseline-and-pump-attribution](16-qmux-h3-baseline-and-pump-attribution.md) | 2026-08-28 | `364dbb2` | Fresh post-PR-45 baseline on the migrated 8573C; exact **70-pump** source split with zero residual |
+| [17-qmux-h3-candidate-a-read-pump-amplification](17-qmux-h3-candidate-a-read-pump-amplification.md) | 2026-08-28 | `4e91115` against `43b7da0` | A2 removed **33/70 pumps**, but socket-serial timing did not clear spread/2% — reverted |
 
 Still outstanding, in the order they are worth doing:
 

@@ -8,7 +8,7 @@ This is the implementation backlog produced by
 [`09-qmux-h2-mechanisms`](../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md).
 The order is measured payoff divided by implementation risk, not source order.
 
-Items 1, 2, 4 and 5 are settled; item 3 is closed without implementation after reprofiling.
+Items 1, 2, 4, 5 and 8 are settled; item 3 is closed without implementation after reprofiling.
 Item 6 is the highest-priority open performance item.
 
 1. **Replace `ngnet-h3`'s linear closed-stream lookup — settled.** `Driver::close_stream` scanned a
@@ -76,6 +76,18 @@ Item 6 is the highest-priority open performance item.
    maximum is exactly 16 KiB while QMux can empty a 64 KiB buffer. A prototype must establish
    whether coalescing frames recovers the kernel-path gap without regressing latency or
    concurrency before it becomes an HTTP/2 change.
+8. **Collapse the remaining QMux event-loop pumps — closed after measured implementation.**
+   Fresh post-PR-45 attribution reconciled every empty-exchange pump: 23 from event filling,
+   seven before queued events, three around open, 32 in transmit drains, and five forced flushes.
+   A safe source-collapse implementation removed the duplicate open pre-pump and every
+   unconditional transmit pump, retaining only a buffer-capacity pump. Exact counts improved
+   from **70 → 37 pumps** and **73 → 40 reads**, with event/transmit/driver passes unchanged at
+   30/14/14. Despite that 47% count reduction, three controlled passes improved duplex serial
+   by 5.62% but socket serial by only **1.13%**, below both the 2% floor and the candidate's
+   2.87% spread, so the code was reverted. Pending-read caching remains unsafe without a new
+   guaranteed wake source, and driver-pass suppression lacks an outer turn boundary in the
+   transport interface. Do not retry these mechanisms from counts alone; see
+   [`run 17`](../benchmarks/data/xeon-8370c-azure/17-qmux-h3-candidate-a-read-pump-amplification.md).
 
 The duplicate-pump portion of the former 91-read observation is resolved in item 4; the remaining
 reads are not presumed redundant. The 16382-byte record payload and the fixed 64-offer yield were
