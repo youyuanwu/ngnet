@@ -69,6 +69,16 @@ What did transfer is everything above the transport: the driver-and-handle split
 role trait, handler futures the driver polls rather than spawns, and the shape of the error
 surface.
 
+### Shared driver work snapshot — settled
+
+The async driver formerly acquired the same shared mutex once per category and then once per
+category again around idle and park decisions. It now transfers all five work categories into
+driver-owned scratch under one lock, processes them with the lock released, and uses coherent
+idle, completion, and under-waker readiness predicates. Matched count builds reduce these method
+entries from 155 to 29 per empty exchange; controlled timing improves phase-one duplex/socket
+serial by 7.64% / 6.24%. The generic contract and race tests live in this crate; the timed QMux/H3
+evidence is [`run 15`](../benchmarks/data/xeon-8370c-azure/15-qmux-h3-shared-snapshot.md).
+
 ### QPACK is used but not exposed
 
 The encoder and decoder are driven internally and no public API reaches them. nghttp3 exposes

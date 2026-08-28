@@ -43,6 +43,7 @@ in-memory byte-stream pair and reads what each surfaced.
 | Property | Where |
 | --- | --- |
 | **Every real driver suspension first polls the transport flush** | `crates/ngnet-h3/tests/http_flush.rs`. A recording transport proves the pending operation precedes the flush at all four sites, and each site covers ready, pending-with-wake, and explicit-error outcomes. The QMux-specific drain, backpressure, and ending behavior is enforced by the translation tests above. |
+| **Shared work cannot be missed while the driver parks** | Unit tests beside `crates/ngnet-h3/src/http/shared.rs` pin the coherent five-category drain, post-snapshot next-pass boundary, and both sides of atomic waker registration/readiness recheck. Run 15 supplies the QMux/H3 operation counts and controlled timing. |
 
 ## Enforced end to end
 

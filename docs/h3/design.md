@@ -33,6 +33,30 @@ exactly what the paragraph above describes, with one dependency and no asynchron
 
 Server push is absent because nghttp3 does not implement it.
 
+## Shared work is transferred once per driver pass
+
+Handles, bodies, and nghttp3 callbacks queue five kinds of driver work: ready streams, caller
+resets, returned credit, transport actions, and graceful shutdown. They already live under one
+mutex because they are consumed at the same pass boundary. The driver transfers all five into
+reused driver-owned scratch with one acquisition, releases the lock, then processes them in the
+established credit, action, reset, ready, shutdown order. No shared lock spans a call into
+nghttp3, a transport, a body, or a waker.
+
+The transfer is a scheduling and ownership boundary. Work queued after it belongs to the next
+pass, so processing an early category cannot pull a later category across the boundary. If a
+fatal operation fails, the transferred batch dies with the driver and is not replayed: replaying
+the unprocessed tail could repeat a side effect already applied before the failure.
+
+Idle and normal-completion decisions inspect all five categories coherently. At the actual park,
+the driver installs its waker and repeats the readiness check while holding the same lock. Work
+queued before registration is seen by the recheck; work queued afterwards wakes the installed
+waker. The lock is dropped before that waker is invoked. A writability wake remains sufficient
+to retry blocked transport streams even when it carries no event.
+
+The four vector categories reuse capacity across passes. An adversarial burst above 2,048 entries
+is shrunk toward 1,024 after processing; ordinary loads at or below the high-water mark do not
+churn their allocation.
+
 ## Five differences from nghttp2 that are load-bearing
 
 Each of these compiles fine if you assume the nghttp2 shape, and each is silently wrong.

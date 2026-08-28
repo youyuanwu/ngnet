@@ -56,12 +56,15 @@ is the highest-priority open performance item.
    Controlled timing is **5.26% faster duplex serial and 2.37% faster socket serial** beyond
    matching controls and spread; duplex concurrency 64 and socket concurrency 1 also clear those
    bars. See [`run 14`](../benchmarks/data/xeon-8370c-azure/14-qmux-h3-one-pump.md).
-5. **Collapse the HTTP/3 driver's repeated shared-state probes.** The fresh profile counts 155
-   named `Shared` take/pending/readiness calls per empty QMux/H3 exchange. They account for
-   2.71 microseconds / 10.9% of QMux/H3 CPU, but analogous HTTP/2 methods already account for
-   1.16 microseconds / 10.4%, so they are secondary rather than the main cross-stack
-   differential. After item 4, investigate one combined drain/readiness snapshot under the
-   existing single mutex and measure before retaining it.
+5. **Collapse the HTTP/3 driver's repeated shared-state probes — settled.** One pass now drains
+   ready, reset, credit, action and shutdown work under one lock, then processes it outside the
+   lock; idle, completion and under-waker checks each use one coherent predicate. Exact matched
+   count builds reduce the eleven old take/readiness/refresh entries from **155 → 29** per empty
+   exchange. Controlled phase-1-to-snapshot timing improves duplex/socket serial by
+   **7.64% / 6.24%** and both concurrency-1 targets by **5.97% / 6.09%**, beyond controls and
+   spread. Fresh base-to-final serial timing is **11.95% / 8.00%** faster. The timing gate,
+   rather than the count alone, retains the change; see
+   [`run 15`](../benchmarks/data/xeon-8370c-azure/15-qmux-h3-shared-snapshot.md).
 6. **Design a cheaper ownership path for delivered record data.** At 1 MiB, QMux/H3 performs
    818 allocator calls against HTTP/2's 205, and 83% of QMux/H3 malloc stacks belong to the
    per-record delivery ownership path. The known pooled-reference design cut allocations but
