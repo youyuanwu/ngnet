@@ -74,8 +74,8 @@ is the highest-priority open performance item.
    whether coalescing frames recovers the kernel-path gap without regressing latency or
    concurrency before it becomes an HTTP/2 change.
 
-Do **not** prioritize the 91 QMux transport read polls per empty exchange: suppressing redundant
-pumps bought only **1.3%**. The 16382-byte record payload and the fixed 64-offer yield were
+The duplicate-pump portion of the former 91-read observation is resolved in item 4; the remaining
+reads are not presumed redundant. The 16382-byte record payload and the fixed 64-offer yield were
 eliminated as causes of the concurrency inversion. Do not pursue allocation counts without a
 timing hypothesis—the delivery-aliasing experiment already showed that a large allocation
 reduction can be slower—and do not modify `deps/dwnx` as part of this backlog.
