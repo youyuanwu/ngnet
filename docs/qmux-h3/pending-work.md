@@ -108,6 +108,14 @@ reprofiling.
    gate. Do not retry header-storage or registry changes from allocation counts alone. Native QPACK
    algorithm changes or a concrete concurrency-only mechanism would need independent gates. See
    [`run 19`](../benchmarks/data/xeon-8370c-azure/19-qmux-h3-candidate-c-fixed-header-work.md).
+10. **Reduce QMux event-queue traffic independently — closed as coupled to Candidate A.** Fresh
+    counts still show **23 pops = 23 `Inner::fill` iterations**, seven pushes and 16 empty pops per
+    exchange. An uncontended locked empty pop costs 16.09–16.26 ns, so skipping all empty locks is
+    only about 0.26 µs and still leaves 23 registered pop calls. Atomic emptiness hints and storage
+    changes therefore fail the count gate; wholesale drain violates the lower queue's read-ahead
+    accounting boundary. Reducing caller invocations requires changing the fill/driver schedule,
+    which is the already measured and reverted Candidate A mechanism. See
+    [`run 20`](../benchmarks/data/xeon-8370c-azure/20-qmux-h3-candidate-d-event-queue.md).
 
 The duplicate-pump portion of the former 91-read observation is resolved in item 4; the remaining
 reads are not presumed redundant. The 16382-byte record payload and the fixed 64-offer yield were
