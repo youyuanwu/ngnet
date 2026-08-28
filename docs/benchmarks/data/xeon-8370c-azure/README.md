@@ -96,6 +96,7 @@ submodules. [`../../running.md`](../../running.md) states the requirement in ful
 | [18-qmux-h3-candidate-b-delivery-ownership](18-qmux-h3-candidate-b-delivery-ownership.md) | 2026-08-28 | `96a20e6` against `0104e85` | B3 removed **160 allocations**, but improved duplex by <1.1% and was flat on socket — reverted |
 | [19-qmux-h3-candidate-c-fixed-header-work](19-qmux-h3-candidate-c-fixed-header-work.md) | 2026-08-28 | `c188758` against `c7c95d9` | C1–C3 removed **20 mallocs and 3 reallocs**, but timing was inconsistent and failed both-substrate gates — reverted |
 | [20-qmux-h3-candidate-d-event-queue](20-qmux-h3-candidate-d-event-queue.md) | 2026-08-28 | `6bff8ee` | Pops remain **23 = 23 fill iterations**, including 16 empty; queue-local options cannot reduce the registered count — closed |
+| [21-qmux-h3-combined-final-matrix](21-qmux-h3-combined-final-matrix.md) | 2026-08-28 | `0984e1c` against `364dbb2` | Final binaries are hash-identical to the merged predecessor; fresh 16-case QMux/H3 ÷ H2 ratios range from **0.842× to 2.088×** |
 
 Still outstanding, in the order they are worth doing:
 
