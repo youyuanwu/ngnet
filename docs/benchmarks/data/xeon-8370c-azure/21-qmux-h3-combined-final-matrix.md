@@ -6,12 +6,24 @@
 **Immediate merged predecessor:** `364dbb2`
 **Production-code result:** byte-for-byte unchanged; every optimization candidate failed its
 pre-registered elapsed gate and was reverted
+**Cases:** 16 Criterion cases — duplex and loopback-socket substrates ×
+{serial; concurrency 1, 8, 64; body 0, 1 KiB, 64 KiB, 1 MiB} — from the `serial_latency`,
+`concurrent_throughput` and `body_throughput` targets and their `transport_*` socket twins, each
+carrying its unchanged HTTP/2 arm
 **Commands:** `cargo build --release -p ngnet-bench --benches --example probe`; each Criterion
 binary as `taskset -c 3 <binary> --bench <stack-filter> --sample-size 50 --measurement-time 3
 --warm-up-time 1 --save-baseline final-{1,2} --noplot`
 **Repetitions:** three duplex passes and two socket passes of all 16 cases
 **Controls:** unchanged H2 arm in every pass; within-pass QMux/H3 ÷ H2 ratios
-**Exclusions:** none; all 64 stack/case/pass medians are reported
+**Exclusions:** none; all 80 stack/case/pass medians are reported
+
+## What was being asked
+
+After runs 17–20 rejected every optimization candidate, this run asks what the QMux/H3 stack
+actually costs against HTTP/2 on this host across the full registered 16-case workload matrix, and
+whether the final build differs in any measurable way from the merged predecessor `364dbb2` it was
+branched from. Because no mechanism was retained, the second question reduces to a build-identity
+check followed by a fresh, fully controlled ratio matrix.
 
 ## Revision identity
 
@@ -30,7 +42,7 @@ binary hashes built from merged revision `364dbb2`:
 
 Thus the final build, the revision immediately before any attempted candidate, and `364dbb2`
 collapse to the same executable comparison side. Running duplicate copies would compare a binary
-with itself, so the two fresh passes below are the direct final/predecessor/base measurement.
+with itself, so the fresh passes below are the direct final/predecessor/base measurement.
 Differences from run 16 are machine drift and sampling spread, not a code effect.
 
 ## Final 16-case matrix
@@ -80,6 +92,32 @@ follows:
 These movements are not optimization claims: hash identity proves a zero production-code delta.
 They demonstrate why the candidate gates required matching controls and spreads.
 
+## Drift controls in the same session
+
+The unchanged HTTP/2 arm is the control in every pass, and every ratio is formed within its own
+pass, so session drift cancels in the reported ratios.
+
+| Control arm | Movement across passes |
+| --- | --- |
+| duplex H2 (8 cases, three passes) | 0.73–4.11% spread |
+| socket H2 (8 cases, two passes) | 0.00–2.13% spread |
+| duplex QMux/H3 (8 cases, three passes) | 0.45–5.40% spread |
+| socket QMux/H3 (8 cases, two passes) | 0.00–1.90% spread |
+
+No movement in this run is attributed to code, because there is no code delta to attribute it to.
+
+## What this establishes
+
+- The final branch head builds byte-identical benchmark binaries to merged revision `364dbb2`, so
+  the production-code delta of this work is exactly zero and is provable from the hashes above.
+- On this Xeon 8573C, in this session, QMux/H3 ÷ H2 spans 0.842× to 2.088× across the 16 registered
+  cases: slower for empty, small-body and concurrent workloads, at parity near a 64 KiB body
+  (0.979×), and faster only at a 1 MiB body on the socket (0.842×).
+- Run 16's exact count vector still describes the measured executable, because the `probe` hash is
+  unchanged, so the counts and the timings in this record refer to the same binary.
+- Every candidate disposition recorded in runs 17–20 survives the combined check: there is no
+  retained mechanism whose claim could have regressed, and no adverse interaction to isolate.
+
 ## Final exact state and disposition
 
 Because the probe hash is also identical, run 16's lossless two-point final count vector applies
@@ -93,7 +131,7 @@ and missed both-substrate repeatability. Candidate D had no queue-confined mecha
 reducing its registered count. Every prototype was reverted, so the final PR carries measured
 evidence and backlog closure rather than an unproven optimization.
 
-## What this run does not claim
+## What it does not
 
 This run does not compare absolute timings with the older Xeon 8370C, claim that rerun drift is a
 code effect, or turn duplex concurrency into an improvement claim. It does not sweep header
