@@ -301,9 +301,10 @@ pub trait QuicConnection {
     /// task suspension and does not call this operation.
     ///
     /// [`Poll::Ready`] means either that the current output obligation has been discharged,
-    /// or that a terminal ending makes delivery impossible and the operation that was already
-    /// pending will report it. An ending that was already latched needs no new wake. Only an
-    /// ending newly discovered by this call must arrange the wake described below.
+    /// or that a terminal ending transfers any remaining obligation to the connection's
+    /// completion/error path and the operation that was already pending will report it. An
+    /// ending that was already latched needs no new wake. Only an ending newly discovered by
+    /// this call must arrange the wake described below.
     /// [`Poll::Pending`] means progress cannot be made now and this call registered `cx` to
     /// be woken when it can. An implementation must not return an unwoken `Pending`.
     ///
