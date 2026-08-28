@@ -35,7 +35,13 @@ in-memory byte-stream pair and reads what each surfaced.
 | **A close reaches the peer with its code** | `a_close_reaches_the_peer_with_its_code`. `QuicConnection::close` writes nothing, so a close that was encoded and never flushed would satisfy every check that only asked what this side did. This one reads it off the other end. |
 | **A peer that closes is an event, not a failure** | `a_peer_that_closes_is_an_event_and_not_a_failure`. The orderly/failed split decides whether the HTTP/3 driver winds down or reports a protocol error, and getting it backwards turns every polite disconnection into a server-side failure. |
 | **A stream ending keeps its own event batch** | `final_data_and_stream_close_are_separated_by_a_woken_boundary`. The trace is final `Data`, a self-woken `Pending`, then `StreamClosed`; response heads settle and the close cannot overtake the last bytes. This is the correctness boundary the flush change must not remove. |
-| **Suspension flushes once without inventing a wake loop** | `a_direct_caller_can_force_buffered_output`, `a_flush_wakes_once_for_a_new_ending_and_never_spins_on_it`, and the flush backpressure tests. A forced flush drains retained output or registers the byte stream's wake; an ending discovered there wakes the interrupted operation exactly once. |
+| **Suspension flushes once without inventing a wake loop** | `a_suspension_flush_parks_on_backpressure_and_finishes_after_its_wake` and `a_flush_wakes_once_for_a_new_ending_and_never_spins_on_it`. A forced flush drains retained output or registers the byte stream's wake; an ending discovered there wakes the interrupted operation exactly once. |
+
+## Enforced at the shared HTTP/3 transport seam
+
+| Property | Where |
+| --- | --- |
+| **Every real driver suspension first polls the transport flush** | `crates/ngnet-h3/tests/http_flush.rs`. A recording transport proves all four sites invoke a ready flush; representative bind-path tests separately prove pending wake registration and explicit error propagation. The QMux-specific drain, backpressure, and ending behavior is enforced by the translation tests above. |
 
 ## Enforced end to end
 
@@ -55,7 +61,6 @@ In `tests/ngnet-qmux-h3-tests/`, over the in-memory pair and over a loopback TCP
 | **A run of credit reports becomes one connection-window extension** | `credit_batching.rs`, `a_run_of_credit_reports_reaches_the_connection_as_one_extension_per_window`. Eight concurrent bodies, so a pass reports the shared window many times over; the assertion is a ratio rather than a fixed figure because how many deliveries a body arrives in is not this test's business. |
 | **A request completes over loopback TCP** | `loopback.rs`, `a_request_completes_over_loopback_tcp`. The in-memory pair is a legitimate deployment of QMux rather than a stand-in, but it preserves write boundaries a socket does not. |
 | **Concurrent empty exchanges do not restore a per-stream write** | `concurrent_driver_writes.rs`, at 1, 8, and 64 streams. The whole-run logs cover both endpoints and require at most 7/12/12 writes respectively; the current result is 5/5/5. A return to the old linear client term fails by a wide margin. |
-| **Every driver suspension discharges the buffered-output obligation** | The QMux cases in `crates/ngnet-h3/tests/http_flush.rs` cover binding, request-stream opening, transmit backpressure, and idle event polling. Each either drains before the task parks or proves that the byte stream's wake is wired. Completion, local close, orderly EOF, explicit error, short acceptance, and cancellation are covered by the translation, lifecycle, and closing suites rather than being left to an incidental later poll. |
 
 ## Enforced about the configuration passthrough
 

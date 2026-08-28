@@ -62,7 +62,7 @@ side's two medians divided by that side's mean. Lower is better.
 | socket concurrent 64 | 564.571 | 563.227 | 564.186 | 560.367 | −0.46% |
 
 The pre-registered serial gate normalises QMux movement by the matching HTTP/2 movement inside
-each paired pass. Duplex ratios were 1.0055 and 1.0210, whose two-pass median (the arithmetic
+each paired pass. Duplex ratios were 1.0054 and 1.0210, whose two-pass median (the arithmetic
 mean) is a 1.32% regression. The gate is 2%, the largest of 2%, absolute control movement, and
 QMux within-side spread, so this is not a serial blocker. Socket ratios were 0.9027 and 0.9015,
 a 9.79% normalised improvement.
@@ -72,6 +72,10 @@ a 9.79% normalised improvement.
 Raw syscall counts include process setup and the probe's two diagnostic `write` calls. The
 two-point subtraction removes both. HTTP/2 used `writev`; QMux used `sendto`; `send`, `sendmsg`,
 and the other protocol's write primitive were zero throughout.
+
+Run 09 summarised the old linear shape as `2n + 2`. The 64-stream observation here is about
+two writes above that idealised formula because the runtime occasionally slices a batch; the
+per-stream term, rather than an exact intercept, is the defect this run tests.
 
 | Revision | arm | streams | `c(1000)` | `c(3000)` | writes per batch |
 | --- | --- | ---: | ---: | ---: | ---: |
