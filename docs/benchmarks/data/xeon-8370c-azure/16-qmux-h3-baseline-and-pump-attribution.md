@@ -16,6 +16,10 @@ candidate code exists. It asks how much QMux/H3 still costs relative to H2 after
 that differential belongs, and what exact call/allocation/write counts later candidates must move.
 It does not use absolute values from the pre-migration Xeon 8370C as controlled evidence.
 
+## Results
+
+The environment, timings, exact counts, attribution, gates and validation follow.
+
 ## Environment and exact binaries
 
 | Property | Value |

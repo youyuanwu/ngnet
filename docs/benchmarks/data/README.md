@@ -10,7 +10,7 @@ what the run does and does not establish.
 | Machine | Status | Runs |
 | --- | --- | --- |
 | [`legacy-dev-host`](legacy-dev-host/) | **Retired, unavailable.** Every measurement taken before 2026-08-16. Noisy: unchanged control arms drifted 5–15% within a session. | 4 |
-| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current VM; historical machine label and recorded spec are Intel Xeon Platinum 8370C. Runs 12–15 report 8573C, but when Azure migrated the VM is unknown, so absolute figures across runs are not controlled. | 15 |
+| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current VM; historical machine label and recorded spec are Intel Xeon Platinum 8370C. Runs 12–21 report 8573C, but when Azure migrated the VM is unknown, so absolute figures across runs are not controlled. | 21 |
 
 **Absolute figures from different machines must never be tabulated together.** Nothing here
 is normalised for CPU model, kernel or io_uring implementation, and those are exactly the
@@ -41,6 +41,12 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [13-qmux-h3-current-bottlenecks](xeon-8370c-azure/13-qmux-h3-current-bottlenecks.md) | xeon-8370c-azure | 2026-08-28 | Differential profile against HTTP/2 — **duplicate event-path pump is the next confirmed fix** | — |
 | [14-qmux-h3-one-pump](xeon-8370c-azure/14-qmux-h3-one-pump.md) | xeon-8370c-azure | 2026-08-28 | Production one-pump event rule — **96 → 73 reads; −5.26% duplex / −2.37% socket serial** | — |
 | [15-qmux-h3-shared-snapshot](xeon-8370c-azure/15-qmux-h3-shared-snapshot.md) | xeon-8370c-azure | 2026-08-28 | One coherent shared-work snapshot — **155 → 29 operations; −7.59% / −5.68% incremental serial** | — |
+| [16-qmux-h3-baseline-and-pump-attribution](xeon-8370c-azure/16-qmux-h3-baseline-and-pump-attribution.md) | xeon-8370c-azure | 2026-08-28 | Fresh PR #45 baseline and exact 70-pump source attribution | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
+| [17-qmux-h3-candidate-a-read-pump-amplification](xeon-8370c-azure/17-qmux-h3-candidate-a-read-pump-amplification.md) | xeon-8370c-azure | 2026-08-28 | Remove 33 pumps/reads — **socket gate failed; reverted** | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
+| [18-qmux-h3-candidate-b-delivery-ownership](xeon-8370c-azure/18-qmux-h3-candidate-b-delivery-ownership.md) | xeon-8370c-azure | 2026-08-28 | Remove 160 mallocs — **elapsed gate failed; reverted** | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
+| [19-qmux-h3-candidate-c-fixed-header-work](xeon-8370c-azure/19-qmux-h3-candidate-c-fixed-header-work.md) | xeon-8370c-azure | 2026-08-28 | Remove 20 mallocs and three reallocs — **unstable timing; reverted** | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
+| [20-qmux-h3-candidate-d-event-queue](xeon-8370c-azure/20-qmux-h3-candidate-d-event-queue.md) | xeon-8370c-azure | 2026-08-28 | Queue-local changes cannot reduce the 23 registered pops | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
+| [21-qmux-h3-combined-final-matrix](xeon-8370c-azure/21-qmux-h3-combined-final-matrix.md) | xeon-8370c-azure | 2026-08-28 | Final 16-case QMux/H3 ÷ H2 matrix — **0.842× to 2.088×** | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
 
 **The cross-protocol comparison is [`08`](xeon-8370c-azure/08-qmux-against-h2.md), and it is the
 only run here that is one.** That sentence replaces a standing note saying no such run existed.

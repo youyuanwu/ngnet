@@ -1,13 +1,43 @@
 # What HTTP/3 over QMux costs against HTTP/2
 
-**Measurements:** [`08-qmux-against-h2`](../data/xeon-8370c-azure/08-qmux-against-h2.md) —
-`xeon-8370c-azure`, five passes, ratios formed within each pass. The mechanisms behind those
-ratios are [`09-qmux-h2-mechanisms`](../data/xeon-8370c-azure/09-qmux-h2-mechanisms.md), which
-answered both questions `08` left open by counting rather than timing.
+**Current measurement:** [`21-qmux-h3-combined-final-matrix`](../data/xeon-8370c-azure/21-qmux-h3-combined-final-matrix.md)
+— Xeon 8573C, three duplex and two socket passes, ratios formed within each pass. Runs
+[`16`](../data/xeon-8370c-azure/16-qmux-h3-baseline-and-pump-attribution.md) through
+[`20`](../data/xeon-8370c-azure/20-qmux-h3-candidate-d-event-queue.md) provide current counts,
+attribution, and rejected-candidate evidence. Runs
+[`08`](../data/xeon-8370c-azure/08-qmux-against-h2.md) and
+[`09`](../data/xeon-8370c-azure/09-qmux-h2-mechanisms.md) are the historical first comparison and
+mechanism study; their absolute timings are not controls across the Azure CPU migration.
+
+## Current post-PR-45 result
+
+| Workload | duplex QMux/H3 ÷ H2 | socket QMux/H3 ÷ H2 |
+| --- | ---: | ---: |
+| serial | **2.065×** | **1.898×** |
+| concurrency 1 | 1.980× | 1.880× |
+| concurrency 8 | 1.880× | 1.828× |
+| concurrency 64 | 1.815× | 1.792× |
+| body 0 | 2.088× | 1.917× |
+| body 1 KiB | 1.773× | 1.234× |
+| body 64 KiB | 1.505× | **0.979×** |
+| body 1 MiB | 1.219× | **0.842×** |
+
+Over a socket, QMux/H3 reaches parity near 64 KiB and is 15.8% faster at 1 MiB because it still
+writes far less often: 67 writes versus HTTP/2's 189. For empty and concurrent work it remains
+roughly 1.8–2.1× slower. The final branch's benchmark binaries are hash-identical to merged PR #45,
+so this work claims no production speedup.
+
+Four evidence-driven candidates were tested. Removing duplicate open/transmit pumps cut reads and
+pumps from 73/70 to 40/37 but missed the socket timing gate. Safe delivery transfer removed 160
+mallocs, and bounded header storage removed 20 mallocs plus three reallocs; neither produced a
+stable qualifying elapsed win. Queue-local changes cannot reduce the 23 registered pops because
+they are one-for-one with fill-loop iterations. Every prototype was reverted.
+
+## Historical mechanism result
 
 The cross-protocol arms were added so this question could be asked, and then it was not asked for
-several increments: every run before this one compared a build against another build. This is the
-first that compares the two stacks.
+several increments: every run before run 08 compared a build against another build. Run 08 was
+the first to compare the two stacks.
 
 ## The answer is two numbers, not one
 

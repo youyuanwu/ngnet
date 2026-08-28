@@ -2,20 +2,22 @@
 
 **Machine:** historical [`xeon-8370c-azure`](README.md) label; Intel Xeon Platinum 8573C
 **Date:** 2026-08-28
-**Baseline:** `c7c95d9` (production code identical to `364dbb2`)
-**Candidate:** `c188758`; reverted by `3b5c576`
+**Commit(s):** baseline `c7c95d9` against candidate `c188758`, reverted by `3b5c576`
+**Baseline:** production code identical to `364dbb2`
 **Disposition:** **implemented, measured, and reverted**; 20 mallocs and three reallocs were
 removed, but the elapsed result was not repeatable and did not clear both substrate gates
 **Cases:** warmed empty QMux/H3 exchange over duplex and loopback socket
-**Commands:** `taskset -c 3 target/release/examples/probe qmux-{duplex,socket} body 0 10000`
+**Command:** `taskset -c 3 target/release/examples/probe qmux-{duplex,socket} body 0 10000`
 under repeated 4 kHz DWARF `task-clock:u` profiles; exact malloc/realloc/free counts from
 100/300-exchange uprobes; Criterion as two baseline/candidate passes, 50 samples, 3 s
 measurement, 1 s warm-up, and matching H2 controls
+**Repetitions:** two sequential profile repeats per substrate and two interleaved Criterion
+baseline/candidate passes per substrate
 **Controls:** the immutable 2% floors, each pass's H2 movement, and the observed repeat spread
 **Exclusions:** an accidentally concurrent first profile pair was discarded before analysis and
 reacquired sequentially on CPU 3; no reported profile or exact-count observation was discarded
 
-## Question and gate
+## What was being asked
 
 Candidate C asked whether fixed Rust header storage, head construction, native allocation, QPACK,
 or per-stream registry work could produce a safe serial optimization. Retention required:
@@ -28,7 +30,9 @@ The initial profile-only bound was withdrawn during review because it omitted de
 reallocation-copy and memcpy time. The complete safe storage prototype was therefore implemented
 and timed directly; no retention decision below relies on that bound.
 
-## Exact allocation sites
+## Results
+
+### Exact allocation sites
 
 The 10/30 subtraction reproduced the warmed baseline at approximately 128 calls per exchange
 (128.35 recorded stack events; run 16's lossless `perf stat` count is **128**). Stack membership
@@ -58,7 +62,7 @@ construct `HeaderName`, `HeaderValue`, method/status, scheme, authority, path/qu
 their allocation events are represented by the map/head row or residual rather than counted
 again.
 
-## H3-only work outside field storage
+### H3-only work outside field storage
 
 The warmed exchange has two field sections and eight field callbacks. `Events::slot` therefore
 does ten one-entry slot scans (two begins plus eight fields), while the two end-section lookups
@@ -88,7 +92,7 @@ improvement to 2%, so it is not an independently plausible candidate.
 Those sites are absent from H2 but are not header-storage mechanisms. The driver, registry, and
 native QPACK costs remain attribution, not permission to charge them to C1–C3.
 
-## Measured C1–C3 prototype
+### Measured C1–C3 prototype
 
 Commit `c188758` implemented the complete safe set rather than relying on the incomplete sampled
 bound:
@@ -134,7 +138,7 @@ The socket control itself moved +2.68% and +1.23%, confirming that the apparentl
 normalized second pass did not establish a stable absolute win. The result therefore fails the
 pre-registered dual-substrate gate without needing larger-workload regression guards.
 
-## Semantic and cleanup validation
+### Semantic and cleanup validation
 
 The prototype added a deterministic inline/heap-fallback ownership test and passed all 121
 `ngnet-h3` unit tests plus all 27 `ngnet-h3-tests` integration tests. Existing tests exercised:
@@ -149,7 +153,7 @@ No unsafe lifetime extension was introduced. Inline storage moved with the recei
 fallback owned its bytes after callback return; both were dropped on every early error. The
 prototype was then reverted completely by `3b5c576`.
 
-## Disposition
+### Disposition
 
 Candidate C is **rejected after implementation and direct measurement**. Its exact allocator
 improvement is real, but allocation count alone did not produce a repeatable elapsed-time win.
@@ -158,7 +162,7 @@ also rejected as a companion: its complete measured socket population is too sma
 failed prototype, and it would add a new retained-capacity policy. Do not retry these mechanisms
 from allocation counts alone.
 
-## Validation
+### Validation
 
 The candidate's focused H3/H3-tests suites passed before timing. After `3b5c576`, production
 source is again identical to `7c36518`; the restored-source release QMux-H3/QMux-H3-tests,
@@ -166,3 +170,19 @@ feature variants, clippy, rustdoc, and diff hygiene are rerun at the phase gate.
 release probe must reproduce Phase 4's SHA-256
 `0e8b5b1f1a71759db9e53b35e306e9c81ab2cf8292594b4625839279de9370c8` after temporary profiles,
 uprobes, copied binaries and Criterion baselines are removed.
+
+## Drift controls in the same session
+
+H2 movement was +0.05%/−0.17% on duplex and +2.68%/+1.23% on socket. Candidate QMux/H3 ranged
+20.343–20.514 µs duplex and 31.226–32.115 µs socket, including one socket regression.
+
+## What this establishes
+
+- C1–C3 remove exactly 20 mallocs and three reallocs without unsafe lifetime extension.
+- The allocation reduction does not produce a stable dual-substrate elapsed-time win.
+- C4 and registry/task-map work are too small to rescue the failed socket gate.
+
+## What it does not
+
+- It does not change HTTP semantics, retain the prototype, or measure an upstream native QPACK
+  algorithm change.

@@ -2,17 +2,18 @@
 
 **Machine:** historical [`xeon-8370c-azure`](README.md) label; Intel Xeon Platinum 8573C
 **Date:** 2026-08-28
-**Baseline:** `6bff8ee` (production code identical to `364dbb2`)
+**Commit(s):** `6bff8ee` (production code identical to `364dbb2`)
 **Disposition:** **documentation-only: gate-incompatible**; queue-local changes cannot reduce
 registered pop calls
-**Case:** warmed empty QMux/H3 exchange over duplex
-**Commands:** release-visible source counters around 100 and 300 exchanges; pinned release
+**Cases:** warmed empty QMux/H3 exchange over duplex
+**Command:** release-visible source counters around 100 and 300 exchanges; pinned release
 microprobe of 10,000,000 empty `Mutex<VecDeque<Event>>` pops, repeated five times
+**Repetitions:** exact counters at 100 and 300 exchanges; five lock-cost repeats
 **Controls:** immutable D gate: pops below 23, pushes exactly 7; 2% elapsed floors on socket serial
 and socket concurrency 1
 **Exclusions:** none; all counter runs and all five lock-cost repeats are reported
 
-## Question and gate
+## What was being asked
 
 Candidate D asks whether cost *inside* `EventQueue` can be removed independently of Candidate A's
 driver/read amplification. Retention requires all of:
@@ -23,7 +24,9 @@ driver/read amplification. Retention requires all of:
 
 An optimization that makes an existing pop cheaper but leaves 23 calls is not admissible.
 
-## Refreshed exact counts
+## Results
+
+### Refreshed exact counts
 
 Temporary release-visible counters were sampled immediately after the fixture warm exchange:
 
@@ -41,7 +44,7 @@ inferred from the old run-16 value.
 
 All instrumentation was removed before this run was committed.
 
-## Uncontended lock cost
+### Uncontended lock cost
 
 The release microprobe timed the exact recovered-lock plus `VecDeque::pop_front` operation on an
 empty queue and subtracted an otherwise identical black-box loop:
@@ -58,7 +61,7 @@ The full 23-lock population is about 0.37 µs. Even granting D1 all 16 empty loc
 0.257–0.260 µs, below the approximately 0.63 µs socket-serial 2% floor before control movement or
 spread. More importantly, it leaves the registered pop count at 23 and fails the count gate.
 
-## Options
+### Options
 
 - **D1 — atomic empty hint:** queue-confined and capable of avoiding up to 16 uncontended mutex
   acquisitions, but it still invokes `EventQueue::pop` 23 times. It fails the immutable count
@@ -75,7 +78,7 @@ No newly discovered mechanism exists inside `EventQueue` that changes how often 
 `pop`. Reducing calls requires changing the `Inner::fill`/driver schedule, which is Candidate A's
 already measured and reverted mechanism, not an independent D optimization.
 
-## Disposition and validation
+### Disposition and validation
 
 Candidate D is closed without production code. Ordering, poisoning recovery, `Send` behavior and
 the events-before-ending boundary remain byte-for-byte unchanged. Focused QMux/QMux-H3 tests,
@@ -84,3 +87,20 @@ feature variants, clippy and rustdoc are run on the uninstrumented tree at the p
 Do not retry an atomic hint, queue pre-sizing or wholesale draining from the 16-empty-pop count.
 A future queue candidate must independently reduce registered pop calls while preserving the
 read-ahead boundary.
+
+## Drift controls in the same session
+
+This count/microprobe run has no cross-build elapsed claim. All five lock repeats are reported;
+net locked-empty-pop cost ranged from 16.09 to 16.26 ns.
+
+## What this establishes
+
+- The queue still receives 23 pops and seven pushes, and 16 pops are empty.
+- Pop count equals fill-loop iterations, so reducing calls is Candidate A-shaped rather than
+  queue-internal.
+- Every known queue-local option fails the immutable count gate.
+
+## What it does not
+
+- It does not time an atomic hint, change the read-ahead boundary, or claim that a future
+  independently count-reducing queue mechanism is impossible.

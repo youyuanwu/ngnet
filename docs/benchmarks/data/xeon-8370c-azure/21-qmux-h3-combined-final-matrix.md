@@ -2,7 +2,7 @@
 
 **Machine:** historical [`xeon-8370c-azure`](README.md) label; Intel Xeon Platinum 8573C
 **Date:** 2026-08-28
-**Final revision:** `0984e1c`
+**Commit(s):** final `0984e1c` against merged predecessor `364dbb2`
 **Immediate merged predecessor:** `364dbb2`
 **Production-code result:** byte-for-byte unchanged; every optimization candidate failed its
 pre-registered elapsed gate and was reverted
@@ -10,7 +10,7 @@ pre-registered elapsed gate and was reverted
 {serial; concurrency 1, 8, 64; body 0, 1 KiB, 64 KiB, 1 MiB} — from the `serial_latency`,
 `concurrent_throughput` and `body_throughput` targets and their `transport_*` socket twins, each
 carrying its unchanged HTTP/2 arm
-**Commands:** `cargo build --release -p ngnet-bench --benches --example probe`; each Criterion
+**Command:** `cargo build --release -p ngnet-bench --benches --example probe`; each Criterion
 binary as `taskset -c 3 <binary> --bench <stack-filter> --sample-size 50 --measurement-time 3
 --warm-up-time 1 --save-baseline final-{1,2} --noplot`
 **Repetitions:** three duplex passes and two socket passes of all 16 cases
@@ -24,6 +24,10 @@ actually costs against HTTP/2 on this host across the full registered 16-case wo
 whether the final build differs in any measurable way from the merged predecessor `364dbb2` it was
 branched from. Because no mechanism was retained, the second question reduces to a build-identity
 check followed by a fresh, fully controlled ratio matrix.
+
+## Results
+
+The exact revision identity and complete matrix follow.
 
 ## Revision identity
 
@@ -130,6 +134,19 @@ did not improve elapsed time. Candidate C removed 20 mallocs and three reallocs 
 and missed both-substrate repeatability. Candidate D had no queue-confined mechanism capable of
 reducing its registered count. Every prototype was reverted, so the final PR carries measured
 evidence and backlog closure rather than an unproven optimization.
+
+## Validation
+
+Focused H3, QMux and QMux/H3 suites passed in default, no-default-feature and release
+configurations. The supported workspace suite, dependency-graph structural test, all-feature and
+no-default-feature clippy with warnings denied, rustdoc with warnings denied, and benchmark smoke
+all passed. `cargo check -p ngnet-quic --no-default-features` also passed.
+
+The five OpenSSL-dependent QUIC surfaces were attempted and reached the documented host limit:
+the installed OpenSSL 3.0.13 is below ngtcp2's required 3.5.0, beginning at
+`ngnet-quic-sys`. CI is assigned `ngnet-quic-sys`, `ngnet-quic`, `ngnet-quic-h3`,
+`ngnet-quic-h3-tests`, and `ngnet-quic-tests`; `ngnet-workspace-tests --no-run` and its
+dependency-graph test passed locally.
 
 ## What it does not
 

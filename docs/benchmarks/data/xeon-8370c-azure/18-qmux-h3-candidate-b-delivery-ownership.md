@@ -2,8 +2,8 @@
 
 **Machine:** historical [`xeon-8370c-azure`](README.md) label; Intel Xeon Platinum 8573C
 **Date:** 2026-08-28
-**Baseline:** `0104e85` (production code identical to `a4a26b7` and `364dbb2`)
-**Candidate:** `96a20e6`
+**Commit(s):** baseline `0104e85` against candidate `96a20e6`, reverted by `971b6b7`
+**Baseline:** production code identical to `a4a26b7` and `364dbb2`
 **Disposition:** **reverted** by `971b6b7`; B3 passed the allocation gate but failed both
 elapsed-time claim targets
 **Cases:** QMux/H3 1 MiB echo over duplex and loopback socket
@@ -17,7 +17,7 @@ stacks as `sudo perf record -e probe_libc:candidate_b_malloc -g --call-graph dwa
 **Exclusions:** none; temporary counters, the malloc uprobe, profiles, and instrumented binary
 were removed after the pristine probe hash was reproduced
 
-## Question and immutable gate
+## What was being asked
 
 Candidate B asked whether delivery data could leave dwnx's callback without the
 `event.data.to_vec()` copy and without repeating run 05's recycling pool. Retention required all
@@ -31,7 +31,9 @@ The selection rule required investigation to stop before production code when no
 could meet the count gate. B3 could meet that gate, so review correctly required a measured
 prototype rather than treating QMux-minus-H2 allocation self-time as an upper bound.
 
-## Fresh ownership and allocation counts
+## Results
+
+### Fresh ownership and allocation counts
 
 The release-visible counter build changed no branch, buffer, owner, or event. It counted each
 productive QMux read, stream-data callback, callback containment result, framer capacity growth,
@@ -98,7 +100,7 @@ The remaining roughly 31 H3 `RawVec` calls are header/map and adjacent driver st
 belong to Candidate C's fixed-work investigation, not to the complete-record owner. B4 is
 therefore deferred with a concrete site boundary rather than mislabelled as framer growth.
 
-## The four ownership options
+### The four ownership options
 
 ### B1 — one bounded owner per read batch or record
 
@@ -185,7 +187,7 @@ The proposed adjacent mechanism has no population here: zero framer growth and z
 bytes in both substrates. The observed `RawVec` cost is H3 batch storage and is carried into
 Candidate C; changing the framer cannot move it.
 
-## Contracts checked
+### Contracts checked
 
 - The current owner is created by `to_vec()` inside the callback; no dwnx borrow escapes.
 - `Event` remains `Send`, and read-ahead delivered/credited accounting is unchanged.
@@ -196,7 +198,7 @@ Candidate C; changing the framer cannot move it.
 - No pool, free list, unsafe lifetime extension, `deps/dwnx` change, dependency addition, or
   large-buffer retention was introduced.
 
-## Disposition
+### Disposition
 
 Candidate B is **closed with B3 reverted**. B1 and the bounded arena cannot reduce the required
 allocation count without the recycling design run 05 already rejected. B2 violates the
@@ -209,7 +211,7 @@ The preserved probe hashes were baseline
 were baseline/candidate `4910af4e…`/`0868effe…` for duplex and
 `e2325e73…`/`42fcd8c9…` for socket. No allocation-only code is retained.
 
-## Validation
+### Validation
 
 All locally supported phase checks passed on the pristine source:
 
@@ -224,3 +226,19 @@ All locally supported phase checks passed on the pristine source:
 
 The OpenSSL-dependent linkage test remains assigned to CI under the repository's documented
 machine limitation. `deps/dwnx` was not changed.
+
+## Drift controls in the same session
+
+Every elapsed pass carried unchanged H2. Baseline/candidate QMux/H3 spreads were 2.634%/2.814%
+duplex and 1.929%/2.774% socket; H2 moved between −0.925% and +0.329%.
+
+## What this establishes
+
+- Safe whole-parent transfer removes 160 mallocs but does not produce a qualifying elapsed win.
+- Per-read/per-record owners cannot beat the current ownership floor without pool bookkeeping.
+- The pooled run-05 shape and the non-pooled B3 shape must not be retried from counts alone.
+
+## What it does not
+
+- It does not modify dwnx, weaken read-ahead credit, or establish that all future upstream
+  ownership APIs are infeasible.

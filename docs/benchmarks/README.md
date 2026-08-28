@@ -146,6 +146,7 @@ HTTP/2 arm and an HTTP/3-over-QMux arm.
 | [Write path and gathering](findings/write-path-and-gathering.md) | The arms separated on **write syscalls per pass**, not on the I/O model. Gathering closed the gap: −52% at N=8, −59% at N=64. |
 | [Reusing the coalescing buffer](findings/coalescing-buffer-reuse.md) | About 4–7% for the completion transport, from not rebuilding the buffer each pass. |
 | [Handing bodies over](findings/handing-bodies-over.md) | `NGHTTP2_DATA_FLAG_NO_COPY` is worth −24% to −31% at 1 MiB on the readiness transport, and a small but real gain on the completion one. |
+| [QMux against HTTP/2](findings/qmux-against-h2.md) | Post-PR-45 QMux/H3 is 1.8–2.1× slower for fixed/concurrent work, reaches 0.979× at socket 64 KiB and 0.842× at socket 1 MiB; four new count/allocation candidates failed elapsed gates and were reverted. |
 
 ## Where the numbers are
 

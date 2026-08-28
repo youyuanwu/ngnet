@@ -2,8 +2,8 @@
 
 **Machine:** historical [`xeon-8370c-azure`](README.md) label; Intel Xeon Platinum 8573C
 **Date:** 2026-08-28
-**Baseline:** `43b7da0` (production code identical to `364dbb2`)
-**Candidate:** `4e91115`
+**Commit(s):** baseline `43b7da0` against candidate `4e91115`, reverted by `c23df30`
+**Baseline:** production code identical to `364dbb2`
 **Disposition:** **reverted** by `c23df30`; socket serial failed the pre-registered elapsed gate
 **Cases:** duplex/socket empty serial; socket concurrency 1/8/64; duplex/socket 1 MiB
 **Command:** preserved binaries run as `taskset -c 3 <binary> --bench <paired-filter>
@@ -14,7 +14,7 @@
 decision because that implementation was replaced before `4e91115`; no final-candidate pass,
 sample, or count was discarded
 
-## Question and immutable gate
+## What was being asked
 
 Phase 2 attributed 35 of 70 empty-exchange pumps to `poll_open` and `transmit::drain`, selecting
 the low-risk A2 source-collapse design. Candidate A could be retained only if:
@@ -25,7 +25,11 @@ the low-risk A2 source-collapse design. Candidate A could be retained only if:
 - reads fell below 73 and pumps below 70 while `poll_event`/`poll_transmit`/`drain_work` remained
   exactly 30/14/14.
 
-## Stage-1 transition and wake analysis
+## Results
+
+The attribution, implementation, exact-count and timing results follow.
+
+### Stage-1 transition and wake analysis
 
 The selected A2 design caches no pending-read state and suppresses no read *inside* a lower pump.
 Every retained pump still executes `read_side` with the current `Context`. The eleven state
@@ -54,7 +58,7 @@ No waker is stored by A2, so there is no stale-registration invalidation set and
 read; A3 would require a driver-turn reset boundary that the transport interface does not expose.
 Those facts are why the selection rule chose A2 rather than either caching design.
 
-## Mechanism tested
+### Mechanism tested
 
 The candidate removed the duplicate join pre-pump before the lower `poll_open`, whose lower call
 already begins with the same pump. In `transmit::drain`, it removed unconditional per-offer and
@@ -83,7 +87,7 @@ Focused deterministic tests pinned:
 The exact candidate commit was rebuilt after these tests were integrated; all six benchmark
 hashes below reproduced the measured binaries byte for byte.
 
-## Binary identity
+### Binary identity
 
 | Binary | baseline SHA-256 | candidate SHA-256 |
 | --- | --- | --- |
@@ -94,7 +98,7 @@ hashes below reproduced the measured binaries byte for byte.
 | `body_throughput` | `4910af4e89d7b9283ea90fe6611a52d57f4b948f535e3646c5f9f3abc7efbc18` | `7bd44cea30c80ba072cbe08201b51cabcd4722bf771402d3b42dd327ab278694` |
 | `transport_body_throughput` | `e2325e731a92f39aca2658d063bdd5e12dcb5e60ecc987bb83ae7f9755972af2` | `0d34d10d8dd5c00489515146d994b787c1a1555d88e5aa04f09d9fb61f545f8f` |
 
-## Exact counts
+### Exact counts
 
 Counts are `(c(300)-c(100))/200` against the preserved candidate probe. The release symbols were
 mapped to ELF file offsets and all uprobes were removed immediately after the two runs.
@@ -113,7 +117,7 @@ mapped to ELF file offsets and all uprobes were removed immediately after the tw
 The count gate passed exactly: 33 repeated pending reads/pumps disappeared without changing the
 driver pass structure.
 
-## Criterion medians
+### Criterion medians
 
 Times are Criterion median point estimates in microseconds. `raw` is candidate versus baseline;
 `control` is candidate-binary H2 versus baseline-binary H2 in the same pass pair; `ratio` is the
@@ -143,7 +147,7 @@ Socket serial's 1.13% median change is below the immutable 2% floor and below th
 2.87% spread. Its third paired pass showed no raw improvement. Count reduction alone cannot
 retain the mechanism.
 
-## Guard arms
+### Guard arms
 
 | Guard/pass | baseline H2 / QMux | candidate H2 / QMux | raw | control |
 | --- | ---: | ---: | ---: | ---: |
@@ -158,7 +162,7 @@ retain the mechanism.
 
 No guard regressed. That does not override a failed claim target.
 
-## Validation and removal proof
+### Validation and removal proof
 
 At exact candidate commit `4e91115`, all of the following passed:
 
@@ -183,7 +187,7 @@ while leaving the candidate tests in place made
 `several_small_offers_share_one_entry_pump` fail with **6 pumps observed versus 0 expected**.
 The candidate files were restored before the complete revert was created.
 
-## Decision
+### Decision
 
 **Rejected and reverted.** A2 is safe enough to pass the focused correctness suite and removes
 47% of pumps/reads, but the removed operations do not own a stable 2% of socket-serial elapsed
@@ -194,3 +198,19 @@ the elapsed upper bound.
 A1 pending-read caching remains structurally unsafe without a new guaranteed wake source. A3
 requires an outer driver-turn boundary unavailable through the current transport interface.
 Neither was prototyped after the lower-risk A2 mechanism failed the elapsed gate.
+
+## Drift controls in the same session
+
+Every Criterion pass carried the unchanged H2 arm. Control movement ranged from −1.98% to +2.96%;
+the failed socket-serial claim was only −1.13% across passes against 2.87% candidate spread.
+
+## What this establishes
+
+- Removing 33 of 70 pumps and reads is not sufficient evidence of an elapsed-time win.
+- Candidate A is reverted because socket serial failed both its 2% and measured-spread gates.
+- Pending-read caching remains inadmissible without a guaranteed wake/reset event.
+
+## What it does not
+
+- It does not prove all remaining reads redundant, suppress the required ending boundary, or
+  evaluate a transport interface with a new outer driver-turn epoch.
