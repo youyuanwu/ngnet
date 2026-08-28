@@ -75,8 +75,9 @@ The async driver formerly acquired the same shared mutex once per category and t
 category again around idle and park decisions. It now transfers all five work categories into
 driver-owned scratch under one lock, processes them with the lock released, and uses coherent
 idle, completion, and under-waker readiness predicates. Matched count builds reduce these method
-entries from 155 to 29 per empty exchange; controlled timing improves phase-one duplex/socket
-serial by 7.59% / 5.68%. The generic contract and race tests live in this crate; the timed QMux/H3
+entries from 155 to 29 per empty exchange; controlled timing improves duplex/socket serial by
+7.59% / 5.68% against retained phase one. The generic contract and race tests live in this crate;
+the timed QMux/H3
 evidence is [`run 15`](../benchmarks/data/xeon-8370c-azure/15-qmux-h3-shared-snapshot.md).
 
 ### QPACK is used but not exposed

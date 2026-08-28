@@ -610,8 +610,12 @@ fn final_data_and_stream_close_are_separated_by_a_woken_boundary() {
 #[test]
 fn a_queued_release_uses_one_pump_and_precedes_a_new_terminal_error() {
     let mut pair = Pair::new();
-    let stream = pair.open(Side::Client, true);
-    let mut source = Offer::one(stream, b"queued for release", false);
+    let first = pair.open(Side::Client, true);
+    let second = pair.open(Side::Client, true);
+    let mut source = Offer::new(vec![
+        (first, b"first queued release".to_vec(), false),
+        (second, b"second queued release".to_vec(), false),
+    ]);
     pair.transmit(Side::Client, &mut source);
     assert!(source.drained());
 
@@ -627,12 +631,27 @@ fn a_queued_release_uses_one_pump_and_precedes_a_new_terminal_error() {
             stream: id,
             delivered: true,
             ..
-        })) if id == stream
+        })) if id == first
     ));
     assert_eq!(
         pair.client.pump_calls() - pumps,
         1,
         "queued releases must not skip or duplicate the initial pump"
+    );
+
+    let pumps = pair.client.pump_calls();
+    assert!(matches!(
+        pair.client.poll_event(&mut cx),
+        Poll::Ready(Ok(QuicEvent::Released {
+            stream: id,
+            delivered: true,
+            ..
+        })) if id == second
+    ));
+    assert_eq!(
+        pair.client.pump_calls() - pumps,
+        0,
+        "an already-latched ending makes the queued-work pump a no-op"
     );
 
     assert!(

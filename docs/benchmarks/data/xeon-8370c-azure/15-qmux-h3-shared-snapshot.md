@@ -13,6 +13,12 @@ The VM reports an Intel Xeon Platinum 8573C under the historical 8370C directory
 Only interleaved comparisons within this run are controlled evidence; absolute timings are not
 compared with runs from before the host migration.
 
+As in run 14, exact counts use run 13's empty-serial `body 0` workload rather than the plan's
+mistaken `concurrent 1` spelling. The phase-one recount reproduces the established empty-exchange
+unit. Positive claims below use a conservative 2% reporting floor in addition to clearing the
+absolute matching-control movement and both within-side spreads; the retention decision itself
+uses the pre-registered serial and concurrency-1 targets.
+
 ## What was being asked
 
 Run 13 counted 155 entries into the HTTP/3 `Shared` drain, readiness, and waker-refresh methods
@@ -36,7 +42,7 @@ binaries. Raw totals include setup and teardown.
 | --- | ---: | ---: | ---: | ---: |
 | destructive drains | five × 1,428 / 4,228 | 1,428 / 4,228 | 70 | **14** |
 | idle/readiness predicates | five × 1,528 / 4,528 | 510 / 1,510 | 75 | **5** |
-| normal-completion predicate | included above | 0 / 0 | — | **0** |
+| normal-completion predicate | none (new class) | 0 / 0 | — | **0** |
 | waker refresh/recheck | 1,018 / 3,018 | 1,018 / 3,018 | 10 | **10** |
 | **all counted operations** | **15,798 / 46,798** | **2,956 / 8,756** | **155** | **29** |
 
@@ -44,6 +50,11 @@ The snapshot removes 126 entries per exchange, an 81.3% reduction. Every product
 still performs one drain (14 per exchange); only five eligible idle decisions need the coherent
 idle predicate; the ten park attempts each use one combined waker refresh and readiness recheck.
 This workload ends through the peer-gone path, so it creates no normal-completion candidate.
+The completion probe has no phase-one predecessor; its cost and extra-pass behavior are covered
+by the driven `shared_snapshot.rs` tests rather than this peer-gone count workload. All five
+legacy drain symbols and all five legacy readiness symbols recorded their respective collapsed
+raw pairs above: every counted readiness decision found all categories empty, and no park took
+the blocked-stream short-circuit.
 
 ## Incremental phase 1 → snapshot timing
 
@@ -65,7 +76,8 @@ per side. Spread is `(max / min) - 1` within a side.
 
 Both serial targets and both concurrency-1 targets clear matching controls and both side spreads,
 so the pre-registered phase-two positive gate passes. Duplex concurrency 8 and socket concurrency
-8/64 also clear those bars. Duplex concurrency 64 remains unclaimed.
+8/64 also clear those bars and the 2% reporting floor. Duplex concurrency 64 clears control and
+spread but remains unclaimed because its 1.40% point estimate is below that floor.
 The bulk arms show no regression but remain guards rather than optimization claims.
 
 ## Fresh base → retained-final timing

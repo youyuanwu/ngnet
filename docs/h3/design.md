@@ -46,6 +46,9 @@ The transfer is a scheduling and ownership boundary. Work queued after it belong
 pass, so processing an early category cannot pull a later category across the boundary. If a
 fatal operation fails, the transferred batch dies with the driver and is not replayed: replaying
 the unprocessed tail could repeat a side effect already applied before the failure.
+Progress without an external wake is guaranteed at the idle and normal-completion decisions.
+If the pass is already suspended on stream capacity or transmit backpressure, deferred work waits
+for that transport suspension to end, as it did before this change.
 
 Idle and normal-completion decisions inspect all five categories coherently. At the actual park,
 the driver installs its waker and repeats the readiness check while holding the same lock. Work
@@ -53,9 +56,9 @@ queued before registration is seen by the recheck; work queued afterwards wakes 
 waker. The lock is dropped before that waker is invoked. A writability wake remains sufficient
 to retry blocked transport streams even when it carries no event.
 
-The four vector categories reuse capacity across passes. An adversarial burst above 2,048 entries
-is shrunk toward 1,024 after processing; ordinary loads at or below the high-water mark do not
-churn their allocation.
+The four driver-owned scratch vectors reuse capacity across passes. Scratch capacity above 2,048
+is shrunk toward 1,024 after processing; ordinary capacity at or below the high-water mark does
+not churn its allocation.
 
 ## Five differences from nghttp2 that are load-bearing
 

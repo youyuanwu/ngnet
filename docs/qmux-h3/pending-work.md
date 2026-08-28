@@ -8,8 +8,8 @@ This is the implementation backlog produced by
 [`09-qmux-h2-mechanisms`](../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md).
 The order is measured payoff divided by implementation risk, not source order.
 
-Items 1, 2 and 4 are settled; item 3 is closed without implementation after reprofiling. Item 5
-is the highest-priority open performance item.
+Items 1, 2, 4 and 5 are settled; item 3 is closed without implementation after reprofiling.
+Item 6 is the highest-priority open performance item.
 
 1. **Replace `ngnet-h3`'s linear closed-stream lookup — settled.** `Driver::close_stream` scanned a
    1024-entry tombstone `Vec` on every close after a connection reaches steady state. A

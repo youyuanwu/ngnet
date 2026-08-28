@@ -13,6 +13,12 @@ The VM now reports an Intel Xeon Platinum 8573C under the historical 8370C direc
 Only the interleaved comparisons within this run are controlled evidence. Absolute timings are
 not compared with pre-migration runs.
 
+The exact-count command uses run 13's empty-serial `body 0` workload rather than the plan's
+mistaken `concurrent 1` spelling. The base recount reproduces run 13's 96 reads and 93 pumps
+exactly, confirming the intended measurement unit. The three concurrency rows that beat their
+controls but not within-side spread were left unclaimed after two passes rather than escalating
+to four; phase-one retention rests on the two serial targets, which cleared both required bars.
+
 ## What was being asked
 
 Run 13 isolated one duplicate: when no release or translated event was queued,

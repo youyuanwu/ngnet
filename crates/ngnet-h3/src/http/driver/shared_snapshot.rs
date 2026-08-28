@@ -1,4 +1,4 @@
-use core::convert::Infallible;
+use core::fmt;
 use core::task::{Context, Poll};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,31 +14,51 @@ use crate::http::shared::{Registry, Shared};
 use crate::stream::{Directionality, Initiator, StreamId};
 
 #[derive(Clone, Copy)]
-enum QueueShutdown {
+enum QueueWork {
     AfterFirstTransmit,
     DuringResetAction,
+    ResetAfterFirstTransmit,
 }
 
 #[derive(Default)]
 struct Observed {
     transmits: AtomicUsize,
+    resets: AtomicUsize,
+    stop_sendings: AtomicUsize,
     shutdown_pass: AtomicUsize,
     closed: AtomicBool,
     shutdowns: Mutex<Vec<Shutdown>>,
 }
 
+#[derive(Debug)]
+struct TestError;
+
+impl fmt::Display for TestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("injected backend failure")
+    }
+}
+
+impl core::error::Error for TestError {}
+
 struct TestBackend {
     shared: Arc<Shared>,
     observed: Arc<Observed>,
     peer: Conn<()>,
-    trigger: QueueShutdown,
+    trigger: QueueWork,
+    fail_reset: bool,
     triggered: bool,
     next_uni: u64,
     now: u64,
 }
 
 impl TestBackend {
-    fn new(shared: Arc<Shared>, observed: Arc<Observed>, trigger: QueueShutdown) -> Self {
+    fn new(
+        shared: Arc<Shared>,
+        observed: Arc<Observed>,
+        trigger: QueueWork,
+        fail_reset: bool,
+    ) -> Self {
         let for_shutdown = Arc::clone(&observed);
         let mut peer = ConnBuilder::<()>::new(CoreRole::Client)
             .on_shutdown(move |_, shutdown| {
@@ -66,6 +86,7 @@ impl TestBackend {
             observed,
             peer,
             trigger,
+            fail_reset,
             triggered: false,
             next_uni: 0,
             now: 0,
@@ -80,7 +101,7 @@ impl TestBackend {
 }
 
 impl QuicConnection for TestBackend {
-    type Error = Infallible;
+    type Error = TestError;
 
     const RETAINS_BUFFERS: bool = false;
 
@@ -111,8 +132,14 @@ impl QuicConnection for TestBackend {
                 .expect("the peer accepts driver output");
             WriteOutcome::Accepted(bytes.len())
         }) {}
-        if !self.triggered && matches!(self.trigger, QueueShutdown::AfterFirstTransmit) {
+        if !self.triggered && matches!(self.trigger, QueueWork::AfterFirstTransmit) {
             self.queue_shutdown();
+        }
+        if !self.triggered && matches!(self.trigger, QueueWork::ResetAfterFirstTransmit) {
+            self.shared
+                .reset(StreamId::new(0).expect("a stream"), ErrorCode::new(0x10c));
+            self.shared.wake_driver();
+            self.triggered = true;
         }
         Poll::Ready(Ok(()))
     }
@@ -137,13 +164,19 @@ impl QuicConnection for TestBackend {
     }
 
     fn reset(&mut self, _stream: StreamId, _code: ErrorCode) -> Result<(), Self::Error> {
-        if !self.triggered && matches!(self.trigger, QueueShutdown::DuringResetAction) {
+        self.observed.resets.fetch_add(1, Ordering::SeqCst);
+        if !self.triggered && matches!(self.trigger, QueueWork::DuringResetAction) {
             self.queue_shutdown();
         }
-        Ok(())
+        if self.fail_reset {
+            Err(TestError)
+        } else {
+            Ok(())
+        }
     }
 
     fn stop_sending(&mut self, _stream: StreamId, _code: ErrorCode) -> Result<(), Self::Error> {
+        self.observed.stop_sendings.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -195,7 +228,7 @@ impl Role for DoneRole {
     fn abandon(&mut self) {}
 }
 
-fn run_completed_server(trigger: QueueShutdown, with_action: bool) -> Arc<Observed> {
+fn run_completed_server(trigger: QueueWork, with_action: bool) -> Arc<Observed> {
     let shared = Arc::new(Shared::new());
     if with_action {
         shared.push_action(TransportAction::Reset {
@@ -207,7 +240,7 @@ fn run_completed_server(trigger: QueueShutdown, with_action: bool) -> Arc<Observ
     let config = Config::default();
     let conn = build_conn(CoreRole::Server, &config, &shared).expect("a server connection");
     let observed = Arc::new(Observed::default());
-    let backend = TestBackend::new(Arc::clone(&shared), Arc::clone(&observed), trigger);
+    let backend = TestBackend::new(Arc::clone(&shared), Arc::clone(&observed), trigger, false);
     let driver = Driver::new(
         backend,
         conn,
@@ -228,7 +261,7 @@ fn run_completed_server(trigger: QueueShutdown, with_action: bool) -> Arc<Observ
 
 #[test]
 fn work_queued_during_final_processing_gets_a_next_pass_and_sends_goaway() {
-    let observed = run_completed_server(QueueShutdown::AfterFirstTransmit, false);
+    let observed = run_completed_server(QueueWork::AfterFirstTransmit, false);
     assert_eq!(observed.transmits.load(Ordering::SeqCst), 2);
     assert_eq!(observed.shutdown_pass.load(Ordering::SeqCst), 2);
     assert_eq!(
@@ -241,11 +274,92 @@ fn work_queued_during_final_processing_gets_a_next_pass_and_sends_goaway() {
 
 #[test]
 fn work_induced_by_an_earlier_category_waits_for_the_next_snapshot() {
-    let observed = run_completed_server(QueueShutdown::DuringResetAction, true);
+    let observed = run_completed_server(QueueWork::DuringResetAction, true);
     assert_eq!(
         observed.shutdown_pass.load(Ordering::SeqCst),
         2,
         "shutdown queued by action processing cannot cross into its source snapshot"
     );
     assert_eq!(observed.shutdowns.lock().expect("shutdowns").len(), 1);
+}
+
+#[test]
+fn a_fatal_backend_error_drops_the_owned_tail_and_ends_the_driver() {
+    let shared = Arc::new(Shared::new());
+    let first = StreamId::new(0).expect("a stream");
+    let second = StreamId::new(4).expect("a stream");
+    shared.push_action(TransportAction::Reset {
+        stream: first,
+        code: ErrorCode::new(1),
+    });
+    shared.push_action(TransportAction::StopSending {
+        stream: second,
+        code: ErrorCode::new(2),
+    });
+
+    let registry = Arc::new(Registry::new());
+    let config = Config::default();
+    let conn = build_conn(CoreRole::Server, &config, &shared).expect("a server connection");
+    let observed = Arc::new(Observed::default());
+    let backend = TestBackend::new(
+        Arc::clone(&shared),
+        Arc::clone(&observed),
+        QueueWork::DuringResetAction,
+        true,
+    );
+    let driver = Driver::new(
+        backend,
+        conn,
+        Arc::clone(&shared),
+        Arc::clone(&registry),
+        config,
+    );
+    let guard = DriverGuard::new(Arc::clone(&shared), registry, DoneRole);
+
+    crate::http::testing::block_on(run(driver, guard))
+        .expect_err("the injected backend failure must end the driver");
+    assert_eq!(observed.resets.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        observed.stop_sendings.load(Ordering::SeqCst),
+        0,
+        "the unprocessed tail of the destructive snapshot is not replayed"
+    );
+    assert!(!observed.closed.load(Ordering::SeqCst));
+    assert!(shared.is_gone(), "driver teardown marks every handle gone");
+    assert!(
+        shared.work_pending_for_completion(),
+        "work queued by the failing operation stays beyond its source snapshot, but the gone \
+         driver cannot replay it"
+    );
+}
+
+#[test]
+fn failing_work_found_at_completion_is_a_terminal_driver_error() {
+    let shared = Arc::new(Shared::new());
+    let registry = Arc::new(Registry::new());
+    let config = Config::default();
+    let conn = build_conn(CoreRole::Server, &config, &shared).expect("a server connection");
+    let observed = Arc::new(Observed::default());
+    let backend = TestBackend::new(
+        Arc::clone(&shared),
+        Arc::clone(&observed),
+        QueueWork::ResetAfterFirstTransmit,
+        true,
+    );
+    let driver = Driver::new(
+        backend,
+        conn,
+        Arc::clone(&shared),
+        Arc::clone(&registry),
+        config,
+    );
+    let guard = DriverGuard::new(Arc::clone(&shared), registry, DoneRole);
+
+    crate::http::testing::block_on(run(driver, guard))
+        .expect_err("completion-deferred backend failures retain normal error propagation");
+    assert_eq!(observed.transmits.load(Ordering::SeqCst), 1);
+    assert_eq!(observed.resets.load(Ordering::SeqCst), 1);
+    assert_eq!(observed.stop_sendings.load(Ordering::SeqCst), 0);
+    assert!(!observed.closed.load(Ordering::SeqCst));
+    assert!(shared.is_gone());
 }
