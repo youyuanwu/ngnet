@@ -10,9 +10,16 @@ elapsed-time claim targets
 **Command:** `cargo build --release -p ngnet-bench --example probe`; source counters as
 `taskset -c 3 target/release/examples/probe qmux-{duplex,socket} body 1048576 10`; exact malloc
 stacks as `sudo perf record -e probe_libc:candidate_b_malloc -g --call-graph dwarf,8192
---no-buildid -- taskset -c 3 <probe> qmux-duplex body 1048576 <N>`
+--no-buildid -- taskset -c 3 <probe> qmux-duplex body 1048576 <N>`; final timing as
+`taskset -c 3 <duplex-body-binary> --bench
+'body_throughput/(ngnet-h2|ngnet-qmux-h3)/1048576$' <criterion-options>` and
+`taskset -c 3 <socket-body-binary> --bench
+'transport_body_throughput/(ngnet-h2-tokio|ngnet-qmux-h3-tokio)/1048576$'
+<criterion-options>`, where `<criterion-options>` was
+`--sample-size 100 --measurement-time 3 --warm-up-time 1 --save-baseline <pass> --noplot`
 **Repetitions:** ten exchanges on each substrate for source counts; malloc stacks at 1/3 and
-10/30 exchanges, reduced by two-point subtraction
+10/30 exchanges, reduced by two-point subtraction; three interleaved 100-sample Criterion
+baseline/candidate passes per substrate
 **Controls:** unchanged H2 arm in every Criterion pass
 **Exclusions:** none; temporary counters, the malloc uprobe, profiles, and instrumented binary
 were removed after the pristine probe hash was reproduced
@@ -68,7 +75,7 @@ long 10/30 event-record subtraction; the fractional long result reflects lost tr
 Run 16's 100/300 `perf stat` count of **710** remains the gate baseline. The short exact stack
 split was:
 
-| Allocation site | Calls per exchange | Share of 710 |
+| Allocation site | Calls per exchange | Share of the 711-call short trace |
 | --- | ---: | ---: |
 | QMux callback `event.data.to_vec()` | **162** | 22.8% |
 | `bytes::shallow_clone_vec` promotion | **163** | 23.0% |
@@ -156,10 +163,12 @@ The candidate reduced exact allocator calls from **710.02 to 550.02** per exchan
 profiles captured every malloc, removed the separately captured setup/warm-up prefix, and then
 applied the registered one-in-20 classifier. Both repeats observed the same result:
 
-| Build | Classified / observed | Delivery-path share |
+| Build/repeat | Classified / observed | Delivery-path share |
 | --- | ---: | ---: |
-| baseline | 123 / 143 | **86.01%** |
-| candidate | 90 / 111 | **81.08%** |
+| baseline 1 | 123 / 143 | **86.01%** |
+| baseline 2 | 123 / 143 | **86.01%** |
+| candidate 1 | 90 / 111 | **81.08%** |
+| candidate 2 | 90 / 111 | **81.08%** |
 
 The candidate is below both the historical 82.9% and fresh predecessor share. The site counts
 explain the 160-call reduction: callback copies stayed at 162, while first-parent promotions fell
@@ -169,14 +178,15 @@ Count success did not become elapsed success:
 
 | Substrate/pass | Baseline median | Candidate median | Candidate delta | H2 control |
 | --- | ---: | ---: | ---: | ---: |
-| duplex 1 | 602.319 µs | 596.023 µs | **−1.045%** | +0.138% |
-| duplex 2 | 618.182 µs | 612.795 µs | **−0.872%** | −0.925% |
-| socket 1 | 1144.129 µs | 1136.995 µs | **−0.623%** | +0.325% |
-| socket 2 | 1166.193 µs | 1168.536 µs | **+0.201%** | +0.329% |
+| duplex 1 | 600.949 µs | 594.382 µs | **−1.093%** | +0.118% |
+| duplex 2 | 598.171 µs | 595.598 µs | **−0.430%** | +1.045% |
+| duplex 3 | 596.912 µs | 592.358 µs | **−0.763%** | +0.005% |
+| socket 1 | 1141.727 µs | 1138.209 µs | **−0.308%** | +0.742% |
+| socket 2 | 1136.649 µs | 1136.075 µs | **−0.050%** | +0.347% |
+| socket 3 | 1141.225 µs | 1143.455 µs | **+0.195%** | +0.262% |
 
-Baseline/candidate full median spreads were 2.634%/2.814% duplex and 1.929%/2.774% socket. The
-required improvements therefore had to exceed 2.814% and 2.774%, respectively. Neither pass on
-either substrate cleared even the immutable 2% floor; socket changed sign. Run 05 remains useful
+Baseline/candidate full median spreads were 0.676%/0.547% duplex and 0.447%/0.650% socket.
+Neither pass on either substrate cleared the immutable 2% floor; socket changed sign. Run 05 remains useful
 prior evidence, but it is a different pooled mechanism and was not used as B3's timing bound.
 Because both claim targets failed, guard timing could not change the mandatory rejection and was
 not run.
@@ -203,13 +213,17 @@ Candidate C; changing the framer cannot move it.
 Candidate B is **closed with B3 reverted**. B1 and the bounded arena cannot reduce the required
 allocation count without the recycling design run 05 already rejected. B2 violates the
 dependency/public-shape boundary. B3 removed 160 allocator calls but improved duplex by less than
-1.1% and was flat on socket. B4 has zero framer population.
+1.1% and was flat on socket across three 100-sample passes. B4 has zero framer population.
 
 The preserved probe hashes were baseline
 `0e8b5b1f1a71759db9e53b35e306e9c81ab2cf8292594b4625839279de9370c8` and candidate
 `7a2bc8fbad10416972c35892a571611afac649c101c978759c4d52c81dc9a733`. Criterion binary hashes
-were baseline/candidate `4910af4e…`/`0868effe…` for duplex and
-`e2325e73…`/`42fcd8c9…` for socket. No allocation-only code is retained.
+were baseline/candidate
+`4910af4e89d7b9283ea90fe6611a52d57f4b948f535e3646c5f9f3abc7efbc18` /
+`0868effed12515cd4220237b4e9d8a893ce576b0adcac01eb8204ce8ac6b425b` for duplex and
+`e2325e731a92f39aca2658d063bdd5e12dcb5e60ecc987bb83ae7f9755972af2` /
+`42fcd8c9ac1338a7e92decd4cc689cf455fc9fbcd4abc35b0e7abf0e542a89aa` for socket. No
+allocation-only code is retained.
 
 ### Validation
 
@@ -229,8 +243,8 @@ machine limitation. `deps/dwnx` was not changed.
 
 ## Drift controls in the same session
 
-Every elapsed pass carried unchanged H2. Baseline/candidate QMux/H3 spreads were 2.634%/2.814%
-duplex and 1.929%/2.774% socket; H2 moved between −0.925% and +0.329%.
+Every elapsed pass carried unchanged H2. Baseline/candidate QMux/H3 spreads were 0.676%/0.547%
+duplex and 0.447%/0.650% socket; H2 moved between +0.005% and +1.045%.
 
 ## What this establishes
 

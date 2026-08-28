@@ -13,25 +13,26 @@ mechanism study; their absolute timings are not controls across the Azure CPU mi
 
 | Workload | duplex QMux/H3 ÷ H2 | socket QMux/H3 ÷ H2 |
 | --- | ---: | ---: |
-| serial | **2.065×** | **1.898×** |
-| concurrency 1 | 1.980× | 1.880× |
-| concurrency 8 | 1.880× | 1.828× |
-| concurrency 64 | 1.815× | 1.792× |
-| body 0 | 2.088× | 1.917× |
-| body 1 KiB | 1.773× | 1.234× |
-| body 64 KiB | 1.505× | **0.979×** |
-| body 1 MiB | 1.219× | **0.842×** |
+| serial | **2.052×** | **1.876×** |
+| concurrency 1 | 2.010× | 1.854× |
+| concurrency 8 | 1.887× | 1.818× |
+| concurrency 64 | 1.816× | 1.776× |
+| body 0 | 2.063× | 1.878× |
+| body 1 KiB | 1.780× | 1.236× |
+| body 64 KiB | 1.508× | **1.005×** |
+| body 1 MiB | 1.222× | **0.845×** |
 
-Over a socket, QMux/H3 reaches parity near 64 KiB and is 15.8% faster at 1 MiB because it still
+Over a socket, QMux/H3 reaches parity near 64 KiB and is 15.5% faster at 1 MiB because it still
 writes far less often: 67 writes versus HTTP/2's 189. For empty and concurrent work it remains
 roughly 1.8–2.1× slower. The final branch's benchmark binaries are hash-identical to merged PR #45,
 so this work claims no production speedup.
 
-Four evidence-driven candidates were tested. Removing duplicate open/transmit pumps cut reads and
+Four evidence-driven candidates were investigated. Removing duplicate open/transmit pumps cut reads and
 pumps from 73/70 to 40/37 but missed the socket timing gate. Safe delivery transfer removed 160
 mallocs, and bounded header storage removed 20 mallocs plus three reallocs; neither produced a
-stable qualifying elapsed win. Queue-local changes cannot reduce the 23 registered pops because
-they are one-for-one with fill-loop iterations. Every prototype was reverted.
+stable qualifying elapsed win. Those three prototypes were reverted. Candidate D was not
+implemented: queue-local changes cannot reduce the 23 registered pops because they are
+one-for-one with fill-loop iterations, so the registered count gate was structurally impossible.
 
 ## Historical mechanism result
 
@@ -39,8 +40,9 @@ The cross-protocol arms were added so this question could be asked, and then it 
 several increments: every run before run 08 compared a build against another build. Run 08 was
 the first to compare the two stacks.
 
-Every section below reports runs `08` and `09` on the pre-migration host state. Their mechanism
-explanations still hold; their ratios are superseded by the current table above.
+Every section below reports runs `08` and `09` on the pre-migration host state. Their ratios are
+superseded by the current table above. The body-write mechanism remains current; the concurrency
+write-amplification mechanism was removed by run 11 and is retained below only as history.
 
 ## The answer is two numbers, not one
 
@@ -98,7 +100,7 @@ Before the write-path work in the same branch, that identifier was 1.29×. Coale
 records into one write is what moved it, and the mechanism is measured separately in
 [the QMux write path](qmux-write-path.md).
 
-## The concurrency inversion, which was the last thing unexplained
+## Historical concurrency inversion — superseded by run 11
 
 Concurrency over a socket is QMux's worst case at 3.12–3.14×, and it is *worse* than the same
 parameter over a duplex at 2.33× — the only workload in the suite where adding a kernel makes
@@ -123,9 +125,10 @@ ending to start a fresh batch — and a `Pending` ends the driver's turn, which 
 the outbound buffer to flush. One ending, one flush, one write, on each side: `2n + 2`. Deleting the
 rule to confirm this breaks the connection in precisely the way its own doc comment predicts.
 
-This also **corrects a claim** the earlier write-path work left behind. That work established the
-write count per *driver turn* no longer grows with the streams in flight, which is true. The number
-of driver turns does.
+This explained the pre-run-11 state only. Run 11 decoupled flushing from productive event-batch
+boundaries and reduced QMux writes at concurrency 1/8/64 from 4/18.009/132.052 to
+3/3.009/3.052. The old inversion and `2n + 2` write law therefore must not be projected onto the
+current implementation.
 
 ## What is still not explained
 

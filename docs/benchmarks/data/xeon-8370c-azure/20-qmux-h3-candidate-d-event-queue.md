@@ -46,8 +46,8 @@ All instrumentation was removed before this run was committed.
 
 ### Uncontended lock cost
 
-The release microprobe timed the exact recovered-lock plus `VecDeque::pop_front` operation on an
-empty queue and subtracted an otherwise identical black-box loop:
+The temporary release microprobe timed the exact recovered-lock plus `VecDeque::pop_front`
+operation on an empty queue and subtracted an otherwise identical black-box loop:
 
 | Repeat | Empty loop | Locked empty pop | Net per pop |
 | ---: | ---: | ---: | ---: |
@@ -57,7 +57,9 @@ empty queue and subtracted an otherwise identical black-box loop:
 | 4 | 3.261 ms | 165.723 ms | 16.246 ns |
 | 5 | 3.400 ms | 164.413 ms | 16.101 ns |
 
-The full 23-lock population is about 0.37 µs. Even granting D1 all 16 empty locks gives only
+The microprobe source was removed with the temporary instrumentation, so these values are an
+illustrative calibration rather than a standalone reproducible benchmark artifact. The
+count-gate decision does not rely on them. The full 23-lock population is about 0.37 µs. Even granting D1 all 16 empty locks gives only
 0.257–0.260 µs, below the approximately 0.63 µs socket-serial 2% floor before control movement or
 spread. More importantly, it leaves the registered pop count at 23 and fails the count gate.
 
@@ -82,7 +84,7 @@ already measured and reverted mechanism, not an independent D optimization.
 
 Candidate D is closed without production code. Ordering, poisoning recovery, `Send` behavior and
 the events-before-ending boundary remain byte-for-byte unchanged. Focused QMux/QMux-H3 tests,
-feature variants, clippy and rustdoc are run on the uninstrumented tree at the phase gate.
+feature variants, clippy and rustdoc passed on the uninstrumented tree at the phase gate.
 
 Do not retry an atomic hint, queue pre-sizing or wholesale draining from the 16-empty-pop count.
 A future queue candidate must independently reduce registered pop calls while preserving the

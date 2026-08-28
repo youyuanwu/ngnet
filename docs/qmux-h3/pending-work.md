@@ -74,15 +74,16 @@ reprofiling. Item 7 is the only open performance item.
    allocations, so it cannot satisfy the count gate; a per-record owner merely breaks even at
    324 before bookkeeping. Constructing `Bytes` in QMux violates its one-dependency boundary.
    The safe B3 range-deferral prototype did remove 160 calls (**710 → 550**) and reduced the
-   sampled delivery share from 86.01% to 81.08%, but two controlled passes improved duplex by
-   only 0.87–1.05% and socket by −0.20–0.62%, below the 2% and spread gates. The apparent
+   sampled delivery share from 86.01% to 81.08%. Three 100-sample controlled passes improved
+   duplex by only 0.43–1.09%; socket changed from a 0.31% improvement to a 0.20% regression,
+   below the 2% and spread gates. The apparent
    `RawVec` opportunity is not framer retention—fresh counters observed zero framer growth and
    attributed 242 H3 growths to transport/event batches. Run 05's pooled negative remains
    valid; do not retry delivery ownership without a changed lower-layer owner API or a newly
    measured cost large enough to clear the elapsed gate. See
    [`run 18`](../benchmarks/data/xeon-8370c-azure/18-qmux-h3-candidate-b-delivery-ownership.md).
 7. **Test HTTP/2 coalescing beyond one 16 KiB frame.** This is comparative work, not a QMux
-   defect. At a 1 MiB exchange HTTP/2 issues 189 writes and QMux issues 68; the measured HTTP/2
+   defect. At a 1 MiB exchange HTTP/2 issues 189 writes and QMux issues 67; the measured HTTP/2
    maximum is exactly 16 KiB while QMux can empty a 64 KiB buffer. A prototype must establish
    whether coalescing frames recovers the kernel-path gap without regressing latency or
    concurrency before it becomes an HTTP/2 change.
@@ -102,9 +103,9 @@ reprofiling. Item 7 is the only open performance item.
    prototype inlined small received fields with heap fallback, reserved known field capacities,
    and removed redundant validation/submission vectors without changing public APIs or validation.
    It reduced exact per-exchange allocator activity from **128.02/6.02/128.02** to
-   **108.02/3.02/108.02 malloc/realloc/free**. Timing was not repeatable: duplex passes changed
-   −2.12% and −1.31%, while socket changed +1.44% and −1.57%; only one of four raw results cleared
-   2%, and one socket pass regressed. The code was reverted. The per-section slot scan remained
+   **108.02/3.02/108.02 malloc/realloc/free**. Timing remained below the retention gate: duplex passes changed
+   −1.30% to −1.92%, while socket changed −0.74% to −0.88%, across three 100-sample passes.
+   No raw result cleared 2%. The code was reverted. The per-section slot scan remained
    below profile resolution, and Registry/Tasks map work was too small to rescue the failed socket
    gate. Do not retry header-storage or registry changes from allocation counts alone. Native QPACK
    algorithm changes or a concrete concurrency-only mechanism would need independent gates. See

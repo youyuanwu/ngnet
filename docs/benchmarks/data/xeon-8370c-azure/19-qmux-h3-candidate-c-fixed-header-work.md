@@ -5,13 +5,19 @@
 **Commit(s):** baseline `c7c95d9` against candidate `c188758`, reverted by `3b5c576`
 **Baseline:** production code identical to `364dbb2`
 **Disposition:** **implemented, measured, and reverted**; 20 mallocs and three reallocs were
-removed, but the elapsed result was not repeatable and did not clear both substrate gates
+removed, but no 100-sample elapsed pass cleared the 2% floor
 **Cases:** warmed empty QMux/H3 exchange over duplex and loopback socket
 **Command:** `taskset -c 3 target/release/examples/probe qmux-{duplex,socket} body 0 10000`
 under repeated 4 kHz DWARF `task-clock:u` profiles; exact malloc/realloc/free counts from
-100/300-exchange uprobes; Criterion as two baseline/candidate passes, 50 samples, 3 s
-measurement, 1 s warm-up, and matching H2 controls
-**Repetitions:** two sequential profile repeats per substrate and two interleaved Criterion
+100/300-exchange uprobes; Criterion as three baseline/candidate passes, 100 samples, 3 s
+measurement, 1 s warm-up, and matching H2 controls:
+`taskset -c 3 <duplex-serial-binary> --bench
+'serial_latency/(ngnet-h2|ngnet-qmux-h3)$' <criterion-options>` and
+`taskset -c 3 <socket-serial-binary> --bench
+'transport_serial_latency/(ngnet-h2-tokio|ngnet-qmux-h3-tokio)$' <criterion-options>`, where
+`<criterion-options>` was `--sample-size 100 --measurement-time 3 --warm-up-time 1
+--save-baseline <pass> --noplot`
+**Repetitions:** two sequential profile repeats per substrate and three interleaved Criterion
 baseline/candidate passes per substrate
 **Controls:** the immutable 2% floors, each pass's H2 movement, and the observed repeat spread
 **Exclusions:** an accidentally concurrent first profile pair was discarded before analysis and
@@ -86,8 +92,8 @@ Repeated task-clock profiles found:
 registry self samples totaled at most 0.77% (under 0.18 µs) on duplex and 0.39% (under 0.09 µs)
 on socket; `Tasks` was below the approximately 0.025 µs symbol resolution. Replacing those maps
 would also introduce peak-concurrency retention policy. Even granting all named work as
-removable cannot repair the prototype's socket regression in pass 1 or bring pass 2's raw
-improvement to 2%, so it is not an independently plausible candidate.
+removable cannot lift the prototype's 0.74–0.88% socket improvement to 2%, so it is not an
+independently plausible candidate.
 
 Those sites are absent from H2 but are not header-storage mechanisms. The driver, registry, and
 native QPACK costs remain attribution, not permission to charge them to C1–C3.
@@ -127,21 +133,21 @@ matching baseline pass; normalized delta compares `(candidate QMux/H3 ÷ candida
 
 | Substrate/pass | Baseline H2 | Baseline QMux/H3 | Candidate H2 | Candidate QMux/H3 | Raw delta | Normalized delta |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| duplex 1 | 10.058 | 20.784 | 10.063 | 20.343 | **−2.12%** | **−2.17%** |
-| duplex 2 | 10.132 | 20.786 | 10.115 | 20.514 | **−1.31%** | **−1.14%** |
-| socket 1 | 16.784 | 31.659 | 17.234 | 32.115 | **+1.44%** | **−1.21%** |
-| socket 2 | 16.783 | 31.723 | 16.989 | 31.226 | **−1.57%** | **−2.76%** |
+| duplex 1 | 10.139 | 20.793 | 10.106 | 20.522 | **−1.30%** | **−0.98%** |
+| duplex 2 | 10.078 | 20.798 | 10.017 | 20.398 | **−1.92%** | **−1.33%** |
+| duplex 3 | 10.075 | 20.691 | 10.050 | 20.375 | **−1.53%** | **−1.28%** |
+| socket 1 | 16.794 | 31.750 | 16.986 | 31.496 | **−0.80%** | **−1.92%** |
+| socket 2 | 16.824 | 31.879 | 17.029 | 31.598 | **−0.88%** | **−2.08%** |
+| socket 3 | 16.986 | 31.803 | 16.889 | 31.569 | **−0.74%** | **−0.17%** |
 
-The candidate's QMux/H3 range was 20.343–20.514 µs on duplex and 31.226–32.115 µs on socket.
-Only one raw pass cleared 2%; duplex pass 2 and socket pass 2 did not, and socket pass 1 regressed.
-The socket control itself moved +2.68% and +1.23%, confirming that the apparently favorable
-normalized second pass did not establish a stable absolute win. The result therefore fails the
-pre-registered dual-substrate gate without needing larger-workload regression guards.
+The candidate's QMux/H3 range was 20.375–20.522 µs on duplex and 31.496–31.598 µs on socket.
+No raw pass cleared the immutable 2% floor. The result therefore fails the pre-registered
+dual-substrate gate without needing larger-workload regression guards.
 
 ### Semantic and cleanup validation
 
-The prototype added a deterministic inline/heap-fallback ownership test and passed all 121
-`ngnet-h3` unit tests plus all 27 `ngnet-h3-tests` integration tests. Existing tests exercised:
+The prototype added a deterministic inline/heap-fallback ownership test. The complete
+`ngnet-h3` and `ngnet-h3-tests` suites passed; existing tests exercised:
 
 - pseudo-header order/uniqueness, unknown pseudo-headers and `:protocol`;
 - CONNECT, scheme, authority/host, userinfo, path, asterisk, forbidden-field and `te` rules;
@@ -153,10 +159,16 @@ No unsafe lifetime extension was introduced. Inline storage moved with the recei
 fallback owned its bytes after callback return; both were dropped on every early error. The
 prototype was then reverted completely by `3b5c576`.
 
+The preserved Criterion binary hashes were baseline/candidate
+`294ec76d110f77eeb86b2c222fa27cc22e6462df6cd6e4077bf55231f368776a` /
+`52c555765639541d7c296bfc7f1070ec05729a63da9538356a7017b3d7904ed9` for duplex and
+`1a704657a524a6677a960c36f7d1ba98df66fdced24376ee1481009de9e66c82` /
+`68d4f04a6a6af0d169d74f0acd1abaab3a9160434099dd400ea42ec429d6cad9` for socket.
+
 ### Disposition
 
 Candidate C is **rejected after implementation and direct measurement**. Its exact allocator
-improvement is real, but allocation count alone did not produce a repeatable elapsed-time win.
+improvement is real, but allocation count alone did not produce a qualifying elapsed-time win.
 C4's one-entry section scan remained below profile resolution. Registry/Tasks map replacement is
 also rejected as a companion: its complete measured socket population is too small to rescue the
 failed prototype, and it would add a new retained-capacity policy. Do not retry these mechanisms
@@ -166,20 +178,20 @@ from allocation counts alone.
 
 The candidate's focused H3/H3-tests suites passed before timing. After `3b5c576`, production
 source is again identical to `7c36518`; the restored-source release QMux-H3/QMux-H3-tests,
-feature variants, clippy, rustdoc, and diff hygiene are rerun at the phase gate. The pristine
-release probe must reproduce Phase 4's SHA-256
+feature variants, clippy, rustdoc, and diff hygiene passed at the phase gate. The pristine
+release probe reproduced Phase 4's SHA-256
 `0e8b5b1f1a71759db9e53b35e306e9c81ab2cf8292594b4625839279de9370c8` after temporary profiles,
 uprobes, copied binaries and Criterion baselines are removed.
 
 ## Drift controls in the same session
 
-H2 movement was +0.05%/−0.17% on duplex and +2.68%/+1.23% on socket. Candidate QMux/H3 ranged
-20.343–20.514 µs duplex and 31.226–32.115 µs socket, including one socket regression.
+H2 movement was −0.61% to −0.25% on duplex and −0.57% to +1.22% on socket. Candidate QMux/H3
+ranged 20.375–20.522 µs duplex and 31.496–31.598 µs socket.
 
 ## What this establishes
 
 - C1–C3 remove exactly 20 mallocs and three reallocs without unsafe lifetime extension.
-- The allocation reduction does not produce a stable dual-substrate elapsed-time win.
+- The allocation reduction does not produce a qualifying dual-substrate elapsed-time win.
 - C4 and registry/task-map work are too small to rescue the failed socket gate.
 
 ## What it does not
