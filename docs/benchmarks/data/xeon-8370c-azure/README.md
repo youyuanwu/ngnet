@@ -90,7 +90,7 @@ submodules. [`../../running.md`](../../running.md) states the requirement in ful
 | [12-apply-events-reprofile](12-apply-events-reprofile.md) | 2026-08-28 | `700bfa6` | Fresh inclusive `apply_events` attribution is **0.74–1.05% serial, 1.86–1.89% at n=64**; run 09's 8.1% was flat/self, and scratch reuse was rejected before implementation |
 | [13-qmux-h3-current-bottlenecks](13-qmux-h3-current-bottlenecks.md) | 2026-08-28 | `5477450` | Current bottlenecks — a duplicate event-path pump is **−5.4% duplex / −3.7% socket serial** in a diagnostic |
 | [14-qmux-h3-one-pump](14-qmux-h3-one-pump.md) | 2026-08-28 | `c6f1191` against `5477450` | Production one-pump rule — **96 → 73 reads; −5.26% duplex / −2.37% socket serial** |
-| [15-qmux-h3-shared-snapshot](15-qmux-h3-shared-snapshot.md) | 2026-08-28 | `c171f4f` against `c6f1191`, then `5477450` | Coherent shared work — **155 → 29 operations; −7.64% / −6.24% incremental serial** |
+| [15-qmux-h3-shared-snapshot](15-qmux-h3-shared-snapshot.md) | 2026-08-28 | `0b6dcbd` against `c6f1191`, then `5477450` | Coherent shared work — **155 → 29 operations; −7.59% / −5.68% incremental serial** |
 
 Still outstanding, in the order they are worth doing:
 

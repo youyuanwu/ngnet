@@ -40,7 +40,7 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [12-apply-events-reprofile](xeon-8370c-azure/12-apply-events-reprofile.md) | xeon-8370c-azure | 2026-08-28 | Reprofile `apply_events` after runs 10 and 11 — **0.74–1.05% inclusive serial; no implementation** | — |
 | [13-qmux-h3-current-bottlenecks](xeon-8370c-azure/13-qmux-h3-current-bottlenecks.md) | xeon-8370c-azure | 2026-08-28 | Differential profile against HTTP/2 — **duplicate event-path pump is the next confirmed fix** | — |
 | [14-qmux-h3-one-pump](xeon-8370c-azure/14-qmux-h3-one-pump.md) | xeon-8370c-azure | 2026-08-28 | Production one-pump event rule — **96 → 73 reads; −5.26% duplex / −2.37% socket serial** | — |
-| [15-qmux-h3-shared-snapshot](xeon-8370c-azure/15-qmux-h3-shared-snapshot.md) | xeon-8370c-azure | 2026-08-28 | One coherent shared-work snapshot — **155 → 29 operations; −7.64% / −6.24% incremental serial** | — |
+| [15-qmux-h3-shared-snapshot](xeon-8370c-azure/15-qmux-h3-shared-snapshot.md) | xeon-8370c-azure | 2026-08-28 | One coherent shared-work snapshot — **155 → 29 operations; −7.59% / −5.68% incremental serial** | — |
 
 **The cross-protocol comparison is [`08`](xeon-8370c-azure/08-qmux-against-h2.md), and it is the
 only run here that is one.** That sentence replaces a standing note saying no such run existed.

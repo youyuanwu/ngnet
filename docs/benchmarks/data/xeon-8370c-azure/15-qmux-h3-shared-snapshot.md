@@ -2,10 +2,10 @@
 
 **Machine:** historical [`xeon-8370c-azure`](README.md) VM label; the current VM reports an **Intel Xeon Platinum 8573C**
 **Date:** 2026-08-28
-**Commit(s):** retained phase 1 `c6f119107d5bb6058015cb60530ae61c3d2639e0` against snapshot prototype/final `c171f4f77a4ae787ac828582a3e0209ed75b4a30`; fresh final comparison against base `54774504ca968140f3c25ce9b3bfc84d06a2bb6e`
+**Commit(s):** retained phase 1 `c6f119107d5bb6058015cb60530ae61c3d2639e0` against final `0b6dcbd64bc6085e4dc11b732739627563041379`; fresh final comparison against base `54774504ca968140f3c25ce9b3bfc84d06a2bb6e`
 **Cases:** exact empty duplex shared-operation counts; duplex and loopback-socket serial; concurrency 1, 8 and 64; 1 MiB duplex/socket regression guards; matching HTTP/2 controls
 **Commands:** exact detached revisions were built with `cargo build --release -p ngnet-bench --benches --example probe`; copied executables ran as `taskset -c 3 <binary> --bench ngnet --save-baseline <pass> --noplot`. Count-only debug executables from both exact revisions retained uninlined method symbols and ran under elevated `perf` uprobes as `taskset -c 3 <probe-count> qmux-duplex body 0 <N>`.
-**Repetitions:** Criterion phase 1 → prototype → phase 1 → prototype, then fresh base → final → base → final; 100 samples per benchmark per pass. Counts used `N=100` and `3N=300`, reported as `(count(300) - count(100)) / 200`.
+**Repetitions:** Criterion phase 1 → final → phase 1 → final, then fresh base → final → base → final; 100 samples per benchmark per pass. Counts used `N=100` and `3N=300`, reported as `(count(300) - count(100)) / 200`.
 **Controls:** unchanged matching HTTP/2 implementations were present in every binary and pass; movements are reported per row
 **Exclusions:** none. No sample, benchmark, pass, or count was discarded. The 1 MiB cases were pre-registered as regression guards, not improvement targets.
 
@@ -32,7 +32,7 @@ The release build inlines these small methods. Count-only binaries therefore use
 same-revision debug-symbol fallback on both sides; Criterion continued to use untouched release
 binaries. Raw totals include setup and teardown.
 
-| Operation class | phase 1 raw N / 3N | prototype raw N / 3N | phase 1 per exchange | prototype per exchange |
+| Operation class | phase 1 raw N / 3N | final raw N / 3N | phase 1 per exchange | final per exchange |
 | --- | ---: | ---: | ---: | ---: |
 | destructive drains | five × 1,428 / 4,228 | 1,428 / 4,228 | 70 | **14** |
 | idle/readiness predicates | five × 1,528 / 4,528 | 510 / 1,510 | 75 | **5** |
@@ -52,56 +52,56 @@ per side. Spread is `(max / min) - 1` within a side.
 
 | Benchmark | phase 1 1/2 | snapshot 1/2 | change | phase 1 / snapshot spread | H2 control |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| duplex serial | 22.759 / 22.625 | 20.963 / 20.953 | **−7.64%** | 0.59% / 0.05% | −0.24% |
-| socket serial | 33.871 / 34.046 | 31.966 / 31.711 | **−6.24%** | 0.52% / 0.80% | −0.49% |
-| duplex concurrency 1 | 23.197 / 23.158 | 21.944 / 21.644 | **−5.97%** | 0.17% / 1.38% | +0.77% |
-| duplex concurrency 8 | 125.743 / 124.794 | 124.175 / 121.822 | −1.81% | 0.76% / 1.93% | +0.59% |
-| duplex concurrency 64 | 1008.080 / 999.117 | 1007.301 / 984.658 | −0.76% | 0.90% / 2.30% | +0.40% |
-| socket concurrency 1 | 34.586 / 35.104 | 32.700 / 32.743 | **−6.09%** | 1.50% / 0.13% | +0.10% |
-| socket concurrency 8 | 136.539 / 137.642 | 133.137 / 132.379 | **−3.16%** | 0.81% / 0.57% | −1.06% |
-| socket concurrency 64 | 1016.295 / 1025.490 | 993.798 / 989.387 | **−2.87%** | 0.90% / 0.45% | −1.09% |
-| duplex 1 MiB guard | 641.433 / 641.638 | 600.647 / 596.856 | −6.67% | 0.03% / 0.64% | +0.60% |
-| socket 1 MiB guard | 1089.646 / 1084.635 | 1053.916 / 1051.753 | −3.16% | 0.46% / 0.21% | −1.94% |
+| duplex serial | 22.665 / 22.769 | 21.074 / 20.913 | **−7.59%** | 0.46% / 0.77% | −0.55% |
+| socket serial | 33.663 / 33.976 | 31.973 / 31.821 | **−5.68%** | 0.93% / 0.48% | −0.60% |
+| duplex concurrency 1 | 23.201 / 23.782 | 21.576 / 21.716 | **−7.86%** | 2.51% / 0.65% | +0.42% |
+| duplex concurrency 8 | 125.039 / 125.398 | 122.409 / 122.344 | **−2.27%** | 0.29% / 0.05% | −0.95% |
+| duplex concurrency 64 | 1002.527 / 1008.878 | 989.488 / 993.814 | −1.40% | 0.63% / 0.44% | −1.03% |
+| socket concurrency 1 | 34.499 / 35.094 | 32.570 / 32.647 | **−6.29%** | 1.73% / 0.24% | −0.81% |
+| socket concurrency 8 | 136.600 / 136.642 | 131.707 / 132.429 | **−3.33%** | 0.03% / 0.55% | −1.11% |
+| socket concurrency 64 | 1006.176 / 1014.665 | 988.335 / 988.660 | **−2.17%** | 0.84% / 0.03% | −0.65% |
+| duplex 1 MiB guard | 639.451 / 627.840 | 599.416 / 602.803 | −5.13% | 1.85% / 0.57% | −0.64% |
+| socket 1 MiB guard | 1086.744 / 1080.890 | 1054.700 / 1050.382 | −2.89% | 0.54% / 0.41% | +1.42% |
 
 Both serial targets and both concurrency-1 targets clear matching controls and both side spreads,
-so the pre-registered phase-two positive gate passes. Socket concurrency 8 and 64 also clear
-those bars. Duplex concurrency 8 and 64 do not clear snapshot-side spread and remain unclaimed.
+so the pre-registered phase-two positive gate passes. Duplex concurrency 8 and socket concurrency
+8/64 also clear those bars. Duplex concurrency 64 remains unclaimed.
 The bulk arms show no regression but remain guards rather than optimization claims.
 
 ## Fresh base → retained-final timing
 
 | Benchmark | base 1/2 | final 1/2 | change | base / final spread | H2 control |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| duplex serial | 23.731 / 23.677 | 20.875 / 20.868 | **−11.95%** | 0.23% / 0.04% | +1.16% |
-| socket serial | 34.870 / 34.474 | 31.972 / 31.821 | **−8.00%** | 1.15% / 0.47% | −0.78% |
-| duplex concurrency 1 | 24.452 / 24.264 | 21.677 / 21.672 | **−11.01%** | 0.77% / 0.02% | +1.23% |
-| duplex concurrency 8 | 128.829 / 129.541 | 121.864 / 123.025 | **−5.22%** | 0.55% / 0.95% | −0.16% |
-| duplex concurrency 64 | 1030.822 / 1031.671 | 992.406 / 996.493 | **−3.57%** | 0.08% / 0.41% | +0.74% |
-| socket concurrency 1 | 35.710 / 35.472 | 32.928 / 32.812 | **−7.65%** | 0.67% / 0.35% | −0.23% |
-| socket concurrency 8 | 138.462 / 139.296 | 133.197 / 132.959 | **−4.18%** | 0.60% / 0.18% | +0.42% |
-| socket concurrency 64 | 1019.885 / 1027.763 | 997.249 / 1015.024 | −1.73% | 0.77% / 1.78% | −0.51% |
-| duplex 1 MiB guard | 661.435 / 644.691 | 615.811 / 607.712 | −6.32% | 2.60% / 1.33% | +2.78% |
-| socket 1 MiB guard | 1107.142 / 1103.656 | 1062.722 / 1081.329 | −3.02% | 0.32% / 1.75% | +0.53% |
+| duplex serial | 23.741 / 23.650 | 20.963 / 20.860 | **−11.75%** | 0.38% / 0.49% | +0.65% |
+| socket serial | 35.351 / 34.410 | 31.920 / 31.848 | **−8.59%** | 2.73% / 0.23% | −1.59% |
+| duplex concurrency 1 | 24.755 / 24.701 | 21.867 / 21.797 | **−11.71%** | 0.22% / 0.32% | +0.00% |
+| duplex concurrency 8 | 129.141 / 129.032 | 121.965 / 122.556 | **−5.29%** | 0.08% / 0.48% | −0.07% |
+| duplex concurrency 64 | 1035.326 / 1031.154 | 987.303 / 995.782 | **−4.04%** | 0.40% / 0.86% | +0.48% |
+| socket concurrency 1 | 35.475 / 35.298 | 32.599 / 32.452 | **−8.09%** | 0.50% / 0.46% | +0.02% |
+| socket concurrency 8 | 138.056 / 141.183 | 133.008 / 132.236 | **−5.01%** | 2.26% / 0.58% | −0.41% |
+| socket concurrency 64 | 1030.318 / 1029.242 | 989.423 / 991.718 | **−3.81%** | 0.10% / 0.23% | −0.44% |
+| duplex 1 MiB guard | 650.296 / 642.948 | 597.839 / 598.908 | −7.46% | 1.14% / 0.18% | −0.26% |
+| socket 1 MiB guard | 1104.832 / 1093.831 | 1049.412 / 1047.984 | −4.61% | 1.01% / 0.14% | −0.45% |
 
-The retained final is faster on every target. Socket concurrency 64 does not clear the 2% floor
-or final-side spread and is unclaimed. Both bulk arms remain regression guards; the duplex guard
-does not clear the pre-registered 10.42% historical within-host drift for that identifier.
+The retained final is faster on every target, and every serial/concurrency row clears controls
+and both side spreads. Both bulk arms remain regression guards; the duplex guard does not clear
+the pre-registered 10.42% historical within-host drift for that identifier.
 
 ## Exact-revision binaries
 
 | Binary | base | phase 1 | snapshot/final |
 | --- | --- | --- | --- |
-| `probe` | `53ee9ed95756034043982a268ab80e42c700dce102a47f431b3e3b396a63296f` | `2cf914d6d8d3a9ed6d4ae491ae42cf72ba54646d9d72cf22d9d82d3f0556da51` | `03ec82e18678f96051b2fefdffe78642928209940143eb503735315a6f5f4503` |
-| count-only `probe` | — | `e746f29b97d5b2d9192698ba0f94c3b10f822793cca84198ffc042de9ecd0e38` | `cb012b51e107f9f0a5c62d85fcb02588347bdda2264d133288a486e8cf06e04e` |
-| `serial_latency` | `8fceeea596c3b26062a59d32e5a2204ee0f3c835aeadb374819aa1a5d3fcbd11` | `c2cce20ec4ab0a73550ef849ccc3b9eb3e2d0d6e0d57a99d3e7b8efa3b5ad3c0` | `5610172fd888bd6e3952e0395b1751560606a68a8bf1e8b6a8c8742ccff847ad` |
-| `transport_serial_latency` | `0f332aec4984f2fbb3fefc045ae5c3cc946b32332dded94820ac3c8e30158f2a` | `573a443ae8d4eb097c73543cc23a686653bd0580afec4373440ddd6d9847130e` | `cf6c517f145eaf529ea0da804327c84eee1fd036ab7da8da4d5396b7d149b163` |
+| `probe` | `53ee9ed95756034043982a268ab80e42c700dce102a47f431b3e3b396a63296f` | `2cf914d6d8d3a9ed6d4ae491ae42cf72ba54646d9d72cf22d9d82d3f0556da51` | `0e8b5b1f1a71759db9e53b35e306e9c81ab2cf8292594b4625839279de9370c8` |
+| count-only `probe` | — | `e746f29b97d5b2d9192698ba0f94c3b10f822793cca84198ffc042de9ecd0e38` | `978d63ee7ebec03a790ca6cf72b7ecb0a4d75021258d57419d0bae84612c16d6` |
+| `serial_latency` | `8fceeea596c3b26062a59d32e5a2204ee0f3c835aeadb374819aa1a5d3fcbd11` | `c2cce20ec4ab0a73550ef849ccc3b9eb3e2d0d6e0d57a99d3e7b8efa3b5ad3c0` | `294ec76d110f77eeb86b2c222fa27cc22e6462df6cd6e4077bf55231f368776a` |
+| `transport_serial_latency` | `0f332aec4984f2fbb3fefc045ae5c3cc946b32332dded94820ac3c8e30158f2a` | `573a443ae8d4eb097c73543cc23a686653bd0580afec4373440ddd6d9847130e` | `1a704657a524a6677a960c36f7d1ba98df66fdced24376ee1481009de9e66c82` |
 
 ## Verdict
 
 The prototype passes both required gates: counted shared operations fall 155 → 29 and the
-incremental predicted targets improve 5.97–7.64% beyond controls and spread. Phase 2 is retained.
-Together with phase 1, the fresh base-to-final comparison is 11.95% faster duplex serial and
-8.00% faster socket serial, with no target regression.
+incremental predicted targets improve 5.68–7.86% beyond controls and spread. Phase 2 is retained.
+Together with phase 1, the fresh base-to-final comparison is 11.75% faster duplex serial and
+8.59% faster socket serial, with no target regression.
 
 ## What this does not establish
 

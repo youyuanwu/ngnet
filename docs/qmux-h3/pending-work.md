@@ -61,8 +61,8 @@ is the highest-priority open performance item.
    lock; idle, completion and under-waker checks each use one coherent predicate. Exact matched
    count builds reduce the eleven old take/readiness/refresh entries from **155 → 29** per empty
    exchange. Controlled phase-1-to-snapshot timing improves duplex/socket serial by
-   **7.64% / 6.24%** and both concurrency-1 targets by **5.97% / 6.09%**, beyond controls and
-   spread. Fresh base-to-final serial timing is **11.95% / 8.00%** faster. The timing gate,
+   **7.59% / 5.68%** and both concurrency-1 targets by **7.86% / 6.29%**, beyond controls and
+   spread. Fresh base-to-final serial timing is **11.75% / 8.59%** faster. The timing gate,
    rather than the count alone, retains the change; see
    [`run 15`](../benchmarks/data/xeon-8370c-azure/15-qmux-h3-shared-snapshot.md).
 6. **Design a cheaper ownership path for delivered record data.** At 1 MiB, QMux/H3 performs

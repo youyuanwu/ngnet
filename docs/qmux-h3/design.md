@@ -87,7 +87,7 @@ keep waking and spin.
 The driver above this join now also transfers its five handle/callback work categories through
 one coherent shared snapshot per pass. That is an `ngnet-h3` rule rather than a QMux-specific
 one, but QMux/H3 provides its controlled timing evidence: run 15 reduces matched shared-operation
-entries from 155 to 29 and improves phase-one duplex/socket serial by 7.64% / 6.24%.
+entries from 155 to 29 and improves phase-one duplex/socket serial by 7.59% / 5.68%.
 
 Capacity pressure remains a forced write inside productive work, and close and finish remain
 independent finalisation boundaries. A broken byte stream returns its explicit error and the
