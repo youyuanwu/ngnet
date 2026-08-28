@@ -15,11 +15,9 @@
 //! was therefore what let a pass move more than a single record, and it flushed because
 //! flushing was the only way to make room.
 //!
-//! The layer below now accumulates records up to a documented ceiling and writes them
-//! together. The pump between offers must accumulate with it — [`pump_buffered`] — and the one
-//! at the end of the turn must not — [`pump`]. Keeping a single flushing pump would have left
-//! the driver turn paying one write per record with the connection underneath it coalescing
-//! perfectly, which is a null result that looks like a working change.
+//! The layer below accumulates records up to a documented ceiling and writes them together.
+//! Productive driver passes use [`pump_buffered`]. [`pump`] is reserved for the explicit
+//! suspension hook and the connection tail, where no later pass may be assumed.
 
 use core::task::{Context, Poll};
 
@@ -37,12 +35,9 @@ use crate::connection::Inner;
 /// connection has ended — the ending is latched on `inner`, not returned, because every
 /// caller here reports it in its own shape — or the byte stream is not taking more yet.
 ///
-/// **This is the forced form, and it is what discharges the obligation
-/// [`pump_buffered`] leaves.** Every caller of it is a place the HTTP/3 driver may stop
-/// polling this connection: the end of a transmit pass, an event poll that returns nothing,
-/// an open that is about to be reported. Output left behind at one of those waits for a pass
-/// that nothing is obliged to make, and a connection that has said everything it means to say
-/// and written none of it is indistinguishable, from the peer, from one that has hung.
+/// **This is the forced form, and it discharges the obligation [`pump_buffered`] leaves.**
+/// The HTTP/3 driver reaches it immediately before its task suspends; the connection tail
+/// uses the layer's corresponding forced operations before shutdown.
 pub(crate) fn pump<S: AsyncByteStream, C: Clock>(
     inner: &mut Inner<S, C>,
     cx: &mut Context<'_>,
@@ -62,11 +57,11 @@ pub(crate) fn pump<S: AsyncByteStream, C: Clock>(
 
 /// Drives the connection one pass, leaving what it produced to accumulate.
 ///
-/// The form for the middle of a transmit pass, where the caller is going to offer again and
-/// will finish with [`pump`]. The QMux layer writes only when its output buffer can no longer
-/// take another record, so a run of offers becomes a run of records in one write instead of a
-/// write apiece. Since a single offer now fills records until the buffer or the peer's window
-/// stops it, that run is as often one large offer's worth of records as several streams'.
+/// The form for productive driver work. The QMux layer writes only when its output buffer can
+/// no longer take another record, so offers and internal passes accumulate until the task is
+/// genuinely about to suspend. Since a single offer now fills records until the buffer or the
+/// peer's window stops it, that run is as often one large offer's worth of records as several
+/// streams'.
 ///
 /// `true` here means the connection can take another record, which is the question an offer
 /// loop is asking; `false` means it cannot until the byte stream takes some of what is already
@@ -78,8 +73,9 @@ pub(crate) fn pump<S: AsyncByteStream, C: Clock>(
 /// This distinction is the whole of the write-count reduction, and it is invisible from below.
 /// A connection that coalesced perfectly would still write once per record if every pump
 /// between two offers flushed it, and every test written against the connection alone would
-/// still pass. The guard that can see it is at the driver level:
-/// `tests/ngnet-qmux-h3-tests/tests/driver_writes.rs`.
+/// still pass. The guards that can see it are at the driver level:
+/// `tests/ngnet-qmux-h3-tests/tests/driver_writes.rs` for records within a body offer and
+/// `concurrent_driver_writes.rs` for records retained across internal passes.
 ///
 /// [`Connection::try_write_stream`]: ngnet_qmux::io::Connection::try_write_stream
 pub(crate) fn pump_buffered<S: AsyncByteStream, C: Clock>(

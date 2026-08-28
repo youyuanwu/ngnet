@@ -11,7 +11,7 @@
 //! returns pending *with a wake* to start a fresh batch, and a loop that stopped at the
 //! first pending would miss every event after a stream ended.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use std::io::IoSlice;
 use std::sync::Arc;
@@ -20,7 +20,8 @@ use std::task::Wake;
 use ngnet_h3::ErrorCode;
 use ngnet_h3::StreamId;
 use ngnet_h3::http::{QuicConnection, QuicEvent, StreamSource, WriteOutcome};
-use ngnet_qmux::io::testing::{TestByteStream, TestClock, WriteLog, stream_pair};
+use ngnet_qmux::io::AsyncByteStream;
+use ngnet_qmux::io::testing::{Fault, TestByteStream, TestClock, WriteLog, stream_pair};
 use ngnet_qmux_h3::QmuxConnection;
 
 type Endpoint = QmuxConnection<TestByteStream, TestClock>;
@@ -43,6 +44,96 @@ impl Wake for Woken {
     fn wake_by_ref(self: &Arc<Self>) {
         self.0.store(true, Ordering::SeqCst);
     }
+}
+
+#[derive(Default)]
+struct WakeCount(AtomicUsize);
+
+impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn a_flush_wakes_once_for_a_new_ending_and_never_spins_on_it() {
+    let (client_io, _peer_io) = stream_pair();
+    client_io.inject(Fault::Broken);
+    let mut connection = QmuxConnection::client(client_io, TestClock::new()).expect("a client");
+    let wakes = Arc::new(WakeCount::default());
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(
+        connection.poll_flush(&mut cx).is_ready(),
+        "a newly discovered ending is ready for its original operation to report"
+    );
+    assert_eq!(
+        wakes.0.load(Ordering::SeqCst),
+        1,
+        "a newly latched ending needs exactly one continuation"
+    );
+
+    match connection.poll_event(&mut cx) {
+        Poll::Ready(Err(_)) => {}
+        other => panic!("the pending event operation did not report the ending: {other:?}"),
+    }
+    assert_eq!(
+        wakes.0.load(Ordering::SeqCst),
+        1,
+        "reporting the ending must not add a courtesy wake"
+    );
+
+    assert!(connection.poll_flush(&mut cx).is_ready());
+    assert_eq!(
+        wakes.0.load(Ordering::SeqCst),
+        1,
+        "an already latched ending must not self-wake into a spin"
+    );
+}
+
+#[test]
+fn a_suspension_flush_parks_on_backpressure_and_finishes_after_its_wake() {
+    let (client_io, mut peer_io) = stream_pair();
+    client_io.set_capacity(Some(1));
+    let mut connection = QmuxConnection::client(client_io, TestClock::new()).expect("a client");
+    let wakes = Arc::new(WakeCount::default());
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+
+    // The productive event poll may build the transport announcement, but it must leave the
+    // sub-ceiling tail for the explicit suspension flush.
+    assert!(connection.poll_event(&mut cx).is_pending());
+    assert!(
+        connection.poll_flush(&mut cx).is_pending(),
+        "a one-byte substrate cannot take the whole announcement"
+    );
+
+    let before = wakes.0.load(Ordering::SeqCst);
+    let mut byte = [0_u8; 1];
+    assert!(matches!(
+        peer_io.poll_read(&mut cx, &mut byte),
+        Poll::Ready(Ok(1))
+    ));
+    assert!(
+        wakes.0.load(Ordering::SeqCst) > before,
+        "draining the backed-up substrate must wake the pending flush"
+    );
+
+    for _ in 0..256 {
+        match connection.poll_flush(&mut cx) {
+            Poll::Ready(Ok(())) => return,
+            Poll::Ready(Err(error)) => panic!("the flush failed: {error}"),
+            Poll::Pending => {
+                let _ = peer_io.poll_read(&mut cx, &mut byte);
+            }
+        }
+    }
+    panic!("the short-accepting substrate never drained the buffered output");
 }
 
 /// A pair of endpoints that deliver to each other.
@@ -110,7 +201,15 @@ impl Pair {
                 // A pending with a wake is the batching rule asking to be polled again, not
                 // the connection running out of things to say.
                 Poll::Pending if flag.take() => continue,
-                Poll::Pending => break,
+                Poll::Pending => {
+                    match end.poll_flush(&mut cx) {
+                        Poll::Ready(Ok(())) | Poll::Pending => {}
+                        Poll::Ready(Err(error)) => {
+                            panic!("flushing before the event consumer stopped: {error}")
+                        }
+                    }
+                    break;
+                }
             }
         }
     }
@@ -150,7 +249,15 @@ impl Pair {
                 Poll::Ready(Err(error)) => panic!("could not open a stream: {error}"),
                 // Waiting on the peer's transport parameters, which arrive only if
                 // something reads.
-                Poll::Pending => self.settle(),
+                Poll::Pending => {
+                    match end.poll_flush(&mut cx) {
+                        Poll::Ready(Ok(())) | Poll::Pending => {}
+                        Poll::Ready(Err(error)) => {
+                            panic!("flushing before the open parked: {error}")
+                        }
+                    }
+                    self.settle();
+                }
             }
         }
         panic!("a stream never opened");
@@ -356,6 +463,59 @@ fn an_empty_final_delivery_is_not_swallowed() {
         )),
         "the end of the stream must arrive on its own: {server:?}",
     );
+}
+
+#[test]
+fn final_data_and_stream_close_are_separated_by_a_woken_boundary() {
+    for expected in [b"last response bytes".as_slice(), b"".as_slice()] {
+        let mut pair = Pair::new();
+        let stream = pair.open(Side::Client, true);
+
+        let mut request = Offer::one(stream, b"request", true);
+        send_all(&mut pair, Side::Client, &mut request);
+
+        // Do not settle after this transmit: the test has to observe the exact public boundary
+        // between the final data and the close rather than only their eventual order.
+        let mut response = Offer::one(stream, expected, true);
+        pair.transmit(Side::Server, &mut response);
+        let (waker, flag) = pair.context();
+        let mut cx = Context::from_waker(&waker);
+        assert!(pair.server.poll_flush(&mut cx).is_ready());
+
+        loop {
+            match pair.client.poll_event(&mut cx) {
+                Poll::Ready(Ok(QuicEvent::Data {
+                    stream: id,
+                    bytes,
+                    fin: true,
+                })) if id == stream => {
+                    assert_eq!(&bytes[..], expected);
+                    break;
+                }
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(error)) => panic!("the connection failed: {error}"),
+                Poll::Pending if flag.take() => {}
+                Poll::Pending => panic!("the final response data never arrived"),
+            }
+        }
+
+        flag.take();
+        assert!(
+            pair.client.poll_event(&mut cx).is_pending(),
+            "a close in the final data's batch would be applied before those bytes"
+        );
+        assert!(
+            flag.take(),
+            "the correctness boundary must schedule the batch which carries the close"
+        );
+        assert!(matches!(
+            pair.client.poll_event(&mut cx),
+            Poll::Ready(Ok(QuicEvent::StreamClosed {
+                stream: id,
+                ..
+            })) if id == stream
+        ));
+    }
 }
 
 /// SC-013. Every accepted byte is released exactly once.

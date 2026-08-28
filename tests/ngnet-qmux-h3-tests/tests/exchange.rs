@@ -41,6 +41,33 @@ async fn a_request_and_a_response_carry_bodies_both_ways() {
         .await;
 }
 
+/// The HTTP/3 half of the transport-level data → boundary → close trace.
+///
+/// `translation.rs` observes the exact QMux events. This test keeps the HTTP/3 driver in the
+/// path and proves that a response head settles and its nonempty final data remains readable.
+/// If the stream close overtakes that data, the response future or body fails instead.
+#[tokio::test]
+async fn a_response_head_and_its_final_data_settle_before_stream_close() {
+    LocalSet::new()
+        .run_until(async {
+            let sender =
+                memory_pair(|_request| async move { ok(Bytes::from_static(b"final data")) });
+
+            let response = timeout(LIMIT, sender.send_request(get("https://qmux.test/final")))
+                .await
+                .expect("the response head must not hang")
+                .expect("a response head");
+            assert_eq!(response.status(), 200);
+
+            let body = timeout(LIMIT, drain(response.into_body()))
+                .await
+                .expect("the final data must not hang")
+                .expect("the final data");
+            assert_eq!(body.as_ref(), b"final data");
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn the_first_request_on_a_fresh_connection_completes() {
     // The handshake hazard, isolated. The HTTP/3 layer's first act is to open three

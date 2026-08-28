@@ -488,6 +488,11 @@ impl QuicConnection for Loopback {
         }
     }
 
+    fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // This transport delivers accepted writes directly into its peer's inbox.
+        Poll::Ready(Ok(()))
+    }
+
     fn poll_open_uni(&mut self, _cx: &mut Context<'_>) -> Poll<Result<StreamId, Self::Error>> {
         let sequence = self.next_uni;
         self.next_uni += 1;

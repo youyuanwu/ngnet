@@ -31,9 +31,10 @@ const MAX_OFFERS: usize = 64;
 /// record had reached the byte stream; that rule is gone, and a flushing pump here would now
 /// buy nothing while costing a write per record.
 ///
-/// After the loop it is [`pump::pump`], which writes everything. That is the pass's obligation
-/// to its driver: whatever the offers produced is on the byte stream by the time this returns,
-/// because no other call is obliged to come along and move it.
+/// After the loop it remains [`pump::pump_buffered`]. The driver may start another productive
+/// pass in the same poll, so those records can coalesce with its output. The separate
+/// `QuicConnection::poll_flush` suspension hook is what writes everything before the task can
+/// park; capacity pressure still writes here to make room.
 pub(crate) fn drain<S: AsyncByteStream, C: Clock, Src: StreamSource>(
     inner: &mut Inner<S, C>,
     cx: &mut Context<'_>,
@@ -125,10 +126,8 @@ pub(crate) fn drain<S: AsyncByteStream, C: Clock, Src: StreamSource>(
         }
     }
 
-    // Everything the pass produced is still sitting in the connection's outbound buffer, and
-    // no other call is obliged to come along and move it. This is the forced flush of the whole
-    // arrangement: the offers above left their records to accumulate on the promise that this
-    // line writes them, and a pass that returned without it would leave a driver waiting on a
-    // peer that had heard nothing.
-    pump::pump(inner, cx);
+    // Keep a sub-ceiling tail across the driver's internal passes. The driver calls the
+    // transport's explicit flush operation before its connection future can suspend, and a
+    // full buffer still writes here to make room.
+    pump::pump_buffered(inner, cx);
 }

@@ -85,6 +85,8 @@ pub struct Turns {
     pub writes: Vec<usize>,
     /// Every write length the client issued, in order, across the whole run.
     pub lengths: Vec<usize>,
+    /// Every write length the server issued when both endpoints are being measured.
+    pub server_lengths: Vec<usize>,
 }
 
 impl Turns {
@@ -98,6 +100,12 @@ impl Turns {
     #[must_use]
     pub fn total(&self) -> usize {
         self.lengths.len()
+    }
+
+    /// How many writes both endpoints issued in total.
+    #[must_use]
+    pub fn whole_total(&self) -> usize {
+        self.lengths.len() + self.server_lengths.len()
     }
 
     /// Drives three futures to the exchange's completion, recording the client's writes.
@@ -114,6 +122,37 @@ impl Turns {
     /// connection future, which would mean a turn is not what this module says it is.
     pub fn drive<Conn, Serve, Exchange, Out>(
         client_log: &WriteLog,
+        connection: Conn,
+        serving: Serve,
+        exchange: Exchange,
+    ) -> (Out, Self)
+    where
+        Conn: Future,
+        Serve: Future,
+        Exchange: Future<Output = Out>,
+    {
+        Self::drive_inner(client_log, None, connection, serving, exchange)
+    }
+
+    /// Drives an exchange while recording both endpoint byte streams.
+    pub fn drive_both<Conn, Serve, Exchange, Out>(
+        client_log: &WriteLog,
+        server_log: &WriteLog,
+        connection: Conn,
+        serving: Serve,
+        exchange: Exchange,
+    ) -> (Out, Self)
+    where
+        Conn: Future,
+        Serve: Future,
+        Exchange: Future<Output = Out>,
+    {
+        Self::drive_inner(client_log, Some(server_log), connection, serving, exchange)
+    }
+
+    fn drive_inner<Conn, Serve, Exchange, Out>(
+        client_log: &WriteLog,
+        server_log: Option<&WriteLog>,
         connection: Conn,
         serving: Serve,
         exchange: Exchange,
@@ -164,6 +203,7 @@ impl Turns {
                     Self {
                         writes: turns,
                         lengths: client_log.lengths(),
+                        server_lengths: server_log.map_or_else(Vec::new, WriteLog::lengths),
                     },
                 );
             }

@@ -296,7 +296,7 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
     /// Pulls from the layer until there is an event to hand over, or nothing left to pull.
     fn fill(&mut self, cx: &mut Context<'_>) {
         while self.next.is_none() {
-            match self.conn.poll_next_event(cx) {
+            match self.conn.poll_next_event_buffered(cx) {
                 Poll::Ready(Ok(event)) => self.next = translate(event, self.local),
                 Poll::Ready(Err(error)) => {
                     self.end(&error);
@@ -314,7 +314,7 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
         // interaction, without a list of which kinds count.
         self.flush_credit();
 
-        pump::pump(self, cx);
+        pump::pump_buffered(self, cx);
 
         // Releases first. They belong to bytes the layer handed over earlier and hold its
         // buffers until they are delivered, so nothing is served by making them queue behind
@@ -371,24 +371,20 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
         // capacity the peer has not granted -- and credit stranded behind a park is a window
         // the peer is never told about while both ends wait for the other.
         self.flush_credit();
-        pump::pump(self, cx);
+        pump::pump_buffered(self, cx);
         if self.ending.is_some() {
             return Poll::Ready(Err(self.ended()));
         }
         let opened = if bidi {
-            self.conn.poll_open_bidi(cx)
+            self.conn.poll_open_bidi_buffered(cx)
         } else {
-            self.conn.poll_open_uni(cx)
+            self.conn.poll_open_uni_buffered(cx)
         };
         match opened {
-            // The open itself is only a record; pumping again is what puts it on the wire,
-            // and the peer will not answer on a stream it has not heard of. Forced rather than
-            // buffered, unlike the pumps between offers: a driver opens the streams a pass
-            // needs before it offers anything onto any of them, so there is nothing buffered
-            // here for a record to accumulate with, and the buffered form was measured across
-            // the concurrency sweep and saved no write anywhere.
+            // The open itself is only a record. Keep it with the request or control bytes the
+            // driver is about to offer; `poll_flush` writes it before any operation can park.
             Poll::Ready(Ok(id)) => {
-                pump::pump(self, cx);
+                pump::pump_buffered(self, cx);
                 Poll::Ready(Ok(stream_id(id)))
             }
             Poll::Ready(Err(error)) => {
@@ -438,6 +434,12 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
 /// Built by [`QmuxConnection::client`] or [`QmuxConnection::server`] from a byte stream that
 /// is already connected, and normally reached through [`connect`](crate::connect) or
 /// [`serve`](crate::serve) rather than directly.
+///
+/// A caller driving the [`QuicConnection`] methods itself must poll
+/// [`QuicConnection::poll_flush`] before returning `Pending` to its executor. Productive event,
+/// open, and transmit calls may retain bounded QMux output so that adjacent internal passes can
+/// coalesce it; the suspension flush drains that output or registers its write wake.
+/// [`poll_finish`](Self::poll_finish) remains the separate completion boundary.
 ///
 /// # Why this is a handle and not the connection
 ///
@@ -568,7 +570,9 @@ impl<S: AsyncByteStream, C: Clock> QmuxConnection<S, C> {
     /// [`ngnet_h3::http::handshake`] themselves has the same obligation and no other way to
     /// discharge it: the driver's last act is to call `close` and return, so a connection
     /// nobody polled afterwards leaves the close in a buffer and the peer waiting out its
-    /// idle timeout.
+    /// idle timeout. Such a hand-driven caller must also use
+    /// [`QuicConnection::poll_flush`] before task suspension, as described on
+    /// [`QmuxConnection`].
     pub fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         self.with(|inner| inner.poll_finish(cx))
     }
@@ -664,6 +668,25 @@ impl<S: AsyncByteStream, C: Clock> QuicConnection for QmuxConnection<S, C> {
             // "orderly endings are an event, failures are an error" decision in one place
             // too.
             Poll::Ready(Ok(()))
+        })
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        self.with(|inner| {
+            inner.flush_credit();
+            let ended_before = inner.has_ended();
+            if pump::pump(inner, cx) {
+                return Poll::Ready(Ok(()));
+            }
+            if inner.has_ended() {
+                // The operation which parked will report this ending in its existing shape.
+                // Only a newly discovered ending needs a wake; repeating it would spin.
+                if !ended_before {
+                    cx.waker().wake_by_ref();
+                }
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Pending
         })
     }
 

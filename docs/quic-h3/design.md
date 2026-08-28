@@ -56,6 +56,14 @@ The endpoint's own driver avoids all of this by producing datagrams every pass r
 whether the application wrote anything. This crate has to do the same, from wherever it is
 called.
 
+`QuicConnection::poll_flush` is therefore immediate here. The ngtcp2 connection does not keep a
+QMux-style byte-stream output buffer: pumping has already handed its datagrams to the endpoint,
+so there is no deferred output for a suspension hook to discharge. The explicit implementation
+is still required so the HTTP/3 driver can make the same progress guarantee for every
+transport, without a silent default. It was statically audited for this change; this host's
+OpenSSL 3.0.13 cannot build the crate because `ngnet-quic-sys` requires OpenSSL 3.5 or newer, so
+CI compilation remains required.
+
 ## A stream's close needs a batch of its own
 
 Found by running it. The whole exchange worked — request sent, response body received intact

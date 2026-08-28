@@ -8,7 +8,7 @@ This is the implementation backlog produced by
 [`09-qmux-h2-mechanisms`](../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md).
 The order is measured payoff divided by implementation risk, not source order.
 
-Item 1 is settled; item 2 is now the highest-priority open performance item.
+Items 1 and 2 are settled; item 3 is now the highest-priority open performance item.
 
 1. **Replace `ngnet-h3`'s linear closed-stream lookup — settled.** `Driver::close_stream` scanned a
    1024-entry tombstone `Vec` on every close after a connection reaches steady state. A
@@ -21,14 +21,16 @@ Item 1 is settled; item 2 is now the highest-priority open performance item.
    [`run 10`](../benchmarks/data/xeon-8370c-azure/10-h3-closed-stream-lookup.md). This is shared
    HTTP/3 work rather than QMux-specific work, and its verified resolution is in
    [`../h3/pending-work.md`](../h3/pending-work.md#a-linear-scan-on-every-stream-close).
-2. **Decouple QMux flushing from the end of an HTTP/3 driver turn.** At concurrency `n`, QMux
-   issues `2n + 2` socket writes while HTTP/2 remains constant at two: 132 against 2 at 64
-   streams. The stream-ending batch boundary is required for correctness and must remain; the
-   opportunity is to carry buffered output across that boundary without risking a stall. This
-   is the largest remaining measured opportunity, but it changes the flush invariant and
-   therefore follows the contained tombstone fix. The explained lead and required guardrails
-   are recorded under
-   [the write-count entry](#something-scales-with-in-flight-streams-on-a-real-socket--it-is-the-write-count).
+2. **Decouple QMux flushing from HTTP/3 event-batch boundaries — settled.** QMux may now retain
+   bounded output across productive internal driver passes, while a required transport
+   operation flushes immediately before the HTTP/3 task can actually suspend. The
+   correctness-required stream-ending boundary is unchanged. Exact socket counts at
+   concurrency 1, 8, and 64 moved from 4/18.009/132.052 writes per batch to
+   **3/3.009/3.052**, while HTTP/2 remained exactly two. Loopback concurrency improved
+   **8.9–24.6%**, and the pre-registered serial-latency gate passed. The implementation and
+   controlled evidence are recorded under
+   [the write-count entry](#something-scales-with-in-flight-streams-on-a-real-socket--it-is-the-write-count)
+   and in [`run 11`](../benchmarks/data/xeon-8370c-azure/11-qmux-flush-decoupling.md).
 3. **Reuse `ngnet-h3::Driver::apply_events` scratch storage.** Its owned event vector and the
    `data` and `unheard` vectors allocated for each pass account for 2.39 microseconds, or 8.1%,
    of a profiled empty exchange. Reuse buffers owned by the driver, while preserving the
@@ -419,8 +421,8 @@ replaced rather than something worse.
 
 ## Something scales with in-flight streams on a real socket — it is the write count
 
-**Explained and closed.** The answer is at the head of this entry; everything below it is the
-history of getting there, kept because a lead's provenance is part of it.
+**Explained, fixed, and closed.** The answer is at the head of this entry; everything below it
+is the history of getting there, kept because a lead's provenance is part of it.
 
 ### The answer
 
@@ -430,30 +432,40 @@ HTTP/2 is **constant at 2**, one stream or sixty-four. Reads do not scale on eit
 takes three at every concurrency, so the sixty-four responses do arrive coalesced. The bytes are
 collectable and only the writer will not collect them.
 
-The cause is the batch boundary at the join, and it is required for correctness. `ngnet-h3`
+The cause was the interaction between the batch boundary and forced per-interaction flushing.
+The boundary at the join is required for correctness. `ngnet-h3`
 applies control-plane events before data events within a batch, so a stream ending sharing a batch
 with that stream's last bytes would release the stream before the bytes were read. `poll_event`
-therefore returns `Pending` at every stream ending to start a fresh batch — and a `Pending` ends
-the HTTP/3 driver's turn, which is exactly what forces the outbound buffer to flush. One ending,
-one flush, one write, on each side. Removing the rule to confirm this breaks the connection in
-precisely the way `emitted_since_pending`'s own doc comment predicts: the warm-up dies with *the
-exchange ended before a response arrived*.
+therefore returns `Pending` at every stream ending to start a fresh batch. Earlier text called
+that the end of an HTTP/3 driver turn; code research corrected the conflation. This `Pending`
+ends one event batch, but the connection future may execute further productive passes in the
+same executor poll. The old adapter nevertheless forced the QMux buffer at every such
+interaction, turning each boundary into a write. Removing the boundary still breaks the
+connection exactly as `emitted_since_pending` predicts: the warm-up dies with *the exchange
+ended before a response arrived*.
 
 Over a duplex each of those writes is a memcpy and the penalty is mild; over a socket each is a
 syscall, which is why this is the one workload whose ratio worsens when a kernel is added.
 
 **This corrects a claim made in this entry's own text below**, and in
 [`../benchmarks/data/xeon-8370c-azure/README.md`](../benchmarks/data/xeon-8370c-azure/README.md).
-The write-path work established that the write count *per driver turn* no longer grows with the
-streams in flight. That is true and remains true. The number of driver turns grows instead, so
-writes per exchange still do.
+The write-path work established that the write count *per driver turn* no longer grew with the
+streams in flight. That was true but incomplete: the number of driver passes grew instead, so
+writes per exchange still did at the old revision. Run 11 removes that second coupling.
 
-**What is left, and it is a design question rather than a lead.** Flushing is currently tied to
-the end of a driver turn, and stream endings make turns end often. Anything that decouples the two
-— deferring the flush across a batch boundary while keeping the boundary itself — would collapse
-`2n + 2` toward a constant. Neither of the two candidates this entry used to name survived:
-the 16382-against-16384 record size and the sixty-four-offer yield are both untouched by a write
-count that tracks stream *endings* rather than payload or offers.
+**What settled it.** Productive event/open/transmit operations use bounded buffering, and
+`QuicConnection::poll_flush` is called at every real suspension site: binding, bidirectional
+stream opening, transmit backpressure, and the idle event poll. Capacity pressure still writes
+immediately, and close, finish, orderly EOF, and explicit error handling retain their own
+finalization paths. No timer or unrelated future wakeup is involved. The ending boundary and
+its self-wake are unchanged.
+
+[`11-qmux-flush-decoupling`](../benchmarks/data/xeon-8370c-azure/11-qmux-flush-decoupling.md)
+measured exact socket writes at 1, 8, and 64 streams as **3/3.009/3.052**, replacing
+4/18.009/132.052. HTTP/2 stayed exactly two. The socket timing arms improved 8.9% at n=1,
+21.9% at n=8, and 24.6% at n=64; the normalised serial gate passed. The deterministic
+both-endpoint regression independently reports 5/5/5, so a return of the linear term fails
+without depending on scheduler timing.
 
 ### The history
 
@@ -582,7 +594,7 @@ The suite added in `docs/benchmarks/` does not, because it holds the count fixed
 in every arm; what it would take is the same sweep run against two builds differing only in
 that constant.
 
-## Each request is submitted in a driver pass of its own, and every pass owes its driver a write
+## Each request is submitted in a driver pass of its own — the write consequence is settled
 
 Coalescing removed nearly every write from a payload-carrying workload and left the empty-body
 concurrency arms almost untouched: at concurrency 64 the count went from seventy writes per
@@ -591,34 +603,28 @@ driver turn to sixty-six, which is a four-write saving where the same concurrenc
 and the four writes that did disappear say where it is — they are the connection preamble, which
 genuinely did have several records to merge, and not the requests.
 
-The requests do not merge because each is submitted in a driver pass of its own, and a pass that
-ends must flush before it returns: a caller may stop polling after any public entry point, so
-bytes left in the buffer at that moment might never be written. Sixty-four submissions therefore
-cost at least sixty-four writes however well the buffer coalesces. The screen in
+The requests did not merge because each is submitted in a driver pass of its own and the old
+adapter flushed at the end of each interaction. It was correct that a caller may stop polling
+at a public boundary and bytes cannot be left waiting there; it was incorrect to infer that
+every productive internal pass was such a boundary. The screen in
 `.paw/work/qmux-h3-perf/Phase2Screen.md` predicted a collapse here and was wrong for an
 instructive reason: its model merged every write within a harness *turn*, and a turn is one poll
 of the connection future and contains many passes. That made it an upper bound rather than a
 prediction, and the distance between the bound and the outcome is exactly the per-pass forced
 write.
 
-This residual is worth naming rather than filing under noise, because "coalescing saved most
-of the writes" is true of a body and false of a request burst, and the two are easy to conflate. It is
-measured by `tests/ngnet-qmux-h3-tests/tests/concurrent_driver_writes.rs`, whose module
-documentation records the same reasoning beside the assertions.
+This residual was worth naming rather than filing under noise, because "coalescing saved most
+of the writes" was true of a body and false of a request burst, and the two were easy to
+conflate. It is the historical baseline replaced by the regression in
+`tests/ngnet-qmux-h3-tests/tests/concurrent_driver_writes.rs`.
 
-**What it would take to reduce it:** submitting several requests in one driver pass, so that
-their records share a forced flush. That is a change to how a caller drives the join rather than
-to this crate — the join has no way to know that a caller is about to submit sixty-three more
-requests, and inventing one means either a batching entry point or deferring the forced flush
-past the point where it is safe. The second is not available: the flush exists precisely because
-the caller may stop, and a layer cannot tell "stopped" from "about to call again". A batching
-entry point is available and has not been designed, and it should not be until something
-establishes that sixty-four small writes at connection start cost enough to be worth a wider
-API. Nothing on file does.
-
-**What would settle it:** a run holding everything else fixed and varying only whether requests
-are submitted individually or in one pass. The suite cannot show this today, because every arm
-submits individually; the fixture change is small and the measurement is the work.
+**What settled it:** the driver, unlike the transport in isolation, does know whether it is
+about to stop. It now invokes an explicit flush operation immediately before each actual task
+suspension. Productive passes can therefore share the bounded buffer without guessing whether
+another call will arrive, while every real stop-polling boundary either drains or registers the
+transport's write wake. Exact socket counts are approximately three at 1, 8, and 64 streams,
+and the deterministic both-endpoint test is exactly five at all three points; see
+[`run 11`](../benchmarks/data/xeon-8370c-azure/11-qmux-flush-decoupling.md).
 
 ## No datagrams, no WebTransport, no priority
 

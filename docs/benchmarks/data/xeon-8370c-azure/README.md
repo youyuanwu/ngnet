@@ -2,7 +2,7 @@
 
 **Status: current.** The machine benchmarks are being collected on from 2026-08-16.
 
-**First run:** 2026-08-16 · **Last run:** 2026-08-17
+**First run:** 2026-08-16 · **Last run:** 2026-08-28
 
 ## Hardware and system
 
@@ -81,6 +81,7 @@ submodules. [`../../running.md`](../../running.md) states the requirement in ful
 | [08-qmux-against-h2](08-qmux-against-h2.md) | 2026-08-18 | `c525aa1` | **QMux against HTTP/2**, five passes — fixed +19–34 µs per exchange, **0.86×** per byte over a socket |
 | [09-qmux-h2-mechanisms](09-qmux-h2-mechanisms.md) | 2026-08-27 | `dc922be` | **Why**, by counting — 68 writes against 189 at 1 MiB, `2n + 2` against 2 at concurrency, and 45% of the fixed cost inside `ngnet-h3` |
 | [10-h3-closed-stream-lookup](10-h3-closed-stream-lookup.md) | 2026-08-27 | `6d13712` against `419a774` | Constant-time closed-stream lookup — **−13–18% duplex, −7–13% socket** |
+| [11-qmux-flush-decoupling](11-qmux-flush-decoupling.md) | 2026-08-28 | `736b460` against `b6c76d6` | QMux concurrent socket writes collapse from `2n + 2` to **~3**, improving n=64 by **24.6%** without a serial-latency blocker |
 
 Still outstanding, in the order they are worth doing:
 
@@ -92,11 +93,10 @@ Still outstanding, in the order they are worth doing:
    [`09`](09-qmux-h2-mechanisms.md), and it answered more than it was asked.** QMux issues 68
    writes per megabyte-exchange where HTTP/2 issues 189, because HTTP/2 caps a write at one
    16 KiB frame and QMux empties a 64 KiB buffer. That is the mechanism behind the 61% kernel
-   path [`08`](08-qmux-against-h2.md) could only compute. The same run settled the concurrency
-   inversion, and in doing so **corrected a claim that used to sit in this entry**: the write
-   count per *driver turn* no longer grows with the streams in flight, which is what the
-   write-path work established and is still true, but the number of driver turns does, so writes
-   per exchange are `2n + 2` against HTTP/2's constant 2.
+   path [`08`](08-qmux-against-h2.md) could only compute. The same run explained the concurrency
+   inversion as `2n + 2` writes against HTTP/2's constant two. [`11`](11-qmux-flush-decoupling.md)
+   then decoupled internal event batches from actual task suspension and reduced the QMux count
+   to approximately three at 1, 8, and 64 streams without removing the ordering boundary.
 3. **Replicate the duplex 1 MiB arms**, the only place this host is noisy — and note that `04`
    sharpens this: `body_throughput/ngnet-qmux-h3/1048576` drifts **10.42%**, the worst
    identifier in the suite, so the QMux arm needs this more than the others do.
