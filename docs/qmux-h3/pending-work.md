@@ -65,12 +65,20 @@ Item 6 is the highest-priority open performance item.
    spread. Fresh base-to-final serial timing is **11.75% / 8.59%** faster. The timing gate,
    rather than the count alone, retains the change; see
    [`run 15`](../benchmarks/data/xeon-8370c-azure/15-qmux-h3-shared-snapshot.md).
-6. **Design a cheaper ownership path for delivered record data.** At 1 MiB, QMux/H3 performs
-   818 allocator calls against HTTP/2's 205, and 83% of QMux/H3 malloc stacks belong to the
-   per-record delivery ownership path. The known pooled-reference design cut allocations but
-   was 2.5–4.8% slower, so do not repeat it. Any new design must remove the owned event
-   allocation without pool bookkeeping or long-lived large-buffer pinning, and must win a
-   timed A/B.
+6. **Design a cheaper ownership path for delivered record data — closed after refreshed
+   structural accounting.** The post-PR-45 baseline is 710 allocator calls at 1 MiB. Each
+   exchange has 193 productive reads, 162 callback copies and 162 first-`Bytes` promotions;
+   158 of 160 H3 body views cover their whole parent. A safe non-pooled read/record owner needs
+   at least 193 owner allocations plus 162 `Bytes` control blocks, replacing only 324 current
+   allocations, so it cannot satisfy the count gate. Constructing `Bytes` in QMux violates its
+   one-dependency boundary. Deferring whole-parent conversion could remove the promotions, but
+   they are only 22.8% of calls and the entire measured allocation/memory differential is below
+   1% of elapsed time on both required substrates. The apparent `RawVec` opportunity is not
+   framer retention—fresh counters observed zero framer growth and attributed 242 H3 growths
+   to transport/event batches. Run 05's pooled negative remains valid; do not retry delivery
+   ownership without a changed lower-layer owner API or a newly measured cost large enough to
+   clear the elapsed gate. See
+   [`run 18`](../benchmarks/data/xeon-8370c-azure/18-qmux-h3-candidate-b-delivery-ownership.md).
 7. **Test HTTP/2 coalescing beyond one 16 KiB frame.** This is comparative work, not a QMux
    defect. At a 1 MiB exchange HTTP/2 issues 189 writes and QMux issues 68; the measured HTTP/2
    maximum is exactly 16 KiB while QMux can empty a 64 KiB buffer. A prototype must establish
