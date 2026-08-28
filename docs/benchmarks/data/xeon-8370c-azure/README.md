@@ -93,7 +93,7 @@ submodules. [`../../running.md`](../../running.md) states the requirement in ful
 | [15-qmux-h3-shared-snapshot](15-qmux-h3-shared-snapshot.md) | 2026-08-28 | `0b6dcbd` against `c6f1191`, then `5477450` | Coherent shared work — **155 → 29 operations; −7.59% / −5.68% incremental serial** |
 | [16-qmux-h3-baseline-and-pump-attribution](16-qmux-h3-baseline-and-pump-attribution.md) | 2026-08-28 | `364dbb2` | Fresh post-PR-45 baseline on the migrated 8573C; exact **70-pump** source split with zero residual |
 | [17-qmux-h3-candidate-a-read-pump-amplification](17-qmux-h3-candidate-a-read-pump-amplification.md) | 2026-08-28 | `4e91115` against `43b7da0` | A2 removed **33/70 pumps**, but socket-serial timing did not clear spread/2% — reverted |
-| [18-qmux-h3-candidate-b-delivery-ownership](18-qmux-h3-candidate-b-delivery-ownership.md) | 2026-08-28 | `a4a26b7` | Non-pooled ownership cannot pass the count gate; the whole-parent fast path cannot clear 2% — closed without code |
+| [18-qmux-h3-candidate-b-delivery-ownership](18-qmux-h3-candidate-b-delivery-ownership.md) | 2026-08-28 | `96a20e6` against `0104e85` | B3 removed **160 allocations**, but improved duplex by <1.1% and was flat on socket — reverted |
 
 Still outstanding, in the order they are worth doing:
 

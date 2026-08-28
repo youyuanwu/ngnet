@@ -2,9 +2,10 @@
 
 **Machine:** historical [`xeon-8370c-azure`](README.md) label; Intel Xeon Platinum 8573C
 **Date:** 2026-08-28
-**Baseline:** `a4a26b7` (production code identical to `364dbb2`)
-**Disposition:** **closed before implementation**; every safe non-pooled owner misses the
-allocation gate, and the only count-reducing fast path cannot clear the elapsed-time gate
+**Baseline:** `0104e85` (production code identical to `a4a26b7` and `364dbb2`)
+**Candidate:** `96a20e6`
+**Disposition:** **reverted** by `971b6b7`; B3 passed the allocation gate but failed both
+elapsed-time claim targets
 **Cases:** QMux/H3 1 MiB echo over duplex and loopback socket
 **Command:** `cargo build --release -p ngnet-bench --example probe`; source counters as
 `taskset -c 3 target/release/examples/probe qmux-{duplex,socket} body 1048576 10`; exact malloc
@@ -12,8 +13,7 @@ stacks as `sudo perf record -e probe_libc:candidate_b_malloc -g --call-graph dwa
 --no-buildid -- taskset -c 3 <probe> qmux-duplex body 1048576 <N>`
 **Repetitions:** ten exchanges on each substrate for source counts; malloc stacks at 1/3 and
 10/30 exchanges, reduced by two-point subtraction
-**Controls:** no timed candidate was created; the immutable gate and run 05's directly measured
-prototype bound selection before implementation
+**Controls:** unchanged H2 arm in every Criterion pass
 **Exclusions:** none; temporary counters, the malloc uprobe, profiles, and instrumented binary
 were removed after the pristine probe hash was reproduced
 
@@ -28,8 +28,8 @@ of the following:
 - no material regression in duplex/socket serial or socket concurrency 1.
 
 The selection rule required investigation to stop before production code when no safe option
-could meet the count gate, or when a count-reducing option's measured upper bound could not meet
-both elapsed gates. That is the outcome here.
+could meet the count gate. B3 could meet that gate, so review correctly required a measured
+prototype rather than treating QMux-minus-H2 allocation self-time as an upper bound.
 
 ## Fresh ownership and allocation counts
 
@@ -118,15 +118,15 @@ The non-pooled construction cannot pass the count gate:
    afterwards avoids allocation on `Pending`, but safely creates at least one owner allocation
    and copy for each of **193** productive reads.
 3. Every one of the **162** delivered ranges then needs a `Bytes::from_owner` control block.
-   The minimum is therefore **355** new allocations replacing the current 324
+   The per-read minimum is therefore **355** new allocations replacing the current 324
    copy-plus-promotion allocations. It raises the whole-exchange lower bound from 710 to at least
    **741**, before queue growth or an `Arc<Vec<u8>>`'s second allocation.
 
-A complete-record owner has the same arithmetic because this workload has no framer retention
-and at least one owner per delivered record. A bounded batched arena also has the same 193-owner
-floor unless it spans reads; spanning reads becomes the excluded retained-buffer pool and needs
-compaction bookkeeping. B1 is safe in principle, but gate-incompatible without the forbidden
-recycling mechanism.
+A complete-record owner has a lower floor of 162 record owners plus 162 `Bytes` control blocks:
+**324**, exactly the number it replaces, so it cannot satisfy the strict less-than-710 count gate
+before any owner bookkeeping. A bounded batched arena has the 193-owner floor unless it spans
+reads; spanning reads becomes the excluded retained-buffer pool and needs compaction bookkeeping.
+B1 is safe in principle, but gate-incompatible without the forbidden recycling mechanism.
 
 ### B2 — construct `Bytes` in the QMux callback
 
@@ -143,13 +143,41 @@ The population exists: **158 of 160** H3 body views cover their entire parent. M
 ranges and move the original parent only after `read_stream` returns; cloning the parent before
 the call has already paid `shallow_clone_vec`.
 
-That internal range-deferral design can be memory-safe, but the removable count is 162 of 710,
-**22.8%**, below the selection rule's 30% preference threshold. More importantly, run 16
-attributes only +4.74 µs/+6.07 µs of the duplex/socket QMux-minus-H2 result to the entire
-allocation/memory category. Even granting B3 that whole differential—far more than one promotion
-site owns—bounds it to 0.77% of duplex and 0.52% of socket time, below the immutable 2% floor.
-Run 05's stronger copy-removing prototype improved the 1 MiB duplex arm by only 0.61%, inside
-controls. B3 is therefore gate-incompatible and was not prototyped.
+That internal range-deferral design is memory-safe and became `96a20e6`. During the FFI call,
+callbacks recorded only checked integer ranges; no borrowed byte was dereferenced later. After
+the call returned, one whole-parent range took the original `Bytes` by move. Proper slices shared
+the parent after the call, multiple ranges stayed ordered, and foreign QPACK replay was copied
+immediately. Empty data, read errors, close ordering, and early cleanup retained their existing
+paths.
+
+The candidate reduced exact allocator calls from **710.02 to 550.02** per exchange. Two repeated
+profiles captured every malloc, removed the separately captured setup/warm-up prefix, and then
+applied the registered one-in-20 classifier. Both repeats observed the same result:
+
+| Build | Classified / observed | Delivery-path share |
+| --- | ---: | ---: |
+| baseline | 123 / 143 | **86.01%** |
+| candidate | 90 / 111 | **81.08%** |
+
+The candidate is below both the historical 82.9% and fresh predecessor share. The site counts
+explain the 160-call reduction: callback copies stayed at 162, while first-parent promotions fell
+from about 162 to the two genuine-slice cases.
+
+Count success did not become elapsed success:
+
+| Substrate/pass | Baseline median | Candidate median | Candidate delta | H2 control |
+| --- | ---: | ---: | ---: | ---: |
+| duplex 1 | 602.319 µs | 596.023 µs | **−1.045%** | +0.138% |
+| duplex 2 | 618.182 µs | 612.795 µs | **−0.872%** | −0.925% |
+| socket 1 | 1144.129 µs | 1136.995 µs | **−0.623%** | +0.325% |
+| socket 2 | 1166.193 µs | 1168.536 µs | **+0.201%** | +0.329% |
+
+Baseline/candidate full median spreads were 2.634%/2.814% duplex and 1.929%/2.774% socket. The
+required improvements therefore had to exceed 2.814% and 2.774%, respectively. Neither pass on
+either substrate cleared even the immutable 2% floor; socket changed sign. Run 05 remains useful
+prior evidence, but it is a different pooled mechanism and was not used as B3's timing bound.
+Because both claim targets failed, guard timing could not change the mandatory rejection and was
+not run.
 
 ### B4 — partial-record growth
 
@@ -170,15 +198,16 @@ Candidate C; changing the framer cannot move it.
 
 ## Disposition
 
-Candidate B is **closed without production code**. B1 and the bounded arena cannot reduce the
-required allocation count without the recycling design run 05 already rejected. B2 violates the
-dependency/public-shape boundary. B3 has a large whole-parent population but removes only 22.8%
-of allocations, and its generous measured upper bound cannot reach either 2% elapsed target. B4
-has zero framer population.
+Candidate B is **closed with B3 reverted**. B1 and the bounded arena cannot reduce the required
+allocation count without the recycling design run 05 already rejected. B2 violates the
+dependency/public-shape boundary. B3 removed 160 allocator calls but improved duplex by less than
+1.1% and was flat on socket. B4 has zero framer population.
 
-No timing claim is made, no allocation-only code is retained, and no candidate binary exists to
-compare. The pristine release probe was rebuilt after removing all counters and reproduced
-SHA-256 `0e8b5b1f1a71759db9e53b35e306e9c81ab2cf8292594b4625839279de9370c8`.
+The preserved probe hashes were baseline
+`0e8b5b1f1a71759db9e53b35e306e9c81ab2cf8292594b4625839279de9370c8` and candidate
+`7a2bc8fbad10416972c35892a571611afac649c101c978759c4d52c81dc9a733`. Criterion binary hashes
+were baseline/candidate `4910af4e…`/`0868effe…` for duplex and
+`e2325e73…`/`42fcd8c9…` for socket. No allocation-only code is retained.
 
 ## Validation
 
