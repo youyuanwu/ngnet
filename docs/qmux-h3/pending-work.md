@@ -35,10 +35,12 @@ before implementation.
    and in [`run 11`](../benchmarks/data/xeon-8370c-azure/11-qmux-flush-decoupling.md).
 3. **Reuse `ngnet-h3::Driver::apply_events` scratch storage — closed without implementation.**
    Run 09's 2.39 microseconds / 8.1% attribution became stale after items 1 and 2 landed. Fresh
-   profiling on their merged result, `700bfa6`, places `apply_events` across both roles at
+   profiling on their merged result, `700bfa6`, places inclusive `apply_events` across both roles at
    **0.259 microseconds / 1.04–1.05% on a duplex** and
-   **0.269–0.280 microseconds / 0.74–0.78% on a socket** for an empty serial exchange.
-   Concurrency 64 is 0.300 microseconds per exchange / 1.89%. Exact call-site uprobes still
+   **0.268–0.280 microseconds / 0.74–0.78% on a socket** for an empty serial exchange.
+   Concurrency 64 is 0.300–0.303 microseconds per exchange / 1.86–1.89%. Run 09's 2.39
+   microseconds / 8.1% was a flat/self symbol bucket; the like-for-like fresh self costs are
+   lower still. Exact call-site uprobes
    count twelve scratch-vector allocations per serial exchange, but the combined
    `take_events` plus `apply_events` path is only 0.365–0.548 microseconds per serial exchange.
    Reuse could remove only part of it and would put two-sweep ordering, same-batch reset replay,

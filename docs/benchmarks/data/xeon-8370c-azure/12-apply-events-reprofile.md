@@ -3,21 +3,31 @@
 **Machine:** historical [`xeon-8370c-azure`](README.md) VM label; this run's `perf` header
 reported an **Intel Xeon Platinum 8573C**, so absolute comparisons with runs 09–11 are not
 controlled hardware A/B comparisons
+
 **Date:** 2026-08-28
-**Commit:** `700bfa6fdb96cc5fe25991ad42da4956941e7957` exactly, the merge result after
+
+**Commit(s):** `700bfa6fdb96cc5fe25991ad42da4956941e7957` exactly, the merge result after
 the changes measured in runs 10 and 11
+
 **Cases:** the single-arm `tests/ngnet-bench/examples/probe.rs` driver, QMux/H3 empty
 serial exchanges over a duplex and loopback socket, plus duplex concurrency 64; allocation
 shape was also counted at concurrency 8
+
 **Command:** `cargo build --example probe -p ngnet-bench --release`, followed by the exact
 sampling and uprobe commands below
+
 **Repetitions:** two 150,000-exchange serial profiles per substrate and two 3,000-batch
 concurrency-64 profiles. The serial profiles contained about 14,000 duplex samples and 21,000
 socket samples per pass; concurrency 64 contained about 12,000 samples per pass
+An additional representative pass per workload used the same commands after review solely to
+count address-only symbols; it did not replace the two attribution passes.
+
 **Allocation counts:** exact uprobes on the release binary's `RawVec::grow_one` call sites,
 reduced as `(count(3N) - count(N)) / 2N`; serial used N=1,000 and concurrency used N=100
+
 **Controls:** none. This is attribution of one unchanged revision, not a timing comparison.
 The two serial sampling passes are the stability check
+
 **Exclusions:** none. `kernel.perf_event_paranoid` was temporarily changed from 4 to 1 for
 sampling and restored to 4; all probe events were removed. No source instrumentation was added
 
@@ -85,7 +95,36 @@ sudo perf probe --del 'probe_probe:ae_*'
 sudo sysctl kernel.perf_event_paranoid=4
 ```
 
-## Question and pre-registered decision
+The report commands were:
+
+```sh
+# Flat layer ownership and self cost.
+perf report -i <data-file> --stdio -g none --no-children \
+  --percent-limit 0 --sort dso,symbol --demangle
+
+# Inclusive target/callee cost.
+perf report -i <data-file> --stdio -g none --children \
+  --percent-limit 0 --sort dso,symbol --demangle
+
+# Sample count and task-clock event total.
+perf report -i <data-file> --stdio -g none --no-children \
+  --percent-limit 99
+
+# Discover the target symbols, call instructions, and load-segment offset used above.
+nm -C target/release/examples/probe
+objdump -d -C target/release/examples/probe
+readelf -lW target/release/examples/probe
+```
+
+For layer attribution, each flat `perf report` row was assigned by its outer symbol:
+`ngnet_h3`/`nghttp3`, `ngnet_qmux`, `dwnx`, `tokio`, libc, kernel/vDSO, or other. The printed
+two-decimal percentages were summed per class and the two serial/concurrency passes averaged.
+Address-only rows—symbols beginning `0x` in any DSO—were also summed separately for the
+unresolved-symbol audit. Absolute microseconds are
+`task-clock event total / completed workload units × inclusive percentage`, rounded to three
+decimals from the percentages printed by `perf report`.
+
+## What was being asked
 
 Run 09 attributed 2.39 microseconds, 8.1% of an empty exchange, to
 `Driver::apply_events` across both roles. That number predates both the constant-time
@@ -135,17 +174,23 @@ separately because its owned event vector is the third proposed scratch buffer.
 | --- | ---: | ---: | ---: | ---: | ---: |
 | duplex serial | 1 | 1.04% | 0.39% / 0.65% | 0.259 µs/exchange | 0.49% |
 | duplex serial | 2 | 1.05% | 0.49% / 0.56% | 0.259 µs/exchange | 0.43% |
-| socket serial | 1 | 0.74% | 0.35% / 0.39% | 0.269 µs/exchange | 0.70% |
+| socket serial | 1 | 0.74% | 0.35% / 0.39% | 0.268 µs/exchange | 0.70% |
 | socket serial | 2 | 0.78% | 0.36% / 0.42% | 0.280 µs/exchange | 0.75% |
 | duplex concurrency 64 | 1 | 1.89% | 0.34% / 1.55% | 0.300 µs/exchange | 0.39% |
 | duplex concurrency 64 | 2 | 1.86% | 0.32% / 1.54% | 0.303 µs/exchange | 0.39% |
 
 Serial `apply_events` attribution reproduced within 0.01 percentage point on the duplex and
 0.04 point on the socket. Its absolute inclusive cost is also nearly constant across the three
-workloads: 0.259–0.300 microseconds per exchange. Even adding all of `take_events` produces an
+workloads: 0.259–0.303 microseconds per exchange. Even adding all of `take_events` produces an
 upper bound of 1.48–1.53% on the serial duplex, 1.44–1.53% on the serial socket, and 2.28% at
 duplex concurrency 64. Scratch reuse could remove only part of those bounds because event
 dispatch, reads, and transport polling still have to occur.
+
+Those bounds do include both sides of the measured scratch lifecycle. `take_events` allocates
+the owned event vector, which is consumed and dropped within `apply_events`; the local `data`
+vector is allocated and dropped there as well. `unheard` is returned to the run loop, but it
+never allocated in these workloads. Allocation and deallocation time therefore do not escape
+the combined bound.
 
 ## Exact scratch allocation shape
 
@@ -182,19 +227,24 @@ combined `take_events` plus `apply_events` path, whose inclusive serial bound is
 
 ## Comparison with run 09
 
-| Profile | `apply_events`, both roles |
-| --- | ---: |
-| run 09, `dc922be` | 2.39 µs, 8.1% |
-| run 12, `700bfa6`, duplex serial | 0.259 µs, 1.04–1.05% |
-| run 12, `700bfa6`, socket serial | 0.269–0.280 µs, 0.74–0.78% |
-| run 12, `700bfa6`, duplex concurrency 64 | 0.300 µs/exchange, 1.89% |
+| Profile | flat/self, both roles | inclusive, both roles |
+| --- | ---: | ---: |
+| run 09, `dc922be` | 2.39 µs, 8.1% | not recorded |
+| run 12, `700bfa6`, duplex serial | 0.097–0.121 µs, 0.39–0.49% | 0.259 µs, 1.04–1.05% |
+| run 12, `700bfa6`, socket serial | 0.127–0.129 µs, 0.35–0.36% | 0.268–0.280 µs, 0.74–0.78% |
+| run 12, `700bfa6`, duplex concurrency 64 | 0.052–0.054 µs/exchange, 0.32–0.34% | 0.300–0.303 µs/exchange, 1.86–1.89% |
 
-The old number is stale by roughly an order of magnitude. The underlying Azure VM reported a
-different CPU model for this run, so the table is not evidence that runs 10 and 11 alone caused
-the full absolute reduction. The current-revision values stand independently as the baseline
-that matters for deciding whether to optimize now.
+Run 09 used flat symbol attribution and did not record call graphs, while run 12 deliberately
+records both flat/self and inclusive cost. Comparing run 09's 2.39 microseconds with run 12's
+inclusive quarter microsecond is conservative: the like-for-like current self cost is only
+0.097–0.121 microseconds on the duplex. The old number is stale by more than an order of
+magnitude on that basis.
 
-## Verdict
+The underlying Azure VM reported a different CPU model for this run, so the table is not
+evidence that runs 10 and 11 alone caused the full absolute reduction. The current-revision
+values stand independently as the baseline that matters for deciding whether to optimize now.
+
+## What this establishes
 
 Do not implement scratch reuse from this evidence. The fresh `apply_events` hotspot is at most
 1.05% of a serial exchange and 1.89% at concurrency 64 inclusive of work that reuse cannot
@@ -215,14 +265,16 @@ on migrated hardware, and cannot recompute the HTTP/3-versus-HTTP/2 layer gap fr
 updates the implementation backlog whose priority depended directly on the stale
 `apply_events` sub-attribution.
 
-## Limitations
+## What it does not
 
 - The host reports Xeon 8573C although this historical result directory is named for the
   original 8370C host. Percentages and within-run repeats are usable; strict absolute
   comparison to old runs is not.
-- About 14% of serial samples and 17% of concurrency samples are in the broad
-  other/unresolved bucket. DWARF call chains resolve `apply_events`, `take_events`, and their
-  named callees directly, so that bucket does not hide samples charged to those symbols.
+- The broad `other and unresolved` layer bucket combines Rust support, fixture work, and
+  address-only symbols. A separate representative-pass audit counts address-only samples alone
+  at **8.40% duplex serial, 6.48% socket serial, and 21.18% duplex concurrency 64**. Most are
+  unresolved libc/vDSO offsets. DWARF call chains resolve `apply_events`, `take_events`, and
+  their named callees directly, so those shares do not hide samples charged to the target.
 - Sampling cannot identify which instruction inside an allocator benefited a particular
   vector. Exact call-site uprobes supply the allocation counts; inclusive symbol attribution
   supplies the time bound.
