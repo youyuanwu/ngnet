@@ -2,14 +2,16 @@
 
 **Machine:** historical [`xeon-8370c-azure`](README.md) label; Intel Xeon Platinum 8573C
 **Date:** 2026-08-28
-**Baseline:** `7c36518` (production code identical to `364dbb2`)
-**Disposition:** **closed before implementation**; the complete safe C1–C3 set cannot clear the
-socket serial timing floor, and C4 has no serial population
+**Baseline:** `c7c95d9` (production code identical to `364dbb2`)
+**Candidate:** `c188758`; reverted by `3b5c576`
+**Disposition:** **implemented, measured, and reverted**; 20 mallocs and three reallocs were
+removed, but the elapsed result was not repeatable and did not clear both substrate gates
 **Cases:** warmed empty QMux/H3 exchange over duplex and loopback socket
 **Commands:** `taskset -c 3 target/release/examples/probe qmux-{duplex,socket} body 0 10000`
-under repeated 4 kHz DWARF `task-clock:u` profiles; exact malloc stacks from 10/30-exchange
-`candidate_c_malloc=malloc` uprobes; branch-neutral source counters over ten exchanges
-**Controls:** the immutable 2% floors and run 16's unchanged H2 control/spread bounds
+under repeated 4 kHz DWARF `task-clock:u` profiles; exact malloc/realloc/free counts from
+100/300-exchange uprobes; Criterion as two baseline/candidate passes, 50 samples, 3 s
+measurement, 1 s warm-up, and matching H2 controls
+**Controls:** the immutable 2% floors, each pass's H2 movement, and the observed repeat spread
 **Exclusions:** an accidentally concurrent first profile pair was discarded before analysis and
 reacquired sequentially on CPU 3; no reported profile or exact-count observation was discarded
 
@@ -22,8 +24,9 @@ or per-stream registry work could produce a safe serial optimization. Retention 
 - both duplex and socket serial faster beyond matching control movement, both spreads, and 2%;
 - no regression in duplex/socket 1 MiB or socket concurrency 8/64.
 
-The selection rule required a directly attributed removable upper bound above the complete
-threshold on both substrates before code was written.
+The initial profile-only bound was withdrawn during review because it omitted deallocation,
+reallocation-copy and memcpy time. The complete safe storage prototype was therefore implemented
+and timed directly; no retention decision below relies on that bound.
 
 ## Exact allocation sites
 
@@ -34,17 +37,21 @@ and capacity-before-push counters produced:
 | Site | Allocations per exchange | Notes |
 | --- | ---: | --- |
 | `Events::push_field` name/value copies | **16** | eight fields, two independent `Vec<u8>` allocations each |
-| `OwnedFields::push` and its inputs | **14** | outgoing request/response names and values |
+| outgoing field payloads | **16** | eight names, seven borrowed values copied by `OwnedFields::push`, and the authority input allocation |
 | `OwnedFields::views` `Vec<Header<'_>>` | **4** | validation and submission paths |
 | submit-site `Vec<nghttp3_nv>` | **2** | request and response |
 | `HeaderMap::try_reserve_one` / head assembly | **8** | request/response map growth |
 | native nghttp3 allocator shim | **17** | one QPACK-associated stack; the rest nghttp3 stream/field storage |
-| all other Rust/runtime/fixture sites | **67** | total residual to 128 |
+| all other Rust/runtime/fixture sites | **65** | total residual to 128 |
 
-These rows are mutually classified malloc events, not percentages. Temporary exact capacity
-counters independently found **three** `OwnedFields.fields` growth allocations and **three**
-received `Partial.fields` growth allocations per exchange. The partial-stream registry itself
-did not grow after warm-up.
+These rows are mutually classified malloc events, not percentages. The former 14-event outgoing
+bucket was an undercount caused by assigning two inlined conversions to the residual bucket:
+the fixture emits six request fields and two response fields, hence eight name buffers and eight
+value buffers. Seven borrowed values allocate in `OwnedFields::push`; the already-owned authority
+allocates immediately before the push. Temporary capacity counters independently found three
+`OwnedFields.fields` growth calls and three received `Partial.fields` growth calls per exchange.
+Because only the first growth uses `malloc`, subsequent growth is visible in the separate
+`realloc` count rather than as another row above.
 
 Trailers have zero population in the empty fixture. `request_head`/`response_head` continue to
 construct `HeaderName`, `HeaderValue`, method/status, scheme, authority, path/query and URI values;
@@ -66,89 +73,96 @@ Repeated task-clock profiles found:
 - `BodyRegistry` accounting self samples but **zero** per-exchange registry allocation for an
   empty body;
 - `Deliveries` credit/silence bookkeeping self samples but **zero** allocation;
-- warmed `ClosedStreams` contains/insert self cost of 0.10–0.23%, with **zero** growth allocation;
+- `ClosedStreams` grows until its 1,024-entry bound, even after the first warm exchange; after
+  Criterion's warm-up fills it, each insertion evicts one entry with no further capacity growth;
 - `Shared::drain_work` at 1.69–2.22% as already optimized shared-state work, with reused storage
   and **zero** allocation.
+
+`Registry` and server `Tasks` use per-exchange `BTreeMap` insert/lookup/remove paths. Their named
+registry self samples totaled at most 0.77% (under 0.18 µs) on duplex and 0.39% (under 0.09 µs)
+on socket; `Tasks` was below the approximately 0.025 µs symbol resolution. Replacing those maps
+would also introduce peak-concurrency retention policy. Even granting all named work as
+removable cannot repair the prototype's socket regression in pass 1 or bring pass 2's raw
+improvement to 2%, so it is not an independently plausible candidate.
 
 Those sites are absent from H2 but are not header-storage mechanisms. The driver, registry, and
 native QPACK costs remain attribution, not permission to charge them to C1–C3.
 
-## Direct removable self-cost
+## Measured C1–C3 prototype
 
-Each profile ran 10,000 exchanges. Duplex consumed 22.20–24.78 µs of sampled task-clock per
-exchange; socket consumed 22.13–22.50 µs of CPU inside a 33.33–33.38 µs wall-time exchange.
-The socket claim floor is therefore at least **0.667 µs** before considering any larger fresh
-spread.
+Commit `c188758` implemented the complete safe set rather than relying on the incomplete sampled
+bound:
 
-The following socket bounds include the named function's self samples and only malloc descendants
-from allocations the option can remove:
+- **C1:** received names up to 32 bytes and values up to 128 bytes used bounded inline storage;
+  larger fields used an owned boxed slice, so callback lifetime was never extended and one large
+  field could not pin a large shared arena;
+- **C2:** received sections reserved eight field slots and outgoing sections reserved their known
+  field count;
+- **C3:** validation iterated without constructing a `Vec<Header>`, while private request,
+  response and trailer submission accepted a checked `nghttp3_nv` vector directly. Public
+  low-level submission APIs and their validation remained unchanged.
 
-| Option | Exact maximum allocation reduction | Socket removable bound, repeats 1 / 2 |
-| --- | ---: | ---: |
-| C1, inline received small fields | 16 | 0.10 / 0.17 µs |
-| C2, reserve known-capacity containers | 3 (plus map growth only with a larger head rewrite) | 0.08 / 0.09 µs |
-| C3, remove intermediate `Header` vectors | 4 | 0.35 / 0.35 µs |
-| **complete C1–C3 set** | **23**, yielding at best 105 total calls | **0.53 / 0.61 µs** |
+The exact two-point allocator results include allocator teardown and distinguish growth:
 
-The complete set can satisfy the allocation count but cannot reach the 0.667 µs socket floor in
-either repeat. This is an upper bound: it grants C3 every `OwnedFields::views` iterator/vector
-self sample even though validation must remain, and grants C2 all three outer-vector growths.
-The duplex bound can cross 2%, but both claim targets are mandatory.
+| Revision | `malloc` | `realloc` | `free` |
+| --- | ---: | ---: | ---: |
+| `c7c95d9` baseline | **128.02** | **6.02** | **128.02** |
+| `c188758` prototype | **108.02** | **3.02** | **108.02** |
+| change | **−20.00** | **−3.00** | **−20.00** |
 
-C4's one-entry serial scan had no standalone self symbol at the profile's 0.10% resolution
-(less than 0.025 µs per exchange), removes no allocation, and cannot bridge the socket gap. It is
-not admitted as a companion.
+C1 removes 16 received name/value mallocs. C3 removes four intermediate-vector mallocs: two
+validation vectors and two redundant submission vectors. C2 does not remove the first malloc for
+each outer vector, but it removes the measured growth reallocations. Baseline realloc stacks split
+between Rust `RawVec::finish_grow` and native nghttp3; the prototype removed exactly three Rust
+calls while native calls remained. Reallocation copying, field memcpy, destruction, and all
+other effects are included in the direct elapsed measurements below.
 
-## Option decisions
+Criterion median point estimates are microseconds. Raw delta compares the candidate with its
+matching baseline pass; normalized delta compares `(candidate QMux/H3 ÷ candidate H2)` with
+`(baseline QMux/H3 ÷ baseline H2)`.
 
-- **C1 — inline small-field accumulator:** safe with a bounded inline/heap fallback and
-  early-error drop, but its 16 allocations plus directly attributed copy/allocator work are too
-  small. It was not implemented.
-- **C2 — capacity reservation:** `views()` and `nghttp3_nv` collection already use exact-size
-  iterators. The only directly removable growth is three `OwnedFields` expansions; nghttp3 does
-  not expose a received field count at `begin_section`, and `http::Request::builder()` provides
-  no reserve hook. It cannot close the gap.
-- **C3 — collapse submit buffering:** a private direct `nghttp3_nv` path could preserve
-  `Header::new` validation order and public APIs while removing four `Header` vectors. It is the
-  largest safe option, but still only about 0.35 µs on socket.
-- **C4 — replace the slot scan:** no allocation and no meaningful serial population. It remains
-  a concurrency-only hypothesis rather than a companion to a non-qualifying set.
+| Substrate/pass | Baseline H2 | Baseline QMux/H3 | Candidate H2 | Candidate QMux/H3 | Raw delta | Normalized delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| duplex 1 | 10.058 | 20.784 | 10.063 | 20.343 | **−2.12%** | **−2.17%** |
+| duplex 2 | 10.132 | 20.786 | 10.115 | 20.514 | **−1.31%** | **−1.14%** |
+| socket 1 | 16.784 | 31.659 | 17.234 | 32.115 | **+1.44%** | **−1.21%** |
+| socket 2 | 16.783 | 31.723 | 16.989 | 31.226 | **−1.57%** | **−2.76%** |
 
-## Protocol and cleanup checklist
+The candidate's QMux/H3 range was 20.343–20.514 µs on duplex and 31.226–32.115 µs on socket.
+Only one raw pass cleared 2%; duplex pass 2 and socket pass 2 did not, and socket pass 1 regressed.
+The socket control itself moved +2.68% and +1.23%, confirming that the apparently favorable
+normalized second pass did not establish a stable absolute win. The result therefore fails the
+pre-registered dual-substrate gate without needing larger-workload regression guards.
 
-No code changed, so every checked rule remains byte-for-byte present:
+## Semantic and cleanup validation
 
-- outgoing request rejects CONNECT, unsupported schemes, missing authority, forbidden
-  connection-specific fields, and `te` other than `trailers`;
-- outgoing response rejects `te` and forbidden fields; outgoing trailers reject forbidden names;
-- incoming request requires pseudo-headers before regular fields, rejects duplicates, unknown
-  pseudo-headers and `:protocol`, and requires `:method`, `:path`, and authority or matching host;
-- incoming request rejects bad name/value syntax, forbidden fields, invalid `te`, unsupported
-  scheme, invalid method, CONNECT, invalid authority, userinfo, invalid path/query, asterisk form,
-  and URI/head assembly failure;
-- incoming response permits only one leading `:status`, requires it, validates status/name/value,
-  and rejects response `te` and forbidden fields;
-- incoming trailers reject pseudo-headers, malformed names/values and forbidden fields;
-- regular duplicates still use `HeaderMap::append`, preserving order rather than replacing;
-- informational responses still bypass final-response settlement; malformed heads still run the
-  server cleanup; stream close still forgets bodies before delivery bookkeeping.
+The prototype added a deterministic inline/heap-fallback ownership test and passed all 121
+`ngnet-h3` unit tests plus all 27 `ngnet-h3-tests` integration tests. Existing tests exercised:
 
-Blocked-compression replay, trailers, reset/stop mid-section, failed-submit rollback, and
-oversized-section cleanup remain covered by the unchanged suites. Because no storage shape was
-selected, no new retention or cleanup state exists to test.
+- pseudo-header order/uniqueness, unknown pseudo-headers and `:protocol`;
+- CONNECT, scheme, authority/host, userinfo, path, asterisk, forbidden-field and `te` rules;
+- informational responses, trailers, duplicates through `HeaderMap::append`, and malformed heads;
+- blocked-QPACK replay, failed-submit rollback, reset/stop cleanup, stream close ordering, and
+  oversized field-section rejection.
+
+No unsafe lifetime extension was introduced. Inline storage moved with the received event; heap
+fallback owned its bytes after callback return; both were dropped on every early error. The
+prototype was then reverted completely by `3b5c576`.
 
 ## Disposition
 
-Candidate C is **documentation-only: gate-incompatible**. Exact counts show that C1–C3 could
-reduce 128 calls to about 105, but direct dual-substrate profiling shows the complete safe set
-cannot clear socket's 2% floor. C4 has no serial population. Allocation reduction alone is not a
-retention reason, so no prototype or count-only test was created.
+Candidate C is **rejected after implementation and direct measurement**. Its exact allocator
+improvement is real, but allocation count alone did not produce a repeatable elapsed-time win.
+C4's one-entry section scan remained below profile resolution. Registry/Tasks map replacement is
+also rejected as a companion: its complete measured socket population is too small to rescue the
+failed prototype, and it would add a new retained-capacity policy. Do not retry these mechanisms
+from allocation counts alone.
 
 ## Validation
 
-The source remained production-identical to `7c36518`. Focused H3/H3-tests and release
-QMux-H3/QMux-H3-tests suites passed, as did the H3 no-default-feature suite, all-target/all-feature
-and no-default-feature clippy with warnings denied, H3 rustdoc with warnings denied, and
-`git diff --check`. The pristine release probe reproduced Phase 4's SHA-256
-`0e8b5b1f1a71759db9e53b35e306e9c81ab2cf8292594b4625839279de9370c8` after all temporary
-instrumentation was removed.
+The candidate's focused H3/H3-tests suites passed before timing. After `3b5c576`, production
+source is again identical to `7c36518`; the restored-source release QMux-H3/QMux-H3-tests,
+feature variants, clippy, rustdoc, and diff hygiene are rerun at the phase gate. The pristine
+release probe must reproduce Phase 4's SHA-256
+`0e8b5b1f1a71759db9e53b35e306e9c81ab2cf8292594b4625839279de9370c8` after temporary profiles,
+uprobes, copied binaries and Criterion baselines are removed.

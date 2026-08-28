@@ -97,15 +97,16 @@ reprofiling.
    guaranteed wake source, and driver-pass suppression lacks an outer turn boundary in the
    transport interface. Do not retry these mechanisms from counts alone; see
    [`run 17`](../benchmarks/data/xeon-8370c-azure/17-qmux-h3-candidate-a-read-pump-amplification.md).
-9. **Reduce fixed HTTP/3 header/QPACK overhead — closed after exact site attribution.** A warmed
-   empty exchange performs 16 incoming field-copy allocations, 14 outgoing-field allocations,
-   four intermediate `Header` vector allocations, two `nghttp3_nv` vector allocations, eight
-   head/map allocations, and 17 native nghttp3 allocations. The complete safe C1–C3 storage set
-   could reduce the total from 128 to about 105, but its generous removable bound was only
-   0.53–0.61 µs on socket against a 0.667 µs 2% floor. The per-stream slot scan had no
-   measurable serial population and no allocation. No code was implemented: do not retry
-   header-storage changes from allocation counts alone. Native QPACK algorithm changes or a
-   concrete concurrency-only slot mechanism would need independent gates. See
+9. **Reduce fixed HTTP/3 header/QPACK overhead — measured and reverted.** A complete bounded
+   prototype inlined small received fields with heap fallback, reserved known field capacities,
+   and removed redundant validation/submission vectors without changing public APIs or validation.
+   It reduced exact per-exchange allocator activity from **128.02/6.02/128.02** to
+   **108.02/3.02/108.02 malloc/realloc/free**. Timing was not repeatable: duplex passes changed
+   −2.12% and −1.31%, while socket changed +1.44% and −1.57%; only one of four raw results cleared
+   2%, and one socket pass regressed. The code was reverted. The per-section slot scan remained
+   below profile resolution, and Registry/Tasks map work was too small to rescue the failed socket
+   gate. Do not retry header-storage or registry changes from allocation counts alone. Native QPACK
+   algorithm changes or a concrete concurrency-only mechanism would need independent gates. See
    [`run 19`](../benchmarks/data/xeon-8370c-azure/19-qmux-h3-candidate-c-fixed-header-work.md).
 
 The duplicate-pump portion of the former 91-read observation is resolved in item 4; the remaining

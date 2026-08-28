@@ -94,7 +94,7 @@ submodules. [`../../running.md`](../../running.md) states the requirement in ful
 | [16-qmux-h3-baseline-and-pump-attribution](16-qmux-h3-baseline-and-pump-attribution.md) | 2026-08-28 | `364dbb2` | Fresh post-PR-45 baseline on the migrated 8573C; exact **70-pump** source split with zero residual |
 | [17-qmux-h3-candidate-a-read-pump-amplification](17-qmux-h3-candidate-a-read-pump-amplification.md) | 2026-08-28 | `4e91115` against `43b7da0` | A2 removed **33/70 pumps**, but socket-serial timing did not clear spread/2% — reverted |
 | [18-qmux-h3-candidate-b-delivery-ownership](18-qmux-h3-candidate-b-delivery-ownership.md) | 2026-08-28 | `96a20e6` against `0104e85` | B3 removed **160 allocations**, but improved duplex by <1.1% and was flat on socket — reverted |
-| [19-qmux-h3-candidate-c-fixed-header-work](19-qmux-h3-candidate-c-fixed-header-work.md) | 2026-08-28 | `7c36518` | Complete safe header-storage set is bounded below socket's 2% floor — closed without code |
+| [19-qmux-h3-candidate-c-fixed-header-work](19-qmux-h3-candidate-c-fixed-header-work.md) | 2026-08-28 | `c188758` against `c7c95d9` | C1–C3 removed **20 mallocs and 3 reallocs**, but timing was inconsistent and failed both-substrate gates — reverted |
 
 Still outstanding, in the order they are worth doing:
 
