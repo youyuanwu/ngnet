@@ -467,53 +467,55 @@ fn an_empty_final_delivery_is_not_swallowed() {
 
 #[test]
 fn final_data_and_stream_close_are_separated_by_a_woken_boundary() {
-    let mut pair = Pair::new();
-    let stream = pair.open(Side::Client, true);
+    for expected in [b"last response bytes".as_slice(), b"".as_slice()] {
+        let mut pair = Pair::new();
+        let stream = pair.open(Side::Client, true);
 
-    let mut request = Offer::one(stream, b"request", true);
-    send_all(&mut pair, Side::Client, &mut request);
+        let mut request = Offer::one(stream, b"request", true);
+        send_all(&mut pair, Side::Client, &mut request);
 
-    // Do not settle after this transmit: the test has to observe the exact public boundary
-    // between the final data and the close rather than only their eventual order.
-    let mut response = Offer::one(stream, b"last response bytes", true);
-    pair.transmit(Side::Server, &mut response);
-    let (waker, flag) = pair.context();
-    let mut cx = Context::from_waker(&waker);
-    assert!(pair.server.poll_flush(&mut cx).is_ready());
+        // Do not settle after this transmit: the test has to observe the exact public boundary
+        // between the final data and the close rather than only their eventual order.
+        let mut response = Offer::one(stream, expected, true);
+        pair.transmit(Side::Server, &mut response);
+        let (waker, flag) = pair.context();
+        let mut cx = Context::from_waker(&waker);
+        assert!(pair.server.poll_flush(&mut cx).is_ready());
 
-    loop {
-        match pair.client.poll_event(&mut cx) {
-            Poll::Ready(Ok(QuicEvent::Data {
-                stream: id,
-                bytes,
-                fin: true,
-            })) if id == stream => {
-                assert_eq!(&bytes[..], b"last response bytes");
-                break;
+        loop {
+            match pair.client.poll_event(&mut cx) {
+                Poll::Ready(Ok(QuicEvent::Data {
+                    stream: id,
+                    bytes,
+                    fin: true,
+                })) if id == stream => {
+                    assert_eq!(&bytes[..], expected);
+                    break;
+                }
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(error)) => panic!("the connection failed: {error}"),
+                Poll::Pending if flag.take() => {}
+                Poll::Pending => panic!("the final response data never arrived"),
             }
-            Poll::Ready(Ok(_)) => {}
-            Poll::Ready(Err(error)) => panic!("the connection failed: {error}"),
-            Poll::Pending if flag.take() => {}
-            Poll::Pending => panic!("the final response data never arrived"),
         }
-    }
 
-    flag.take();
-    assert!(
-        pair.client.poll_event(&mut cx).is_pending(),
-        "a close in the final data's batch would be applied before those bytes"
-    );
-    assert!(
-        flag.take(),
-        "the correctness boundary must schedule the batch which carries the close"
-    );
-    assert!(matches!(
-        pair.client.poll_event(&mut cx),
-        Poll::Ready(Ok(QuicEvent::StreamClosed {
-            stream: id,
-            ..
-        })) if id == stream
-    ));
+        flag.take();
+        assert!(
+            pair.client.poll_event(&mut cx).is_pending(),
+            "a close in the final data's batch would be applied before those bytes"
+        );
+        assert!(
+            flag.take(),
+            "the correctness boundary must schedule the batch which carries the close"
+        );
+        assert!(matches!(
+            pair.client.poll_event(&mut cx),
+            Poll::Ready(Ok(QuicEvent::StreamClosed {
+                stream: id,
+                ..
+            })) if id == stream
+        ));
+    }
 }
 
 /// SC-013. Every accepted byte is released exactly once.

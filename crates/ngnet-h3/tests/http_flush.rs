@@ -6,8 +6,8 @@ use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::Wake;
 
 use ngnet_h3::http::{ErrorKind, QuicConnection, QuicEvent, StreamSource, handshake};
@@ -61,21 +61,32 @@ struct Parking {
     park: Option<ParkAt>,
     flush: Flush,
     flushes: Arc<AtomicUsize>,
+    calls: Arc<Mutex<Vec<&'static str>>>,
 }
 
 impl Parking {
-    fn new(park: Option<ParkAt>, flush: Flush) -> (Self, Arc<AtomicUsize>) {
+    fn new(
+        park: Option<ParkAt>,
+        flush: Flush,
+    ) -> (Self, Arc<AtomicUsize>, Arc<Mutex<Vec<&'static str>>>) {
         let (inner, _) = stub();
         let flushes = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
                 inner,
                 park,
                 flush,
                 flushes: Arc::clone(&flushes),
+                calls: Arc::clone(&calls),
             },
             flushes,
+            calls,
         )
+    }
+
+    fn note(&self, call: &'static str) {
+        self.calls.lock().expect("call log").push(call);
     }
 
     fn parks(&mut self, at: ParkAt) -> bool {
@@ -99,6 +110,7 @@ impl QuicConnection for Parking {
     const RETAINS_BUFFERS: bool = false;
 
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Result<QuicEvent, Self::Error>> {
+        self.note("event");
         map_poll(self.inner.poll_event(cx))
     }
 
@@ -107,6 +119,7 @@ impl QuicConnection for Parking {
         cx: &mut Context<'_>,
         source: &mut S,
     ) -> Poll<Result<(), Self::Error>> {
+        self.note("transmit");
         if self.parks(ParkAt::Transmit) {
             Poll::Pending
         } else {
@@ -115,6 +128,7 @@ impl QuicConnection for Parking {
     }
 
     fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.note("flush");
         self.flushes.fetch_add(1, Ordering::SeqCst);
         match self.flush {
             Flush::Ready => Poll::Ready(Ok(())),
@@ -128,6 +142,7 @@ impl QuicConnection for Parking {
     }
 
     fn poll_open_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<StreamId, Self::Error>> {
+        self.note("open_uni");
         if self.parks(ParkAt::Bind) {
             Poll::Pending
         } else {
@@ -136,6 +151,7 @@ impl QuicConnection for Parking {
     }
 
     fn poll_open_bi(&mut self, cx: &mut Context<'_>) -> Poll<Result<StreamId, Self::Error>> {
+        self.note("open_bi");
         if self.parks(ParkAt::Open) {
             Poll::Pending
         } else {
@@ -181,13 +197,13 @@ fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
 
 #[test]
 fn every_driver_suspension_flushes_the_transport() {
-    for (park, submit) in [
-        (Some(ParkAt::Bind), false),
-        (Some(ParkAt::Open), true),
-        (Some(ParkAt::Transmit), true),
-        (None, false),
+    for (park, submit, operation) in [
+        (Some(ParkAt::Bind), false, "open_uni"),
+        (Some(ParkAt::Open), true, "open_bi"),
+        (Some(ParkAt::Transmit), true, "transmit"),
+        (None, false, "event"),
     ] {
-        let (backend, flushes) = Parking::new(park, Flush::Ready);
+        let (backend, flushes, calls) = Parking::new(park, Flush::Ready);
         let (handle, driver) = handshake::<_, Payload>(backend).expect("constructing a connection");
         if submit {
             request(&handle);
@@ -199,6 +215,11 @@ fn every_driver_suspension_flushes_the_transport() {
             flushes.load(Ordering::SeqCst),
             1,
             "one impending suspension must perform one flush"
+        );
+        let calls = calls.lock().expect("call log");
+        assert!(
+            calls.ends_with(&[operation, "flush"]),
+            "the driver must poll the operation before flushing at its suspension: {calls:?}"
         );
     }
 }
@@ -217,34 +238,72 @@ impl Wake for WakeCount {
 
 #[test]
 fn a_pending_flush_registers_the_wake_that_resumes_it() {
-    let (backend, flushes) = Parking::new(Some(ParkAt::Bind), Flush::PendingOnce);
-    let (_handle, driver) = handshake::<_, Payload>(backend).expect("constructing a connection");
-    let mut driver = Box::pin(driver);
-    let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
-    let waker = Waker::from(Arc::clone(&wakes));
-    let mut cx = Context::from_waker(&waker);
+    for (park, submit, operation) in [
+        (Some(ParkAt::Bind), false, "open_uni"),
+        (Some(ParkAt::Open), true, "open_bi"),
+        (Some(ParkAt::Transmit), true, "transmit"),
+        (None, false, "event"),
+    ] {
+        let (backend, flushes, calls) = Parking::new(park, Flush::PendingOnce);
+        let (handle, driver) = handshake::<_, Payload>(backend).expect("constructing a connection");
+        if submit {
+            request(&handle);
+        }
+        let mut driver = Box::pin(driver);
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
 
-    assert!(driver.as_mut().poll(&mut cx).is_pending());
-    assert_eq!(flushes.load(Ordering::SeqCst), 1);
-    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+        assert!(driver.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            1,
+            "the pending flush at {operation} must provide the only continuation"
+        );
+        assert!(
+            calls
+                .lock()
+                .expect("call log")
+                .ends_with(&[operation, "flush"])
+        );
 
-    assert!(driver.as_mut().poll(&mut cx).is_pending());
-    assert!(
-        flushes.load(Ordering::SeqCst) >= 2,
-        "the resumed driver must reach its ordinary idle flush"
-    );
+        assert!(driver.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            flushes.load(Ordering::SeqCst) >= 2,
+            "the resumed driver must reach its ordinary idle flush"
+        );
+    }
 }
 
 #[test]
 fn a_flush_failure_is_a_transport_error() {
-    let (backend, _flushes) = Parking::new(Some(ParkAt::Bind), Flush::Fail);
-    let (_handle, driver) = handshake::<_, Payload>(backend).expect("constructing a connection");
-    let mut driver = Box::pin(driver);
+    for (park, submit, operation) in [
+        (Some(ParkAt::Bind), false, "open_uni"),
+        (Some(ParkAt::Open), true, "open_bi"),
+        (Some(ParkAt::Transmit), true, "transmit"),
+        (None, false, "event"),
+    ] {
+        let (backend, _flushes, calls) = Parking::new(park, Flush::Fail);
+        let (handle, driver) = handshake::<_, Payload>(backend).expect("constructing a connection");
+        if submit {
+            request(&handle);
+        }
+        let mut driver = Box::pin(driver);
 
-    let outcome = match poll_once(driver.as_mut()) {
-        Poll::Ready(outcome) => outcome,
-        Poll::Pending => panic!("the flush failure was swallowed"),
-    };
-    let error = outcome.expect_err("the connection should fail");
-    assert_eq!(error.kind(), ErrorKind::Transport);
+        let outcome = match poll_once(driver.as_mut()) {
+            Poll::Ready(outcome) => outcome,
+            Poll::Pending => panic!("the flush failure at {operation} was swallowed"),
+        };
+        let error = outcome.expect_err("the connection should fail");
+        assert_eq!(error.kind(), ErrorKind::Transport);
+        assert!(
+            calls
+                .lock()
+                .expect("call log")
+                .windows(2)
+                .any(|pair| pair == [operation, "flush"]),
+            "the failing flush did not follow {operation}"
+        );
+    }
 }

@@ -82,6 +82,8 @@ bounded buffer is released when the ended connection is dropped; an orderly EOF 
 the finish tail and deliver already produced output. Dropping the outer connection future
 before its tail is cancellation: ownership of the bounded buffer is destroyed, and delivery is
 deliberately not promised. No timer or unrelated future event is part of the progress argument.
+Under sustained productive input, deferral is bounded by `OUTBOUND_CEILING` bytes rather than by
+a pass count or a timer; reaching that bound forces a capacity write.
 
 And it is why the pump's answer is read rather than discarded. `try_write_stream` refuses an
 offer once the outbound buffer has no room for another record, so a transmit pass that kept

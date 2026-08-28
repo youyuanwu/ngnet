@@ -44,6 +44,12 @@
 //! reached until the streams open, which is waiting on the record. The same shape strands
 //! the window updates that would unblock a peer whose flow control is exhausted.
 //!
+//! Productive event, open, and transmit calls may leave bounded output in QMux so adjacent
+//! internal HTTP/3 passes can share one byte-stream write. A caller driving [`QmuxConnection`]
+//! through the [`ngnet_h3::http::QuicConnection`] trait itself must poll
+//! [`ngnet_h3::http::QuicConnection::poll_flush`] before its task returns `Pending`.
+//! [`QmuxConnection::poll_finish`] is still required after the HTTP/3 driver resolves.
+//!
 //! # What this crate does not do
 //!
 //! No sockets, no runtime, no timer, no TLS. A byte stream and a clock come in; whoever

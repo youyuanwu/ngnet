@@ -338,6 +338,10 @@ fn measure(concurrency: usize, body: usize) -> Point {
          misattribute one"
     );
     let whole_total = turns.whole_total();
+    assert!(
+        whole_total > turns.lengths.len(),
+        "the whole-connection measurement did not capture the server write log"
+    );
 
     Point {
         concurrency,
@@ -502,15 +506,36 @@ fn concurrent_empty_exchanges_do_not_add_a_write_per_stream() {
     let points = sweep(EMPTY);
     for point in &points {
         let limit = if point.concurrency == 1 { 7 } else { 12 };
+        let server_total = point.whole_total - point.total;
         assert!(
             point.whole_total <= limit,
             "{} concurrent empty exchanges issued {} writes across both endpoints; the fixed \
              budget is {limit}. The pre-change hand-driven counts were 7, 14 and 72 at 1, 8 and \
              64 streams, so exceeding this budget means internal passes have started forcing \
-             output again. Client writes per turn: {:?}",
+             output again. Client/server writes: {}/{}; client writes per turn: {:?}",
             point.concurrency,
             point.whole_total,
+            point.total,
+            server_total,
             point.per_turn
         );
     }
+
+    let serial = points[0].whole_total;
+    assert!(
+        points[1].whole_total <= serial + 2,
+        "writes grew between 1 and 8 streams: {:?}",
+        points
+            .iter()
+            .map(|point| point.whole_total)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        points[2].whole_total <= serial + 4,
+        "writes grew between 1 and 64 streams: {:?}",
+        points
+            .iter()
+            .map(|point| point.whole_total)
+            .collect::<Vec<_>>()
+    );
 }

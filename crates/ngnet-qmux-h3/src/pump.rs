@@ -73,8 +73,9 @@ pub(crate) fn pump<S: AsyncByteStream, C: Clock>(
 /// This distinction is the whole of the write-count reduction, and it is invisible from below.
 /// A connection that coalesced perfectly would still write once per record if every pump
 /// between two offers flushed it, and every test written against the connection alone would
-/// still pass. The guard that can see it is at the driver level:
-/// `tests/ngnet-qmux-h3-tests/tests/driver_writes.rs`.
+/// still pass. The guards that can see it are at the driver level:
+/// `tests/ngnet-qmux-h3-tests/tests/driver_writes.rs` for records within a body offer and
+/// `concurrent_driver_writes.rs` for records retained across internal passes.
 ///
 /// [`Connection::try_write_stream`]: ngnet_qmux::io::Connection::try_write_stream
 pub(crate) fn pump_buffered<S: AsyncByteStream, C: Clock>(

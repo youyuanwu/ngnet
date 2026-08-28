@@ -640,12 +640,10 @@ fn finishing_without_a_close_shuts_the_write_side_down() {
     let mut conn =
         Connection::client(near, TestClock::new(), Config::new()).expect("constructing a client");
 
-    let buffered = poll_once(|cx| conn.poll_pump_buffered(cx));
-    assert!(matches!(buffered, Poll::Ready(Ok(()))));
-    assert!(
-        conn.queued_output() > 0,
-        "the finish must start with retained output to exercise its flush obligation"
-    );
+    // Nothing has been pumped, deliberately. An ending has to *produce* what the state
+    // machine has queued and not merely flush what is already in the buffer: a reset or a
+    // stop-sending issued just before the end lives inside the state machine until a
+    // production pass turns it into a record.
 
     let finished = poll_once(|cx| conn.poll_finish(cx));
     assert!(
@@ -668,6 +666,37 @@ fn finishing_without_a_close_shuts_the_write_side_down() {
         announced > 0,
         "finishing flushed nothing, so the transport parameters never left the buffer"
     );
+}
+
+#[test]
+fn finishing_with_retained_output_drains_it_before_shutdown() {
+    let (near, mut far) = stream_pair();
+    let mut conn =
+        Connection::client(near, TestClock::new(), Config::new()).expect("constructing a client");
+
+    assert!(matches!(
+        poll_once(|cx| conn.poll_pump_buffered(cx)),
+        Poll::Ready(Ok(()))
+    ));
+    assert!(
+        conn.queued_output() > 0,
+        "the finish must start with retained output to exercise its flush obligation"
+    );
+
+    assert!(matches!(
+        poll_once(|cx| conn.poll_finish(cx)),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(conn.queued_output(), 0);
+    assert!(
+        !drain_written(&mut far).is_empty(),
+        "finishing discarded the retained announcement"
+    );
+    let mut byte = [0_u8; 1];
+    assert!(matches!(
+        poll_once(|cx| far.poll_read(cx, &mut byte)),
+        Poll::Ready(Ok(0))
+    ));
 }
 
 #[test]

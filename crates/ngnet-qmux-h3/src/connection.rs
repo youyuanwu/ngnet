@@ -435,6 +435,12 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
 /// is already connected, and normally reached through [`connect`](crate::connect) or
 /// [`serve`](crate::serve) rather than directly.
 ///
+/// A caller driving the [`QuicConnection`] methods itself must poll
+/// [`QuicConnection::poll_flush`] before returning `Pending` to its executor. Productive event,
+/// open, and transmit calls may retain bounded QMux output so that adjacent internal passes can
+/// coalesce it; the suspension flush drains that output or registers its write wake.
+/// [`poll_finish`](Self::poll_finish) remains the separate completion boundary.
+///
 /// # Why this is a handle and not the connection
 ///
 /// The HTTP/3 driver takes its transport **by value** and holds it for the connection's
@@ -564,7 +570,9 @@ impl<S: AsyncByteStream, C: Clock> QmuxConnection<S, C> {
     /// [`ngnet_h3::http::handshake`] themselves has the same obligation and no other way to
     /// discharge it: the driver's last act is to call `close` and return, so a connection
     /// nobody polled afterwards leaves the close in a buffer and the peer waiting out its
-    /// idle timeout.
+    /// idle timeout. Such a hand-driven caller must also use
+    /// [`QuicConnection::poll_flush`] before task suspension, as described on
+    /// [`QmuxConnection`].
     pub fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         self.with(|inner| inner.poll_finish(cx))
     }

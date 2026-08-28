@@ -300,7 +300,10 @@ pub trait QuicConnection {
     /// continues synchronously with the batch it already collected; that boundary is not a
     /// task suspension and does not call this operation.
     ///
-    /// [`Poll::Ready`] means the current output obligation has been discharged.
+    /// [`Poll::Ready`] means either that the current output obligation has been discharged,
+    /// or that a terminal ending makes delivery impossible and the operation that was already
+    /// pending will report it. An ending that was already latched needs no new wake. Only an
+    /// ending newly discovered by this call must arrange the wake described below.
     /// [`Poll::Pending`] means progress cannot be made now and this call registered `cx` to
     /// be woken when it can. An implementation must not return an unwoken `Pending`.
     ///
