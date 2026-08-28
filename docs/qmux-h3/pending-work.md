@@ -97,6 +97,16 @@ reprofiling.
    guaranteed wake source, and driver-pass suppression lacks an outer turn boundary in the
    transport interface. Do not retry these mechanisms from counts alone; see
    [`run 17`](../benchmarks/data/xeon-8370c-azure/17-qmux-h3-candidate-a-read-pump-amplification.md).
+9. **Reduce fixed HTTP/3 header/QPACK overhead — closed after exact site attribution.** A warmed
+   empty exchange performs 16 incoming field-copy allocations, 14 outgoing-field allocations,
+   four intermediate `Header` vector allocations, two `nghttp3_nv` vector allocations, eight
+   head/map allocations, and 17 native nghttp3 allocations. The complete safe C1–C3 storage set
+   could reduce the total from 128 to about 105, but its generous removable bound was only
+   0.53–0.61 µs on socket against a 0.667 µs 2% floor. The per-stream slot scan had no
+   measurable serial population and no allocation. No code was implemented: do not retry
+   header-storage changes from allocation counts alone. Native QPACK algorithm changes or a
+   concrete concurrency-only slot mechanism would need independent gates. See
+   [`run 19`](../benchmarks/data/xeon-8370c-azure/19-qmux-h3-candidate-c-fixed-header-work.md).
 
 The duplicate-pump portion of the former 91-read observation is resolved in item 4; the remaining
 reads are not presumed redundant. The 16382-byte record payload and the fixed 64-offer yield were
