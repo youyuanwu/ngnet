@@ -94,9 +94,9 @@ intercept, is the defect this run tests.
 | after | QMux `sendto` | 64 | 3058 | 9161 | 3.052 |
 
 The after-side values satisfy all three pre-registered limits:
-`w(8) <= w(1) + 2`, `w(64) <= w(1) + 4`, and `w(64) <= 12`. The small fractional increase is consistent with occasional scheduler slicing across 1,000
-batches, though the aggregate probe does not attribute individual extra calls. It is not a
-per-stream term. The deterministic
+`w(8) <= w(1) + 2`, `w(64) <= w(1) + 4`, and `w(64) <= 12`. The small fractional increase is
+consistent with occasional scheduler slicing across 1,000 batches, though the aggregate probe
+does not attribute individual extra calls. It is not a per-stream term. The deterministic
 in-memory regression counts both endpoints and obtains exactly 5 writes at 1, 8, and 64. The
 socket probe counts the process's socket syscalls after setup and obtains approximately 3; the
 fixed offset differs, but both instruments now have a constant concurrency shape and both
