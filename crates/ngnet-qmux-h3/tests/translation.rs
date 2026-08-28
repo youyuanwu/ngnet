@@ -11,7 +11,7 @@
 //! returns pending *with a wake* to start a fresh batch, and a loop that stopped at the
 //! first pending would miss every event after a stream ended.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use std::io::IoSlice;
 use std::sync::Arc;
@@ -20,7 +20,7 @@ use std::task::Wake;
 use ngnet_h3::ErrorCode;
 use ngnet_h3::StreamId;
 use ngnet_h3::http::{QuicConnection, QuicEvent, StreamSource, WriteOutcome};
-use ngnet_qmux::io::testing::{TestByteStream, TestClock, WriteLog, stream_pair};
+use ngnet_qmux::io::testing::{Fault, TestByteStream, TestClock, WriteLog, stream_pair};
 use ngnet_qmux_h3::QmuxConnection;
 
 type Endpoint = QmuxConnection<TestByteStream, TestClock>;
@@ -43,6 +43,56 @@ impl Wake for Woken {
     fn wake_by_ref(self: &Arc<Self>) {
         self.0.store(true, Ordering::SeqCst);
     }
+}
+
+#[derive(Default)]
+struct WakeCount(AtomicUsize);
+
+impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn a_flush_wakes_once_for_a_new_ending_and_never_spins_on_it() {
+    let (client_io, _peer_io) = stream_pair();
+    client_io.inject(Fault::Broken);
+    let mut connection = QmuxConnection::client(client_io, TestClock::new()).expect("a client");
+    let wakes = Arc::new(WakeCount::default());
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(
+        connection.poll_flush(&mut cx).is_ready(),
+        "a newly discovered ending is ready for its original operation to report"
+    );
+    assert_eq!(
+        wakes.0.load(Ordering::SeqCst),
+        1,
+        "a newly latched ending needs exactly one continuation"
+    );
+
+    match connection.poll_event(&mut cx) {
+        Poll::Ready(Err(_)) => {}
+        other => panic!("the pending event operation did not report the ending: {other:?}"),
+    }
+    assert_eq!(
+        wakes.0.load(Ordering::SeqCst),
+        1,
+        "reporting the ending must not add a courtesy wake"
+    );
+
+    assert!(connection.poll_flush(&mut cx).is_ready());
+    assert_eq!(
+        wakes.0.load(Ordering::SeqCst),
+        1,
+        "an already latched ending must not self-wake into a spin"
+    );
 }
 
 /// A pair of endpoints that deliver to each other.

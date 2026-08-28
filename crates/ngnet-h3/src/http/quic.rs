@@ -295,7 +295,10 @@ pub trait QuicConnection {
     /// The driver calls this only after another transport operation has returned
     /// [`Poll::Pending`] and the connection future is about to return `Pending` to its
     /// executor. It is not an end-of-pass hook: transports may accumulate bounded output
-    /// across the driver's internal passes.
+    /// across the driver's internal passes. In particular, a transport may use a self-woken
+    /// `Pending` from [`poll_event`](Self::poll_event) to end one event batch while the driver
+    /// continues synchronously with the batch it already collected; that boundary is not a
+    /// task suspension and does not call this operation.
     ///
     /// [`Poll::Ready`] means the current output obligation has been discharged.
     /// [`Poll::Pending`] means progress cannot be made now and this call registered `cx` to

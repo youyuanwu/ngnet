@@ -361,8 +361,9 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
     }
 
     fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<Result<()>> {
-        // `poll_transmit` stages every accepted write directly in ngtcp2. There is no
-        // join-owned output left for a later driver pass.
+        // Every parkable operation starts by producing the datagrams ngtcp2 currently
+        // owes and handing them to the endpoint. Accepted stream bytes therefore leave no
+        // join-owned output for a later driver pass.
         Poll::Ready(Ok(()))
     }
 
