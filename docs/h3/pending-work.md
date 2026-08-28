@@ -4,11 +4,58 @@ Known gaps, deferred decisions and things worth doing next for the `ngnet-h3` fa
 entry records the evidence that produced it and what would settle it, so a later reader can
 judge whether it still applies rather than re-deriving the argument.
 
-Nothing here is a known defect. Items were deferred on their merits, not left half-finished.
+Everything still pending here was deferred on its merits rather than left half-finished.
 
 The HTTP/2 family keeps its own list in [`../h2/pending-work.md`](../h2/pending-work.md).
 
 ## Resolved
+
+### A linear scan on every stream close
+
+**Resolved.** `Driver::close_stream` used to open with `self.closed.contains(&stream)` over a
+`Vec<StreamId>` held at `CLOSED_TOMBSTONES = 1024`.
+The tombstones exist to discard a late release for a stream already gone, and the bound is there
+so the list cannot grow without end. Both are right. What was not considered is that `contains`
+is linear, so on any connection that has closed more than 1024 streams — which is every
+long-lived one — **every subsequent close scans 8 KiB of stream ids before doing anything**.
+
+What the original mechanism cost, from
+[`../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md`](../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md),
+measured by changing only that constant from 1024 to 16 and re-timing:
+
+| Workload | 1024 | 16 | change |
+| --- | --- | --- | --- |
+| empty exchange, duplex | 28.93 µs | 25.56 µs | **−11.7%** |
+| empty exchange, socket | 54.98 µs | 51.16 µs | −6.9% |
+| 64 concurrent streams, duplex | 1218.26 µs | 975.73 µs | **−19.9%** |
+
+No range overlapped its pair over five runs each. It is 6.9% of the profiled cost of an empty
+exchange, and about a quarter of everything this driver spends on one.
+
+**It is the scan and not the `drain` beside it.** Leaving the constant at 1024 but trimming only
+at 2048 amortises the drain while lengthening the average scan by half; both arms got *worse*, in
+proportion — 30.73 µs and 1318.26 µs. A cost that tracks the length of the scanned list is the
+scan.
+
+**What settled it:** the driver now keeps membership in a `HashSet<StreamId>` and insertion order
+in a `VecDeque<StreamId>`, behind one component that inserts and evicts from both together.
+The bound remains 1024, duplicate closes remain no-ops, and the oldest distinct close is evicted
+first. The driver also discards the state machine's callback observation for a close it has
+already applied, so a batch larger than the tombstone window cannot replay close side effects
+after eviction. Unit tests cross the bound and compare both representations;
+`http_closed_streams` distinguishes retained from evicted late releases; and
+`closed_stream_membership_never_scans_eviction_order` pins both driver call sites to the hash
+index. The valid implementation was then measured directly in
+[`10-h3-closed-stream-lookup`](../benchmarks/data/xeon-8370c-azure/10-h3-closed-stream-lookup.md):
+**13–18% faster on the tested duplex arms and 7–13% faster on the socket arms**, with every
+effect larger than its matching HTTP/2 control movement. The earlier A/B remains diagnostic
+evidence of the original mechanism, and **16 is not a correct setting** — it would expire
+tombstones that still matter.
+
+The measurement was taken through the QMux join because that is the transport this host can
+build. Nothing in the entry is QMux-specific: `close_stream` is in `ngnet-h3`, so
+`ngnet-quic-h3` should pay the same cost. That is an inference from shared source, not a
+measurement — see the same run's *What it does not*.
 
 ### The asynchronous layer
 

@@ -124,6 +124,28 @@ impl Events {
         self.observed.push(Observation::Closed { stream, closed });
     }
 
+    /// Discards close observations produced by one driver-initiated state-machine close.
+    ///
+    /// The driver has already applied that close and its side effects. Leaving the callback's
+    /// observation queued would replay the same close later, after a sufficiently large batch
+    /// may already have evicted its bounded late-release tombstone.
+    pub(crate) fn discard_closed_since(&mut self, checkpoint: usize, stream: StreamId) {
+        let mut index = checkpoint;
+        while index < self.observed.len() {
+            if matches!(
+                self.observed[index],
+                Observation::Closed {
+                    stream: observed,
+                    ..
+                } if observed == stream
+            ) {
+                self.observed.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
     /// Records a graceful shutdown.
     pub(crate) fn push_shutdown(&mut self, shutdown: Shutdown) {
         self.observed.push(Observation::Shutdown(shutdown));
@@ -248,5 +270,35 @@ mod tests {
         let observed = events.drain();
         assert_eq!(observed.len(), 1);
         assert!(matches!(observed[0], Observation::Closed { .. }));
+    }
+
+    #[test]
+    fn discarding_one_close_preserves_other_observations() {
+        let mut events = Events::default();
+        let target = StreamId::new(0).expect("a stream");
+        let other = StreamId::new(4).expect("a stream");
+
+        events.push_closed(target, StreamClosed::clean());
+        let checkpoint = events.observed.len();
+        events.push_end(target);
+        events.push_closed(other, StreamClosed::clean());
+        events.push_closed(target, StreamClosed::clean());
+
+        events.discard_closed_since(checkpoint, target);
+
+        let observed = events.drain();
+        assert_eq!(observed.len(), 3);
+        assert!(matches!(
+            observed[0],
+            Observation::Closed { stream, .. } if stream == target
+        ));
+        assert!(matches!(
+            observed[1],
+            Observation::End { stream } if stream == target
+        ));
+        assert!(matches!(
+            observed[2],
+            Observation::Closed { stream, .. } if stream == other
+        ));
     }
 }

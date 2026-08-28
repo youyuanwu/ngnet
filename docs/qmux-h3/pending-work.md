@@ -2,6 +2,54 @@
 
 What is missing, and what would settle each.
 
+## Performance work, in priority order
+
+This is the implementation backlog produced by
+[`09-qmux-h2-mechanisms`](../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md).
+The order is measured payoff divided by implementation risk, not source order.
+
+Item 1 is settled; item 2 is now the highest-priority open performance item.
+
+1. **Replace `ngnet-h3`'s linear closed-stream lookup — settled.** `Driver::close_stream` scanned a
+   1024-entry tombstone `Vec` on every close after a connection reaches steady state. A
+   diagnostic that shortened the list reduced empty-exchange time by **11.7%** on a duplex and
+   **6.9%** on a socket, and reduced the 64-stream duplex arm by **19.9%**. The fix kept the
+   tombstone bound and insertion-order eviction, made membership constant-time, and did not ship
+   the diagnostic value of sixteen. A synchronized hash index and FIFO queue now preserve the
+   1024-entry semantics without the scan. The shipped implementation measures **13–18% faster
+   on the tested duplex arms and 7–13% faster on the socket arms** in
+   [`run 10`](../benchmarks/data/xeon-8370c-azure/10-h3-closed-stream-lookup.md). This is shared
+   HTTP/3 work rather than QMux-specific work, and its verified resolution is in
+   [`../h3/pending-work.md`](../h3/pending-work.md#a-linear-scan-on-every-stream-close).
+2. **Decouple QMux flushing from the end of an HTTP/3 driver turn.** At concurrency `n`, QMux
+   issues `2n + 2` socket writes while HTTP/2 remains constant at two: 132 against 2 at 64
+   streams. The stream-ending batch boundary is required for correctness and must remain; the
+   opportunity is to carry buffered output across that boundary without risking a stall. This
+   is the largest remaining measured opportunity, but it changes the flush invariant and
+   therefore follows the contained tombstone fix. The explained lead and required guardrails
+   are recorded under
+   [the write-count entry](#something-scales-with-in-flight-streams-on-a-real-socket--it-is-the-write-count).
+3. **Reuse `ngnet-h3::Driver::apply_events` scratch storage.** Its owned event vector and the
+   `data` and `unheard` vectors allocated for each pass account for 2.39 microseconds, or 8.1%,
+   of a profiled empty exchange. Reuse buffers owned by the driver, while preserving the
+   control-plane-before-data ordering and same-batch reset handling.
+4. **Collapse the HTTP/3 driver's repeated shared-state probes.** The separate
+   `Shared::*_pending` and `take_*` checks account for about 1.35 microseconds, or 4.6%, of an
+   empty exchange. Investigate one combined readiness word or one collected action batch rather
+   than probing each category separately. Measure before retaining this change: unlike the first
+   two items, its mechanism is profiled but no implementation has been A/B tested.
+5. **Test HTTP/2 coalescing beyond one 16 KiB frame.** This is comparative work, not a QMux
+   defect. At a 1 MiB exchange HTTP/2 issues 189 writes and QMux issues 68; the measured HTTP/2
+   maximum is exactly 16 KiB while QMux can empty a 64 KiB buffer. A prototype must establish
+   whether coalescing frames recovers the kernel-path gap without regressing latency or
+   concurrency before it becomes an HTTP/2 change.
+
+Do **not** prioritize the 91 QMux transport read polls per empty exchange: suppressing redundant
+pumps bought only **1.3%**. The 16382-byte record payload and the fixed 64-offer yield were
+eliminated as causes of the concurrency inversion. Do not pursue allocation counts without a
+timing hypothesis—the delivery-aliasing experiment already showed that a large allocation
+reduction can be slower—and do not modify `deps/dwnx` as part of this backlog.
+
 ## Interoperability is proven against nothing
 
 Everything here runs against this workspace's own stack: `ngnet-h3` over `ngnet-qmux` over an
@@ -369,9 +417,47 @@ hundreds. `MAX_PENDING_STREAMS` (sixty-four, the driver's own per-pass offer bou
 run early rather than letting the scan grow, so the worst case is exactly the behaviour this
 replaced rather than something worse.
 
-## Something scales with in-flight streams on a real socket
+## Something scales with in-flight streams on a real socket — it is the write count
 
-**Now measured, still unexplained, and its leading suspect has been eliminated.** This began as a
+**Explained and closed.** The answer is at the head of this entry; everything below it is the
+history of getting there, kept because a lead's provenance is part of it.
+
+### The answer
+
+[`09-qmux-h2-mechanisms`](../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md) counted
+writes per exchange over a socket at one, eight and sixty-four streams. QMux fits **`2n + 2`**;
+HTTP/2 is **constant at 2**, one stream or sixty-four. Reads do not scale on either side — QMux
+takes three at every concurrency, so the sixty-four responses do arrive coalesced. The bytes are
+collectable and only the writer will not collect them.
+
+The cause is the batch boundary at the join, and it is required for correctness. `ngnet-h3`
+applies control-plane events before data events within a batch, so a stream ending sharing a batch
+with that stream's last bytes would release the stream before the bytes were read. `poll_event`
+therefore returns `Pending` at every stream ending to start a fresh batch — and a `Pending` ends
+the HTTP/3 driver's turn, which is exactly what forces the outbound buffer to flush. One ending,
+one flush, one write, on each side. Removing the rule to confirm this breaks the connection in
+precisely the way `emitted_since_pending`'s own doc comment predicts: the warm-up dies with *the
+exchange ended before a response arrived*.
+
+Over a duplex each of those writes is a memcpy and the penalty is mild; over a socket each is a
+syscall, which is why this is the one workload whose ratio worsens when a kernel is added.
+
+**This corrects a claim made in this entry's own text below**, and in
+[`../benchmarks/data/xeon-8370c-azure/README.md`](../benchmarks/data/xeon-8370c-azure/README.md).
+The write-path work established that the write count *per driver turn* no longer grows with the
+streams in flight. That is true and remains true. The number of driver turns grows instead, so
+writes per exchange still do.
+
+**What is left, and it is a design question rather than a lead.** Flushing is currently tied to
+the end of a driver turn, and stream endings make turns end often. Anything that decouples the two
+— deferring the flush across a batch boundary while keeping the boundary itself — would collapse
+`2n + 2` toward a constant. Neither of the two candidates this entry used to name survived:
+the 16382-against-16384 record size and the sixty-four-offer yield are both untouched by a write
+count that tracks stream *endings* rather than payload or offers.
+
+### The history
+
+**Now measured, its leading suspect eliminated — and then explained, above.** This began as a
 lead from unpinned exploratory runs, and that provenance is kept below because the sequence
 matters. It is no longer the evidence:
 [`08-qmux-against-h2`](../benchmarks/data/xeon-8370c-azure/08-qmux-against-h2.md) measured it
@@ -393,12 +479,12 @@ the only one.
 What is left. The two remaining candidates named when this entry was written are untouched: QMux
 produces more records for the same payload than HTTP/2 produces frames, since a record caps at
 16382 bytes against a 16384-byte frame payload; and the pump's fixed sixty-four-offer yield may
-interact with sixty-four concurrent streams in a way worth not dismissing. A third is now
-available: [`08`](../benchmarks/data/xeon-8370c-azure/08-qmux-against-h2.md) implies QMux's
-kernel-path cost per megabyte is 61% of HTTP/2's, which is a *favourable* asymmetry on the body
-axis and might be an unfavourable one on the concurrency axis if it comes from writing fewer,
-larger chunks. **What would settle it:** a write count per pass and per megabyte for both arms at
-each concurrency — both stacks already have the instrumentation, and neither has been asked.
+interact with sixty-four concurrent streams in a way worth not dismissing. A third was named
+here as most promising — that QMux's favourable 61% kernel-path cost per megabyte might be
+unfavourable on the concurrency axis — and it was right about where to look but not about the
+direction: the counts came back showing QMux writing *more* often at concurrency, not fewer and
+larger. **What settled it** was the count this entry asked for, taken in
+[`09`](../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md).
 
 The original provenance note, kept because a lead's history is part of it: the numbers that
 produced this entry came from unpinned, short-sample exploratory runs taken while the benchmark

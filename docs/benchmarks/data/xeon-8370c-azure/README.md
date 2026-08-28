@@ -79,6 +79,8 @@ submodules. [`../../running.md`](../../running.md) states the requirement in ful
 | [06-qmux-write-path](06-qmux-write-path.md) | 2026-08-17 | `524fa54` against `a54ea43` | The write-path set end to end — **−30% at 1 MiB**, −8.5% at concurrency 64 on a socket |
 | [07-qmux-per-commit-attribution](07-qmux-per-commit-attribution.md) | 2026-08-17 | seven commits, each against its predecessor | Coalescing is **−21.7%** at 1 MiB; four of the six are inside their step's controls — duplex only |
 | [08-qmux-against-h2](08-qmux-against-h2.md) | 2026-08-18 | `c525aa1` | **QMux against HTTP/2**, five passes — fixed +19–34 µs per exchange, **0.86×** per byte over a socket |
+| [09-qmux-h2-mechanisms](09-qmux-h2-mechanisms.md) | 2026-08-27 | `dc922be` | **Why**, by counting — 68 writes against 189 at 1 MiB, `2n + 2` against 2 at concurrency, and 45% of the fixed cost inside `ngnet-h3` |
+| [10-h3-closed-stream-lookup](10-h3-closed-stream-lookup.md) | 2026-08-27 | `6d13712` against `419a774` | Constant-time closed-stream lookup — **−13–18% duplex, −7–13% socket** |
 
 Still outstanding, in the order they are worth doing:
 
@@ -86,16 +88,15 @@ Still outstanding, in the order they are worth doing:
    `transport_concurrent_throughput`.** This is the direct test of the mechanism the whole
    write-path finding rests on, and the one thing
    [02-first-survey](02-first-survey.md) could not settle from a standing survey.
-2. **A write count per megabyte for both stacks.** [`08`](08-qmux-against-h2.md) established
-   that QMux moves bulk bytes over a socket for 61% of what HTTP/2's kernel path costs, which is
-   arithmetic on measured numbers with no mechanism attached. Writes per megabyte is the obvious
-   candidate and both stacks already have the instrumentation, so this is cheap. It has taken
-   over from the cross-protocol run as the item most likely to close an entry rather than
-   confirm one. *(The cross-protocol run itself is done: it is [`08`](08-qmux-against-h2.md). It
-   answered the concurrency question in the unwelcome direction — the ratio is still worse over
-   a socket than over a duplex, 3.12× against 2.33×, even though the write count no longer grows
-   with concurrency, so the lead in `docs/qmux-h3/pending-work.md` survives its own leading
-   suspect being removed.)*
+2. ~~**A write count per megabyte for both stacks.**~~ **Done — it is
+   [`09`](09-qmux-h2-mechanisms.md), and it answered more than it was asked.** QMux issues 68
+   writes per megabyte-exchange where HTTP/2 issues 189, because HTTP/2 caps a write at one
+   16 KiB frame and QMux empties a 64 KiB buffer. That is the mechanism behind the 61% kernel
+   path [`08`](08-qmux-against-h2.md) could only compute. The same run settled the concurrency
+   inversion, and in doing so **corrected a claim that used to sit in this entry**: the write
+   count per *driver turn* no longer grows with the streams in flight, which is what the
+   write-path work established and is still true, but the number of driver turns does, so writes
+   per exchange are `2n + 2` against HTTP/2's constant 2.
 3. **Replicate the duplex 1 MiB arms**, the only place this host is noisy — and note that `04`
    sharpens this: `body_throughput/ngnet-qmux-h3/1048576` drifts **10.42%**, the worst
    identifier in the suite, so the QMux arm needs this more than the others do.
