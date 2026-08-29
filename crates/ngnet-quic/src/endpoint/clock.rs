@@ -17,7 +17,7 @@
 //! It is easy to believe a QUIC driver needs two deadlines: one for loss recovery and the
 //! idle timeout, and another for pacing, since ngtcp2 refuses to send before the pacing
 //! deadline passes. It does not. `ngtcp2_conn_get_expiry2` finishes with
-//! `ngtcp2_min(res, conn->tx.pacing.next_ts)` (`deps/ngtcp2/lib/ngtcp2_conn.c:11387`), so
+//! `ngtcp2_min(res, conn->tx.pacing.next_ts)` (`crates/ngnet-quic-sys/vendor/ngtcp2/lib/ngtcp2_conn.c:11387`), so
 //! the value [`crate::Conn::expiry`] reports is already the earlier of the two.
 //!
 //! The practical consequence is the whole reason this is written down: a driver that stops

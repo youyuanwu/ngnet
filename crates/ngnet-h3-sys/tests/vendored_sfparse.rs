@@ -38,12 +38,12 @@ fn the_two_vendored_copies_of_sfparse_are_identical() {
 
     for (nghttp2_relative, nghttp3_relative) in [
         (
-            "deps/nghttp2/lib/sfparse.c",
-            "deps/nghttp3/lib/sfparse/sfparse.c",
+            "crates/ngnet-h2-sys/vendor/nghttp2/lib/sfparse.c",
+            "crates/ngnet-h3-sys/vendor/nghttp3/lib/sfparse/sfparse.c",
         ),
         (
-            "deps/nghttp2/lib/sfparse.h",
-            "deps/nghttp3/lib/sfparse/sfparse.h",
+            "crates/ngnet-h2-sys/vendor/nghttp2/lib/sfparse.h",
+            "crates/ngnet-h3-sys/vendor/nghttp3/lib/sfparse/sfparse.h",
         ),
     ] {
         let in_nghttp2 = root.join(nghttp2_relative);

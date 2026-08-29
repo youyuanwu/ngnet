@@ -1,12 +1,44 @@
 [package]
 name = "ngnet-quic-sys"
-version = "0.1.0"
+version = "0.0.1"
 description = "Low level FFI bindings to libngtcp2, built from the vendored ngtcp2 submodule"
-# Withheld from release alongside `ngnet-quic`, whose API is still expected to change.
-publish = false
+readme = "README.md"
+# Released at 0.0.x alongside `ngnet-quic`, whose API is still expected to change.
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+include = [
+    "src/**",
+    "tests/**",
+    "build.rs",
+    "README.md",
+    "wrapper.h",
+    "vendor/ngtcp2/CMakeLists.txt",
+    "vendor/ngtcp2/CMakeOptions.txt",
+    "vendor/ngtcp2/cmake/*.cmake",
+    "vendor/ngtcp2/cmakeconfig.h.in",
+    "vendor/ngtcp2/README.rst",
+    "vendor/ngtcp2/COPYING",
+    "vendor/ngtcp2/lib/CMakeLists.txt",
+    "vendor/ngtcp2/lib/config.cmake.in",
+    "vendor/ngtcp2/lib/libngtcp2.pc.in",
+    "vendor/ngtcp2/lib/*.c",
+    "vendor/ngtcp2/lib/*.h",
+    "vendor/ngtcp2/lib/includes/CMakeLists.txt",
+    "vendor/ngtcp2/lib/includes/ngtcp2/*.h",
+    "vendor/ngtcp2/lib/includes/ngtcp2/*.in",
+    "vendor/ngtcp2/crypto/CMakeLists.txt",
+    "vendor/ngtcp2/crypto/shared.c",
+    "vendor/ngtcp2/crypto/shared.h",
+    "vendor/ngtcp2/crypto/includes/CMakeLists.txt",
+    "vendor/ngtcp2/crypto/includes/ngtcp2/ngtcp2_crypto.h",
+    "vendor/ngtcp2/crypto/includes/ngtcp2/ngtcp2_crypto_ossl.h",
+    "vendor/ngtcp2/crypto/ossl/CMakeLists.txt",
+    "vendor/ngtcp2/crypto/ossl/ossl.c",
+    "vendor/ngtcp2/crypto/ossl/libngtcp2_crypto_ossl.pc.in",
+    # The top-level project enters this directory, but its guarded targets are disabled.
+    "vendor/ngtcp2/third-party/CMakeLists.txt",
+]
 
 # Declares that this crate links the native `ngtcp2` library, so cargo will
 # refuse to link two copies of it into the same binary.

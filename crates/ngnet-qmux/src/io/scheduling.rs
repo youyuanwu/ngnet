@@ -20,7 +20,8 @@
 //! - A write with no flow-control credit waits on [`Signals::park_credit`], and the
 //!   `extend_max_stream_data` handler wakes it. The connection-level window has **no
 //!   callback** -- dwnx updates `tx.max_offset` from a MAX_DATA frame and tells nobody
-//!   (`deps/dwnx/lib/dwnx_conn.c:1045-1056`) -- so the connection watches
+//!   (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conn.c:1045-1056`) -- so the connection
+//!   watches
 //!   [`max_data_left`](crate::Conn::max_data_left) across a read and wakes the same slot when
 //!   it moves. Waking on *any* inbound bytes would have been simpler and would have spun a
 //!   blocked writer once per arriving record for as long as the peer kept talking.

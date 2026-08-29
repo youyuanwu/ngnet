@@ -22,7 +22,7 @@ use ngnet_qmux_sys as sys;
 /// compares against, and no operation returns it.
 fn conditions_from_header() -> BTreeSet<(String, i32)> {
     let header = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../deps/dwnx/lib/includes/dwnx/dwnx.h");
+        .join("../ngnet-qmux-sys/vendor/dwnx/lib/includes/dwnx/dwnx.h");
     let source = fs::read_to_string(&header)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", header.display()));
 

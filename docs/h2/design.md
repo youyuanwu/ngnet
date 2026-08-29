@@ -7,7 +7,7 @@ failed.
 ## Layering
 
 ```
-ngnet-h2-sys      raw FFI; builds libnghttp2 from deps/nghttp2
+ngnet-h2-sys      raw FFI; builds packaged vendor/nghttp2 source
    ↑
 ngnet-h2          sans-I/O state machine  ── feature "http" ──▶  async HTTP/2 API
    ↑                (src/*.rs)                                    (src/http/)

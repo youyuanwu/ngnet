@@ -40,9 +40,10 @@ nothing if arbitrary text can be pulled in at compile time.
 
 ## The manifest declares what it should
 
-Exactly `ngnet-h3`, `ngnet-quic` and `bytes`, and `publish = false`. The point of the crate is
-that it is the only place the two families meet; a fourth dependency is not necessarily wrong
-but should be a decision rather than a drift.
+Exactly `ngnet-h3`, `ngnet-quic` and `bytes`, and no `publish = false` — here or in either
+crate it binds, since a published crate cannot depend on an unpublished one. The point of the
+crate is that it is the only place the two families meet; a fourth dependency is not
+necessarily wrong but should be a decision rather than a drift.
 
 ## The scanner works
 

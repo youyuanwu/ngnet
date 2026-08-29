@@ -7,7 +7,8 @@
 //! the obvious alternative -- ask the state machine where it stands -- is the one that was
 //! tried and rejected, because there is nothing to ask. `dwnx_conn_read` returns `0` for "that
 //! was fine, feed me more", whether it stopped between records or halfway through a length
-//! prefix (`deps/dwnx/lib/dwnx_conn.c:1158-1228`). There is no accessor for the record reader's
+//! prefix (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conn.c:1158-1228`). There is no
+//! accessor for the record reader's
 //! state, and the reader itself is private.
 //!
 //! Two questions this layer must answer therefore have no answer from below.
@@ -19,7 +20,8 @@
 //! the caller as a clean ending, which is the failure mode with no symptom.
 //!
 //! **What did the peer's close say?** dwnx parses CONNECTION_CLOSE into a private frame struct
-//! and returns `DWNX_ERR_DRAINING` (`deps/dwnx/lib/dwnx_conn.c:2044-2110`), so the kind, error
+//! and returns `DWNX_ERR_DRAINING`
+//! (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conn.c:2044-2110`), so the kind, error
 //! code, frame type and reason are unreachable from outside. Recovering them means holding on
 //! to the record's own bytes and decoding them here; see [`super::close`].
 //!
@@ -98,7 +100,8 @@
 //!
 //! A declared length above the maximum is refused rather than trusted, so a peer cannot use
 //! the length prefix to make this layer allocate. dwnx refuses the same record for the same
-//! reason (`deps/dwnx/lib/dwnx_conn.c:1200-1204`); the framer refuses it first, since it is the
+//! reason (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conn.c:1200-1204`); the framer refuses
+//! it first, since it is the
 //! one holding the buffer.
 
 use crate::ccerr::CloseReason;
@@ -140,8 +143,10 @@ pub(super) fn read_varint(input: &[u8]) -> Option<(u64, usize)> {
 /// caller's error code and a reason length, and a close that cannot be written is worse than a
 /// close carrying a saturated code.
 ///
-/// dwnx emits every record length as a two-byte prefix (`deps/dwnx/lib/dwnx_qre.c:93-108`) and
-/// accepts all four widths on read (`deps/dwnx/lib/dwnx_conn.c:1158-1228`), so the shortest
+/// dwnx emits every record length as a two-byte prefix
+/// (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_qre.c:93-108`) and
+/// accepts all four widths on read
+/// (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conn.c:1158-1228`), so the shortest
 /// encoding is both legal and what a conforming peer must handle.
 pub(super) fn write_varint(out: &mut Vec<u8>, value: u64) {
     let value = value.min(MAX_VARINT);
@@ -471,7 +476,8 @@ impl RecordFramer {
         }
         // The whole record is scanned, never just its first frame: a record may carry several
         // frames and dwnx returns to its frame-type state for each
-        // (`deps/dwnx/lib/dwnx_record_reader.c:88-103`), so a close may follow anything. Which
+        // (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_record_reader.c:88-103`), so a close
+        // may follow anything. Which
         // buffer the payload is in changes; that it is scanned end to end does not.
         match in_place {
             Some(payload) => {

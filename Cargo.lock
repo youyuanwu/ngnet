@@ -1063,7 +1063,7 @@ dependencies = [
 
 [[package]]
 name = "ngnet-h2"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bytes",
  "compio",
@@ -1075,7 +1075,7 @@ dependencies = [
 
 [[package]]
 name = "ngnet-h2-sys"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bindgen",
  "cmake",
@@ -1095,7 +1095,7 @@ dependencies = [
 
 [[package]]
 name = "ngnet-h3"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bytes",
  "http",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "ngnet-h3-sys"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bindgen",
  "cmake",
@@ -1167,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "ngnet-quic"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "ngnet-quic-sys",
  "tokio",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "ngnet-quic-h3"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bytes",
  "ngnet-h3",
@@ -1201,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "ngnet-quic-sys"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bindgen",
  "cmake",

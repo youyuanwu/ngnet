@@ -7,7 +7,7 @@ in ways that are easy to miss.
 ## Layering
 
 ```
-ngnet-h3-sys      raw FFI; builds libnghttp3 from deps/nghttp3
+ngnet-h3-sys      raw FFI; builds packaged vendor/nghttp3 source
    ↑
 ngnet-h3          sans-I/O connection state machine
    ↑              + src/http/, an async API behind the default-on `http` feature

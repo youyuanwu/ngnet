@@ -23,13 +23,13 @@ use ngnet_h2::{ALL_NATIVE_CODES, Error, ErrorKind};
 /// crate's build script accepts.
 fn header_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../deps/nghttp2/lib/includes/nghttp2/nghttp2.h")
+        .join("../ngnet-h2-sys/vendor/nghttp2/lib/includes/nghttp2/nghttp2.h")
 }
 
 /// Extracts `NGHTTP2_ERR_<NAME> = -<N>,` members from the vendored header.
 fn native_codes_declared_in_header() -> BTreeSet<i32> {
     let header = std::fs::read_to_string(header_path()).expect(
-        "vendored nghttp2 header not found; run `git submodule update --init deps/nghttp2`",
+        "vendored nghttp2 header not found; run `just submodules`",
     );
 
     // Every line that begins a declaration must parse. Silently skipping an

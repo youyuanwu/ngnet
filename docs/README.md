@@ -124,6 +124,7 @@ in a document of its own.
 | --- | --- |
 | [`benchmarks/`](benchmarks/) | How the benchmarks are run, one page per bench case, what their numbers do and do not mean, which protocol settings are matched between the stacks and protocols being compared — and the measurements themselves, filed under the machine that produced them. |
 | [`ci.md`](ci.md) | Every check CI runs, across all four families and the axum integration, and the ones it deliberately does not. |
+| [`publishing.md`](publishing.md) | How to inspect, package, dry-run and publish the release crates together, including the native-source archive checks and dependency order. |
 
 The benchmarks sit here rather than under a family because a comparison spans the stacks it
 compares; the suite's own index says which cases cover which of them.

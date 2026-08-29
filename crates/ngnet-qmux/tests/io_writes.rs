@@ -608,11 +608,13 @@ fn the_octets_a_peer_receives_survive_a_change_of_write_shape() {
 /// The assertion is cheap and the failure it guards against is not. A record is now serialised
 /// straight into the outbound buffer, whose free tail is normally several records long, and
 /// dwnx does not cap a record on the write path: `dwnx_qre_start` initialises the record with
-/// the whole destination it is handed (`deps/dwnx/lib/dwnx_qre.c:36-41`),
+/// the whole destination it is handed
+/// (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_qre.c:36-41`),
 /// `dwnx_qre_stream_max_datalen` bounds the payload only by what is left of that destination
 /// (`:47-80`), and `dwnx_qre_final` then writes the record's length as a fixed two-byte varint
 /// (`:107`) whose encoder asserts the value is below 16384 and, where that assertion is
-/// compiled out, truncates it to sixteen bits (`deps/dwnx/lib/dwnx_conv.c:145-157`).
+/// compiled out, truncates it to sixteen bits
+/// (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conv.c:145-157`).
 ///
 /// Which of those happens was checked rather than assumed. This workspace builds dwnx without
 /// `NDEBUG` in either profile, so the perturbation -- handing the record writer the buffer's

@@ -5,8 +5,7 @@ description = "Run an axum Router over ngnet-h2 instead of hyper, serving cleart
 # Not released yet. The crate is pinned to a single axum minor version by the `Service` impl
 # it calls, so publishing would commit this workspace to tracking axum's release cadence on
 # top of its own, and the server surface has not been used by anyone but its own tests. It
-# is withheld until both settle. `ngnet-h3` and `ngnet-quic` carry the same line for their
-# own reasons.
+# is withheld until both settle. `ngnet-util` carries the same line for its own reasons.
 publish = false
 edition.workspace = true
 license.workspace = true

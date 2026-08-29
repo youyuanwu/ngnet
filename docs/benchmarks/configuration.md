@@ -155,7 +155,7 @@ it does not make the two stacks compress alike, and no configuration could.
 
 | Setting | HTTP/2 arms | QMux arms | Why neither is reachable |
 | --- | --- | --- | --- |
-| The largest unit either protocol puts on the wire in one piece | `MAX_FRAME_SIZE` = **16384** payload bytes, plus a 9-byte frame header — 16393 on the wire | `max_record_size` = **16382** bytes for the *whole record*, framing included | libnghttp2 fixes the first and `ngnet-h2`'s `Config` does not carry it. dwnx overwrites any configured `max_record_size` with `DWNX_DEFAULT_MAX_RECORD_SIZE` immediately after copying the parameters in, with the upstream comment "We do not let application increase max record size" — see [`../qmux/design.md`](../qmux/design.md) and `deps/dwnx/lib/includes/dwnx/dwnx.h:94` |
+| The largest unit either protocol puts on the wire in one piece | `MAX_FRAME_SIZE` = **16384** payload bytes, plus a 9-byte frame header — 16393 on the wire | `max_record_size` = **16382** bytes for the *whole record*, framing included | libnghttp2 fixes the first and `ngnet-h2`'s `Config` does not carry it. dwnx overwrites any configured `max_record_size` with `DWNX_DEFAULT_MAX_RECORD_SIZE` immediately after copying the parameters in, with the upstream comment "We do not let application increase max record size" — see [`../qmux/design.md`](../qmux/design.md) and `crates/ngnet-qmux-sys/vendor/dwnx/lib/includes/dwnx/dwnx.h:94` |
 
 The two numbers are two bytes apart and the difference between them is larger than that,
 because they bound different things: 16384 is an HTTP/2 DATA frame's *payload*, while 16382
@@ -222,7 +222,8 @@ of the comparison's way.
 
 **2^40 is bounded above as well as below**, and a later reader "tidying" it in either direction
 breaks the suite differently. dwnx's own ceiling is `DWNX_MAX_STREAMS` = `1 << 60`
-(`deps/dwnx/lib/dwnx_transport_params.h:63`), enforced where the *peer* decodes the transport
+(`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_transport_params.h:63`), enforced where the
+*peer* decodes the transport
 parameters — so a value at 2^61 is accepted where it is configured and then fails the
 connection during setup, with an error that names nothing about streams.
 `TransportParams::validate`'s varint check does not catch that: it bounds the encoding, not

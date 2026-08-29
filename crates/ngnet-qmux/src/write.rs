@@ -255,7 +255,8 @@ impl<'c, 'h, 'b> RecordWriter<'c, 'h, 'b> {
         // One fragment is the degenerate vectored case, and it is spelled that way rather
         // than given a second call into dwnx: `dwnx_conn_write_stream` is itself a wrapper
         // that builds a one-element `dwnx_vec` array and calls `dwnx_conn_writev_stream`
-        // (`deps/dwnx/lib/dwnx_conn.c`), so a separate path here would be a second copy of
+        // (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conn.c`), so a separate path here
+        // would be a second copy of
         // the outcome mapping below with nothing else to distinguish it.
         self.push_vectored(VectoredWriteRequest {
             stream: request.stream,
@@ -275,8 +276,10 @@ impl<'c, 'h, 'b> RecordWriter<'c, 'h, 'b> {
     /// # The count that comes back is a total, not a per-fragment tally
     ///
     /// [`Push::Accepted`] and [`Push::Complete`] report how many bytes were taken **across
-    /// all the fragments**, in order (`deps/dwnx/lib/includes/dwnx/dwnx.h`, and
-    /// `dwnx_conn_write_stream_frame` in `deps/dwnx/lib/dwnx_conn.c`, which sets `*pdatalen`
+    /// all the fragments**, in order
+    /// (`crates/ngnet-qmux-sys/vendor/dwnx/lib/includes/dwnx/dwnx.h`, and
+    /// `dwnx_conn_write_stream_frame` in
+    /// `crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conn.c`, which sets `*pdatalen`
     /// to the single figure `wdatalen`). A caller resuming after a short take therefore has
     /// to walk the array to find where the next push starts, and cannot assume whole
     /// fragments were consumed: dwnx copies a *prefix* of the concatenation
@@ -523,9 +526,11 @@ impl<'h> Conn<'h> {
     /// # A larger one is not permitted, and nothing here refuses it
     ///
     /// dwnx fills whatever buffer it is given and then describes the result with a **fixed
-    /// two-byte** record length (`dwnx_qre_final` in `deps/dwnx/lib/dwnx_qre.c`), so a record
+    /// two-byte** record length (`dwnx_qre_final` in
+    /// `crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_qre.c`), so a record
     /// built into a longer buffer can reach a length that prefix cannot express. The encoder
-    /// asserts the value is below 16384 (`deps/dwnx/lib/dwnx_conv.c`) and, where that assertion
+    /// asserts the value is below 16384
+    /// (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conv.c`) and, where that assertion
     /// is compiled out, truncates it to sixteen bits — which is a well-formed prefix in front
     /// of the wrong number of bytes, and a peer that has lost record framing with no error
     /// raised anywhere.

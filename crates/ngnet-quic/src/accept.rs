@@ -11,7 +11,7 @@
 //! # This is not optional for a server
 //!
 //! `ngtcp2_conn_server_new` asserts that the transport parameters carry `original_dcid`
-//! (`deps/ngtcp2/lib/ngtcp2_conn.c:1264-1265`), and that value comes from the client's first
+//! (`crates/ngnet-quic-sys/vendor/ngtcp2/lib/ngtcp2_conn.c:1264-1265`), and that value comes from the client's first
 //! packet. A server therefore *cannot be built* without decoding one first. Since the
 //! assertion is compiled out of release builds, skipping this step is undefined behaviour
 //! rather than a crash — which is why [`crate::TransportParams::build`] checks it too.

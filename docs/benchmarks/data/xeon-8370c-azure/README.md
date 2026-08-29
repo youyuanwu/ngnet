@@ -56,11 +56,14 @@ every arm, including `compio-push` and `compio-shared`, which abort unless they 
 `DriverType::IoUring` — so io_uring is genuinely available here and not silently falling back
 to a polling driver.
 
-`ngnet-bench` needs the `deps/nghttp2`, `deps/nghttp3` (with its nested `lib/sfparse`) and
-`deps/dwnx` submodules, and it still needs **neither `deps/ngtcp2` nor OpenSSL ≥ 3.5**, which
-belong to `ngnet-quic-sys` and are reached by no arm in the suite: `cargo bench -p ngnet-bench`
-builds with the pinned toolchain, a C compiler, CMake and libclang, plus those three
-submodules. [`../../running.md`](../../running.md) states the requirement in full.
+`ngnet-bench` needs the `crates/ngnet-h2-sys/vendor/nghttp2`,
+`crates/ngnet-h3-sys/vendor/nghttp3` (with its nested `lib/sfparse`) and
+`crates/ngnet-qmux-sys/vendor/dwnx` submodules, and it still needs **neither
+`crates/ngnet-quic-sys/vendor/ngtcp2` nor OpenSSL ≥ 3.5**, which belong to
+`ngnet-quic-sys` and are reached by no arm in the suite:
+`cargo bench -p ngnet-bench` builds with the pinned toolchain, a C compiler, CMake and
+libclang, plus those three submodules. [`../../running.md`](../../running.md) states the
+requirement in full.
 
 > **Editorial note, 2026-08-17.** The paragraph above previously read that `ngnet-bench`
 > "depends on `ngnet-h2` alone, so it needs neither the ngtcp2/nghttp3 submodules nor

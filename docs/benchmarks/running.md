@@ -9,9 +9,9 @@ anything.
 
 | Submodule | Reached through | Needed by |
 | --- | --- | --- |
-| `deps/nghttp2` | `ngnet-h2-sys` | every HTTP/2 arm |
-| `deps/nghttp3` **and its nested `lib/sfparse`** | `ngnet-h3-sys` | every QMux arm |
-| `deps/dwnx` | `ngnet-qmux-sys` | every QMux arm |
+| `crates/ngnet-h2-sys/vendor/nghttp2` | `ngnet-h2-sys` | every HTTP/2 arm |
+| `crates/ngnet-h3-sys/vendor/nghttp3` **and its nested `lib/sfparse`** | `ngnet-h3-sys` | every QMux arm |
+| `crates/ngnet-qmux-sys/vendor/dwnx` | `ngnet-qmux-sys` | every QMux arm |
 
 `nghttp3/lib/sfparse` is not optional and is not a test dependency: the structured-field
 parser is part of the library, and nghttp3 does not compile without it. "Clone
@@ -31,8 +31,8 @@ By hand, if `just` is not installed — or is older than 1.27, which cannot pars
 `error: Unknown attribute 'doc'` before running anything:
 
 ```sh
-git submodule update --init deps/nghttp2 deps/nghttp3 deps/dwnx
-git -C deps/nghttp3 submodule update --init lib/sfparse
+git submodule update --init crates/ngnet-h2-sys/vendor/nghttp2 crates/ngnet-h3-sys/vendor/nghttp3 crates/ngnet-qmux-sys/vendor/dwnx
+git -C crates/ngnet-h3-sys/vendor/nghttp3 submodule update --init lib/sfparse
 
 # The equivalent of `just submodules-status`:
 git submodule status --recursive
@@ -42,7 +42,8 @@ Building those three needs a C compiler, CMake 3.14 or newer, and libclang for `
 
 **What is still not needed is OpenSSL 3.5 or newer.** That requirement belongs to
 `ngnet-quic-sys`, which builds ngtcp2 and drives its handshake through OpenSSL's QUIC TLS API,
-and no arm in this suite reaches it — `deps/ngtcp2` need not be checked out to run the
+and no arm in this suite reaches it — `crates/ngnet-quic-sys/vendor/ngtcp2` need not be
+checked out to run the
 benchmarks at all. This is worth stating rather than leaving implicit, because the naive
 reading of "the benchmarks now cover HTTP/3" is that they must have acquired a QUIC transport
 and therefore a TLS stack with an unusually new OpenSSL floor. They have not: QMux runs over

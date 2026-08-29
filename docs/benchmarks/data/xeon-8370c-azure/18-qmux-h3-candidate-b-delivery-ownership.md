@@ -205,7 +205,8 @@ Candidate C; changing the framer cannot move it.
   investigated inbound option and were not touched.
 - Event/data/close order, fragmented records, multiple deliveries, EOF/error, abandonment, and
   early cleanup are unchanged because no production path changed.
-- No pool, free list, unsafe lifetime extension, `deps/dwnx` change, dependency addition, or
+- No pool, free list, unsafe lifetime extension, `crates/ngnet-qmux-sys/vendor/dwnx` change,
+  dependency addition, or
   large-buffer retention was introduced.
 
 ### Disposition
@@ -239,7 +240,7 @@ All locally supported phase checks passed on the pristine source:
 - `git diff --check`.
 
 The OpenSSL-dependent linkage test remains assigned to CI under the repository's documented
-machine limitation. `deps/dwnx` was not changed.
+machine limitation. `crates/ngnet-qmux-sys/vendor/dwnx` was not changed.
 
 ## Drift controls in the same session
 

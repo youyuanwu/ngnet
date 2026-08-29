@@ -74,13 +74,16 @@ hyper = { version = "1", features = ["client", "server", "http2"] }
 # Only for the tokio glue the bench needs: `TokioExecutor` for hyper's http2 spawns and its
 # own `TokioIo` stream adapter. Distinct from this crate's `TokioIo`; the bench aliases both.
 hyper-util = { version = "0.1", features = ["tokio"] }
+# The published crates carry a version alongside their path: cargo resolves the path for
+# workspace builds and writes the version into the registry manifest at publish time, and
+# refuses to publish a path dependency that has none.
 ngnet-axum = { path = "crates/ngnet-axum" }
-ngnet-h2 = { path = "crates/ngnet-h2" }
-ngnet-h2-sys = { path = "crates/ngnet-h2-sys" }
-ngnet-h3 = { path = "crates/ngnet-h3" }
-ngnet-h3-sys = { path = "crates/ngnet-h3-sys" }
-ngnet-quic-sys = { path = "crates/ngnet-quic-sys", default-features = false }
-ngnet-quic = { path = "crates/ngnet-quic" }
+ngnet-h2 = { path = "crates/ngnet-h2", version = "0.0.1" }
+ngnet-h2-sys = { path = "crates/ngnet-h2-sys", version = "0.0.1" }
+ngnet-h3 = { path = "crates/ngnet-h3", version = "0.0.1" }
+ngnet-h3-sys = { path = "crates/ngnet-h3-sys", version = "0.0.1" }
+ngnet-quic-sys = { path = "crates/ngnet-quic-sys", version = "0.0.1", default-features = false }
+ngnet-quic = { path = "crates/ngnet-quic", version = "0.0.1" }
 # The QMux pair. Unrelated to the QUIC crates above despite the similar name: QMux is a
 # different protocol over a different substrate, and a workspace test asserts neither family
 # reaches the other.
@@ -91,7 +94,7 @@ ngnet-qmux = { path = "crates/ngnet-qmux" }
 # side is what lets a caller take HTTP/3 without a transport implementation, or a transport
 # without an HTTP/3 state machine; a workspace test asserts that no other crate joins them,
 # and that neither transport family reaches the other.
-ngnet-quic-h3 = { path = "crates/ngnet-quic-h3" }
+ngnet-quic-h3 = { path = "crates/ngnet-quic-h3", version = "0.0.1" }
 ngnet-qmux-h3 = { path = "crates/ngnet-qmux-h3" }
 ngnet-util = { path = "crates/ngnet-util" }
 # Build-time only, and only for the `crypto-ossl` feature of `ngnet-quic-sys`:

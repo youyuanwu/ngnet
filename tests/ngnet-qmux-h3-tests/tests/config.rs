@@ -445,7 +445,8 @@ async fn a_small_stream_allowance_is_spent_once_and_never_returned() {
 #[tokio::test]
 async fn a_stream_allowance_at_the_transport_maximum_is_accepted() {
     // The upper bound, from below. `DWNX_MAX_STREAMS` is `1 << 60`
-    // (`deps/dwnx/lib/dwnx_transport_params.h:63`) and it is inclusive, which is worth pinning
+    // (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_transport_params.h:63`) and it is
+    // inclusive, which is worth pinning
     // beside the test that a value above it fails: without this one, that test would be
     // consistent with the whole region near the ceiling being unusable.
     LocalSet::new()

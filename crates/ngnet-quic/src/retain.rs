@@ -8,7 +8,7 @@
 //! > `ngtcp2_callbacks.acked_stream_data_offset` indicates that they are acknowledged by a
 //! > remote endpoint or the stream is closed.
 //! >
-//! > — `deps/ngtcp2/lib/includes/ngtcp2/ngtcp2.h:5244-5248`
+//! > — `crates/ngnet-quic-sys/vendor/ngtcp2/lib/includes/ngtcp2/ngtcp2.h:5244-5248`
 //!
 //! A safe API therefore cannot pass the caller's borrow through and return. The caller is
 //! free to drop that buffer the instant the call ends, and any later retransmission would

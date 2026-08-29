@@ -2,7 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 /// Relative location of the vendored ngtcp2 checkout from this crate's root.
-const VENDOR_RELATIVE: &str = "../../deps/ngtcp2";
+const VENDOR_RELATIVE: &str = "vendor/ngtcp2";
 
 /// The first OpenSSL release with the QUIC TLS API ngtcp2's `ossl` backend is
 /// written against. See [`find_openssl`] for why an older one is a hard error
@@ -470,7 +470,7 @@ fn generate_bindings(
             // This is the *only* part of `libngtcp2_crypto_ossl` that has to be
             // replaced. `SSL_set_quic_tls_cbs` swaps OpenSSL's record layer for
             // a dispatch table of our own, which is what the C helper does
-            // (`deps/ngtcp2/crypto/ossl/ossl.c:1252-1289`) -- it is an adapter
+            // (`vendor/ngtcp2/crypto/ossl/ossl.c:1252-1289`) -- it is an adapter
             // over this API, not a privileged path into OpenSSL.
             //
             // The helper's version of this is unusable here for one specific

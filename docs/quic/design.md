@@ -20,7 +20,7 @@ Almost every name in the ngtcp2 manual — `ngtcp2_conn_read_pkt`, `ngtcp2_conn_
 `ngtcp2_settings_default`, fifteen others — is a **function-like macro**. Each injects a
 struct-version constant and forwards to a `_versioned` symbol, so that a caller compiled
 against an older header keeps working when a struct gains a field
-(`deps/ngtcp2/lib/includes/ngtcp2/ngtcp2.h:7295-7476`).
+(`crates/ngnet-quic-sys/vendor/ngtcp2/lib/includes/ngtcp2/ngtcp2.h:7295-7476`).
 
 bindgen does not emit function-like macros. The generated bindings contain
 `ngtcp2_conn_read_pkt_versioned` and no `ngtcp2_conn_read_pkt` at all.
@@ -36,7 +36,7 @@ none has escaped into another module.
 
 ngtcp2 checks its settings, its transport parameters, and the presence of its mandatory
 callbacks with `assert()` — about forty lines of them at the top of each connection
-constructor (`deps/ngtcp2/lib/ngtcp2_conn.c:1250-1291`).
+constructor (`crates/ngnet-quic-sys/vendor/ngtcp2/lib/ngtcp2_conn.c:1250-1291`).
 
 `assert()` compiles to nothing when `NDEBUG` is defined, and the `cmake` crate maps the
 cargo profile onto `CMAKE_BUILD_TYPE`, so a release build of this workspace produces a
@@ -339,7 +339,7 @@ borrowed a driver field would make the driver self-referential.
 It is natural to assume a QUIC driver needs two deadlines — one for loss recovery and the
 idle timeout, another for pacing, since ngtcp2 refuses to send before its pacing time. It
 does not. `ngtcp2_conn_get_expiry2` ends with `ngtcp2_min(res, conn->tx.pacing.next_ts)`
-(`deps/ngtcp2/lib/ngtcp2_conn.c:11387`), so what `Conn::expiry` reports is already the
+(`crates/ngnet-quic-sys/vendor/ngtcp2/lib/ngtcp2_conn.c:11387`), so what `Conn::expiry` reports is already the
 earlier of the two.
 
 The practical consequence is the whole reason this is written down. The driver rearms from

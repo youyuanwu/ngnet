@@ -14,13 +14,13 @@ Design notes, the invariants the test suite pins, and the tracked backlog live i
 | [`ngnet-h2`](crates/ngnet-h2) | Safe, sans-I/O API driving a client or server connection, the caller owning the transport — plus an optional asynchronous `http`/`http-body` client and server built on it (default `http` feature). |
 | [`ngnet-h2-sys`](crates/ngnet-h2-sys) | Raw FFI bindings. Builds libnghttp2 from source and generates bindings with `bindgen`. |
 | [`ngnet-h2-tests`](tests/ngnet-h2-tests) | Not published. Drives `ngnet-h2` over a real async transport, so the wrapper needs no runtime dependency of its own. |
-| [`ngnet-h3`](crates/ngnet-h3) | Not published yet — the API is still expected to change; see [`docs/h3/pending-work.md`](docs/h3/pending-work.md). Safe, sans-I/O API driving an HTTP/3 client or server connection over QUIC streams the caller owns — plus an optional asynchronous `http`/`http-body` client and server built on it (default `http` feature). No QUIC or TLS of its own. |
-| [`ngnet-h3-sys`](crates/ngnet-h3-sys) | Not published yet, alongside `ngnet-h3`. Raw FFI bindings. Builds libnghttp3 from source and generates bindings with `bindgen`. |
+| [`ngnet-h3`](crates/ngnet-h3) | Published at 0.0.x — the API is still expected to change, so every release is a breaking one; see [`docs/h3/pending-work.md`](docs/h3/pending-work.md). Safe, sans-I/O API driving an HTTP/3 client or server connection over QUIC streams the caller owns — plus an optional asynchronous `http`/`http-body` client and server built on it (default `http` feature). No QUIC or TLS of its own. |
+| [`ngnet-h3-sys`](crates/ngnet-h3-sys) | Published alongside `ngnet-h3`. Raw FFI bindings. Builds libnghttp3 from source and generates bindings with `bindgen`. |
 | [`ngnet-h3-tests`](tests/ngnet-h3-tests) | Not published. Drives `ngnet-h3` over a real QUIC connection using [quinn](https://github.com/quinn-rs/quinn), so the wrapper needs no transport dependency of its own. Contains the reference `QuicConnection` implementation. |
-| [`ngnet-quic`](crates/ngnet-quic) | Not published yet — the API is still expected to change; see [`docs/quic/pending-work.md`](docs/quic/pending-work.md). Safe API driving a QUIC client or server. A sans-I/O state machine, and behind the default-on `endpoint` feature an asynchronous layer that owns a UDP socket and every connection on it, with the socket and clock as seams a caller implements and a ready-made pair for tokio behind an optional feature. Servers can validate client addresses before committing state. TLS is a backend seam with a default-on OpenSSL implementation. |
-| [`ngnet-quic-sys`](crates/ngnet-quic-sys) | Not published yet, alongside `ngnet-quic`. Raw FFI bindings to [ngtcp2](https://github.com/ngtcp2/ngtcp2), the QUIC transport. Builds libngtcp2 from source with `bindgen`, plus its OpenSSL crypto helper behind a default-on `crypto-ossl` feature. |
+| [`ngnet-quic`](crates/ngnet-quic) | Published at 0.0.x — the API is still expected to change, so every release is a breaking one; see [`docs/quic/pending-work.md`](docs/quic/pending-work.md). Safe API driving a QUIC client or server. A sans-I/O state machine, and behind the default-on `endpoint` feature an asynchronous layer that owns a UDP socket and every connection on it, with the socket and clock as seams a caller implements and a ready-made pair for tokio behind an optional feature. Servers can validate client addresses before committing state. TLS is a backend seam with a default-on OpenSSL implementation. |
+| [`ngnet-quic-sys`](crates/ngnet-quic-sys) | Published alongside `ngnet-quic`. Raw FFI bindings to [ngtcp2](https://github.com/ngtcp2/ngtcp2), the QUIC transport. Builds libngtcp2 from source with `bindgen`, plus its OpenSSL crypto helper behind a default-on `crypto-ossl` feature. |
 | [`ngnet-quic-tests`](tests/ngnet-quic-tests) | Not published. Drives `ngnet-quic` through real TLS handshakes and real stream data, in process and over loopback UDP, so the wrapper needs no certificate or runtime dependency of its own. |
-| [`ngnet-quic-h3`](crates/ngnet-quic-h3) | Not published yet, alongside the two crates it binds. HTTP/3 over ngtcp2: implements `ngnet-h3`'s transport trait on an `ngnet-quic` connection, so the two families in this workspace form one stack. The only crate that depends on both — deliberately, and a dependency-graph test enforces it, so a caller wanting either alone pays for neither. |
+| [`ngnet-quic-h3`](crates/ngnet-quic-h3) | Published alongside the two crates it binds. HTTP/3 over ngtcp2: implements `ngnet-h3`'s transport trait on an `ngnet-quic` connection, so the two families in this workspace form one stack. The only crate that depends on both — deliberately, and a dependency-graph test enforces it, so a caller wanting either alone pays for neither. |
 | [`ngnet-quic-h3-tests`](tests/ngnet-quic-h3-tests) | Not published. Drives HTTP/3 over ngtcp2 across real loopback UDP, and interoperates against [quinn](https://github.com/quinn-rs/quinn) in both roles. |
 | [`ngnet-qmux`](crates/ngnet-qmux) | Not published yet — QMux is an unratified IETF draft and dwnx is early-stage; see [`docs/qmux/pending-work.md`](docs/qmux/pending-work.md). Safe API driving a [QMux](https://datatracker.ietf.org/doc/html/draft-ietf-quic-qmux) client or server: QUIC's multiplexed streams carried over any ordered, reliable byte stream. A sans-I/O state machine, and behind the default-on `io` feature an asynchronous layer that drives one connection over a byte stream the caller has already established, with the byte stream and clock as seams a caller implements and a ready-made pair for tokio behind an optional `tokio` feature. No TLS — the protocol mandates none and provides none — and no listener, because a QMux connection owns one stream and shares it with nothing. |
 | [`ngnet-qmux-sys`](crates/ngnet-qmux-sys) | Not published yet, alongside `ngnet-qmux`. Raw FFI bindings to [dwnx](https://github.com/ngtcp2/dwnx). The one `-sys` crate here that compiles its C sources directly with `cc` rather than driving CMake, because dwnx ships autotools only; viable because libdwnx depends on nothing at all. |
@@ -243,10 +243,10 @@ This repo vendors four upstream C libraries as git submodules:
 
 | Submodule | Tag | Purpose |
 | --- | --- | --- |
-| [`deps/nghttp2`](https://github.com/nghttp2/nghttp2) | `v1.70.0` | HTTP/2, behind `ngnet-h2-sys`. |
-| [`deps/nghttp3`](https://github.com/ngtcp2/nghttp3) | `v1.18.0` | HTTP/3 (RFC 9114) framing and QPACK (RFC 9204), behind `ngnet-h3-sys`. |
-| [`deps/ngtcp2`](https://github.com/ngtcp2/ngtcp2) | `v1.25.0` | QUIC transport (RFC 9000), behind `ngnet-quic-sys`. |
-| [`deps/dwnx`](https://github.com/ngtcp2/dwnx) | *(untagged)* | QMux (draft-ietf-quic-qmux), behind `ngnet-qmux-sys`. Pre-release and never tagged, so this one is pinned to a commit rather than a version. |
+| [`crates/ngnet-h2-sys/vendor/nghttp2`](https://github.com/nghttp2/nghttp2) | `v1.70.0` | HTTP/2, packaged with `ngnet-h2-sys`. |
+| [`crates/ngnet-h3-sys/vendor/nghttp3`](https://github.com/ngtcp2/nghttp3) | `v1.18.0` | HTTP/3 (RFC 9114) framing and QPACK (RFC 9204), packaged with `ngnet-h3-sys`. |
+| [`crates/ngnet-quic-sys/vendor/ngtcp2`](https://github.com/ngtcp2/ngtcp2) | `v1.25.0` | QUIC transport (RFC 9000), packaged with `ngnet-quic-sys`. |
+| [`crates/ngnet-qmux-sys/vendor/dwnx`](https://github.com/ngtcp2/dwnx) | *(untagged)* | QMux (draft-ietf-quic-qmux), behind `ngnet-qmux-sys`. Pre-release and never tagged, so this one is pinned to a commit rather than a version. |
 
 `nghttp3` depends on no QUIC transport and on no TLS library — it is a state
 machine over stream bytes — and neither does `ngnet-h3`. Choosing a QUIC
@@ -293,10 +293,10 @@ git clone https://github.com/youyuanwu/ngnet.git
 cd ngnet
 
 # ...then init the four top-level submodules (non-recursive)...
-git submodule update --init deps/nghttp2 deps/nghttp3 deps/ngtcp2 deps/dwnx
+git submodule update --init crates/ngnet-h2-sys/vendor/nghttp2 crates/ngnet-h3-sys/vendor/nghttp3 crates/ngnet-quic-sys/vendor/ngtcp2 crates/ngnet-qmux-sys/vendor/dwnx
 
 # ...plus the one nested submodule that nghttp3's own sources require.
-git -C deps/nghttp3 submodule update --init lib/sfparse
+git -C crates/ngnet-h3-sys/vendor/nghttp3 submodule update --init lib/sfparse
 ```
 
 The same two commands update an existing clone.
@@ -335,7 +335,7 @@ cargo test
 
 `crates/ngnet-h2-sys/build.rs` drives the native build:
 
-1. Locates the `deps/nghttp2` submodule and fails with actionable instructions
+1. Locates the packaged `vendor/nghttp2` submodule and fails with actionable instructions
    if it has not been checked out.
 2. Configures CMake with `ENABLE_LIB_ONLY=ON`, which disables the applications,
    examples and HPACK tools. This is what keeps the nested submodules and the
