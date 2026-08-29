@@ -770,4 +770,147 @@ mod tests {
         ));
         assert!(matches!(lifecycle.next(), Step::NeedInput));
     }
+
+    #[test]
+    fn peer_stop_sending_is_reported_and_closes_after_receive_error() {
+        let mut lifecycle = Lifecycle::new();
+        let id = stream(0);
+        let tx = ErrorCode::new(0x11);
+        let rx = ErrorCode::new(0x22);
+        lifecycle.insert_bidi(id, (), ());
+        lifecycle.push(Incoming::StopSending {
+            stream: id,
+            code: tx,
+        });
+        lifecycle.push(Incoming::Reset {
+            stream: id,
+            code: rx,
+        });
+
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::StopSending { stream, code } if stream == id && code == tx
+        ));
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::Reset { stream, code } if stream == id && code == rx
+        ));
+        assert!(matches!(lifecycle.next(), Step::Boundary));
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::StreamClosed {
+                stream,
+                rx_code: Some(actual_rx),
+                tx_code: Some(actual_tx),
+            } if stream == id && actual_rx == rx && actual_tx == tx
+        ));
+    }
+
+    #[test]
+    fn send_error_first_preserves_both_direction_codes() {
+        let mut lifecycle = Lifecycle::new();
+        let id = stream(0);
+        let tx = ErrorCode::new(0x11);
+        let rx = ErrorCode::new(0x22);
+        lifecycle.insert_bidi(id, (), ());
+        lifecycle.push(Incoming::SendStopped {
+            stream: id,
+            code: Some(tx),
+        });
+        lifecycle.push(Incoming::Reset {
+            stream: id,
+            code: rx,
+        });
+
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::Reset { stream, code } if stream == id && code == rx
+        ));
+        assert!(matches!(lifecycle.next(), Step::Boundary));
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::StreamClosed {
+                stream,
+                rx_code: Some(actual_rx),
+                tx_code: Some(actual_tx),
+            } if stream == id && actual_rx == rx && actual_tx == tx
+        ));
+    }
+
+    #[test]
+    fn peer_reset_wins_a_later_local_stop_race() {
+        let mut lifecycle = Lifecycle::new();
+        let id = stream(0);
+        let peer = ErrorCode::new(0x11);
+        lifecycle.insert_bidi(id, (), ());
+        lifecycle.finish_send(id, None);
+        lifecycle.push(Incoming::Reset {
+            stream: id,
+            code: peer,
+        });
+        lifecycle.push(Incoming::RecvStopped {
+            stream: id,
+            code: ErrorCode::new(0x22),
+        });
+
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::Reset { stream, code } if stream == id && code == peer
+        ));
+        assert!(matches!(lifecycle.next(), Step::Boundary));
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::StreamClosed {
+                stream,
+                rx_code: Some(actual),
+                tx_code: None,
+            } if stream == id && actual == peer
+        ));
+        assert!(matches!(lifecycle.next(), Step::NeedInput));
+    }
+
+    #[test]
+    fn refused_write_after_finish_cannot_fabricate_a_send_error() {
+        let mut streams = Streams::new();
+        let id = stream(0);
+        streams.insert_bidi(id, (), ());
+        assert!(streams.finish_send(id, None));
+        assert!(streams.send_finished(id));
+        assert!(!streams.finish_send(id, Some(ErrorCode::new(0x11))));
+        assert!(streams.finish_recv(id, None));
+        assert_eq!(
+            streams.pop_close(),
+            Some(Closed {
+                stream: id,
+                rx_code: None,
+                tx_code: None,
+            })
+        );
+    }
+
+    #[test]
+    fn continuously_arriving_unrelated_releases_cannot_starve_close() {
+        let mut lifecycle = Lifecycle::new();
+        let closing = stream(0);
+        let other = stream(4);
+        lifecycle.insert_bidi(closing, (), ());
+        lifecycle.insert_bidi(other, (), ());
+        lifecycle.release(closing, 1);
+        lifecycle.finish_send(closing, None);
+        lifecycle.streams.finish_recv(closing, None);
+
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::Released { stream, bytes: 1, .. } if stream == closing
+        ));
+        lifecycle.release(other, 1);
+        assert!(matches!(lifecycle.next(), Step::Boundary));
+        for _ in 0..100 {
+            lifecycle.release(other, 1);
+        }
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::StreamClosed { stream, .. } if stream == closing
+        ));
+    }
 }

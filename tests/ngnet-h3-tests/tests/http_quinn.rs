@@ -60,9 +60,9 @@ fn with_trailers(bytes: Bytes, trailers: http::HeaderMap) -> Payload {
     }
 }
 
-fn pending() -> Payload {
+fn once_then_pending(bytes: Bytes) -> Payload {
     Payload {
-        chunk: None,
+        chunk: Some(bytes),
         trailers: None,
         pending: true,
     }
@@ -856,7 +856,7 @@ fn cancelling_a_live_request_resets_both_quinn_directions() {
                     http::Request::builder()
                         .method("POST")
                         .uri("https://localhost/live-cancel")
-                        .body(pending())
+                        .body(once_then_pending(Bytes::from(vec![0x5a; 512 * 1024])))
                         .expect("a request"),
                 ),
             );
@@ -864,6 +864,9 @@ fn cancelling_a_live_request_resets_both_quinn_directions() {
                 _ = started.notified() => {}
                 result = &mut request => panic!("response settled before cancellation: {result:?}"),
             }
+            // Let the peer reader consume its bounded read-ahead while the handler leaves
+            // the body untouched. Cancellation must still interrupt the parked reader.
+            tokio::time::sleep(Duration::from_millis(50)).await;
             drop(request);
 
             tokio::time::timeout(Duration::from_secs(10), async {
