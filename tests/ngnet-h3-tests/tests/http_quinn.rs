@@ -14,13 +14,19 @@
 //! `tests/ngnet-h3-tests/tests/quic.rs` remains alongside this, driving the *sans-I/O core*
 //! over quinn. Neither replaces the other.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
-use ngnet_h3::http::{Cancelled, IncomingBody, handshake, serve};
-use ngnet_h3_quinn::QuinnBackend;
+use ngnet_h3::http::quic::Timestamp;
+use ngnet_h3::http::{
+    Cancelled, IncomingBody, QuicConnection, QuicEvent, StreamSource, handshake, serve,
+};
+use ngnet_h3::{ErrorCode, StreamId};
+use ngnet_h3_quinn::{QuinnBackend, QuinnError};
 use ngnet_h3_tests::Tuning;
 
 /// A single-chunk body, since `http-body-util` is not a dependency here either.
@@ -78,6 +84,129 @@ impl Body for Payload {
 
 type Answer = std::pin::Pin<Box<dyn core::future::Future<Output = http::Response<Payload>> + Send>>;
 
+#[derive(Default)]
+struct EventLog {
+    pending: u64,
+    fins: HashMap<StreamId, u64>,
+    closes: HashMap<StreamId, (u64, Option<ErrorCode>, Option<ErrorCode>, usize)>,
+    peer_resets: Vec<(StreamId, ErrorCode)>,
+    local_resets: Vec<(StreamId, ErrorCode)>,
+    local_stops: Vec<(StreamId, ErrorCode)>,
+}
+
+impl EventLog {
+    fn record(&mut self, event: &QuicEvent) {
+        match event {
+            QuicEvent::Data {
+                stream, fin: true, ..
+            } => {
+                self.fins.insert(*stream, self.pending);
+            }
+            QuicEvent::StreamClosed {
+                stream,
+                rx_code,
+                tx_code,
+            } => {
+                let entry =
+                    self.closes
+                        .entry(*stream)
+                        .or_insert((self.pending, *rx_code, *tx_code, 0));
+                entry.3 += 1;
+            }
+            QuicEvent::Reset { stream, code } => self.peer_resets.push((*stream, *code)),
+            _ => {}
+        }
+    }
+}
+
+struct RecordedQuinn {
+    inner: QuinnBackend,
+    log: Arc<Mutex<EventLog>>,
+}
+
+impl RecordedQuinn {
+    fn new(inner: QuinnBackend) -> (Self, Arc<Mutex<EventLog>>) {
+        let log = Arc::new(Mutex::new(EventLog::default()));
+        (
+            Self {
+                inner,
+                log: Arc::clone(&log),
+            },
+            log,
+        )
+    }
+}
+
+impl QuicConnection for RecordedQuinn {
+    type Error = QuinnError;
+
+    const RETAINS_BUFFERS: bool = QuinnBackend::RETAINS_BUFFERS;
+
+    fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Result<QuicEvent, Self::Error>> {
+        match self.inner.poll_event(cx) {
+            Poll::Pending => {
+                self.log.lock().expect("event log").pending += 1;
+                Poll::Pending
+            }
+            Poll::Ready(Ok(event)) => {
+                self.log.lock().expect("event log").record(&event);
+                Poll::Ready(Ok(event))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+        }
+    }
+
+    fn poll_transmit<S: StreamSource>(
+        &mut self,
+        cx: &mut Context<'_>,
+        source: &mut S,
+    ) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_transmit(cx, source)
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_flush(cx)
+    }
+
+    fn poll_open_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<StreamId, Self::Error>> {
+        self.inner.poll_open_uni(cx)
+    }
+
+    fn poll_open_bi(&mut self, cx: &mut Context<'_>) -> Poll<Result<StreamId, Self::Error>> {
+        self.inner.poll_open_bi(cx)
+    }
+
+    fn reset(&mut self, stream: StreamId, code: ErrorCode) -> Result<(), Self::Error> {
+        self.log
+            .lock()
+            .expect("event log")
+            .local_resets
+            .push((stream, code));
+        self.inner.reset(stream, code)
+    }
+
+    fn stop_sending(&mut self, stream: StreamId, code: ErrorCode) -> Result<(), Self::Error> {
+        self.log
+            .lock()
+            .expect("event log")
+            .local_stops
+            .push((stream, code));
+        self.inner.stop_sending(stream, code)
+    }
+
+    fn extend_credit(&mut self, stream: Option<StreamId>, bytes: u64) -> Result<(), Self::Error> {
+        self.inner.extend_credit(stream, bytes)
+    }
+
+    fn close(&mut self, code: ErrorCode, reason: &[u8]) -> Result<(), Self::Error> {
+        self.inner.close(code, reason)
+    }
+
+    fn now(&self) -> Timestamp {
+        self.inner.now()
+    }
+}
+
 /// Reads a body to the end, keeping any trailers it carried.
 async fn read_body(mut body: IncomingBody) -> (Vec<u8>, Option<http::HeaderMap>) {
     let mut out = Vec::new();
@@ -132,6 +261,41 @@ where
     let outcome = tokio::time::timeout(LIMIT, body(handle))
         .await
         .expect("the exchange should not take this long");
+
+    client.abort();
+    server.abort();
+    drop(pair);
+    outcome
+}
+
+async fn over_recorded_quic<F, Fut, T>(tuning: Tuning, handler: Responder, body: F) -> T
+where
+    F: FnOnce(
+        ngnet_h3::http::SendRequest<Payload>,
+        Arc<Mutex<EventLog>>,
+        Arc<Mutex<EventLog>>,
+    ) -> Fut,
+    Fut: core::future::Future<Output = T>,
+{
+    let pair = ngnet_h3_tests::connected_pair(tuning)
+        .await
+        .expect("a connected pair");
+
+    let (client_backend, client_log) = RecordedQuinn::new(QuinnBackend::new(pair.client.clone()));
+    let (server_backend, server_log) = RecordedQuinn::new(QuinnBackend::new(pair.server.clone()));
+    let (handle, client_driver) = handshake::<_, Payload>(client_backend).expect("handshake");
+    let server_driver = serve(server_backend, handler).expect("serve");
+
+    let client = tokio::task::spawn_local(async move {
+        let _ = client_driver.await;
+    });
+    let server = tokio::task::spawn_local(async move {
+        let _ = server_driver.await;
+    });
+
+    let outcome = tokio::time::timeout(LIMIT, body(handle, client_log, server_log))
+        .await
+        .expect("the recorded exchange should not take this long");
 
     client.abort();
     server.abort();
@@ -458,4 +622,163 @@ fn a_connection_outlives_the_endpoint_it_was_created_from() {
         client.abort();
         server.abort();
     });
+}
+
+#[test]
+fn successful_streams_close_once_after_fin_without_retaining_history() {
+    const STREAMS: usize = 1_000;
+
+    run(over_recorded_quic(
+        Tuning::roomy(),
+        echo(),
+        |handle, client_log, server_log| async move {
+            for _ in 0..STREAMS {
+                let response = handle
+                    .send_request(
+                        http::Request::builder()
+                            .uri("https://localhost/")
+                            .body(empty())
+                            .expect("a request"),
+                    )
+                    .await
+                    .expect("a response");
+                let (body, trailers) = read_body(response.into_body()).await;
+                assert!(body.is_empty());
+                assert!(trailers.is_none());
+            }
+
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let client_closed = client_log.lock().expect("client log").closes.len();
+                    let server_closed = server_log.lock().expect("server log").closes.len();
+                    if client_closed == STREAMS && server_closed == STREAMS {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("all successful streams should close");
+
+            for (side, log) in [("client", client_log), ("server", server_log)] {
+                let log = log.lock().expect("event log");
+                assert_eq!(log.closes.len(), STREAMS, "{side} closure count");
+                assert_eq!(log.fins.len(), STREAMS, "{side} FIN count");
+                for (stream, (close_pending, rx_code, tx_code, count)) in &log.closes {
+                    assert_eq!(*count, 1, "{side} closed stream {stream} more than once");
+                    assert_eq!(*rx_code, None, "{side} receive direction was not clean");
+                    assert_eq!(*tx_code, None, "{side} send direction was not clean");
+                    let fin_pending = log
+                        .fins
+                        .get(stream)
+                        .unwrap_or_else(|| panic!("{side} closed stream {stream} before FIN"));
+                    assert!(
+                        close_pending > fin_pending,
+                        "{side} closed stream {stream} without a Pending batch boundary"
+                    );
+                }
+            }
+        },
+    ));
+}
+
+#[test]
+fn dropping_a_request_stops_both_quinn_directions_and_closes_once() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let handler_started = Arc::clone(&started);
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handler_cancelled = Arc::clone(&cancelled);
+    let responder: Responder = Box::new(move |request: http::Request<IncomingBody>| {
+        let signal = request
+            .extensions()
+            .get::<Cancelled>()
+            .cloned()
+            .expect("a cancellation signal");
+        handler_started.notify_one();
+        let cancelled = Arc::clone(&handler_cancelled);
+        Box::pin(async move {
+            signal.cancelled().await;
+            cancelled.store(true, std::sync::atomic::Ordering::Release);
+            http::Response::builder()
+                .status(200)
+                .body(empty())
+                .expect("a response")
+        }) as Answer
+    });
+
+    run(over_recorded_quic(
+        Tuning::roomy(),
+        responder,
+        move |handle, client_log, server_log| async move {
+            let request = handle.send_request(
+                http::Request::builder()
+                    .uri("https://localhost/cancel")
+                    .body(empty())
+                    .expect("a request"),
+            );
+            let mut request = Box::pin(request);
+            tokio::select! {
+                _ = started.notified() => {}
+                result = &mut request => panic!("response settled before cancellation: {result:?}"),
+            }
+            drop(request);
+
+            let settled = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let handler_saw_cancel = cancelled.load(std::sync::atomic::Ordering::Acquire);
+                    let client_closed = client_log.lock().expect("client log").closes.len();
+                    let server_closed = server_log.lock().expect("server log").closes.len();
+                    if handler_saw_cancel && client_closed == 1 && server_closed == 1 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            if settled.is_err() {
+                let client = client_log.lock().expect("client log");
+                let server = server_log.lock().expect("server log");
+                panic!(
+                    "cancel did not settle: handler={}, client closes={}, resets={}, stops={}; \
+                     server closes={}, peer resets={}",
+                    cancelled.load(std::sync::atomic::Ordering::Acquire),
+                    client.closes.len(),
+                    client.local_resets.len(),
+                    client.local_stops.len(),
+                    server.closes.len(),
+                    server.peer_resets.len(),
+                );
+            }
+
+            let cancelled_code = ErrorCode::new(0x10c);
+            let client = client_log.lock().expect("client log");
+            assert_eq!(client.local_resets.len(), 1);
+            assert_eq!(client.local_stops.len(), 1);
+            assert_eq!(client.local_resets[0].1, cancelled_code);
+            assert_eq!(client.local_stops[0].1, cancelled_code);
+            let (_, client_rx, client_tx, client_count) =
+                client.closes.values().next().expect("a client close");
+            assert_eq!(
+                (*client_rx, *client_tx),
+                (Some(cancelled_code), None),
+                "the already-finished request send direction must stay clean"
+            );
+            assert_eq!(*client_count, 1);
+            drop(client);
+
+            let server = server_log.lock().expect("server log");
+            assert!(
+                server.peer_resets.is_empty(),
+                "an already-finished request must not acquire a peer reset"
+            );
+            let (_, server_rx, server_tx, server_count) =
+                server.closes.values().next().expect("a server close");
+            assert_eq!(
+                (*server_rx, *server_tx),
+                (None, Some(cancelled_code)),
+                "the server read the request cleanly before its send was stopped"
+            );
+            assert_eq!(*server_count, 1);
+        },
+    ));
 }
