@@ -1,6 +1,6 @@
 //! Private stream ownership and bidirectional lifecycle tracking.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use ngnet_h3::{ErrorCode, StreamId};
 
@@ -17,6 +17,11 @@ struct Bidi<Stop> {
     close_queued: bool,
 }
 
+struct Send<Handle> {
+    handle: Handle,
+    finished: bool,
+}
+
 /// One bidirectional stream whose two directions have ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Closed {
@@ -30,8 +35,7 @@ pub(crate) struct Closed {
 /// The handle type is generic so the exact ownership path used with Quinn handles can be
 /// exercised with inert handles in unit tests.
 pub(crate) struct Streams<Handle, Stop> {
-    sends: HashMap<i64, Handle>,
-    finished: HashSet<i64>,
+    sends: HashMap<i64, Send<Handle>>,
     bidis: HashMap<i64, Bidi<Stop>>,
     closing: VecDeque<Closed>,
 }
@@ -40,18 +44,29 @@ impl<Handle, Stop> Streams<Handle, Stop> {
     pub(crate) fn new() -> Self {
         Self {
             sends: HashMap::new(),
-            finished: HashSet::new(),
             bidis: HashMap::new(),
             closing: VecDeque::new(),
         }
     }
 
     pub(crate) fn insert_uni(&mut self, stream: StreamId, send: Handle) {
-        self.sends.insert(stream.get(), send);
+        self.sends.insert(
+            stream.get(),
+            Send {
+                handle: send,
+                finished: false,
+            },
+        );
     }
 
     pub(crate) fn insert_bidi(&mut self, stream: StreamId, send: Handle, stop: Stop) {
-        self.sends.insert(stream.get(), send);
+        self.sends.insert(
+            stream.get(),
+            Send {
+                handle: send,
+                finished: false,
+            },
+        );
         self.bidis.insert(
             stream.get(),
             Bidi {
@@ -64,18 +79,28 @@ impl<Handle, Stop> Streams<Handle, Stop> {
     }
 
     pub(crate) fn send_mut(&mut self, stream: StreamId) -> Option<&mut Handle> {
-        self.sends.get_mut(&stream.get())
+        self.sends
+            .get_mut(&stream.get())
+            .map(|send| &mut send.handle)
     }
 
     pub(crate) fn send_finished(&self, stream: StreamId) -> bool {
-        self.finished.contains(&stream.get())
+        self.sends
+            .get(&stream.get())
+            .is_some_and(|send| send.finished)
     }
 
     /// Records the first terminal send outcome.
     ///
     /// Returns whether this call changed the direction.
     pub(crate) fn finish_send(&mut self, stream: StreamId, code: Option<ErrorCode>) -> bool {
-        self.finished.insert(stream.get());
+        let Some(send) = self.sends.get_mut(&stream.get()) else {
+            return false;
+        };
+        if send.finished {
+            return false;
+        }
+        send.finished = true;
         let changed = match self.bidis.get_mut(&stream.get()) {
             Some(bidi) if bidi.tx == Direction::Open => {
                 bidi.tx = Direction::Ended(code);
@@ -117,7 +142,6 @@ impl<Handle, Stop> Streams<Handle, Stop> {
     pub(crate) fn pop_close(&mut self) -> Option<Closed> {
         let closed = self.closing.pop_front()?;
         self.sends.remove(&closed.stream.get());
-        self.finished.remove(&closed.stream.get());
         self.bidis.remove(&closed.stream.get());
         Some(closed)
     }
@@ -125,7 +149,6 @@ impl<Handle, Stop> Streams<Handle, Stop> {
     pub(crate) fn clear(&mut self) {
         self.closing.clear();
         self.bidis.clear();
-        self.finished.clear();
         self.sends.clear();
     }
 
@@ -151,7 +174,7 @@ impl<Handle, Stop> Streams<Handle, Stop> {
     fn counts(&self) -> (usize, usize, usize, usize) {
         (
             self.sends.len(),
-            self.finished.len(),
+            self.sends.values().filter(|send| send.finished).count(),
             self.bidis.len(),
             self.closing.len(),
         )
@@ -252,6 +275,43 @@ mod tests {
             assert_eq!(streams.pop_close().map(|closed| closed.stream), Some(id));
         }
         assert_eq!(streams.counts(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn late_send_observation_does_not_retain_closed_stream_history() {
+        let mut streams = Streams::new();
+        let id = stream(0);
+        streams.insert_bidi(id, (), ());
+        assert!(streams.finish_send(id, None));
+        assert!(streams.finish_recv(id, None));
+        assert_eq!(streams.pop_close().map(|closed| closed.stream), Some(id));
+
+        assert!(!streams.finish_send(id, Some(ErrorCode::new(0x11))));
+        assert!(!streams.send_finished(id));
+        assert_eq!(streams.counts(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn terminal_outcome_for_unknown_stream_is_not_remembered() {
+        let mut streams = Streams::new();
+        let id = stream(0);
+
+        assert!(!streams.finish_send(id, Some(ErrorCode::new(0x11))));
+        assert!(!streams.finish_recv(id, Some(ErrorCode::new(0x22))));
+        assert_eq!(streams.counts(), (0, 0, 0, 0));
+
+        streams.insert_bidi(id, (), ());
+        assert!(!streams.send_finished(id));
+        assert!(streams.finish_send(id, None));
+        assert!(streams.finish_recv(id, None));
+        assert_eq!(
+            streams.pop_close(),
+            Some(Closed {
+                stream: id,
+                rx_code: None,
+                tx_code: None,
+            })
+        );
     }
 
     #[test]

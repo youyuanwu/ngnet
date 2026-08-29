@@ -206,7 +206,7 @@ fn spawn_acceptor(
                 Ok((send, recv)) => {
                     let stream = to_stream_id(send.id());
                     let (stop, receive_stop) = oneshot::channel();
-                    spawn_send_observer(send.stopped(), stream, to_driver.clone());
+                    let stopped = send.stopped();
                     // The sending half has to reach the driver *before* the stream is
                     // announced, and it must not be dropped on the way: quinn resets a
                     // stream whose sending half goes away, so a response would be refused
@@ -217,6 +217,9 @@ fn spawn_acceptor(
                     {
                         return;
                     }
+                    // Start observation only after queuing ownership. Otherwise an
+                    // immediately ready STOP_SENDING could overtake `Accepted`.
+                    spawn_send_observer(stopped, stream, to_driver.clone());
                     spawn_reader(recv, Some(receive_stop), to_driver.clone(), budget.clone());
                 }
                 Err(_) => {
@@ -448,17 +451,19 @@ impl QuicConnection for QuinnBackend {
                     return Poll::Ready(Ok(QuicEvent::Accepted { stream }));
                 }
                 Poll::Ready(Some(Incoming::Reset { stream, code })) => {
-                    self.streams.finish_recv(stream, Some(code));
-                    self.batch.emitted();
-                    return Poll::Ready(Ok(QuicEvent::Reset { stream, code }));
+                    if self.streams.finish_recv(stream, Some(code)) {
+                        self.batch.emitted();
+                        return Poll::Ready(Ok(QuicEvent::Reset { stream, code }));
+                    }
                 }
                 Poll::Ready(Some(Incoming::RecvStopped { stream, code })) => {
                     self.streams.finish_recv(stream, Some(code));
                 }
                 Poll::Ready(Some(Incoming::StopSending { stream, code })) => {
-                    self.streams.finish_send(stream, Some(code));
-                    self.batch.emitted();
-                    return Poll::Ready(Ok(QuicEvent::StopSending { stream, code }));
+                    if self.streams.finish_send(stream, Some(code)) {
+                        self.batch.emitted();
+                        return Poll::Ready(Ok(QuicEvent::StopSending { stream, code }));
+                    }
                 }
                 Poll::Ready(Some(Incoming::SendStopped { stream, code })) => {
                     self.streams.finish_send(stream, code);
@@ -598,8 +603,9 @@ impl QuicConnection for QuinnBackend {
                 self.opening_bi = None;
                 let stream = to_stream_id(send.id());
                 let (stop, receive_stop) = oneshot::channel();
-                spawn_send_observer(send.stopped(), stream, self._to_driver.clone());
+                let stopped = send.stopped();
                 self.streams.insert_bidi(stream, send, stop);
+                spawn_send_observer(stopped, stream, self._to_driver.clone());
                 // The receiving half must be read, not dropped: quinn turns a dropped
                 // receiving half into STOP_SENDING, so the peer's answer would be reset
                 // before it was written.
