@@ -1,13 +1,48 @@
 # What HTTP/3 over QMux costs against HTTP/2
 
-**Measurements:** [`08-qmux-against-h2`](../data/xeon-8370c-azure/08-qmux-against-h2.md) —
-`xeon-8370c-azure`, five passes, ratios formed within each pass. The mechanisms behind those
-ratios are [`09-qmux-h2-mechanisms`](../data/xeon-8370c-azure/09-qmux-h2-mechanisms.md), which
-answered both questions `08` left open by counting rather than timing.
+**Current measurement:** [`21-qmux-h3-combined-final-matrix`](../data/xeon-8370c-azure/21-qmux-h3-combined-final-matrix.md)
+— Xeon 8573C, three duplex and two socket passes, ratios formed within each pass. Runs
+[`16`](../data/xeon-8370c-azure/16-qmux-h3-baseline-and-pump-attribution.md) through
+[`20`](../data/xeon-8370c-azure/20-qmux-h3-candidate-d-event-queue.md) provide current counts,
+attribution, and rejected-candidate evidence. Runs
+[`08`](../data/xeon-8370c-azure/08-qmux-against-h2.md) and
+[`09`](../data/xeon-8370c-azure/09-qmux-h2-mechanisms.md) are the historical first comparison and
+mechanism study; their absolute timings are not controls across the Azure CPU migration.
+
+## Current post-PR-45 result
+
+| Workload | duplex QMux/H3 ÷ H2 | socket QMux/H3 ÷ H2 |
+| --- | ---: | ---: |
+| serial | **2.052×** | **1.876×** |
+| concurrency 1 | 2.010× | 1.854× |
+| concurrency 8 | 1.887× | 1.818× |
+| concurrency 64 | 1.816× | 1.776× |
+| body 0 | 2.063× | 1.878× |
+| body 1 KiB | 1.780× | 1.236× |
+| body 64 KiB | 1.508× | **1.005×** |
+| body 1 MiB | 1.222× | **0.845×** |
+
+Over a socket, QMux/H3 reaches parity near 64 KiB and is 15.5% faster at 1 MiB because it still
+writes far less often: 67 writes versus HTTP/2's 189. For empty and concurrent work it remains
+roughly 1.8–2.1× slower. The final branch's benchmark binaries are hash-identical to merged PR #45,
+so this work claims no production speedup.
+
+Four evidence-driven candidates were investigated. Removing duplicate open/transmit pumps cut reads and
+pumps from 73/70 to 40/37 but missed the socket timing gate. Safe delivery transfer removed 160
+mallocs, and bounded header storage removed 20 mallocs plus three reallocs; neither produced a
+stable qualifying elapsed win. Those three prototypes were reverted. Candidate D was not
+implemented: queue-local changes cannot reduce the 23 registered pops because they are
+one-for-one with fill-loop iterations, so the registered count gate was structurally impossible.
+
+## Historical mechanism result
 
 The cross-protocol arms were added so this question could be asked, and then it was not asked for
-several increments: every run before this one compared a build against another build. This is the
-first that compares the two stacks.
+several increments: every run before run 08 compared a build against another build. Run 08 was
+the first to compare the two stacks.
+
+Every section below reports runs `08` and `09` on the pre-migration host state. Their ratios are
+superseded by the current table above. The body-write mechanism remains current; the concurrency
+write-amplification mechanism was removed by run 11 and is retained below only as history.
 
 ## The answer is two numbers, not one
 
@@ -65,7 +100,7 @@ Before the write-path work in the same branch, that identifier was 1.29×. Coale
 records into one write is what moved it, and the mechanism is measured separately in
 [the QMux write path](qmux-write-path.md).
 
-## The concurrency inversion, which was the last thing unexplained
+## Historical concurrency inversion — superseded by run 11
 
 Concurrency over a socket is QMux's worst case at 3.12–3.14×, and it is *worse* than the same
 parameter over a duplex at 2.33× — the only workload in the suite where adding a kernel makes
@@ -90,9 +125,10 @@ ending to start a fresh batch — and a `Pending` ends the driver's turn, which 
 the outbound buffer to flush. One ending, one flush, one write, on each side: `2n + 2`. Deleting the
 rule to confirm this breaks the connection in precisely the way its own doc comment predicts.
 
-This also **corrects a claim** the earlier write-path work left behind. That work established the
-write count per *driver turn* no longer grows with the streams in flight, which is true. The number
-of driver turns does.
+This explained the pre-run-11 state only. Run 11 decoupled flushing from productive event-batch
+boundaries and reduced QMux writes at concurrency 1/8/64 from 4/18.009/132.052 to
+3/3.009/3.052. The old inversion and `2n + 2` write law therefore must not be projected onto the
+current implementation.
 
 ## What is still not explained
 

@@ -1,6 +1,7 @@
 # `xeon-8370c-azure`
 
-**Status: current.** The machine benchmarks are being collected on from 2026-08-16.
+**Status: historical Azure-VM label; current captures use the migrated CPU described below.**
+Runs have been collected in this directory since 2026-08-16.
 
 **First run:** 2026-08-16 · **Last run:** 2026-08-28
 
@@ -18,10 +19,10 @@
 | Frequency scaling | `performance` governor, `intel_pstate` with `no_turbo=0`. Turbo is **not** disabled, and a guest cannot pin the frequency, so some drift is expected. |
 | Rust toolchain | 1.97.1, from `rust-toolchain.toml` |
 
-> **Host migration note, run 12.** The `perf` header for run 12 reported an Intel Xeon Platinum
-> 8573C rather than the 8370C recorded above. The directory remains the historical VM label.
-> Run 12 uses within-run repetition for its current-revision verdict and does not treat absolute
-> differences from earlier runs as controlled hardware A/B measurements.
+> **Host migration note, runs 12–21.** The VM now reports an Intel Xeon Platinum 8573C,
+> kernel `6.17.0-1022-azure`, and Rust 1.98.0 rather than the 8370C/kernel/toolchain recorded
+> above. The directory remains the historical VM label. These runs use within-run controls and
+> never treat absolute differences across the migration as controlled hardware A/B evidence.
 
 **A shared virtual machine is not a benchmark rig.** Turbo cannot be disabled from inside the
 guest, the host's other tenants are invisible from here, and hyper-threading means a "pinned"
@@ -91,6 +92,12 @@ submodules. [`../../running.md`](../../running.md) states the requirement in ful
 | [13-qmux-h3-current-bottlenecks](13-qmux-h3-current-bottlenecks.md) | 2026-08-28 | `5477450` | Current bottlenecks — a duplicate event-path pump is **−5.4% duplex / −3.7% socket serial** in a diagnostic |
 | [14-qmux-h3-one-pump](14-qmux-h3-one-pump.md) | 2026-08-28 | `c6f1191` against `5477450` | Production one-pump rule — **96 → 73 reads; −5.26% duplex / −2.37% socket serial** |
 | [15-qmux-h3-shared-snapshot](15-qmux-h3-shared-snapshot.md) | 2026-08-28 | `0b6dcbd` against `c6f1191`, then `5477450` | Coherent shared work — **155 → 29 operations; −7.59% / −5.68% incremental serial** |
+| [16-qmux-h3-baseline-and-pump-attribution](16-qmux-h3-baseline-and-pump-attribution.md) | 2026-08-28 | `364dbb2` | Fresh post-PR-45 baseline on the migrated 8573C; exact **70-pump** source split with zero residual |
+| [17-qmux-h3-candidate-a-read-pump-amplification](17-qmux-h3-candidate-a-read-pump-amplification.md) | 2026-08-28 | `4e91115` against `43b7da0` | A2 removed **33/70 pumps**, but socket-serial timing did not clear spread/2% — reverted |
+| [18-qmux-h3-candidate-b-delivery-ownership](18-qmux-h3-candidate-b-delivery-ownership.md) | 2026-08-28 | `96a20e6` against `0104e85` | B3 removed **160 allocations**, but improved duplex by <1.1% and was flat on socket — reverted |
+| [19-qmux-h3-candidate-c-fixed-header-work](19-qmux-h3-candidate-c-fixed-header-work.md) | 2026-08-28 | `c188758` against `c7c95d9` | C1–C3 removed **20 mallocs and 3 reallocs**, but timing was inconsistent and failed both-substrate gates — reverted |
+| [20-qmux-h3-candidate-d-event-queue](20-qmux-h3-candidate-d-event-queue.md) | 2026-08-28 | `6bff8ee` | Pops remain **23 = 23 fill iterations**, including 16 empty; queue-local options cannot reduce the registered count — closed |
+| [21-qmux-h3-combined-final-matrix](21-qmux-h3-combined-final-matrix.md) | 2026-08-28 | `0984e1c` against `364dbb2` | Final binaries are hash-identical to the merged predecessor; fresh 16-case QMux/H3 ÷ H2 ratios range from **0.845× to 2.063×** |
 
 Still outstanding, in the order they are worth doing:
 

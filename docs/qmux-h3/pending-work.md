@@ -8,8 +8,8 @@ This is the implementation backlog produced by
 [`09-qmux-h2-mechanisms`](../benchmarks/data/xeon-8370c-azure/09-qmux-h2-mechanisms.md).
 The order is measured payoff divided by implementation risk, not source order.
 
-Items 1, 2, 4 and 5 are settled; item 3 is closed without implementation after reprofiling.
-Item 6 is the highest-priority open performance item.
+Items 1, 2, 4, 5, 6, 8, 9 and 10 are settled; item 3 is closed without implementation after
+reprofiling. Item 7 is the only open performance item.
 
 1. **Replace `ngnet-h3`'s linear closed-stream lookup — settled.** `Driver::close_stream` scanned a
    1024-entry tombstone `Vec` on every close after a connection reaches steady state. A
@@ -65,17 +65,59 @@ Item 6 is the highest-priority open performance item.
    spread. Fresh base-to-final serial timing is **11.75% / 8.59%** faster. The timing gate,
    rather than the count alone, retains the change; see
    [`run 15`](../benchmarks/data/xeon-8370c-azure/15-qmux-h3-shared-snapshot.md).
-6. **Design a cheaper ownership path for delivered record data.** At 1 MiB, QMux/H3 performs
-   818 allocator calls against HTTP/2's 205, and 83% of QMux/H3 malloc stacks belong to the
-   per-record delivery ownership path. The known pooled-reference design cut allocations but
-   was 2.5–4.8% slower, so do not repeat it. Any new design must remove the owned event
-   allocation without pool bookkeeping or long-lived large-buffer pinning, and must win a
-   timed A/B.
+6. **Design a cheaper ownership path for delivered record data — closed after refreshed
+   structural accounting.** The post-PR-45 baseline is 710 allocator calls at 1 MiB against
+   HTTP/2's 194.5, refreshed from the 818-versus-205 counts that opened this item. Each
+   exchange has 193 productive reads, 162 callback copies and 162 first-`Bytes` promotions;
+   158 of 160 H3 body views cover their whole parent. A safe non-pooled read/record owner needs
+   at least 193 owner allocations plus 162 `Bytes` control blocks, replacing only 324 current
+   allocations, so it cannot satisfy the count gate; a per-record owner merely breaks even at
+   324 before bookkeeping. Constructing `Bytes` in QMux violates its one-dependency boundary.
+   The safe B3 range-deferral prototype did remove 160 calls (**710 → 550**) and reduced the
+   sampled delivery share from 86.01% to 81.08%. Three 100-sample controlled passes improved
+   duplex by only 0.43–1.09%; socket changed from a 0.31% improvement to a 0.20% regression,
+   below the 2% and spread gates. The apparent
+   `RawVec` opportunity is not framer retention—fresh counters observed zero framer growth and
+   attributed 242 H3 growths to transport/event batches. Run 05's pooled negative remains
+   valid; do not retry delivery ownership without a changed lower-layer owner API or a newly
+   measured cost large enough to clear the elapsed gate. See
+   [`run 18`](../benchmarks/data/xeon-8370c-azure/18-qmux-h3-candidate-b-delivery-ownership.md).
 7. **Test HTTP/2 coalescing beyond one 16 KiB frame.** This is comparative work, not a QMux
-   defect. At a 1 MiB exchange HTTP/2 issues 189 writes and QMux issues 68; the measured HTTP/2
+   defect. At a 1 MiB exchange HTTP/2 issues 189 writes and QMux issues 67; the measured HTTP/2
    maximum is exactly 16 KiB while QMux can empty a 64 KiB buffer. A prototype must establish
    whether coalescing frames recovers the kernel-path gap without regressing latency or
    concurrency before it becomes an HTTP/2 change.
+8. **Collapse the remaining QMux event-loop pumps — closed after measured implementation.**
+   Fresh post-PR-45 attribution reconciled every empty-exchange pump: 23 from event filling,
+   seven before queued events, three around open, 32 in transmit drains, and five forced flushes.
+   A safe source-collapse implementation removed the duplicate open pre-pump and every
+   unconditional transmit pump, retaining only a buffer-capacity pump. Exact counts improved
+   from **70 → 37 pumps** and **73 → 40 reads**, with event/transmit/driver passes unchanged at
+   30/14/14. Despite that 47% count reduction, three controlled passes improved duplex serial
+   by 5.62% but socket serial by only **1.13%**, below both the 2% floor and the candidate's
+   2.87% spread, so the code was reverted. Pending-read caching remains unsafe without a new
+   guaranteed wake source, and driver-pass suppression lacks an outer turn boundary in the
+   transport interface. Do not retry these mechanisms from counts alone; see
+   [`run 17`](../benchmarks/data/xeon-8370c-azure/17-qmux-h3-candidate-a-read-pump-amplification.md).
+9. **Reduce fixed HTTP/3 header/QPACK overhead — measured and reverted.** A complete bounded
+   prototype inlined small received fields with heap fallback, reserved known field capacities,
+   and removed redundant validation/submission vectors without changing public APIs or validation.
+   It reduced exact per-exchange allocator activity from **128.02/6.02/128.02** to
+   **108.02/3.02/108.02 malloc/realloc/free**. Timing remained below the retention gate: duplex passes changed
+   −1.30% to −1.92%, while socket changed −0.74% to −0.88%, across three 100-sample passes.
+   No raw result cleared 2%. The code was reverted. The per-section slot scan remained
+   below profile resolution, and Registry/Tasks map work was too small to rescue the failed socket
+   gate. Do not retry header-storage or registry changes from allocation counts alone. Native QPACK
+   algorithm changes or a concrete concurrency-only mechanism would need independent gates. See
+   [`run 19`](../benchmarks/data/xeon-8370c-azure/19-qmux-h3-candidate-c-fixed-header-work.md).
+10. **Reduce QMux event-queue traffic independently — closed as coupled to Candidate A.** Fresh
+    counts still show **23 pops = 23 `Inner::fill` iterations**, seven pushes and 16 empty pops per
+    exchange. An uncontended locked empty pop costs 16.09–16.26 ns, so skipping all empty locks is
+    only about 0.26 µs and still leaves 23 registered pop calls. Atomic emptiness hints and storage
+    changes therefore fail the count gate; wholesale drain violates the lower queue's read-ahead
+    accounting boundary. Reducing caller invocations requires changing the fill/driver schedule,
+    which is the already measured and reverted Candidate A mechanism. See
+    [`run 20`](../benchmarks/data/xeon-8370c-azure/20-qmux-h3-candidate-d-event-queue.md).
 
 The duplicate-pump portion of the former 91-read observation is resolved in item 4; the remaining
 reads are not presumed redundant. The 16382-byte record payload and the fixed 64-offer yield were

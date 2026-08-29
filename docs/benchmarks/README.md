@@ -146,6 +146,7 @@ HTTP/2 arm and an HTTP/3-over-QMux arm.
 | [Write path and gathering](findings/write-path-and-gathering.md) | The arms separated on **write syscalls per pass**, not on the I/O model. Gathering closed the gap: −52% at N=8, −59% at N=64. |
 | [Reusing the coalescing buffer](findings/coalescing-buffer-reuse.md) | About 4–7% for the completion transport, from not rebuilding the buffer each pass. |
 | [Handing bodies over](findings/handing-bodies-over.md) | `NGHTTP2_DATA_FLAG_NO_COPY` is worth −24% to −31% at 1 MiB on the readiness transport, and a small but real gain on the completion one. |
+| [QMux against HTTP/2](findings/qmux-against-h2.md) | Post-PR-45 QMux/H3 is 1.8–2.1× slower for fixed/concurrent work, reaches 1.005× at socket 64 KiB and 0.845× at socket 1 MiB. Candidates A–C failed elapsed gates and were reverted; D was closed documentation-only because no queue-local mechanism could satisfy its count gate. |
 
 ## Where the numbers are
 
@@ -163,11 +164,9 @@ drift bar, survey the arms, and re-settle one verdict the legacy host could not.
 together**; a claim carried over from the legacy host is a claim awaiting re-measurement, and
 [`data/README.md`](data/README.md) says how to file the run that settles it.
 
-**No run recorded under [`data/`](data/) contains a QMux arm.** The arms exist and execute;
-nothing has yet been measured through them under the rules in [`running.md`](running.md), and
-so nothing about the two protocols' relative cost is established here. Building the instrument
-and using it were deliberately separated, and a figure taken while checking that the arms run
-is not a measurement — it was taken unpinned, without interleaving and without drift controls,
-which is exactly the shape of run [`controls.md`](controls.md) exists to reject. The one
-observation from that verification worth carrying forward is recorded, labelled as unmeasured,
-on [`../qmux-h3/pending-work.md`](../qmux-h3/pending-work.md).
+QMux/H3 is now measured against HTTP/2 in runs
+[`08`](data/xeon-8370c-azure/08-qmux-against-h2.md),
+[`09`](data/xeon-8370c-azure/09-qmux-h2-mechanisms.md),
+[`16`](data/xeon-8370c-azure/16-qmux-h3-baseline-and-pump-attribution.md), and
+[`21`](data/xeon-8370c-azure/21-qmux-h3-combined-final-matrix.md). Run 21 is the current
+post-PR-45 comparison; the earlier runs remain historical mechanism evidence.
