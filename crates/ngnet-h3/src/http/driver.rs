@@ -892,8 +892,9 @@ where
             // offering write turns to a stream that will never produce bytes again — a
             // failed body's stream is suspended, so it would otherwise be asked
             // indefinitely. It does not close the stream or release its buffers; only a
-            // stream close does that, and the transport reports none for a reset this end
-            // issued.
+            // stream close does that. Adapters that join both directions, such as
+            // ngnet-h3-quinn, report one after local reset; adapters without that authority
+            // may not.
             driver.conn.shutdown_stream_write(stream).ok();
             driver
                 .backend

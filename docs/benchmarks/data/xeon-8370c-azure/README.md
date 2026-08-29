@@ -23,6 +23,11 @@ Runs have been collected in this directory since 2026-08-16.
 > kernel `6.17.0-1022-azure`, and Rust 1.98.0 rather than the 8370C/kernel/toolchain recorded
 > above. The directory remains the historical VM label. These runs use within-run controls and
 > never treat absolute differences across the migration as controlled hardware A/B evidence.
+>
+> **Second migration note, run 24.** The VM again reports an Intel Xeon Platinum 8370C,
+> now with kernel `7.0.0-1012-azure` and Rust 1.98.0. Run 24 therefore uses its own fresh
+> interleaved baseline; neither the original 8370C runs nor the intervening 8573C runs are
+> treated as absolute controls.
 
 **A shared virtual machine is not a benchmark rig.** Turbo cannot be disabled from inside the
 guest, the host's other tenants are invisible from here, and hyper-threading means a "pinned"
@@ -103,6 +108,7 @@ requirement in full.
 | [21-qmux-h3-combined-final-matrix](21-qmux-h3-combined-final-matrix.md) | 2026-08-28 | `0984e1c` against `364dbb2` | Final binaries are hash-identical to the merged predecessor; fresh 16-case QMux/H3 ÷ H2 ratios range from **0.845× to 2.063×** |
 | [22-qmux-h3-at-8-mib](22-qmux-h3-at-8-mib.md) | 2026-08-29 | `cae8330` | At 8 MiB, QMux/H3 is **1.182× over a duplex and 0.919× over a socket** |
 | [23-ngnet-h3-quinn-vs-h3-quinn](23-ngnet-h3-quinn-vs-h3-quinn.md) | 2026-08-29 | `feature/ngnet-h3-quinn` based on `eeddf04` | Quinn-matched HTTP/3 comparison: **2.684× empty, 1.463× at 16 KiB, 1.129× at 1 MiB** |
+| [24-ngnet-h3-quinn-lifecycle](24-ngnet-h3-quinn-lifecycle.md) | 2026-08-29 | `bd83f18` against `7da1866` | Bounded Quinn lifecycle cleanup — **−24.50% adjusted empty serial, 223,968 → 7,300 KiB aged RSS** |
 
 Still outstanding, in the order they are worth doing:
 

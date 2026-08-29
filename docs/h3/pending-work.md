@@ -10,6 +10,16 @@ The HTTP/2 family keeps its own list in [`../h2/pending-work.md`](../h2/pending-
 
 ## Resolved
 
+### A first-party Quinn adapter ships
+
+**Resolved.** `crates/ngnet-h3-quinn` implements `QuicConnection` for an established
+`quinn::Connection` without adding Quinn, Tokio, rustls or socket ownership to `ngnet-h3`.
+The crate owns the runtime-specific reader and acceptor tasks; callers still own endpoint
+creation, TLS, ALPN and driving the returned HTTP/3 connection future. Real-Quinn coverage
+is in `tests/ngnet-h3-tests/tests/http_quinn.rs`, and run
+[`23`](../benchmarks/data/xeon-8370c-azure/23-ngnet-h3-quinn-vs-h3-quinn.md) records the
+first matched upstream comparison.
+
 ### A linear scan on every stream close
 
 **Resolved.** `Driver::close_stream` used to open with `self.closed.contains(&stream)` over a
@@ -139,26 +149,25 @@ without reporting acknowledgement**, which the sans-I/O core does not currently 
 would be a small addition beside `add_ack_offset`, and it is deliberately not being invented
 speculatively before a transport that needs it exists.
 
-### A stream this end resets keeps its body registered until the connection is dropped
+### Locally reset streams need transport closure reporting
 
 `Conn::close_stream` is the only thing that releases a stream's body entry, and the driver
-reaches it from one place: a `StreamClosed` event. A transport reports that for a stream the
-*peer* finished with, and none of them reports it for a reset this end issued — the layer
-asked for the reset, so there is nothing to tell it. So the entry, and whatever body buffers
-it still holds, survive until the connection itself is dropped, which drains the registry.
+reaches it from one place: a `StreamClosed` event. A transport therefore has to join both
+directions and report closure after a locally initiated reset; issuing the reset alone does
+not release the core registry entry.
 
-This is true of every locally initiated reset — a caller dropping a response future, an
-unread incoming body being dropped, a server abandoning an exchange — and predates the change
-that made a failed body reset rather than end its stream. It is bounded by the connection's
-lifetime rather than unbounded, and the reset does tell nghttp3 the write side is finished, so
-no further bytes are ever offered for the stream; what remains is memory held longer than it
-is useful on a long-lived connection that resets many streams.
+**Resolved for `ngnet-h3-quinn`.** Its private lifecycle state joins accepted local reset and
+receive stop with peer FIN/reset/`STOP_SENDING`, emits one `StreamClosed` after both directions
+end, and removes the Quinn handles and stop control as that event is returned. The live and
+already-finished cancellation cases in `http_quinn.rs` pin both direction codes, peer-visible
+`RESET_STREAM`/`STOP_SENDING`, and exactly-once closure. The 1,000-stream test and run
+[`24`](../benchmarks/data/xeon-8370c-azure/24-ngnet-h3-quinn-lifecycle.md) pin bounded
+successful-stream ownership and resident memory.
 
-**Settle it by closing the stream where the reset is issued**, which needs care: the driver
-would be declaring a stream closed on its own authority rather than on the transport's report,
-and a `StreamClosed` arriving afterwards must not then be a second close. The honest form is
-probably for the reset drain to record the stream as closed-by-us and for the event handler to
-recognise its own work.
+The stack-wide gap remains for adapters that do not report locally initiated closure.
+**Settle each adapter at its transport boundary**, where both direction outcomes are known,
+rather than teaching the transport-independent driver to guess that a reset closed the
+opposite direction.
 
 ### The trait has no timer, datagram, priority or stream-limit surface
 
@@ -188,15 +197,19 @@ The cheaper mechanism was chosen deliberately and is correct, but it does more w
 needs to on a connection with many congested streams. **Revisit if a profile shows the
 retries mattering.**
 
-### No first-party quinn adapter ships
+### Quinn hot-path candidates need stronger attribution
 
-`QuinnBackend` lives in `ngnet-h3-tests`, which is unpublished. A user wanting HTTP/3 over
-quinn has a working implementation to read and copy, and no crate to depend on.
+Run [`24`](../benchmarks/data/xeon-8370c-azure/24-ngnet-h3-quinn-lifecycle.md) tested adjacent
+same-stream immediate-release coalescing in isolation. Its two drift-adjusted empty-serial
+comparisons were 6.73% slower and effectively unchanged, so the candidate was reverted rather
+than retained on structural appeal.
 
-Deliberate: quinn brings rustls and a cryptographic backend, and putting that behind a
-feature of a crate whose selling point is having one dependency would undo the thing being
-sold. **Revisit if a separate `ngnet-h3-quinn` crate is wanted**, which is where it would go
-rather than into the wrapper.
+The host denied hardware sampling with `perf_event_paranoid=4`. A scoped syscall profile put
+50.44% of observed syscall time in `sendmsg`, 34.40% in `recvmmsg`, and 14.22% in
+`epoll_wait`; that does not attribute enough user-space cost to justify broad driver scratch
+reuse, lookup changes, multi-slice writes, or reader pooling. **Revisit each only with a
+function-level profile and its own fairness/lifecycle plan.** The failed release-coalescing
+gate is evidence against that specific implementation, not against all release-path work.
 
 ### Self-interop only
 
