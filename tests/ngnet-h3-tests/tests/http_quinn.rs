@@ -33,12 +33,14 @@ use ngnet_h3_tests::Tuning;
 struct Payload {
     chunk: Option<Bytes>,
     trailers: Option<http::HeaderMap>,
+    pending: bool,
 }
 
 fn empty() -> Payload {
     Payload {
         chunk: None,
         trailers: None,
+        pending: false,
     }
 }
 
@@ -46,6 +48,7 @@ fn once(bytes: Bytes) -> Payload {
     Payload {
         chunk: Some(bytes),
         trailers: None,
+        pending: false,
     }
 }
 
@@ -53,6 +56,15 @@ fn with_trailers(bytes: Bytes, trailers: http::HeaderMap) -> Payload {
     Payload {
         chunk: Some(bytes),
         trailers: Some(trailers),
+        pending: false,
+    }
+}
+
+fn pending() -> Payload {
+    Payload {
+        chunk: None,
+        trailers: None,
+        pending: true,
     }
 }
 
@@ -70,11 +82,14 @@ impl Body for Payload {
         if let Some(trailers) = self.trailers.take() {
             return std::task::Poll::Ready(Some(Ok(Frame::trailers(trailers))));
         }
+        if self.pending {
+            return std::task::Poll::Pending;
+        }
         std::task::Poll::Ready(None)
     }
 
     fn is_end_stream(&self) -> bool {
-        self.chunk.is_none() && self.trailers.is_none()
+        !self.pending && self.chunk.is_none() && self.trailers.is_none()
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -464,20 +479,49 @@ fn a_cramped_transport_produces_identical_results() {
     let tuning = Tuning::cramped();
     let payload = patterned(96 * 1024);
     let expected = payload.clone();
-    run(over_quic(tuning, echo(), move |handle| async move {
-        let response = handle
-            .send_request(
-                http::Request::builder()
-                    .method("POST")
-                    .uri("https://localhost/")
-                    .body(once(Bytes::from(payload)))
-                    .expect("a request"),
-            )
+    run(over_recorded_quic(
+        tuning,
+        echo(),
+        move |handle, client_log, server_log| async move {
+            let response = handle
+                .send_request(
+                    http::Request::builder()
+                        .method("POST")
+                        .uri("https://localhost/")
+                        .body(once(Bytes::from(payload)))
+                        .expect("a request"),
+                )
+                .await
+                .expect("a response");
+            let (body, _) = read_body(response.into_body()).await;
+            assert_eq!(body, expected, "a cramped transport changed the answer");
+
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if client_log.lock().expect("client log").closes.len() == 1
+                        && server_log.lock().expect("server log").closes.len() == 1
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .expect("a response");
-        let (body, _) = read_body(response.into_body()).await;
-        assert_eq!(body, expected, "a cramped transport changed the answer");
-    }));
+            .expect("the partially written exchange should close");
+
+            for log in [client_log, server_log] {
+                let log = log.lock().expect("event log");
+                let (stream, (close_pending, _, _, count)) =
+                    log.closes.iter().next().expect("one closed stream");
+                let fin_pending = log.fins.get(stream).expect("a final FIN");
+                assert_eq!(*count, 1);
+                assert!(
+                    close_pending > fin_pending,
+                    "partial writes must not lose or overtake the final FIN"
+                );
+            }
+        },
+    ));
 }
 
 #[test]
@@ -777,6 +821,97 @@ fn dropping_a_request_stops_both_quinn_directions_and_closes_once() {
                 (*server_rx, *server_tx),
                 (None, Some(cancelled_code)),
                 "the server read the request cleanly before its send was stopped"
+            );
+            assert_eq!(*server_count, 1);
+        },
+    ));
+}
+
+#[test]
+fn cancelling_a_live_request_resets_both_quinn_directions() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let handler_started = Arc::clone(&started);
+    let responder: Responder = Box::new(move |request: http::Request<IncomingBody>| {
+        let cancelled = request
+            .extensions()
+            .get::<Cancelled>()
+            .cloned()
+            .expect("a cancellation signal");
+        handler_started.notify_one();
+        Box::pin(async move {
+            cancelled.cancelled().await;
+            http::Response::builder()
+                .status(200)
+                .body(empty())
+                .expect("a response")
+        }) as Answer
+    });
+
+    run(over_recorded_quic(
+        Tuning::roomy(),
+        responder,
+        move |handle, client_log, server_log| async move {
+            let mut request = Box::pin(
+                handle.send_request(
+                    http::Request::builder()
+                        .method("POST")
+                        .uri("https://localhost/live-cancel")
+                        .body(pending())
+                        .expect("a request"),
+                ),
+            );
+            tokio::select! {
+                _ = started.notified() => {}
+                result = &mut request => panic!("response settled before cancellation: {result:?}"),
+            }
+            drop(request);
+
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let client_closed = client_log.lock().expect("client log").closes.len();
+                    let server = server_log.lock().expect("server log");
+                    if client_closed == 1
+                        && server.closes.len() == 1
+                        && server.peer_resets.len() == 1
+                    {
+                        break;
+                    }
+                    drop(server);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("live cancellation should settle both endpoints");
+
+            let cancelled_code = ErrorCode::new(0x10c);
+            let client = client_log.lock().expect("client log");
+            assert_eq!(
+                client.local_resets,
+                vec![(StreamId::new(0).unwrap(), cancelled_code)]
+            );
+            assert_eq!(
+                client.local_stops,
+                vec![(StreamId::new(0).unwrap(), cancelled_code)]
+            );
+            let (_, client_rx, client_tx, client_count) =
+                client.closes.values().next().expect("a client close");
+            assert_eq!(
+                (*client_rx, *client_tx),
+                (Some(cancelled_code), Some(cancelled_code))
+            );
+            assert_eq!(*client_count, 1);
+            drop(client);
+
+            let server = server_log.lock().expect("server log");
+            assert_eq!(
+                server.peer_resets,
+                vec![(StreamId::new(0).unwrap(), cancelled_code)]
+            );
+            let (_, server_rx, server_tx, server_count) =
+                server.closes.values().next().expect("a server close");
+            assert_eq!(
+                (*server_rx, *server_tx),
+                (Some(cancelled_code), Some(cancelled_code))
             );
             assert_eq!(*server_count, 1);
         },

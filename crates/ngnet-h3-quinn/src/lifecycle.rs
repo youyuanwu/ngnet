@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 
 use bytes::Bytes;
 use ngnet_h3::http::QuicEvent;
-use ngnet_h3::{ErrorCode, StreamId};
+use ngnet_h3::{Directionality, ErrorCode, StreamId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Direction {
@@ -365,7 +365,9 @@ impl<Handle, Stop> Lifecycle<Handle, Stop> {
                         return Step::Event(QuicEvent::Accepted { stream });
                     }
                     Incoming::Reset { stream, code } => {
-                        if self.streams.finish_recv(stream, Some(code)) {
+                        if matches!(stream.directionality(), Directionality::Unidirectional)
+                            || self.streams.finish_recv(stream, Some(code))
+                        {
                             self.batch.emitted();
                             return Step::Event(QuicEvent::Reset { stream, code });
                         }
@@ -717,6 +719,55 @@ mod tests {
             code: ErrorCode::new(0x11),
         });
 
+        assert!(matches!(lifecycle.next(), Step::NeedInput));
+    }
+
+    #[test]
+    fn reset_on_unidirectional_stream_is_forwarded() {
+        let mut lifecycle = Lifecycle::<(), ()>::new();
+        let id = stream(3);
+        let code = ErrorCode::new(0x11);
+        lifecycle.push(Incoming::Reset { stream: id, code });
+
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::Reset { stream, code: actual } if stream == id && actual == code
+        ));
+    }
+
+    #[test]
+    fn late_stop_and_reset_notifications_preserve_first_terminal_outcomes() {
+        let mut lifecycle = Lifecycle::new();
+        let id = stream(0);
+        lifecycle.insert_bidi(id, (), ());
+        assert!(lifecycle.finish_send(id, None));
+        lifecycle.push(Incoming::StopSending {
+            stream: id,
+            code: ErrorCode::new(0x11),
+        });
+        lifecycle.push(Incoming::Data {
+            stream: id,
+            bytes: Bytes::new(),
+            fin: true,
+        });
+        lifecycle.push(Incoming::RecvStopped {
+            stream: id,
+            code: ErrorCode::new(0x22),
+        });
+
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::Data { stream, fin: true, .. } if stream == id
+        ));
+        assert!(matches!(lifecycle.next(), Step::Boundary));
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::StreamClosed {
+                stream,
+                rx_code: None,
+                tx_code: None,
+            } if stream == id
+        ));
         assert!(matches!(lifecycle.next(), Step::NeedInput));
     }
 }

@@ -79,10 +79,11 @@ impl ReadBudget {
     }
 
     fn take(&self, bytes: u64) {
-        self.bytes.fetch_sub(
-            bytes.min(self.bytes.load(Ordering::Acquire)),
-            Ordering::AcqRel,
-        );
+        let _ = self
+            .bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+                Some(available.saturating_sub(bytes))
+            });
     }
 }
 
@@ -309,6 +310,10 @@ fn spawn_reader(
                             let _ = to_driver.send(Incoming::RecvStopped { stream, code });
                             return;
                         }
+                        // `ClosedStream` means FIN/reset won the race. Read once despite
+                        // zero application credit so that authoritative terminal result
+                        // can be forwarded instead of parking forever.
+                        break;
                     }
                     BudgetWake::Available => {}
                     BudgetWake::DriverGone => return,
