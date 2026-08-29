@@ -145,7 +145,7 @@ fn the_settings_defaults_arrive_through_the_shim() {
 fn the_restated_private_constant_still_matches_the_vendored_header() {
     let header = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../deps/ngtcp2/lib/ngtcp2_dcidtr.h"
+        "/../ngnet-quic-sys/vendor/ngtcp2/lib/ngtcp2_dcidtr.h"
     );
     let source = match std::fs::read_to_string(header) {
         Ok(source) => source,

@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Relative location of the vendored dwnx checkout from this crate's root.
-const VENDOR_RELATIVE: &str = "../../deps/dwnx";
+const VENDOR_RELATIVE: &str = "vendor/dwnx";
 
 /// The C sources that make up libdwnx, from `lib/Makefile.am`'s `OBJECTS`.
 ///
@@ -110,7 +110,7 @@ fn dwnx_source_dir(manifest_dir: &Path) -> PathBuf {
         panic!(
             "dwnx sources not found at {}.\n\
              The submodule has not been checked out. Run:\n\n    \
-             git submodule update --init deps/dwnx\n\n\
+             git submodule update --init crates/ngnet-qmux-sys/vendor/dwnx\n\n\
              or `just submodules` to check out every vendored dependency.",
             dir.display()
         );

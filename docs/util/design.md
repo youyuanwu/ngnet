@@ -20,8 +20,10 @@ Every boundary below is a boundary rather than a stage on a roadmap:
 - **tokio only.** `ngnet-h2` also has a `completion` transport built on compio. A second
   integration would differ only in which runtime spawns the driver task and would test
   nothing about pooling that this one does not.
-- **Not published.** The API is new and expected to change, matching `ngnet-axum`,
-  `ngnet-h3` and `ngnet-quic`.
+- **Not published.** The API is new and expected to change, matching `ngnet-axum`. The
+  HTTP/3 and QUIC crates made the other choice and ship at 0.0.x while theirs settles; this
+  one is a policy layer whose `Client`, `Config` and `Error` would become compatibility
+  obligations the moment anyone depended on them.
 
 ## This is the layer that spawns
 

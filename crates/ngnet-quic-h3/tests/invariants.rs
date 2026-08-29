@@ -219,7 +219,25 @@ fn the_manifest_declares_what_it_should() {
     );
 
     assert!(
-        manifest.contains("publish = false"),
-        "this crate cannot be published while either crate it binds is unpublished"
+        !manifest.contains("publish = false"),
+        "this crate is published alongside the two crates it binds"
     );
+
+    // A published crate cannot depend on an unpublished one, and the two crates this one
+    // binds are exactly its dependencies. Withdrawing either from release without noticing
+    // this crate would leave a manifest that cannot be published at all.
+    for bound in ["ngnet-h3", "ngnet-quic"] {
+        let manifest = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join(bound)
+                .join("Cargo.toml"),
+        )
+        .expect("reading a bound crate's manifest");
+
+        assert!(
+            !manifest.contains("publish = false"),
+            "{bound} is not published, so this crate cannot be either"
+        );
+    }
 }

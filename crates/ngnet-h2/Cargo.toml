@@ -1,7 +1,8 @@
 [package]
 name = "ngnet-h2"
-version = "0.1.0"
+version = "0.0.1"
 description = "Safe, sans-I/O Rust bindings to libnghttp2 for cleartext HTTP/2 (h2c)"
+readme = "README.md"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

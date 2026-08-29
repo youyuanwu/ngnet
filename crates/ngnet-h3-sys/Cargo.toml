@@ -1,12 +1,39 @@
 [package]
 name = "ngnet-h3-sys"
-version = "0.1.0"
+version = "0.0.1"
 description = "Low level FFI bindings to libnghttp3, built from the vendored nghttp3 submodule"
-# Withheld from release alongside `ngnet-h3`, whose API is still expected to change.
-publish = false
+readme = "README.md"
+# Released at 0.0.x alongside `ngnet-h3`, whose API is still expected to change.
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+include = [
+    "src/**",
+    "tests/**",
+    "build.rs",
+    "README.md",
+    "wrapper.h",
+    "vendor/nghttp3/CMakeLists.txt",
+    "vendor/nghttp3/CMakeOptions.txt",
+    "vendor/nghttp3/cmake/*.cmake",
+    "vendor/nghttp3/cmakeconfig.h.in",
+    "vendor/nghttp3/README.rst",
+    "vendor/nghttp3/COPYING",
+    "vendor/nghttp3/lib/CMakeLists.txt",
+    "vendor/nghttp3/lib/config.cmake.in",
+    "vendor/nghttp3/lib/libnghttp3.pc.in",
+    "vendor/nghttp3/lib/*.c",
+    "vendor/nghttp3/lib/*.h",
+    "vendor/nghttp3/lib/includes/CMakeLists.txt",
+    "vendor/nghttp3/lib/includes/nghttp3/*.h",
+    "vendor/nghttp3/lib/includes/nghttp3/*.in",
+    # The top-level project enters this directory even with examples disabled.
+    "vendor/nghttp3/examples/CMakeLists.txt",
+    # sfparse is a nested submodule, but these are the only files libnghttp3 compiles.
+    "vendor/nghttp3/lib/sfparse/sfparse.c",
+    "vendor/nghttp3/lib/sfparse/sfparse.h",
+    "vendor/nghttp3/lib/sfparse/COPYING",
+]
 
 # Declares that this crate links the native `nghttp3` library, so cargo will
 # refuse to link two copies of it into the same binary.

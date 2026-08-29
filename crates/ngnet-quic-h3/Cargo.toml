@@ -1,10 +1,10 @@
 [package]
 name = "ngnet-quic-h3"
-version = "0.1.0"
+version = "0.0.1"
 description = "HTTP/3 over ngtcp2: an ngnet-h3 transport backed by ngnet-quic"
-# Cannot be published while either crate it binds is unpublished, and both are withheld
-# while their APIs are still expected to change. See `docs/quic-h3/pending-work.md`.
-publish = false
+readme = "README.md"
+# Released at 0.0.x alongside the two crates it binds, and cannot move past them: both APIs
+# are still expected to change. See `docs/quic-h3/pending-work.md`.
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -21,4 +21,3 @@ repository.workspace = true
 ngnet-h3.workspace = true
 ngnet-quic.workspace = true
 bytes.workspace = true
-

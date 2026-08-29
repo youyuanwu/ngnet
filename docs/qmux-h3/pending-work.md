@@ -123,7 +123,8 @@ The duplicate-pump portion of the former 91-read observation is resolved in item
 reads are not presumed redundant. The 16382-byte record payload and the fixed 64-offer yield were
 eliminated as causes of the concurrency inversion. Do not pursue allocation counts without a
 timing hypothesis—the delivery-aliasing experiment already showed that a large allocation
-reduction can be slower—and do not modify `deps/dwnx` as part of this backlog.
+reduction can be slower—and do not modify `crates/ngnet-qmux-sys/vendor/dwnx` as part of
+this backlog.
 
 ## Interoperability is proven against nothing
 
@@ -217,7 +218,8 @@ parameter is the whole allowance for the connection's life.
 
 Raising the initial value is a workaround and not a fix, and it has a ceiling. dwnx caps a
 transport parameter at `DWNX_MAX_STREAMS`, `1 << 60`
-(`deps/dwnx/lib/dwnx_transport_params.h`). Values at or above `1 << 61` pass
+(`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_transport_params.h`). Values at or above
+`1 << 61` pass
 `TransportParams::validate`, which only checks that the number fits a QUIC varint, and then
 fail the connection at setup with `ErrorKind::Closed` — a validation gap on the QMux side worth
 noting on its own. So the largest allowance a connection can actually be given is `1 << 60`,

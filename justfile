@@ -45,8 +45,12 @@ submodules depth="":
     if [ -n "{{ depth }}" ]; then
         args+=(--depth "{{ depth }}")
     fi
-    git submodule update "${args[@]}" deps/nghttp2 deps/nghttp3 deps/ngtcp2 deps/dwnx
-    git -C deps/nghttp3 submodule update "${args[@]}" lib/sfparse
+    git submodule update "${args[@]}" \
+      crates/ngnet-h2-sys/vendor/nghttp2 \
+      crates/ngnet-h3-sys/vendor/nghttp3 \
+      crates/ngnet-quic-sys/vendor/ngtcp2 \
+      crates/ngnet-qmux-sys/vendor/dwnx
+    git -C crates/ngnet-h3-sys/vendor/nghttp3 submodule update "${args[@]}" lib/sfparse
 
 # Report which submodules are present, which are missing, and which have drifted from the
 # commit this repository pins. A leading `-` means "not checked out", `+` means "checked out

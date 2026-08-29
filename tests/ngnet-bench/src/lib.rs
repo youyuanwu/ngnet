@@ -149,7 +149,8 @@ pub const QMUX_CONNECTION_WINDOW: u64 = WINDOW as u64;
 /// - **Too low** — anywhere near what a run can consume — and the suite stops partway through
 ///   without failing, which is worse than failing.
 /// - **Too high** — above dwnx's `DWNX_MAX_STREAMS`, which is `1 << 60`
-///   (`deps/dwnx/lib/dwnx_transport_params.h:63`) — and the *peer* rejects the parameter as it
+///   (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_transport_params.h:63`) — and the *peer*
+///   rejects the parameter as it
 ///   decodes it, failing the connection during setup with an error that names nothing about
 ///   streams. `TransportParams::validate`'s varint check does not catch this — it bounds the
 ///   encoding, not dwnx's limit — so a value at `1 << 61` is accepted where it is configured

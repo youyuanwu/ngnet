@@ -70,6 +70,6 @@ left open on purpose:
   *steady-state* zero allocation but says nothing about the per-stream setup cost. The counts
   that test does pin are in [`allocation-counts.md`](allocation-counts.md).
 - **Throughput, tail latency, CPU and peak RSS under real concurrency** — `h2load` (already
-  vendored under `deps/nghttp2/src/`) driving a real socket server, under `perf stat`, would
+  vendored under `crates/ngnet-h2-sys/vendor/nghttp2/src/`) driving a real socket server, under `perf stat`, would
   measure all four under load the way this harness structurally cannot. That is the pass that
   would turn "faster over a duplex" into "faster on a wire."

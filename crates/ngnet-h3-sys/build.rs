@@ -2,7 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 /// Relative location of the vendored nghttp3 checkout from this crate's root.
-const VENDOR_RELATIVE: &str = "../../deps/nghttp3";
+const VENDOR_RELATIVE: &str = "vendor/nghttp3";
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());

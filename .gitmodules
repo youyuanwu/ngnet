@@ -1,12 +1,12 @@
 [submodule "deps/nghttp2"]
-	path = deps/nghttp2
+	path = crates/ngnet-h2-sys/vendor/nghttp2
 	url = https://github.com/nghttp2/nghttp2.git
 [submodule "deps/nghttp3"]
-	path = deps/nghttp3
+	path = crates/ngnet-h3-sys/vendor/nghttp3
 	url = https://github.com/ngtcp2/nghttp3
 [submodule "deps/ngtcp2"]
-	path = deps/ngtcp2
+	path = crates/ngnet-quic-sys/vendor/ngtcp2
 	url = https://github.com/ngtcp2/ngtcp2
 [submodule "deps/dwnx"]
-	path = deps/dwnx
+	path = crates/ngnet-qmux-sys/vendor/dwnx
 	url = https://github.com/ngtcp2/dwnx

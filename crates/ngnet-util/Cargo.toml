@@ -2,8 +2,8 @@
 name = "ngnet-util"
 version = "0.1.0"
 description = "A pooling, connecting HTTP/2 client over ngnet-h2, for cleartext HTTP/2 on tokio"
-# Not released yet, for the same reason `ngnet-axum`, `ngnet-h3` and `ngnet-quic` carry this
-# line: the surface has not been used by anyone but its own tests. A connection pool's API is
+# Not released yet, for the same reason `ngnet-axum` carries this line: the surface has not
+# been used by anyone but its own tests. A connection pool's API is
 # also the hardest kind to take back -- `Client`, `Config` and `Error` would all become
 # compatibility obligations the moment someone depends on them, and the open questions
 # recorded in `docs/util/design.md` (a second connection per origin, a bound on the wait, a

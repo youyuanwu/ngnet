@@ -532,7 +532,8 @@ fn varint(out: &mut Vec<u8>, value: u64) {
 /// `encode_close_record` cannot produce one: it takes a [`CloseReason`], and the public
 /// constructors set the triggering frame type to zero with no way to change it — which is the
 /// field Spec FR-013 names alongside the code and the reason. The field order is dwnx's
-/// reader's (`deps/dwnx/lib/dwnx_conn.c:1982-2038`): type, error code, triggering frame type,
+/// reader's (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conn.c:1982-2038`): type, error
+/// code, triggering frame type,
 /// reason length, reason.
 fn transport_close_frame(error_code: u64, frame_type: u64, reason: &[u8]) -> Vec<u8> {
     let mut frame = vec![0x1c];

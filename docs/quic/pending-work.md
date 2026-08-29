@@ -53,7 +53,7 @@ during research and are recorded so they are decisions rather than surprises.
 
 **The crypto helper swallows two error codes.**
 `ngtcp2_crypto_recv_crypto_data_cb` catches `-10001` (`WANT_X509_LOOKUP`) and `-10002`
-(`WANT_CLIENT_HELLO_CB`) and returns 0 (`deps/ngtcp2/crypto/shared.c:1789-1798`). Since this
+(`WANT_CLIENT_HELLO_CB`) and returns 0 (`crates/ngnet-quic-sys/vendor/ngtcp2/crypto/shared.c:1789-1798`). Since this
 crate uses the helper's callbacks directly rather than trampolining through Rust, it inherits
 that. It is benign while asynchronous certificate lookup and the client-hello callback are out
 of scope — which they are — but it would become a silent stall the moment either is used.
@@ -89,7 +89,7 @@ OpenSSL 3.5 helper. Only one OpenSSL-family helper can be built at a time.
 ## `ngtcp2_crypto_ossl_free` is never called
 
 A deliberate, bounded leak of the static `EVP_*` objects `ngtcp2_crypto_ossl_init` prefetches.
-They are process-global with no reference counting (`deps/ngtcp2/crypto/ossl/ossl.c:49-60`,
+They are process-global with no reference counting (`crates/ngnet-quic-sys/vendor/ngtcp2/crypto/ossl/ossl.c:49-60`,
 `:62`, `:82`), so calling `_free` from any per-context destructor — as the ngtcp2 examples do
 — would free objects another context is still using.
 

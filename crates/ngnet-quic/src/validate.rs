@@ -3,7 +3,7 @@
 //! ngtcp2 checks the ranges of its settings and transport parameters, and the presence of
 //! its mandatory callbacks, with `assert()` — forty lines of them at the top of
 //! `ngtcp2_conn_client_new` / `ngtcp2_conn_server_new`
-//! (`deps/ngtcp2/lib/ngtcp2_conn.c:1250-1291`).
+//! (`crates/ngnet-quic-sys/vendor/ngtcp2/lib/ngtcp2_conn.c:1250-1291`).
 //!
 //! `assert()` compiles to nothing when `NDEBUG` is defined, and `NDEBUG` is defined in
 //! every release build. The `cmake` crate maps the cargo profile onto `CMAKE_BUILD_TYPE`,
@@ -47,7 +47,8 @@ const MAX_ACK_DELAY_LIMIT: u64 = (1 << 14) * 1_000_000;
 /// The most unused destination connection IDs ngtcp2 will track.
 ///
 /// `NGTCP2_DCIDTR_MAX_UNUSED_DCID_SIZE`, which lives in the **private** header
-/// `deps/ngtcp2/lib/ngtcp2_dcidtr.h:45` and so is absent from the generated bindings. It is
+/// `crates/ngnet-quic-sys/vendor/ngtcp2/lib/ngtcp2_dcidtr.h:45` and so is absent from the
+/// generated bindings. It is
 /// restated here because the assert block bounds `active_connection_id_limit` by it, and a
 /// caller who exceeds it gets undefined behaviour in a release build.
 ///

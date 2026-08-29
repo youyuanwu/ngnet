@@ -2,7 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 /// Relative location of the vendored nghttp2 checkout from this crate's root.
-const VENDOR_RELATIVE: &str = "../../deps/nghttp2";
+const VENDOR_RELATIVE: &str = "vendor/nghttp2";
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
@@ -52,7 +52,7 @@ fn nghttp2_source_dir(manifest_dir: &Path) -> PathBuf {
         panic!(
             "nghttp2 sources not found at {}.\n\
              The submodule has not been checked out. Run:\n\n    \
-             git submodule update --init deps/nghttp2\n\n\
+             git submodule update --init crates/ngnet-h2-sys/vendor/nghttp2\n\n\
              (do not use --recursive; nghttp2's nested submodules are not needed)",
             dir.display()
         );

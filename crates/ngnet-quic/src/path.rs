@@ -7,13 +7,14 @@
 //! Three things about that are worth knowing.
 //!
 //! **The addresses are copied, not borrowed, by the constructor.** `ngtcp2_dcid_init` and
-//! friends run `ngtcp2_path_copy` (`deps/ngtcp2/lib/ngtcp2_path.c:31-35`), and
+//! friends run `ngtcp2_path_copy`
+//! (`crates/ngnet-quic-sys/vendor/ngtcp2/lib/ngtcp2_path.c:31-35`), and
 //! `ngtcp2_conn_client_new` additionally `memcpy`s the local address. So a [`PathStorage`]
 //! may be a stack local that dies when the call returns — unlike the allocator, which must
 //! outlive the connection.
 //!
 //! **`ngtcp2_addr_init` casts away `const`.** It stores `(ngtcp2_sockaddr *)addr`
-//! (`deps/ngtcp2/lib/ngtcp2_addr.c:32-40`), producing a mutable pointer from what the
+//! (`crates/ngnet-quic-sys/vendor/ngtcp2/lib/ngtcp2_addr.c:32-40`), producing a mutable pointer from what the
 //! caller may have had as a shared reference. This module therefore owns its `sockaddr`
 //! storage mutably and hands out pointers derived from a `&mut`, rather than casting a
 //! shared reference and hoping.

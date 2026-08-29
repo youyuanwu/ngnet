@@ -106,11 +106,13 @@
 //! This is the part that would corrupt the wire in silence rather than fail, so it is stated
 //! here as well as at `Connection::produce_within`, which enforces it. dwnx does not cap a
 //! record on the write path: `dwnx_qre_start` initialises the record with the whole buffer it
-//! is given (`deps/dwnx/lib/dwnx_qre.c:36-41`), `dwnx_qre_stream_max_datalen` bounds a
+//! is given (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_qre.c:36-41`),
+//! `dwnx_qre_stream_max_datalen` bounds a
 //! payload only by what is left of that buffer (`:47-80`), and `dwnx_qre_final` writes the
 //! record's length as a **fixed two-byte varint** (`:107`) whose encoder asserts the value is
 //! below 16384 and, where that assertion is compiled out, truncates it to sixteen bits
-//! (`deps/dwnx/lib/dwnx_conv.c:145-157`) -- a record whose declared length is nothing like its
+//! (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conv.c:145-157`) -- a record whose declared
+//! length is nothing like its
 //! real one, and a peer that has lost record framing from that byte onward. Nothing in
 //! [`Conn::record`]'s own contract stops it; a buffer of 64 KiB is a perfectly legal argument
 //! that produces an illegal record.
@@ -612,7 +614,8 @@ struct Produced {
 /// A cursor through a lent list of fragments, and the one place resumption is computed.
 ///
 /// A vectored push reports **one total across every fragment it was given**, not a count per
-/// fragment (`deps/dwnx/lib/includes/dwnx/dwnx.h`; `dwnx_conn_write_stream_frame` sets
+/// fragment (`crates/ngnet-qmux-sys/vendor/dwnx/lib/includes/dwnx/dwnx.h`;
+/// `dwnx_conn_write_stream_frame` sets
 /// `*pdatalen` to the single figure `wdatalen`). dwnx copies a *prefix* of the concatenation,
 /// so a short take stops wherever the record filled -- routinely in the middle of a fragment
 /// and not at a boundary between them. Resuming therefore means walking the list against a byte
@@ -1744,7 +1747,8 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
             let now = self.clock.now();
             // Sampled across the read because a MAX_DATA frame raises this and raises nothing
             // else: dwnx applies it to the connection's send window and invokes no callback
-            // (`deps/dwnx/lib/dwnx_conn.c:1045-1056`), so a write parked on an exhausted
+            // (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conn.c:1045-1056`), so a write
+            // parked on an exhausted
             // connection window has no event to wait for and this comparison is its wakeup.
             // Waking on any inbound bytes would have done as well, and would have spun a
             // blocked writer once per record for as long as the peer kept sending.

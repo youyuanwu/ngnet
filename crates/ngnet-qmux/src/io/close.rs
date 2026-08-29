@@ -4,13 +4,15 @@
 //! `dwnx_conn_write_connection_close`, so a connection cannot be closed on the wire by asking
 //! the state machine to do it; and the close it *does* parse lands in a private frame struct
 //! behind a `DWNX_ERR_DRAINING` return, so its four fields are unreachable from outside
-//! (`deps/dwnx/lib/dwnx_conn.c:1982-2110`). Both halves of the codec therefore live here, and
+//! (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conn.c:1982-2110`). Both halves of the codec
+//! therefore live here, and
 //! both are stand-ins to be deleted if the library grows the functions (Spec C-5).
 //!
 //! # Encoding
 //!
 //! The field order is not a choice; it is what dwnx's reader expects, so it is copied from the
-//! reader's own state machine (`deps/dwnx/lib/dwnx_conn.c:1982-2038`): frame type, error code,
+//! reader's own state machine
+//! (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conn.c:1982-2038`): frame type, error code,
 //! then a frame-type field **only for a transport close**, then the reason length and the
 //! reason bytes. An application close has no frame-type field at all, and writing one produces
 //! a record whose reason length is read out of the wrong bytes -- the peer either rejects the
@@ -27,7 +29,8 @@
 //! The obvious decoder reads the record's first frame and asks whether it is a close. That is
 //! wrong, and dwnx is where the answer is: after each frame it resets its reader to the
 //! frame-type state whenever the record has bytes left
-//! (`deps/dwnx/lib/dwnx_record_reader.c:88-103`), so one record may carry several frames and a
+//! (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_record_reader.c:88-103`), so one record may
+//! carry several frames and a
 //! close may sit behind any of them. A first-frame decoder loses exactly those closes, leaving
 //! the layer to report that the peer closed without being able to say why.
 //!
@@ -41,7 +44,8 @@
 //!
 //! dwnx's header mentions truncating a reason phrase to 1024 bytes, and that describes the
 //! `dwnx_ccerr` struct, which is not on this path. The streaming reader allocates and stores
-//! the full declared length (`deps/dwnx/lib/dwnx_conn.c:2061-2083`). The bound that applies is
+//! the full declared length (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conn.c:2061-2083`).
+//! The bound that applies is
 //! the record's own declared length, itself bounded by the maximum record size -- which is why
 //! [`encode_close_record`] truncates a reason that would not fit rather than emitting a record
 //! the peer must reject.

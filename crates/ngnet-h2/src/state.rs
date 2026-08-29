@@ -230,7 +230,8 @@ impl ResponseGuard {
 /// tempting to pair that with the frame-received callback and call the gap "mid-frame".
 /// That pairing does not hold. A valid `PRIORITY` frame completes through
 /// `session_inbound_frame_reset` without ever reaching the frame-received callback
-/// (`deps/nghttp2/lib/nghttp2_session.c:6218`), as do the paths that discard an ignored
+/// (`crates/ngnet-h2-sys/vendor/nghttp2/lib/nghttp2_session.c:6218`), as do the paths
+/// that discard an ignored
 /// payload (`:6523`). Any of those would leave such a tracker stuck mid-frame, and a
 /// later clean close would then be misreported as a truncated one — the precise error
 /// this exists to avoid making.

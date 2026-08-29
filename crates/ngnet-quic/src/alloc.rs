@@ -4,7 +4,7 @@
 //! module.
 //!
 //! First, **the struct is retained by pointer, not copied**. `ngtcp2_conn` stores
-//! `const ngtcp2_mem *mem` (`deps/ngtcp2/lib/ngtcp2_conn.h:645`), assigned at
+//! `const ngtcp2_mem *mem` (`crates/ngnet-quic-sys/vendor/ngtcp2/lib/ngtcp2_conn.h:645`), assigned at
 //! `ngtcp2_conn.c:1591`, and dereferences it again during `ngtcp2_conn_del`
 //! (`ngtcp2_conn.c:1827`). A stack-local `ngtcp2_mem` would therefore be read after it had
 //! gone — and the read happens in the destructor, so the corruption would appear at

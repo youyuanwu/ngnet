@@ -20,7 +20,7 @@
 //!
 //! **Not rearming after a write pass.** ngtcp2 paces its sending, and reports the pacing
 //! deadline through the same `expiry()` as everything else
-//! (`deps/ngtcp2/lib/ngtcp2_conn.c:11387`). A driver that only rearms after reading will
+//! (`crates/ngnet-quic-sys/vendor/ngtcp2/lib/ngtcp2_conn.c:11387`). A driver that only rearms after reading will
 //! send one datagram and then sleep until the peer says something — which for a bulk
 //! transfer is never, and which looks like a hang rather than a slow connection.
 //!

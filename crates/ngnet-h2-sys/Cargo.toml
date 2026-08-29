@@ -1,10 +1,45 @@
 [package]
 name = "ngnet-h2-sys"
-version = "0.1.0"
+version = "0.0.1"
 description = "Low level FFI bindings to libnghttp2, built from the vendored nghttp2 submodule"
+readme = "README.md"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+include = [
+    "src/**",
+    "tests/**",
+    "build.rs",
+    "README.md",
+    "wrapper.h",
+    "vendor/nghttp2/CMakeLists.txt",
+    "vendor/nghttp2/CMakeOptions.txt",
+    "vendor/nghttp2/cmake/*.cmake",
+    "vendor/nghttp2/cmakeconfig.h.in",
+    "vendor/nghttp2/README.rst",
+    "vendor/nghttp2/LICENSE",
+    "vendor/nghttp2/lib/CMakeLists.txt",
+    "vendor/nghttp2/lib/config.cmake.in",
+    "vendor/nghttp2/lib/libnghttp2.pc.in",
+    "vendor/nghttp2/lib/version.rc.in",
+    "vendor/nghttp2/lib/*.c",
+    "vendor/nghttp2/lib/*.h",
+    "vendor/nghttp2/lib/includes/CMakeLists.txt",
+    "vendor/nghttp2/lib/includes/nghttp2/*.h",
+    "vendor/nghttp2/lib/includes/nghttp2/*.in",
+    # The top-level project enters these directories even in lib-only mode.
+    "vendor/nghttp2/third-party/CMakeLists.txt",
+    "vendor/nghttp2/src/CMakeLists.txt",
+    "vendor/nghttp2/examples/CMakeLists.txt",
+    "vendor/nghttp2/contrib/CMakeLists.txt",
+    "vendor/nghttp2/contrib/*.in",
+    "vendor/nghttp2/bpf/CMakeLists.txt",
+    # Upstream configures these templates unconditionally before disabling
+    # their targets; no integration, documentation, or application source is included.
+    "vendor/nghttp2/integration-tests/config.go.in",
+    "vendor/nghttp2/integration-tests/setenv.in",
+    "vendor/nghttp2/doc/*.in",
+]
 
 # Declares that this crate links the native `nghttp2` library, so cargo will
 # refuse to link two copies of it into the same binary.
