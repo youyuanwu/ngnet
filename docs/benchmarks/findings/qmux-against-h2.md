@@ -86,7 +86,7 @@ and empties it, averaging 30.1 KiB. Same bytes, 2.8× fewer calls to move them, 
 2.7 µs per avoided write on this loopback: enough to pay off QMux's extra processor cost and leave
 the margin `08` measured.
 
-## The crossover
+## Historical crossover
 
 Over a real socket the two effects meet between 64 KiB and 1 MiB:
 
@@ -97,8 +97,10 @@ Over a real socket the two effects meet between 64 KiB and 1 MiB:
 | 64 KiB | 1.21× |
 | 1 MiB | **0.89×** |
 
-`transport_body_throughput/1048576` is the only identifier in the suite where a QMux arm beats its
-HTTP/2 counterpart, and it is not a marginal win: all five passes fell between 0.88× and 0.90×.
+At the time, `transport_body_throughput/1048576` was the only registered identifier where a QMux
+arm beat its HTTP/2 counterpart, and it was not a marginal win: all five passes fell between
+0.88× and 0.90×. The later 8 MiB point also wins over a socket; its current result is reported
+at the head of this finding.
 
 Before the write-path work in the same branch, that identifier was 1.29×. Coalescing a pass's
 records into one write is what moved it, and the mechanism is measured separately in
