@@ -519,6 +519,7 @@ impl QuicConnection for QuinnBackend {
                     if result.is_err() {
                         return WriteOutcome::Gone;
                     }
+                    lifecycle.mark_fin_issued(stream);
                     // Quinn maps a peer STOP_SENDING observed by `finish()` to `Ok(())`.
                     // The stopped observer therefore owns the authoritative clean/code
                     // outcome and prevents a delayed peer code from becoming falsely clean.
@@ -556,12 +557,6 @@ impl QuicConnection for QuinnBackend {
                     WriteOutcome::Gone
                 }
                 Poll::Ready(Ok(written)) => {
-                    if written > 0 {
-                        // Reported on acceptance, which is sound only because quinn
-                        // copied: see `RETAINS_BUFFERS`. A transport that borrowed the
-                        // bytes instead would have to wait for the peer.
-                        lifecycle.release(stream, written as u64);
-                    }
                     if fin && written == total && !lifecycle.send_finished(stream) {
                         let result = lifecycle
                             .send_mut(stream)
@@ -570,8 +565,15 @@ impl QuicConnection for QuinnBackend {
                         if result.is_err() {
                             return WriteOutcome::Gone;
                         }
+                        lifecycle.mark_fin_issued(stream);
                         // The stopped observer distinguishes acknowledged FIN from a peer
                         // STOP_SENDING that raced this successful call.
+                    }
+                    if written > 0 {
+                        // Reported on acceptance, which is sound only because quinn
+                        // copied: see `RETAINS_BUFFERS`. A transport that borrowed the
+                        // bytes instead would have to wait for the peer.
+                        lifecycle.release(stream, written as u64);
                     }
                     WriteOutcome::Accepted(written)
                 }

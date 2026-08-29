@@ -21,6 +21,7 @@ struct Bidi<Stop> {
 
 struct Send<Handle> {
     handle: Handle,
+    fin_issued: bool,
     finished: bool,
 }
 
@@ -56,6 +57,7 @@ impl<Handle, Stop> Streams<Handle, Stop> {
             stream.get(),
             Send {
                 handle: send,
+                fin_issued: false,
                 finished: false,
             },
         );
@@ -66,6 +68,7 @@ impl<Handle, Stop> Streams<Handle, Stop> {
             stream.get(),
             Send {
                 handle: send,
+                fin_issued: false,
                 finished: false,
             },
         );
@@ -89,7 +92,14 @@ impl<Handle, Stop> Streams<Handle, Stop> {
     pub(crate) fn send_finished(&self, stream: StreamId) -> bool {
         self.sends
             .get(&stream.get())
-            .is_some_and(|send| send.finished)
+            .is_some_and(|send| send.fin_issued || send.finished)
+    }
+
+    /// Records that Quinn accepted a FIN without classifying its terminal outcome.
+    pub(crate) fn mark_fin_issued(&mut self, stream: StreamId) {
+        if let Some(send) = self.sends.get_mut(&stream.get()) {
+            send.fin_issued = true;
+        }
     }
 
     /// Records the first terminal send outcome.
@@ -258,6 +268,10 @@ impl<Handle, Stop> Lifecycle<Handle, Stop> {
 
     pub(crate) fn send_finished(&self, stream: StreamId) -> bool {
         self.streams.send_finished(stream)
+    }
+
+    pub(crate) fn mark_fin_issued(&mut self, stream: StreamId) {
+        self.streams.mark_fin_issued(stream);
     }
 
     pub(crate) fn finish_send(&mut self, stream: StreamId, code: Option<ErrorCode>) -> bool {
@@ -894,6 +908,27 @@ mod tests {
                 stream: id,
                 rx_code: None,
                 tx_code: None,
+            })
+        );
+    }
+
+    #[test]
+    fn fin_issued_blocks_local_reset_without_preempting_observer_outcome() {
+        let mut streams = Streams::new();
+        let id = stream(0);
+        let peer = ErrorCode::new(0x11);
+        streams.insert_bidi(id, (), ());
+
+        streams.mark_fin_issued(id);
+        assert!(streams.send_finished(id));
+        assert!(streams.finish_send(id, Some(peer)));
+        assert!(streams.finish_recv(id, None));
+        assert_eq!(
+            streams.pop_close(),
+            Some(Closed {
+                stream: id,
+                rx_code: None,
+                tx_code: Some(peer),
             })
         );
     }
