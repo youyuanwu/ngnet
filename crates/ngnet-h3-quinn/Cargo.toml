@@ -3,6 +3,7 @@ name = "ngnet-h3-quinn"
 version = "0.0.1"
 description = "Quinn transport adapter for ngnet-h3"
 readme = "README.md"
+publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -88,7 +88,7 @@ ngnet-h3 = { path = "crates/ngnet-h3", version = "0.0.1" }
 ngnet-h3-sys = { path = "crates/ngnet-h3-sys", version = "0.0.1" }
 # The external-transport adapter: Quinn stays out of `ngnet-h3` while callers get a reusable
 # implementation instead of copying the former integration-test backend.
-ngnet-h3-quinn = { path = "crates/ngnet-h3-quinn", version = "0.0.1" }
+ngnet-h3-quinn = { path = "crates/ngnet-h3-quinn" }
 ngnet-quic-sys = { path = "crates/ngnet-quic-sys", version = "0.0.1", default-features = false }
 ngnet-quic = { path = "crates/ngnet-quic", version = "0.0.1" }
 # The QMux pair. Unrelated to the QUIC crates above despite the similar name: QMux is a
