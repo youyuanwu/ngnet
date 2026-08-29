@@ -192,6 +192,9 @@ impl QuinnBackend {
         if self.lifecycle.is_closed() {
             return;
         }
+        // Establish the cutoff before draining. Producers can no longer extend this
+        // snapshot indefinitely, and messages racing after the cutoff are rejected.
+        self.events.close();
         let mut queued = Vec::new();
         loop {
             match self.events.try_recv() {
@@ -297,11 +300,50 @@ fn spawn_reader(
 ) {
     let stream = to_stream_id(recv.id());
     tokio::spawn(async move {
+        let mut pending = None;
         loop {
             // Read-ahead is bounded by the credit the layer has extended. Without this the
             // channel below is an unbounded buffer a fast peer controls.
             while budget.bytes.load(Ordering::Acquire) == 0 {
-                match wait_for_budget(&budget, stop.as_mut(), &to_driver).await {
+                let wake = if pending.is_some() {
+                    wait_for_budget(&budget, stop.as_mut(), &to_driver).await
+                } else {
+                    tokio::select! {
+                        wake = wait_for_budget(&budget, stop.as_mut(), &to_driver) => wake,
+                        read = recv.read_chunk(1, true) => {
+                            match read {
+                                Ok(Some(chunk)) => {
+                                    pending = Some(chunk.bytes);
+                                    continue;
+                                }
+                                Ok(None) => {
+                                    let _ = to_driver.send(Incoming::Data {
+                                        stream,
+                                        bytes: bytes::Bytes::new(),
+                                        fin: true,
+                                    });
+                                }
+                                Err(quinn::ReadError::ConnectionLost(_)) => {
+                                    let _ = to_driver.send(Incoming::Closed);
+                                }
+                                Err(quinn::ReadError::Reset(code)) => {
+                                    let _ = to_driver.send(Incoming::Reset {
+                                        stream,
+                                        code: ErrorCode::new(code.into_inner()),
+                                    });
+                                }
+                                Err(_) => {
+                                    let _ = to_driver.send(Incoming::Reset {
+                                        stream,
+                                        code: ErrorCode::new(0x102),
+                                    });
+                                }
+                            }
+                            return;
+                        }
+                    }
+                };
+                match wake {
                     BudgetWake::Stop(signal) => {
                         stop = None;
                         if let Ok(code) = signal
@@ -320,7 +362,9 @@ fn spawn_reader(
                 }
             }
 
-            let read = if let Some(receiver) = stop.as_mut() {
+            let read = if let Some(bytes) = pending.take() {
+                Ok(Some(quinn::Chunk { offset: 0, bytes }))
+            } else if let Some(receiver) = stop.as_mut() {
                 tokio::select! {
                     signal = receiver => {
                         stop = None;
@@ -329,7 +373,9 @@ fn spawn_reader(
                                 let _ = to_driver.send(Incoming::RecvStopped { stream, code });
                                 return;
                             }
-                            _ => continue,
+                            // FIN/reset won the stop race. Read once even if credit
+                            // reached zero so the authoritative terminal result is seen.
+                            _ => recv.read_chunk(READ_CHUNK, true).await,
                         }
                     }
                     read = recv.read_chunk(READ_CHUNK, true) => read,
@@ -401,6 +447,8 @@ impl QuicConnection for QuinnBackend {
     const RETAINS_BUFFERS: bool = false;
 
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Result<QuicEvent, Self::Error>> {
+        const MAX_INTERNAL_MESSAGES: usize = 64;
+        let mut internal_messages = 0;
         loop {
             match self.lifecycle.next() {
                 Step::Event(event) => {
@@ -420,7 +468,14 @@ impl QuicConnection for QuinnBackend {
                         return Poll::Pending;
                     }
                     Poll::Ready(None) => self.lifecycle.push(Incoming::Closed),
-                    Poll::Ready(Some(event)) => self.lifecycle.push(event),
+                    Poll::Ready(Some(event)) => {
+                        self.lifecycle.push(event);
+                        internal_messages += 1;
+                        if internal_messages == MAX_INTERNAL_MESSAGES {
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                    }
                 },
                 Step::Finished => {
                     self.lifecycle.pending();
@@ -464,7 +519,9 @@ impl QuicConnection for QuinnBackend {
                     if result.is_err() {
                         return WriteOutcome::Gone;
                     }
-                    lifecycle.finish_send(stream, None);
+                    // Quinn maps a peer STOP_SENDING observed by `finish()` to `Ok(())`.
+                    // The stopped observer therefore owns the authoritative clean/code
+                    // outcome and prevents a delayed peer code from becoming falsely clean.
                 }
                 return WriteOutcome::Accepted(0);
             }
@@ -513,7 +570,8 @@ impl QuicConnection for QuinnBackend {
                         if result.is_err() {
                             return WriteOutcome::Gone;
                         }
-                        lifecycle.finish_send(stream, None);
+                        // The stopped observer distinguishes acknowledged FIN from a peer
+                        // STOP_SENDING that raced this successful call.
                     }
                     WriteOutcome::Accepted(written)
                 }

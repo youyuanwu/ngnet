@@ -320,25 +320,35 @@ impl<Handle, Stop> Lifecycle<Handle, Stop> {
             if !self.closed
                 && let Some(closed) = self.streams.pending_close()
             {
-                let release_owed = self
+                if let Some(position) = self
                     .released
                     .iter()
-                    .any(|(stream, _)| *stream == closed.stream);
-                if !release_owed {
-                    if self.batch.take_boundary() {
-                        return Step::Boundary;
-                    }
-                    let closed = self
-                        .streams
-                        .pop_close()
-                        .expect("the close was observed above");
+                    .position(|(stream, _)| *stream == closed.stream)
+                {
+                    let (stream, bytes) = self
+                        .released
+                        .remove(position)
+                        .expect("the release position was observed above");
                     self.batch.emitted();
-                    return Step::Event(QuicEvent::StreamClosed {
-                        stream: closed.stream,
-                        rx_code: closed.rx_code,
-                        tx_code: closed.tx_code,
+                    return Step::Event(QuicEvent::Released {
+                        stream,
+                        bytes,
+                        delivered: true,
                     });
                 }
+                if self.batch.take_boundary() {
+                    return Step::Boundary;
+                }
+                let closed = self
+                    .streams
+                    .pop_close()
+                    .expect("the close was observed above");
+                self.batch.emitted();
+                return Step::Event(QuicEvent::StreamClosed {
+                    stream: closed.stream,
+                    rx_code: closed.rx_code,
+                    tx_code: closed.tx_code,
+                });
             }
 
             if let Some((stream, bytes)) = self.released.pop_front() {
@@ -612,8 +622,8 @@ mod tests {
         let other = stream(4);
         lifecycle.insert_bidi(closing, (), ());
         lifecycle.insert_bidi(other, (), ());
-        lifecycle.release(closing, 2);
         lifecycle.release(other, 3);
+        lifecycle.release(closing, 2);
         assert!(lifecycle.finish_send(closing, None));
         assert!(lifecycle.streams.finish_recv(closing, None));
 
