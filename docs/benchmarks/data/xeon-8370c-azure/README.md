@@ -3,7 +3,7 @@
 **Status: historical Azure-VM label; current captures use the migrated CPU described below.**
 Runs have been collected in this directory since 2026-08-16.
 
-**First run:** 2026-08-16 · **Last run:** 2026-08-28
+**First run:** 2026-08-16 · **Last run:** 2026-08-29
 
 ## Hardware and system
 
@@ -51,7 +51,7 @@ in every run.
 
 ## Arms this machine can run
 
-All eight bench targets. `cargo bench -p ngnet-bench -- --test` completes with `Success` for
+All ten bench targets. `cargo bench -p ngnet-bench -- --test` completes with `Success` for
 every arm, including `compio-push` and `compio-shared`, which abort unless they obtain
 `DriverType::IoUring` — so io_uring is genuinely available here and not silently falling back
 to a polling driver.
@@ -102,6 +102,7 @@ requirement in full.
 | [20-qmux-h3-candidate-d-event-queue](20-qmux-h3-candidate-d-event-queue.md) | 2026-08-28 | `6bff8ee` | Pops remain **23 = 23 fill iterations**, including 16 empty; queue-local options cannot reduce the registered count — closed |
 | [21-qmux-h3-combined-final-matrix](21-qmux-h3-combined-final-matrix.md) | 2026-08-28 | `0984e1c` against `364dbb2` | Final binaries are hash-identical to the merged predecessor; fresh 16-case QMux/H3 ÷ H2 ratios range from **0.845× to 2.063×** |
 | [22-qmux-h3-at-8-mib](22-qmux-h3-at-8-mib.md) | 2026-08-29 | `cae8330` | At 8 MiB, QMux/H3 is **1.182× over a duplex and 0.919× over a socket** |
+| [23-ngnet-h3-quinn-vs-h3-quinn](23-ngnet-h3-quinn-vs-h3-quinn.md) | 2026-08-29 | `feature/ngnet-h3-quinn` based on `eeddf04` | Quinn-matched HTTP/3 comparison: **2.684× empty, 1.463× at 16 KiB, 1.129× at 1 MiB** |
 
 Still outstanding, in the order they are worth doing:
 

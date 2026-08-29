@@ -256,8 +256,9 @@ fn no_hyper_reaches_the_client_policy_layer() {
 /// abstraction and takes whatever implements it, which is what lets a caller run HTTP/3 over
 /// quinn, over this workspace's own QUIC stack, over QMux, or over something not written yet.
 ///
-/// The workspace now contains two crates implementing that abstraction: one over `ngnet-quic`
-/// and one over `ngnet-qmux`. That is precisely when this check starts to matter. With a
+/// The workspace now contains three crates implementing that abstraction: one over Quinn, one
+/// over `ngnet-quic`, and one over `ngnet-qmux`. That is precisely when this check starts to
+/// matter. With a
 /// single adapter a stray dependency would be a mild waste; with two, `ngnet-h3` depending on
 /// either one would force every caller of the other to compile a transport they will never
 /// instantiate — ngtcp2 and OpenSSL for the QMux user, ngtcp2-less QMux bindings for the QUIC
@@ -321,6 +322,54 @@ fn the_adapter_depends_on_both_families() {
              join.\n\n{tree}",
         );
     }
+}
+
+/// The Quinn adapter is the one place `ngnet-h3` and Quinn meet.
+///
+/// It is separate from both sides for the same reason as `ngnet-quic-h3`: an HTTP/3 caller
+/// choosing another QUIC implementation must not compile Quinn, while a Quinn caller not using
+/// this HTTP/3 stack must not compile nghttp3. The upstream `h3-quinn` comparison belongs only
+/// to the unpublished benchmark crate and must not leak into this adapter.
+#[test]
+fn the_quinn_adapter_depends_on_http3_and_quinn_only() {
+    let tree = cargo_tree(&["-p", "ngnet-h3-quinn", "-e", "normal"]);
+
+    for required in ["ngnet-h3", "quinn", "tokio"] {
+        assert!(
+            tree.lines()
+                .skip(1)
+                .any(|line| dependency_name(line) == required),
+            "{required} is missing from ngnet-h3-quinn's normal dependency graph.\n\
+             Check with:\n  cargo tree -p ngnet-h3-quinn -e normal\n\
+             This crate exists to adapt ngnet-h3 to Quinn's Tokio API.\n\n{tree}",
+        );
+    }
+
+    for forbidden in [
+        "ngnet-quic",
+        "ngnet-quic-sys",
+        "ngnet-quic-h3",
+        "ngnet-qmux",
+        "ngnet-qmux-sys",
+        "ngnet-qmux-h3",
+    ] {
+        assert!(
+            !contains_at_word_boundary(&tree, forbidden),
+            "{forbidden} reached ngnet-h3-quinn's normal dependency graph.\n\
+             Find it with:\n  cargo tree -p ngnet-h3-quinn -e normal -i {forbidden}\n\
+             The adapter joins ngnet-h3 directly to Quinn and no other transport or HTTP/3 \
+             implementation belongs in that path.\n\n{tree}",
+        );
+    }
+
+    assert!(
+        !tree
+            .lines()
+            .skip(1)
+            .any(|line| dependency_name(line) == "h3-quinn"),
+        "the upstream h3-quinn comparison reached ngnet-h3-quinn's normal dependency graph.\n\
+         It belongs only in ngnet-bench.\n\n{tree}",
+    );
 }
 
 /// The QMux join is the second, and only other, place the two families meet.

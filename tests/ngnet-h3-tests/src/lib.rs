@@ -30,8 +30,6 @@
 //! buffer stays retained across many writes. That case is covered in the wrapper's own
 //! `body.rs`, where acknowledgement is withheld deliberately.
 
-pub mod quic_backend;
-
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;

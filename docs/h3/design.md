@@ -12,7 +12,9 @@ ngnet-h3-sys      raw FFI; builds packaged vendor/nghttp3 source
 ngnet-h3          sans-I/O connection state machine
    ↑              + src/http/, an async API behind the default-on `http` feature
    ↑
-ngnet-h3-tests    unpublished; drives both over a real quinn connection
+ngnet-h3-quinn    reusable async transport adapter for an established quinn connection
+   ↑
+ngnet-h3-tests    unpublished; drives the core and adapter over real quinn connections
 ```
 
 `ngnet-h3` performs no I/O. It opens no socket, blocks nowhere, creates no threads and reads

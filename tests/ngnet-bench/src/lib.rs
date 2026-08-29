@@ -47,9 +47,11 @@
 use std::convert::Infallible;
 use std::fmt::Debug;
 use std::future::poll_fn;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use http_body::Body;
 use http_body_util::Full;
 use tokio::io::duplex;
@@ -67,7 +69,11 @@ use ngnet_h2::http::{
     serve_with,
 };
 
-use ngnet_h3::http::{IncomingBody as H3IncomingBody, SendRequest as H3SendRequest};
+use ngnet_h3::http::{
+    IncomingBody as H3IncomingBody, SendRequest as H3SendRequest, handshake as h3_handshake,
+    serve as h3_serve,
+};
+use ngnet_h3_quinn::QuinnBackend;
 use ngnet_qmux::io::{TokioClock, TokioStream};
 use ngnet_qmux_h3::{HttpConfig, TransportConfig, connect_with, serve_with as qmux_serve_with};
 
@@ -1144,6 +1150,264 @@ impl NgnetQmuxH3 {
     /// test suite can show that a failed exchange ends the run rather than being quietly
     /// recorded as a fast iteration — a property that can only be demonstrated by causing it.
     pub fn abandon_server(&self) {
+        self.server.abort();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/3 over Quinn: ngnet-h3 against h3 + h3-quinn
+// ---------------------------------------------------------------------------
+
+const QUINN_WORKLOAD_URI: &str = "https://bench.local/bench";
+const H3_ALPN: &[u8] = b"h3";
+
+fn quinn_request_for(body: Bytes) -> http::Request<BenchBody> {
+    http::Request::builder()
+        .method(http::Method::POST)
+        .uri(QUINN_WORKLOAD_URI)
+        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+        .header("x-bench", "1")
+        .body(Full::new(body))
+        .expect("a well-formed HTTP/3 request")
+}
+
+fn quinn_request_head() -> http::Request<()> {
+    http::Request::builder()
+        .method(http::Method::POST)
+        .uri(QUINN_WORKLOAD_URI)
+        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+        .header("x-bench", "1")
+        .body(())
+        .expect("a well-formed HTTP/3 request")
+}
+
+fn certified() -> (
+    quinn::rustls::pki_types::CertificateDer<'static>,
+    quinn::rustls::pki_types::PrivatePkcs8KeyDer<'static>,
+) {
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["bench.local".to_string()]).expect("a certificate");
+    let key =
+        quinn::rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
+    (certified.cert.into(), key)
+}
+
+fn quinn_server_endpoint() -> (
+    quinn::Endpoint,
+    quinn::rustls::pki_types::CertificateDer<'static>,
+) {
+    let (certificate, key) = certified();
+    let mut crypto = quinn::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.clone()], key.into())
+        .expect("a server TLS configuration");
+    crypto.alpn_protocols = vec![H3_ALPN.to_vec()];
+    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
+        .expect("a QUIC server TLS configuration");
+    let config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    let endpoint = quinn::Endpoint::server(config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("a Quinn server endpoint");
+    (endpoint, certificate)
+}
+
+fn quinn_client_endpoint(
+    certificate: quinn::rustls::pki_types::CertificateDer<'static>,
+) -> quinn::Endpoint {
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots
+        .add(certificate)
+        .expect("trust the benchmark certificate");
+    let mut crypto = quinn::rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    crypto.alpn_protocols = vec![H3_ALPN.to_vec()];
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+        .expect("a QUIC client TLS configuration");
+    let mut endpoint = quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("a Quinn client endpoint");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+    endpoint
+}
+
+async fn quinn_pair() -> (
+    quinn::Connection,
+    quinn::Connection,
+    (quinn::Endpoint, quinn::Endpoint),
+) {
+    let (server, certificate) = quinn_server_endpoint();
+    let address = server.local_addr().expect("the server address");
+    let client = quinn_client_endpoint(certificate);
+
+    let accepting = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            server
+                .accept()
+                .await
+                .expect("an incoming QUIC connection")
+                .await
+                .expect("an accepted QUIC connection")
+        })
+    };
+    let connected = client
+        .connect(address, "bench.local")
+        .expect("start a QUIC connection")
+        .await
+        .expect("a connected QUIC client");
+    let accepted = accepting.await.expect("the Quinn accept task");
+    (connected, accepted, (client, server))
+}
+
+async fn ngnet_h3_quinn_echo(request: http::Request<H3IncomingBody>) -> http::Response<BenchBody> {
+    response_for(collect(request.into_body()).await)
+}
+
+/// A persistent ngnet-h3 connection over the extracted Quinn adapter.
+pub struct NgnetH3Quinn {
+    handle: H3SendRequest<BenchBody>,
+    client: JoinHandle<()>,
+    server: JoinHandle<()>,
+    _endpoints: (quinn::Endpoint, quinn::Endpoint),
+}
+
+impl NgnetH3Quinn {
+    /// Establishes and warms a client/server pair outside the measured closure.
+    pub async fn establish() -> Self {
+        let (client_quic, server_quic, endpoints) = quinn_pair().await;
+        let server_driver =
+            h3_serve(QuinnBackend::new(server_quic), ngnet_h3_quinn_echo).expect("ngnet server");
+        let server = tokio::spawn(async move {
+            server_driver.await.expect("the ngnet server driver");
+        });
+        let (handle, client_driver) =
+            h3_handshake::<_, BenchBody>(QuinnBackend::new(client_quic)).expect("ngnet client");
+        let client = tokio::spawn(async move {
+            client_driver.await.expect("the ngnet client driver");
+        });
+
+        let fixture = Self {
+            handle,
+            client,
+            server,
+            _endpoints: endpoints,
+        };
+        assert_eq!(fixture.round_trip(Bytes::new()).await, 0);
+        fixture
+    }
+
+    /// Sends one request and drains the echoed response body.
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        let response = self
+            .handle
+            .send_request(quinn_request_for(body))
+            .await
+            .expect("an ngnet response head");
+        assert!(response.status().is_success());
+        drain(response.into_body()).await
+    }
+}
+
+impl Drop for NgnetH3Quinn {
+    fn drop(&mut self) {
+        self.client.abort();
+        self.server.abort();
+    }
+}
+
+async fn upstream_h3_quinn_server(quic: quinn::Connection) {
+    let mut connection = h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(quic))
+        .await
+        .expect("an upstream h3 server");
+    loop {
+        let Some(resolver) = connection.accept().await.expect("an upstream request") else {
+            return;
+        };
+        let (_request, mut stream) = resolver
+            .resolve_request()
+            .await
+            .expect("upstream request headers");
+        let mut body = BytesMut::new();
+        while let Some(chunk) = stream.recv_data().await.expect("upstream request data") {
+            body.put(chunk);
+        }
+        stream
+            .send_response(
+                http::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(())
+                    .expect("an upstream response"),
+            )
+            .await
+            .expect("upstream response headers");
+        if !body.is_empty() {
+            stream
+                .send_data(body.freeze())
+                .await
+                .expect("upstream response data");
+        }
+        stream.finish().await.expect("finish upstream response");
+    }
+}
+
+/// A persistent upstream h3 + h3-quinn connection using the same Quinn setup.
+pub struct UpstreamH3Quinn {
+    sender: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    client: JoinHandle<()>,
+    server: JoinHandle<()>,
+    _endpoints: (quinn::Endpoint, quinn::Endpoint),
+}
+
+impl UpstreamH3Quinn {
+    /// Establishes and warms a client/server pair outside the measured closure.
+    pub async fn establish() -> Self {
+        let (client_quic, server_quic, endpoints) = quinn_pair().await;
+        let server = tokio::spawn(upstream_h3_quinn_server(server_quic));
+        let (mut driver, sender) = h3::client::new(h3_quinn::Connection::new(client_quic))
+            .await
+            .expect("an upstream h3 client");
+        let client = tokio::spawn(async move {
+            let _ = poll_fn(|context| driver.poll_close(context)).await;
+        });
+
+        let fixture = Self {
+            sender,
+            client,
+            server,
+            _endpoints: endpoints,
+        };
+        assert_eq!(fixture.round_trip(Bytes::new()).await, 0);
+        fixture
+    }
+
+    /// Sends one request and drains the echoed response body.
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        let mut sender = self.sender.clone();
+        let mut stream = sender
+            .send_request(quinn_request_head())
+            .await
+            .expect("send an upstream request");
+        if !body.is_empty() {
+            stream.send_data(body).await.expect("upstream request data");
+        }
+        stream.finish().await.expect("finish upstream request");
+        let response = stream
+            .recv_response()
+            .await
+            .expect("an upstream response head");
+        assert!(response.status().is_success());
+
+        let mut total = 0;
+        while let Some(chunk) = stream.recv_data().await.expect("upstream response data") {
+            total += chunk.remaining();
+        }
+        total
+    }
+}
+
+impl Drop for UpstreamH3Quinn {
+    fn drop(&mut self) {
+        self.client.abort();
         self.server.abort();
     }
 }

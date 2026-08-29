@@ -1,12 +1,12 @@
 # Packaging and publishing
 
-This workspace publishes seven crates as one release set:
+This workspace publishes eight crates as one release set:
 
 | Layer | Crates |
 | --- | --- |
 | Native bindings | `ngnet-h2-sys`, `ngnet-h3-sys`, `ngnet-quic-sys` |
 | Safe wrappers | `ngnet-h2`, `ngnet-h3`, `ngnet-quic` |
-| HTTP/3 adapter | `ngnet-quic-h3` |
+| HTTP/3 adapters | `ngnet-h3-quinn`, `ngnet-quic-h3` |
 
 The QMux, axum, util, test and benchmark crates have `publish = false` and are not part of
 this release. The root manifest gives every publishable workspace dependency both a `path`
@@ -69,6 +69,7 @@ cargo package --locked \
   -p ngnet-h2 \
   -p ngnet-h3-sys \
   -p ngnet-h3 \
+  -p ngnet-h3-quinn \
   -p ngnet-quic-sys \
   -p ngnet-quic \
   -p ngnet-quic-h3
@@ -96,6 +97,7 @@ cargo publish --dry-run --locked \
   -p ngnet-h2 \
   -p ngnet-h3-sys \
   -p ngnet-h3 \
+  -p ngnet-h3-quinn \
   -p ngnet-quic-sys \
   -p ngnet-quic \
   -p ngnet-quic-h3
@@ -117,14 +119,15 @@ cargo publish --locked \
   -p ngnet-h2 \
   -p ngnet-h3-sys \
   -p ngnet-h3 \
+  -p ngnet-h3-quinn \
   -p ngnet-quic-sys \
   -p ngnet-quic \
   -p ngnet-quic-h3
 ```
 
 Cargo orders the selected crates by dependency: native bindings first, then safe wrappers,
-then `ngnet-quic-h3`. After each upload it polls the registry index before attempting a
-dependent crate.
+then the two HTTP/3 adapters. After each upload it polls the registry index before attempting
+a dependent crate.
 
 The operation is not atomic. If a later upload fails, every earlier successful version
 remains published. Do not use `--keep-going` for a release. Before retrying, use `cargo info`
@@ -139,7 +142,7 @@ Once Cargo reports success, confirm that every version has reached the registry 
 VERSION=0.0.1
 for crate in \
   ngnet-h2-sys ngnet-h2 \
-  ngnet-h3-sys ngnet-h3 \
+  ngnet-h3-sys ngnet-h3 ngnet-h3-quinn \
   ngnet-quic-sys ngnet-quic \
   ngnet-quic-h3
 do

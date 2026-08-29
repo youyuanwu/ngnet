@@ -16,6 +16,7 @@ repository.workspace = true
 # `src/lib.rs`, and a library target cannot see dev-dependencies.
 [dependencies]
 ngnet-h3.workspace = true
+ngnet-h3-quinn.workspace = true
 
 # The async layer speaks `http` and `http-body`, so a crate driving it needs them too. They
 # reach `ngnet-h3` only through its own optional dependencies; nothing here widens what the

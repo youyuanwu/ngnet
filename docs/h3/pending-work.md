@@ -284,11 +284,10 @@ semantics or move behind test-only plumbing.
 These are decided, not pending. They are here so a reader does not mistake them for gaps.
 
 - **No QUIC or TLS implementation.** nghttp3 depends on neither and neither does this crate.
-  The integration tests happen to use quinn, and that choice reaches no crate but
-  `ngnet-h3-tests`. `ngnet-quic-h3` implements this crate's transport trait over the
-  workspace's own QUIC stack, and it is a *separate crate* for exactly this reason: a
-  dependency-graph test in `ngnet-workspace-tests` fails if a QUIC implementation ever
-  appears in this crate's graph.
+  Quinn support lives in `ngnet-h3-quinn`; `ngnet-quic-h3` implements the same transport trait
+  over the workspace's own QUIC stack. Both are *separate crates* for exactly this reason: a
+  dependency-graph test in `ngnet-workspace-tests` fails if a QUIC implementation ever appears
+  in this crate's graph.
 - **No server push.** nghttp3 does not implement it.
 - **`FieldAction::Stop` does not cancel a field section.** QPACK is stateful, so the
   remaining fields must still be parsed; `Stop` stops them being *delivered*. A caller that
