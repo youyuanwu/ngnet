@@ -25,8 +25,8 @@ reuses the duplex family's points so the two are comparable in shape.
 | `ngnet-qmux-h3-tokio` | this crate | HTTP/3 over QMux | tokio, epoll (readiness) |
 | `hyper-tokio` | hyper | HTTP/2 | tokio, epoll (readiness) |
 
-Body sizes sweep **0 B, 1 KiB, 64 KiB, 1 MiB**; 0 B is reported per-iteration rather than as a
-meaningless `Throughput::Bytes(0)`. The QMux arm is registered immediately after
+Body sizes sweep **0 B, 1 KiB, 64 KiB, 1 MiB, 8 MiB**; 0 B is reported per-iteration rather
+than as a meaningless `Throughput::Bytes(0)`. The QMux arm is registered immediately after
 `ngnet-h2-tokio` inside the size loop, its counterpart on the protocol axis.
 
 ## Reading it
@@ -46,10 +46,12 @@ DATA block is already 16392–16393 bytes:
 | 64 KiB | 5 | **4** | 20% |
 | 1 MiB | 65 | **64** | 1.5% |
 
-So a write-side gain should be large at 1 KiB, moderate at 64 KiB and **absent at 1 MiB**. A
-1 MiB gain therefore needs a different mechanism or it is drift — and the 1 MiB point is also
-the noisiest in the suite, having shown 10.2% spread between two repetitions of an unchanged
-arm. See [`../findings/write-path-and-gathering.md`](../findings/write-path-and-gathering.md).
+So a write-side gain should be large at 1 KiB, moderate at 64 KiB and **absent at 1 MiB**; the
+same mechanism becomes still less significant as body size increases to 8 MiB. A substantial
+gain at either large-body point therefore needs a different mechanism or it is drift. The
+1 MiB point has historically been the noisiest in the suite, having shown 10.2% spread between
+two repetitions of an unchanged arm. See
+[`../findings/write-path-and-gathering.md`](../findings/write-path-and-gathering.md).
 
 **That arithmetic does not carry across to the QMux arm, and reading it as though it does is
 the mistake this paragraph exists to prevent.** The table above counts HTTP/2 DATA blocks. The

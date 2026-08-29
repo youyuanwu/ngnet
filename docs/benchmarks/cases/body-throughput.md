@@ -16,12 +16,12 @@ serialisation, the read-buffer pool, and flow control. The server echoes the bod
 iteration moves `size` bytes up and `size` back; throughput is normalised to one body's
 worth, which is the number reported.
 
-At 1 MiB the 64 KiB initial window — matched between all three arms, see
-[`../configuration.md`](../configuration.md) — forces repeated `WINDOW_UPDATE` round trips, so
-the large end of this sweep is as much a flow-control benchmark as a copy benchmark. That
-sentence needs reading twice on the QMux arm: it is given 65535 bytes of credit per stream and
-65535 across the connection, matched to libnghttp2's fixed window, so it pays repeated credit
-extensions exactly as the HTTP/2 arms do — but the two are not extending quite the same
+At 1 MiB, and especially at 8 MiB, the 64 KiB initial window — matched between all three arms,
+see [`../configuration.md`](../configuration.md) — forces repeated `WINDOW_UPDATE` round trips,
+so the large-body end of this sweep is as much a flow-control benchmark as a copy benchmark.
+That sentence needs reading twice on the QMux arm: it is given 65535 bytes of credit per stream
+and 65535 across the connection, matched to libnghttp2's fixed window, so it pays repeated
+credit extensions exactly as the HTTP/2 arms do — but the two are not extending quite the same
 quantity, since QMux's unidirectional streams spend connection credit where HTTP/2's control
 frames do not. [`../configuration.md`](../configuration.md) accounts for that and for the one
 setting neither stack exposes.
@@ -34,8 +34,8 @@ setting neither stack exposes.
 | `ngnet-qmux-h3` | this crate | HTTP/3 over QMux |
 | `hyper` | hyper | HTTP/2 |
 
-Body sizes sweep **0 B, 1 KiB, 64 KiB, 1 MiB**. 0 B exercises the headers-only path and is
-reported as `Throughput::Elements(1)`, since a `Throughput::Bytes(0)` MB/s figure would be
+Body sizes sweep **0 B, 1 KiB, 64 KiB, 1 MiB, 8 MiB**. 0 B exercises the headers-only path and
+is reported as `Throughput::Elements(1)`, since a `Throughput::Bytes(0)` MB/s figure would be
 meaningless; every non-empty size is reported as bytes/sec.
 
 Read pairwise, as in [`serial-latency`](serial-latency.md): `ngnet-h2` against `ngnet-qmux-h3`

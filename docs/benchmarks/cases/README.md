@@ -13,8 +13,8 @@ tokio over a `tokio::io::duplex`. No sockets, no syscalls, no kernel.
 | --- | --- | --- |
 | [`serial_latency`](serial-latency.md) | stack × protocol | latency of one empty-body exchange |
 | [`concurrent_throughput`](concurrent-throughput.md) | stack × protocol × N ∈ {1, 8, 64} | requests/sec |
-| [`body_throughput`](body-throughput.md) | stack × protocol × body ∈ {0, 1 KiB, 64 KiB, 1 MiB} | MB/s |
-| [`shared_body`](shared-body.md) | body strategy × body size | MB/s |
+| [`body_throughput`](body-throughput.md) | stack × protocol × body ∈ {0, 1 KiB, 64 KiB, 1 MiB, 8 MiB} | MB/s |
+| [`shared_body`](shared-body.md) | body strategy × body ∈ {0, 1 KiB, 64 KiB, 1 MiB} | MB/s |
 
 Two axes, never varied together in a pair worth reading: `ngnet-h2` against `hyper` varies the
 HTTP/2 implementation, `ngnet-h2` against `ngnet-qmux-h3` varies the protocol.
@@ -31,8 +31,8 @@ stream-multiplexing layer over a reliable byte stream, not a UDP transport.
 | --- | --- | --- |
 | [`transport_serial_latency`](transport-serial-latency.md) | stack × I/O model × protocol | latency of one empty-body exchange |
 | [`transport_concurrent_throughput`](transport-concurrent-throughput.md) | stack × I/O model × protocol × N | requests/sec |
-| [`transport_body_throughput`](transport-body-throughput.md) | stack × I/O model × protocol × body | MB/s |
-| [`transport_shared_body`](transport-shared-body.md) | body strategy × I/O model × body | MB/s |
+| [`transport_body_throughput`](transport-body-throughput.md) | stack × I/O model × protocol × body ∈ {0, 1 KiB, 64 KiB, 1 MiB, 8 MiB} | MB/s |
+| [`transport_shared_body`](transport-shared-body.md) | body strategy × I/O model × body ∈ {0, 1 KiB, 64 KiB, 1 MiB} | MB/s |
 
 ## What every case shares
 
@@ -43,8 +43,10 @@ stream-multiplexing layer over a reliable byte stream, not a UDP transport.
   and the direction it biases are recorded in [`../controls.md`](../controls.md).
 - The server echoes the request body, so a body sweep moves the payload up and back;
   throughput is normalised to one body's worth, which is the figure reported.
-- Sizes and concurrency points are deliberately identical across families, so the two are
-  comparable *in shape*. They are not comparable in magnitude — see the reading rule in
+- Corresponding sizes and concurrency points are deliberately identical across families, so
+  the two are comparable *in shape*. The cross-protocol body sweeps use five sizes through
+  8 MiB; the two shared-body sweeps retain their four sizes through 1 MiB because they carry no
+  QMux arm. The families are not comparable in magnitude — see the reading rule in
   [`../README.md`](../README.md).
 - The 0 B point in every body sweep reports `Throughput::Elements(1)` rather than
   `Throughput::Bytes(0)`, which would be a meaningless MB/s.
