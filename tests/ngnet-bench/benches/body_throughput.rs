@@ -3,9 +3,9 @@
 //! iteration moves `size` bytes up and `size` back; throughput is normalised to one body's
 //! worth, which is the number reported.
 //!
-//! The sweep is where flow control and the read-buffer pool start to matter: at 1 MiB the
-//! 64 KiB initial window (matched between the two stacks) forces repeated `WINDOW_UPDATE`
-//! round trips, so this is as much a flow-control benchmark as a copy benchmark.
+//! The sweep is where flow control and the read-buffer pool start to matter: at 1 MiB and
+//! especially 8 MiB, the 64 KiB initial window (matched between the two stacks) forces repeated
+//! `WINDOW_UPDATE` round trips, so this is as much a flow-control benchmark as a copy benchmark.
 //!
 //! Three arms, to be read pairwise. `ngnet-h2` against `ngnet-qmux-h3` varies only the
 //! protocol stack and is the cross-protocol comparison; `ngnet-h2` against `hyper` varies only
@@ -18,7 +18,7 @@
 //!
 //! The flow-control sentence above is the one that most needs reading twice on the QMux arm.
 //! Both stacks are given 65535 bytes of credit per stream and 65535 at the connection level,
-//! so the 1 MiB point costs each of them repeated credit extensions rather than one
+//! so the 1 MiB and 8 MiB points cost each of them repeated credit extensions rather than one
 //! uninterrupted copy — but the two are not extending the same quantity. HTTP/2's control
 //! frames do not consume connection credit where QMux's unidirectional streams do, so the
 //! connection-level figures are equal in number and not quite in meaning.
@@ -33,7 +33,7 @@ use ngnet_bench::{Hyper, NgnetH2, NgnetQmuxH3, body_of, current_thread_runtime};
 
 /// 0 B exercises the headers-only path; the rest climb until the initial window and the
 /// buffer pool dominate.
-const SIZES: [usize; 4] = [0, 1024, 64 * 1024, 1024 * 1024];
+const SIZES: [usize; 5] = [0, 1024, 64 * 1024, 1024 * 1024, 8 * 1024 * 1024];
 
 fn body_throughput(c: &mut Criterion) {
     let runtime = current_thread_runtime();

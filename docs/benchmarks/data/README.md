@@ -10,7 +10,7 @@ what the run does and does not establish.
 | Machine | Status | Runs |
 | --- | --- | --- |
 | [`legacy-dev-host`](legacy-dev-host/) | **Retired, unavailable.** Every measurement taken before 2026-08-16. Noisy: unchanged control arms drifted 5–15% within a session. | 4 |
-| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current VM; historical machine label and recorded spec are Intel Xeon Platinum 8370C. Runs 12–21 report 8573C, but when Azure migrated the VM is unknown, so absolute figures across runs are not controlled. | 21 |
+| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current VM; historical machine label and recorded spec are Intel Xeon Platinum 8370C. Runs 12–22 report 8573C, but when Azure migrated the VM is unknown, so absolute figures across runs are not controlled. | 22 |
 
 **Absolute figures from different machines must never be tabulated together.** Nothing here
 is normalised for CPU model, kernel or io_uring implementation, and those are exactly the
@@ -47,6 +47,7 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [19-qmux-h3-candidate-c-fixed-header-work](xeon-8370c-azure/19-qmux-h3-candidate-c-fixed-header-work.md) | xeon-8370c-azure | 2026-08-28 | Remove 20 mallocs and three reallocs — **unstable timing; reverted** | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
 | [20-qmux-h3-candidate-d-event-queue](xeon-8370c-azure/20-qmux-h3-candidate-d-event-queue.md) | xeon-8370c-azure | 2026-08-28 | Queue-local changes cannot reduce the 23 registered pops | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
 | [21-qmux-h3-combined-final-matrix](xeon-8370c-azure/21-qmux-h3-combined-final-matrix.md) | xeon-8370c-azure | 2026-08-28 | Final 16-case QMux/H3 ÷ H2 matrix — **0.845× to 2.063×** | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
+| [22-qmux-h3-at-8-mib](xeon-8370c-azure/22-qmux-h3-at-8-mib.md) | xeon-8370c-azure | 2026-08-29 | New 8 MiB point — **1.182× duplex, 0.919× socket** | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
 
 Runs [`08`](xeon-8370c-azure/08-qmux-against-h2.md) and
 [`09`](xeon-8370c-azure/09-qmux-h2-mechanisms.md) are the first cross-protocol comparison and its

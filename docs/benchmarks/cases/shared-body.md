@@ -30,7 +30,9 @@ not there needs an explanation for why the socket swallowed it. Without one, it 
 | `ngnet-h2-shared` | hands the caller's `Bytes` over, `NGHTTP2_DATA_FLAG_NO_COPY` |
 | `hyper-tokio` | untouched by this work — carried as a drift control |
 
-Body sizes sweep **0 B, 1 KiB, 64 KiB, 1 MiB**, the same points as every other sweep.
+Body sizes sweep **0 B, 1 KiB, 64 KiB, 1 MiB**. The cross-protocol body sweeps add an 8 MiB
+point, but this benchmark carries no QMux arm and keeps its original four-point strategy
+comparison.
 
 ## Why there is no QMux arm here
 

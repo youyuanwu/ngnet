@@ -10,7 +10,7 @@ once it has survived its drift controls; the measurements it rests on stay in
 | [Reusing the coalescing buffer](coalescing-buffer-reuse.md) | About 4–7% for the completion transport, from not rebuilding the coalescing buffer every pass. |
 | [Handing bodies over](handing-bodies-over.md) | `NGHTTP2_DATA_FLAG_NO_COPY` is worth −24% to −31% at 1 MiB on the readiness transport, and a small but real gain on the completion one. |
 | [The QMux write path](qmux-write-path.md) | Six changes to the QMux write and read paths, together worth **−30% on bodies** and **−8.5% on socket concurrency**, costing a few percent where there is no payload to amortise them. The same parameter moves the *other* way over a duplex, which is the evidence that the mechanism is the syscall count. Coalescing is the only change attributed to a share of the gain; the rest are not resolved individually. A seventh cut allocation a hundredfold, was slower, and was reverted. |
-| [QMux against HTTP/2](qmux-against-h2.md) | Current post-PR-45 ratios are **2.052×/1.876× serial** (duplex/socket), **1.816×/1.776× at concurrency 64**, and **1.222×/0.845× at 1 MiB**. Candidates A–C failed controlled elapsed gates and were reverted; Candidate D was closed documentation-only as gate-incompatible. |
+| [QMux against HTTP/2](qmux-against-h2.md) | Current ratios are **2.052×/1.876× serial** (duplex/socket), **1.222×/0.845× at 1 MiB**, and **1.182×/0.919× at 8 MiB**. QMux/H3 remains faster for large socket bodies, but not over a duplex. |
 
 ## Where each finding stands
 

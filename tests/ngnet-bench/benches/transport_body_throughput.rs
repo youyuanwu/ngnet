@@ -18,13 +18,13 @@
 //! cannot, so a large-body difference is partly write strategy and not purely I/O model or
 //! stack.
 //!
-//! The QMux arm brings a second asymmetry of the same kind to the large sizes. Its 1 MiB point
-//! moves a body through a stream window and a connection window each matched to libnghttp2's
-//! fixed 65535, so it pays repeated credit extensions exactly as the HTTP/2 arms do — but
-//! underneath a transport that frames and paces where a TCP arm hands bytes straight to the
-//! kernel. That layer is part of what the cross-protocol pair compares rather than a defect in
-//! it; `docs/benchmarks/configuration.md` records what is matched, what is fixed on one side
-//! and met by the other, and what neither stack exposes.
+//! The QMux arm brings a second asymmetry of the same kind to the large sizes. Its 1 MiB and
+//! 8 MiB points move a body through a stream window and a connection window each matched to
+//! libnghttp2's fixed 65535, so they pay repeated credit extensions exactly as the HTTP/2 arms
+//! do — but underneath a transport that frames and paces where a TCP arm hands bytes straight
+//! to the kernel. That layer is part of what the cross-protocol pair compares rather than a
+//! defect in it; `docs/benchmarks/configuration.md` records what is matched, what is fixed on
+//! one side and met by the other, and what neither stack exposes.
 
 use std::hint::black_box;
 
@@ -37,7 +37,7 @@ use ngnet_bench::{
 
 /// 0 B exercises the headers-only path; the rest climb until the initial window and the
 /// buffer pool dominate. The same points as the duplex `body_throughput` bench.
-const SIZES: [usize; 4] = [0, 1024, 64 * 1024, 1024 * 1024];
+const SIZES: [usize; 5] = [0, 1024, 64 * 1024, 1024 * 1024, 8 * 1024 * 1024];
 
 fn transport_body_throughput(c: &mut Criterion) {
     let compio = compio_runtime();

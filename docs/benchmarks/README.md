@@ -132,11 +132,11 @@ HTTP/2 arm and an HTTP/3-over-QMux arm.
 | --- | --- | --- | --- |
 | [`serial_latency`](cases/serial-latency.md) | duplex | stack × protocol | latency of one empty-body exchange |
 | [`concurrent_throughput`](cases/concurrent-throughput.md) | duplex | stack × protocol × N ∈ {1, 8, 64} | requests/sec |
-| [`body_throughput`](cases/body-throughput.md) | duplex | stack × protocol × body ∈ {0, 1 KiB, 64 KiB, 1 MiB} | MB/s |
+| [`body_throughput`](cases/body-throughput.md) | duplex | stack × protocol × body ∈ {0, 1 KiB, 64 KiB, 1 MiB, 8 MiB} | MB/s |
 | [`shared_body`](cases/shared-body.md) | duplex | body strategy × body size — HTTP/2 only | MB/s |
 | [`transport_serial_latency`](cases/transport-serial-latency.md) | socket | stack × protocol × I/O model | latency of one empty-body exchange |
 | [`transport_concurrent_throughput`](cases/transport-concurrent-throughput.md) | socket | stack × protocol × I/O model × N | requests/sec |
-| [`transport_body_throughput`](cases/transport-body-throughput.md) | socket | stack × protocol × I/O model × body | MB/s |
+| [`transport_body_throughput`](cases/transport-body-throughput.md) | socket | stack × protocol × I/O model × body ∈ {0, 1 KiB, 64 KiB, 1 MiB, 8 MiB} | MB/s |
 | [`transport_shared_body`](cases/transport-shared-body.md) | socket | body strategy × I/O model × body — HTTP/2 only | MB/s |
 
 ## The findings so far
