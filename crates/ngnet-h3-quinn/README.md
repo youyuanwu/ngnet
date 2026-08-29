@@ -24,3 +24,10 @@ tokio::task::spawn_local(driver);
 
 Endpoint creation, TLS configuration, certificate verification, ALPN negotiation, and socket
 ownership remain the caller's responsibility.
+
+For bidirectional streams, the adapter reports closure only after both Quinn directions have
+ended. Final data and accepted-byte releases are delivered before that closure, with a poll
+boundary preserving `ngnet-h3`'s event-batch ordering. Dropping live HTTP work resets the send
+direction and requests `STOP_SENDING` on receive; connection shutdown supersedes remaining
+per-stream closures and produces one final connection event. Completed stream ownership is
+removed when closure is reported, so it does not grow with connection history.

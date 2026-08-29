@@ -872,14 +872,13 @@ fn cancelling_a_live_request_resets_both_quinn_directions() {
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     let client_closed = client_log.lock().expect("client log").closes.len();
-                    let server = server_log.lock().expect("server log");
-                    if client_closed == 1
-                        && server.closes.len() == 1
-                        && server.peer_resets.len() == 1
-                    {
+                    let server_settled = {
+                        let server = server_log.lock().expect("server log");
+                        server.closes.len() == 1 && server.peer_resets.len() == 1
+                    };
+                    if client_closed == 1 && server_settled {
                         break;
                     }
-                    drop(server);
                     tokio::task::yield_now().await;
                 }
             })
