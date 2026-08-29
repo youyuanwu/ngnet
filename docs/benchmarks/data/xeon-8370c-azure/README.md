@@ -108,7 +108,7 @@ requirement in full.
 | [21-qmux-h3-combined-final-matrix](21-qmux-h3-combined-final-matrix.md) | 2026-08-28 | `0984e1c` against `364dbb2` | Final binaries are hash-identical to the merged predecessor; fresh 16-case QMux/H3 ÷ H2 ratios range from **0.845× to 2.063×** |
 | [22-qmux-h3-at-8-mib](22-qmux-h3-at-8-mib.md) | 2026-08-29 | `cae8330` | At 8 MiB, QMux/H3 is **1.182× over a duplex and 0.919× over a socket** |
 | [23-ngnet-h3-quinn-vs-h3-quinn](23-ngnet-h3-quinn-vs-h3-quinn.md) | 2026-08-29 | `feature/ngnet-h3-quinn` based on `eeddf04` | Quinn-matched HTTP/3 comparison: **2.684× empty, 1.463× at 16 KiB, 1.129× at 1 MiB** |
-| [24-ngnet-h3-quinn-lifecycle](24-ngnet-h3-quinn-lifecycle.md) | 2026-08-29 | `7d5057a` against `7da1866` | Bounded Quinn lifecycle cleanup — **−32.20% adjusted empty serial, 223,984 → 7,256 KiB aged RSS** |
+| [24-ngnet-h3-quinn-lifecycle](24-ngnet-h3-quinn-lifecycle.md) | 2026-08-29 | `bd83f18` against `7da1866` | Bounded Quinn lifecycle cleanup — **−24.50% adjusted empty serial, 223,968 → 7,300 KiB aged RSS** |
 
 Still outstanding, in the order they are worth doing:
 
