@@ -49,7 +49,7 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [21-qmux-h3-combined-final-matrix](xeon-8370c-azure/21-qmux-h3-combined-final-matrix.md) | xeon-8370c-azure | 2026-08-28 | Final 16-case QMux/H3 ÷ H2 matrix — **0.845× to 2.063×** | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
 | [22-qmux-h3-at-8-mib](xeon-8370c-azure/22-qmux-h3-at-8-mib.md) | xeon-8370c-azure | 2026-08-29 | New 8 MiB point — **1.182× duplex, 0.919× socket** | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
 | [23-ngnet-h3-quinn-vs-h3-quinn](xeon-8370c-azure/23-ngnet-h3-quinn-vs-h3-quinn.md) | xeon-8370c-azure | 2026-08-29 | Quinn-matched comparison — **2.684× empty, 1.463× at 16 KiB, 1.129× at 1 MiB** | — |
-| [24-ngnet-h3-quinn-lifecycle](xeon-8370c-azure/24-ngnet-h3-quinn-lifecycle.md) | xeon-8370c-azure | 2026-08-29 | Bounded Quinn lifecycle cleanup — **−27.82% adjusted empty serial, 174,964 → 7,244 KiB aged RSS** | — |
+| [24-ngnet-h3-quinn-lifecycle](xeon-8370c-azure/24-ngnet-h3-quinn-lifecycle.md) | xeon-8370c-azure | 2026-08-29 | Bounded Quinn lifecycle cleanup — **−32.20% adjusted empty serial, 223,984 → 7,256 KiB aged RSS** | — |
 
 Runs [`08`](xeon-8370c-azure/08-qmux-against-h2.md) and
 [`09`](xeon-8370c-azure/09-qmux-h2-mechanisms.md) are the first cross-protocol comparison and its

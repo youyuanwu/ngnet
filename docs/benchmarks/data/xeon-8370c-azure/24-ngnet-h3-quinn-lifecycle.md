@@ -3,18 +3,23 @@
 **Machine:** historical [`xeon-8370c-azure`](README.md) label; Intel Xeon Platinum 8370C
 **Date:** 2026-08-29
 **Baseline:** `7da1866` (Phase 1 harness only)
-**Candidate:** `6335077` (bounded lifecycle and review fixes)
+**Candidate:** `7d5057a` (bounded lifecycle plus final review fixes)
 **CPU / system:** CPU 3, Linux 7.0.0-1012-azure, rustc 1.98.0
 **Cases:** `quinn_serial_latency`, `quinn_body_throughput`, and the checked-in Quinn probe
 **Criterion command:** `taskset -c 3 cargo bench -p ngnet-bench --bench
 quinn_serial_latency --bench quinn_body_throughput -- --warm-up-time 1
 --measurement-time 3 --sample-size 30 --noplot`
 **Probe command:** `taskset -c 3 ./target/release/examples/probe <arm> body 0
-<1000|10000|50000>`
+<1250|12500|62500>`
 **Repetitions:** three interleaved baseline/candidate passes; adjacent upstream `h3-quinn`
 arm retained as drift control
 **RSS:** `/proc/<probe-pid>/status` sampled every 10 ms after `PROBE-READY`; supplemental
-`/usr/bin/time -v` for the 50,000-exchange run
+`/usr/bin/time -v` for the 62,500-exchange run
+**Sampler:** a Python 3 parent starts the command with `subprocess.Popen`, blocks on the
+stderr `PROBE-READY` line, records `time.perf_counter()`, reads `VmRSS` and `VmHWM` from
+`/proc/<pid>/status`, sleeps 10 ms, and repeats until exit; elapsed time divided by the
+explicit iteration count is the repetition mean
+**Otherwise idle:** yes; no build, test, or other benchmark ran concurrently
 **Exclusions:** hardware/function profiling was unavailable because the host has
 `perf_event_paranoid=4`; no timed repetition was discarded
 
@@ -28,26 +33,27 @@ Criterion median time per complete request/response exchange. Lower is better.
 
 | Case | Revision | Pass 1 | Pass 2 | Pass 3 | Median |
 | --- | --- | ---: | ---: | ---: | ---: |
-| empty serial | baseline | 105.230 µs | 108.190 µs | 106.870 µs | **106.870 µs** |
-| empty serial | lifecycle | 79.188 µs | 77.992 µs | 77.858 µs | **77.992 µs** |
-| empty serial control | baseline | 39.038 µs | 40.066 µs | 40.046 µs | **40.046 µs** |
-| empty serial control | lifecycle | 40.487 µs | 41.557 µs | 40.449 µs | **40.487 µs** |
-| 16 KiB echo | baseline | 173.270 µs | 173.620 µs | 174.240 µs | **173.620 µs** |
-| 16 KiB echo | lifecycle | 163.240 µs | 164.890 µs | 158.930 µs | **163.240 µs** |
-| 16 KiB control | baseline | 105.430 µs | 107.420 µs | 110.540 µs | **107.420 µs** |
-| 16 KiB control | lifecycle | 111.060 µs | 105.630 µs | 106.760 µs | **106.760 µs** |
-| 1 MiB echo | baseline | 6.2205 ms | 6.3037 ms | 6.1804 ms | **6.2205 ms** |
-| 1 MiB echo | lifecycle | 6.2546 ms | 5.1614 ms | 5.1437 ms | **5.1614 ms** |
-| 1 MiB control | baseline | 4.5539 ms | 4.6302 ms | 4.5862 ms | **4.5862 ms** |
-| 1 MiB control | lifecycle | 4.8057 ms | 4.8650 ms | 4.5972 ms | **4.8057 ms** |
+| empty serial | baseline | 107.940 µs | 117.580 µs | 117.290 µs | **117.290 µs** |
+| empty serial | lifecycle | 81.395 µs | 80.178 µs | 80.830 µs | **80.830 µs** |
+| empty serial control | baseline | 42.461 µs | 41.481 µs | 40.534 µs | **41.481 µs** |
+| empty serial control | lifecycle | 41.290 µs | 41.719 µs | 41.958 µs | **41.719 µs** |
+| 16 KiB echo | baseline | 195.000 µs | 179.350 µs | 180.610 µs | **180.610 µs** |
+| 16 KiB echo | lifecycle | 166.860 µs | 168.140 µs | 160.560 µs | **166.860 µs** |
+| 16 KiB control | baseline | 124.590 µs | 113.440 µs | 107.860 µs | **113.440 µs** |
+| 16 KiB control | lifecycle | 110.860 µs | 113.070 µs | 109.500 µs | **110.860 µs** |
+| 1 MiB echo | baseline | 6.7610 ms | 6.0901 ms | 6.2450 ms | **6.2450 ms** |
+| 1 MiB echo | lifecycle | 5.2254 ms | 5.2332 ms | 5.2688 ms | **5.2332 ms** |
+| 1 MiB control | baseline | 5.1002 ms | 4.7967 ms | 4.6006 ms | **4.7967 ms** |
+| 1 MiB control | lifecycle | 5.0463 ms | 5.1064 ms | 4.9054 ms | **5.0463 ms** |
 
-Adjusting the baseline-to-candidate ratio by the matching unchanged-arm ratio gives:
+Each lifecycle/baseline pair is normalized by its matching interleaved unchanged-arm pair;
+the reported adjusted change is the median of those three paired ratios:
 
-| Case | Raw lifecycle change | Control-adjusted change | Gate |
-| --- | ---: | ---: | --- |
-| empty serial | −27.02% | **−27.82%** | measured and attributed to removing aged history |
-| 16 KiB echo | −5.98% | **−5.40%** | pass: no regression over 5% |
-| 1 MiB echo | −17.03% | **−20.82%** | pass: no regression over 5% |
+| Case | Raw median change | Adjusted passes | Adjusted median | Gate |
+| --- | ---: | --- | ---: | --- |
+| empty serial | −31.09% | −22.45%, −32.20%, −33.42% | **−32.20%** | measured and attributed to removing aged history |
+| 16 KiB echo | −7.61% | −3.83%, −5.94%, −12.43% | **−5.94%** | pass: no regression over 5% |
+| 1 MiB echo | −16.20% | −21.89%, −19.28%, −20.87% | **−20.87%** | pass: no regression over 5% |
 
 ## Probe latency and resident memory
 
@@ -56,21 +62,25 @@ by their median.
 
 | Exchanges | Revision | µs/exchange repetitions → median | peak RSS KiB repetitions → median |
 | ---: | --- | --- | --- |
-| 1,000 | baseline | 91.766, 81.273, 81.540 → **81.540** | 10,400, 10,256, 10,236 → **10,256** |
-| 1,000 | lifecycle | 92.390, 81.258, 81.246 → **81.258** | 7,296, 7,228, 7,132 → **7,228** |
-| 10,000 | baseline | 79.588, 79.331, 79.571 → **79.571** | 40,824, 40,772, 41,184 → **40,824** |
-| 10,000 | lifecycle | 79.773, 79.596, 79.688 → **79.688** | 7,196, 7,112, 7,184 → **7,184** |
-| 50,000 | baseline | 98.530, 96.747, 97.341 → **97.341** | 174,956, 174,988, 174,964 → **174,964** |
-| 50,000 | lifecycle | 79.863, 79.355, 78.661 → **79.355** | 7,208, 7,244, 7,292 → **7,244** |
+| 1,250 | baseline | 98.697, 89.525, 99.136 → **98.697** | 11,120, 10,964, 11,048 → **11,048** |
+| 1,250 | lifecycle | 97.738, 89.584, 89.553 → **89.584** | 7,220, 7,156, 7,192 → **7,192** |
+| 12,500 | baseline | 81.608, 84.849, 82.971 → **82.971** | 48,688, 48,688, 48,596 → **48,688** |
+| 12,500 | lifecycle | 83.222, 82.118, 83.870 → **83.222** | 7,212, 7,272, 7,320 → **7,272** |
+| 62,500 | baseline | 107.235, 105.761, 105.325 → **105.761** | 223,996, 223,984, 223,972 → **223,984** |
+| 62,500 | lifecycle | 82.083, 81.272, 81.961 → **81.961** | 7,304, 7,256, 7,196 → **7,256** |
 
-The lifecycle 50,000-exchange median is 2.34% below its 1,000-exchange median, within the
-10% stability gate. Its long-window median peak is only 16 KiB above the short-window median,
-well inside the larger-of-25%-or-16-MiB gate and below twice the 10,000-exchange peak.
-Supplemental whole-process maxima were 174,980 KiB for baseline and 7,236 KiB for lifecycle.
+The lifecycle median elapsed windows were approximately 0.112, 1.040, and 5.123 seconds.
+The same fixed counts intentionally took longer on the degraded aged baseline, reaching
+approximately 0.123, 1.037, and 6.610 seconds at its medians.
 
-The upstream probe remained bounded at approximately 6.7 MiB. Its median latency was
-50.874/40.508/39.466 µs for baseline-source runs and 40.954/40.897/39.341 µs for
-candidate-source runs at 1,000/10,000/50,000 exchanges; this is context for shared-host drift,
+The lifecycle 62,500-exchange median is 8.51% below its 1,250-exchange median, within the
+10% stability gate. Its long-window median peak is only 64 KiB above the short-window median,
+well inside the larger-of-25%-or-16-MiB gate and below twice the 12,500-exchange peak.
+Supplemental whole-process maxima were 223,848 KiB for baseline and 7,104 KiB for lifecycle.
+
+The upstream probe remained bounded at approximately 6.6 MiB. Its median latency was
+48.902/41.524/41.968 µs for baseline-source runs and 48.671/41.696/40.762 µs for
+candidate-source runs at 1,250/12,500/62,500 exchanges; this is context for shared-host drift,
 not an implementation difference.
 
 ## Adjacent-release candidate
@@ -99,8 +109,8 @@ driver, registry, FFI, write-slice, or task costs.
 ## What this establishes
 
 - Completed bidirectional lifecycle state, not the checked-in probe or upstream stack, caused
-  the connection-history RSS growth: the 50,000-exchange median fell from 174,964 to
-  7,244 KiB with flat short/long candidate peaks.
+  the connection-history RSS growth: the 62,500-exchange median fell from 223,984 to
+  7,256 KiB with flat short/long candidate peaks.
 - Aged serial latency is stable after cleanup, and the fresh Criterion matrix shows a large
   empty-serial improvement after unchanged-arm adjustment.
 - Neither measured body case regressed. The lifecycle correction is accepted independently
