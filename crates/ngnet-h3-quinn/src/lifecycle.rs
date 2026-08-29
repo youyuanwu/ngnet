@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use bytes::Bytes;
+use ngnet_h3::http::QuicEvent;
 use ngnet_h3::{ErrorCode, StreamId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,30 +183,253 @@ impl<Handle, Stop> Streams<Handle, Stop> {
     }
 }
 
+/// A Quinn observation waiting to be ordered against releases and terminal events.
+pub(crate) enum Incoming<Handle, Stop> {
+    Data {
+        stream: StreamId,
+        bytes: Bytes,
+        fin: bool,
+    },
+    Accepted {
+        stream: StreamId,
+        send: Handle,
+        stop: Stop,
+    },
+    Reset {
+        stream: StreamId,
+        code: ErrorCode,
+    },
+    RecvStopped {
+        stream: StreamId,
+        code: ErrorCode,
+    },
+    StopSending {
+        stream: StreamId,
+        code: ErrorCode,
+    },
+    SendStopped {
+        stream: StreamId,
+        code: Option<ErrorCode>,
+    },
+    Closed,
+}
+
+/// The next action for the connection shell.
+pub(crate) enum Step {
+    Event(QuicEvent),
+    Boundary,
+    NeedInput,
+    Finished,
+}
+
+/// Connection-independent event ordering and stream ownership.
+pub(crate) struct Lifecycle<Handle, Stop> {
+    streams: Streams<Handle, Stop>,
+    released: VecDeque<(StreamId, u64)>,
+    queued: VecDeque<Incoming<Handle, Stop>>,
+    closed: bool,
+    reported_closed: bool,
+    batch: BatchGate,
+}
+
+impl<Handle, Stop> Lifecycle<Handle, Stop> {
+    pub(crate) fn new() -> Self {
+        Self {
+            streams: Streams::new(),
+            released: VecDeque::new(),
+            queued: VecDeque::new(),
+            closed: false,
+            reported_closed: false,
+            batch: BatchGate::new(),
+        }
+    }
+
+    pub(crate) fn insert_uni(&mut self, stream: StreamId, send: Handle) {
+        self.streams.insert_uni(stream, send);
+    }
+
+    pub(crate) fn insert_bidi(&mut self, stream: StreamId, send: Handle, stop: Stop) {
+        self.streams.insert_bidi(stream, send, stop);
+    }
+
+    pub(crate) fn send_mut(&mut self, stream: StreamId) -> Option<&mut Handle> {
+        self.streams.send_mut(stream)
+    }
+
+    pub(crate) fn send_finished(&self, stream: StreamId) -> bool {
+        self.streams.send_finished(stream)
+    }
+
+    pub(crate) fn finish_send(&mut self, stream: StreamId, code: Option<ErrorCode>) -> bool {
+        self.streams.finish_send(stream, code)
+    }
+
+    pub(crate) fn take_stop(&mut self, stream: StreamId) -> Option<Stop> {
+        self.streams.take_stop(stream)
+    }
+
+    pub(crate) fn release(&mut self, stream: StreamId, bytes: u64) {
+        self.released.push_back((stream, bytes));
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Queues one transport observation unless shutdown has already been latched.
+    pub(crate) fn push(&mut self, event: Incoming<Handle, Stop>) {
+        if self.closed {
+            return;
+        }
+        if matches!(event, Incoming::Closed) {
+            self.closed = true;
+        } else {
+            self.queued.push_back(event);
+        }
+    }
+
+    /// Latches shutdown after preserving observations already queued at the latch point.
+    pub(crate) fn latch_external_shutdown(
+        &mut self,
+        events: impl IntoIterator<Item = Incoming<Handle, Stop>>,
+    ) {
+        if self.closed {
+            return;
+        }
+        for event in events {
+            if matches!(event, Incoming::Closed) {
+                break;
+            }
+            self.queued.push_back(event);
+        }
+        self.closed = true;
+    }
+
+    /// Records that the connection shell genuinely ran out of input.
+    pub(crate) fn pending(&mut self) {
+        self.batch.pending();
+    }
+
+    /// Returns the next externally observable event or scheduling action.
+    pub(crate) fn next(&mut self) -> Step {
+        if self.reported_closed {
+            return Step::Finished;
+        }
+
+        loop {
+            if !self.closed
+                && let Some(closed) = self.streams.pending_close()
+            {
+                let release_owed = self
+                    .released
+                    .iter()
+                    .any(|(stream, _)| *stream == closed.stream);
+                if !release_owed {
+                    if self.batch.take_boundary() {
+                        return Step::Boundary;
+                    }
+                    let closed = self
+                        .streams
+                        .pop_close()
+                        .expect("the close was observed above");
+                    self.batch.emitted();
+                    return Step::Event(QuicEvent::StreamClosed {
+                        stream: closed.stream,
+                        rx_code: closed.rx_code,
+                        tx_code: closed.tx_code,
+                    });
+                }
+            }
+
+            if let Some((stream, bytes)) = self.released.pop_front() {
+                self.batch.emitted();
+                return Step::Event(QuicEvent::Released {
+                    stream,
+                    bytes,
+                    delivered: true,
+                });
+            }
+
+            if let Some(event) = self.queued.pop_front() {
+                match event {
+                    Incoming::Data { stream, bytes, fin } => {
+                        if fin {
+                            self.streams.finish_recv(stream, None);
+                        }
+                        self.batch.emitted();
+                        return Step::Event(QuicEvent::Data { stream, bytes, fin });
+                    }
+                    Incoming::Accepted { stream, send, stop } => {
+                        self.streams.insert_bidi(stream, send, stop);
+                        self.batch.emitted();
+                        return Step::Event(QuicEvent::Accepted { stream });
+                    }
+                    Incoming::Reset { stream, code } => {
+                        if self.streams.finish_recv(stream, Some(code)) {
+                            self.batch.emitted();
+                            return Step::Event(QuicEvent::Reset { stream, code });
+                        }
+                    }
+                    Incoming::RecvStopped { stream, code } => {
+                        self.streams.finish_recv(stream, Some(code));
+                    }
+                    Incoming::StopSending { stream, code } => {
+                        if self.streams.finish_send(stream, Some(code)) {
+                            self.batch.emitted();
+                            return Step::Event(QuicEvent::StopSending { stream, code });
+                        }
+                    }
+                    Incoming::SendStopped { stream, code } => {
+                        self.streams.finish_send(stream, code);
+                    }
+                    Incoming::Closed => unreachable!("shutdown markers are never queued"),
+                }
+                continue;
+            }
+
+            if !self.closed {
+                return Step::NeedInput;
+            }
+            if self.batch.take_boundary() {
+                return Step::Boundary;
+            }
+            self.streams.clear();
+            self.reported_closed = true;
+            self.batch.emitted();
+            return Step::Event(QuicEvent::Closed { code: None });
+        }
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize, usize, usize) {
+        self.streams.counts()
+    }
+}
+
 /// Separates terminal events from events already returned in the current driver batch.
-pub(crate) struct BatchGate {
+struct BatchGate {
     emitted_since_pending: bool,
 }
 
 impl BatchGate {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
             emitted_since_pending: false,
         }
     }
 
     /// Records that an event was returned to the driver.
-    pub(crate) fn emitted(&mut self) {
+    fn emitted(&mut self) {
         self.emitted_since_pending = true;
     }
 
     /// Records a genuine poll with no event.
-    pub(crate) fn pending(&mut self) {
+    fn pending(&mut self) {
         self.emitted_since_pending = false;
     }
 
     /// Whether a terminal event must first force a fresh batch.
-    pub(crate) fn take_boundary(&mut self) -> bool {
+    fn take_boundary(&mut self) -> bool {
         if !self.emitted_since_pending {
             return false;
         }
@@ -219,6 +444,13 @@ mod tests {
 
     fn stream(value: i64) -> StreamId {
         StreamId::new(value).expect("a valid stream")
+    }
+
+    fn event(lifecycle: &mut Lifecycle<(), ()>) -> QuicEvent {
+        match lifecycle.next() {
+            Step::Event(event) => event,
+            _ => panic!("expected an event"),
+        }
     }
 
     #[test]
@@ -340,5 +572,151 @@ mod tests {
         gate.emitted();
         gate.pending();
         assert!(!gate.take_boundary());
+    }
+
+    #[test]
+    fn non_empty_final_data_starts_a_new_batch_before_close() {
+        let mut lifecycle = Lifecycle::new();
+        let id = stream(0);
+        lifecycle.insert_bidi(id, (), ());
+        assert!(lifecycle.finish_send(id, None));
+        lifecycle.push(Incoming::Data {
+            stream: id,
+            bytes: Bytes::from_static(b"final"),
+            fin: true,
+        });
+
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::Data { stream, bytes, fin: true }
+                if stream == id && bytes == Bytes::from_static(b"final")
+        ));
+        assert!(matches!(lifecycle.next(), Step::Boundary));
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::StreamClosed {
+                stream,
+                rx_code: None,
+                tx_code: None,
+            } if stream == id
+        ));
+        assert_eq!(lifecycle.counts(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn own_releases_precede_close_but_unrelated_releases_do_not_postpone_it() {
+        let mut lifecycle = Lifecycle::new();
+        let closing = stream(0);
+        let other = stream(4);
+        lifecycle.insert_bidi(closing, (), ());
+        lifecycle.insert_bidi(other, (), ());
+        lifecycle.release(closing, 2);
+        lifecycle.release(other, 3);
+        assert!(lifecycle.finish_send(closing, None));
+        assert!(lifecycle.streams.finish_recv(closing, None));
+
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::Released { stream, bytes: 2, delivered: true } if stream == closing
+        ));
+        assert!(matches!(lifecycle.next(), Step::Boundary));
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::StreamClosed { stream, .. } if stream == closing
+        ));
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::Released { stream, bytes: 3, delivered: true } if stream == other
+        ));
+    }
+
+    #[test]
+    fn peer_reset_and_send_observer_settle_without_a_later_write() {
+        let mut lifecycle = Lifecycle::new();
+        let id = stream(0);
+        let rx = ErrorCode::new(0x11);
+        let tx = ErrorCode::new(0x22);
+        lifecycle.insert_bidi(id, (), ());
+        lifecycle.push(Incoming::Reset {
+            stream: id,
+            code: rx,
+        });
+        lifecycle.push(Incoming::SendStopped {
+            stream: id,
+            code: Some(tx),
+        });
+
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::Reset { stream, code } if stream == id && code == rx
+        ));
+        assert!(matches!(lifecycle.next(), Step::Boundary));
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::StreamClosed {
+                stream,
+                rx_code: Some(actual_rx),
+                tx_code: Some(actual_tx),
+            } if stream == id && actual_rx == rx && actual_tx == tx
+        ));
+        assert_eq!(lifecycle.counts(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn queued_work_precedes_one_final_connection_close() {
+        let mut lifecycle = Lifecycle::new();
+        let active = stream(0);
+        let half_closed = stream(4);
+        let pending_close = stream(8);
+        lifecycle.insert_bidi(active, (), ());
+        lifecycle.insert_bidi(half_closed, (), ());
+        lifecycle.insert_bidi(pending_close, (), ());
+        lifecycle.finish_send(half_closed, None);
+        lifecycle.finish_send(pending_close, None);
+        lifecycle.streams.finish_recv(pending_close, None);
+        lifecycle.release(active, 7);
+        lifecycle.latch_external_shutdown([
+            Incoming::Data {
+                stream: active,
+                bytes: Bytes::from_static(b"last"),
+                fin: true,
+            },
+            Incoming::Closed,
+            Incoming::Reset {
+                stream: active,
+                code: ErrorCode::new(0x33),
+            },
+        ]);
+        lifecycle.push(Incoming::Closed);
+
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::Released { stream, bytes: 7, delivered: true } if stream == active
+        ));
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::Data { stream, bytes, fin: true }
+                if stream == active && bytes == Bytes::from_static(b"last")
+        ));
+        assert!(matches!(lifecycle.next(), Step::Boundary));
+        assert!(matches!(
+            event(&mut lifecycle),
+            QuicEvent::Closed { code: None }
+        ));
+        assert_eq!(lifecycle.counts(), (0, 0, 0, 0));
+        assert!(matches!(lifecycle.next(), Step::Finished));
+    }
+
+    #[test]
+    fn internal_terminal_messages_stop_at_need_input_instead_of_spinning() {
+        let mut lifecycle = Lifecycle::new();
+        let id = stream(0);
+        lifecycle.insert_bidi(id, (), ());
+        lifecycle.push(Incoming::RecvStopped {
+            stream: id,
+            code: ErrorCode::new(0x11),
+        });
+
+        assert!(matches!(lifecycle.next(), Step::NeedInput));
     }
 }

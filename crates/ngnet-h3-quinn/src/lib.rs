@@ -38,10 +38,10 @@ mod lifecycle;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use lifecycle::{BatchGate, Streams};
+use lifecycle::{Incoming, Lifecycle, Step};
 use ngnet_h3::http::quic::Timestamp;
 use ngnet_h3::http::{QuicConnection, QuicEvent, StreamSource, WriteOutcome};
 use ngnet_h3::{ErrorCode, StreamId};
@@ -60,6 +60,32 @@ const READ_CHUNK: usize = 64 * 1024;
 /// exhaust it.
 const INITIAL_BUDGET: u64 = 256 * 1024;
 
+struct ReadBudget {
+    bytes: AtomicU64,
+    available: tokio::sync::Notify,
+}
+
+impl ReadBudget {
+    fn new(bytes: u64) -> Self {
+        Self {
+            bytes: AtomicU64::new(bytes),
+            available: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn add(&self, bytes: u64) {
+        self.bytes.fetch_add(bytes, Ordering::AcqRel);
+        self.available.notify_waiters();
+    }
+
+    fn take(&self, bytes: u64) {
+        self.bytes.fetch_sub(
+            bytes.min(self.bytes.load(Ordering::Acquire)),
+            Ordering::AcqRel,
+        );
+    }
+}
+
 type OpeningUni = Pin<
     Box<dyn Future<Output = Result<quinn::SendStream, quinn::ConnectionError>> + Send + 'static>,
 >;
@@ -73,66 +99,52 @@ type OpeningBi = Pin<
 type StopSender = oneshot::Sender<ErrorCode>;
 type StopReceiver = oneshot::Receiver<ErrorCode>;
 
-/// Something that happened on a quinn connection.
-enum Incoming {
-    Data {
-        stream: StreamId,
-        bytes: bytes::Bytes,
-        fin: bool,
-    },
-    /// A peer-opened bidirectional stream, with the half to answer on.
-    Accepted {
-        stream: StreamId,
-        send: quinn::SendStream,
-        stop: StopSender,
-    },
-    Reset {
-        stream: StreamId,
-        code: ErrorCode,
-    },
-    /// This endpoint successfully stopped its receiving direction.
-    RecvStopped {
-        stream: StreamId,
-        code: ErrorCode,
-    },
-    /// The peer asked this endpoint to stop its sending direction.
-    StopSending {
-        stream: StreamId,
-        code: ErrorCode,
-    },
-    /// Quinn observed how the peer ended this endpoint's sending direction.
-    SendStopped {
-        stream: StreamId,
-        code: Option<ErrorCode>,
-    },
-    Closed,
+enum BudgetWake {
+    Available,
+    Stop(Result<ErrorCode, oneshot::error::RecvError>),
+    DriverGone,
+}
+
+async fn wait_for_budget<T>(
+    budget: &ReadBudget,
+    stop: Option<&mut StopReceiver>,
+    to_driver: &mpsc::UnboundedSender<T>,
+) -> BudgetWake {
+    let available = budget.available.notified();
+    if budget.bytes.load(Ordering::Acquire) != 0 {
+        return BudgetWake::Available;
+    }
+    if let Some(receiver) = stop {
+        tokio::select! {
+            signal = receiver => BudgetWake::Stop(signal),
+            _ = available => BudgetWake::Available,
+            _ = to_driver.closed() => BudgetWake::DriverGone,
+        }
+    } else {
+        tokio::select! {
+            _ = available => BudgetWake::Available,
+            _ = to_driver.closed() => BudgetWake::DriverGone,
+        }
+    }
 }
 
 /// A [`QuicConnection`] over an established `quinn::Connection`.
 pub struct QuinnBackend {
     quic: quinn::Connection,
-    /// Handles and terminal state for every stream this endpoint may write to.
-    streams: Streams<quinn::SendStream, StopSender>,
-    /// Releases owed to the layer, produced by writes and drained by `poll_event`.
-    released: VecDeque<(StreamId, u64)>,
+    /// Stream ownership plus release and terminal-event ordering.
+    lifecycle: Lifecycle<quinn::SendStream, StopSender>,
     /// Data and lifecycle observations produced by Quinn-owned tasks.
-    events: mpsc::UnboundedReceiver<Incoming>,
+    events: mpsc::UnboundedReceiver<Incoming<quinn::SendStream, StopSender>>,
     /// Held so the channel never closes of its own accord.
-    _to_driver: mpsc::UnboundedSender<Incoming>,
+    _to_driver: mpsc::UnboundedSender<Incoming<quinn::SendStream, StopSender>>,
     /// How many more bytes the reader tasks may deliver.
-    budget: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    budget: std::sync::Arc<ReadBudget>,
     /// An in-progress stream open must survive `Poll::Pending`.
     opening_uni: Option<OpeningUni>,
     /// An in-progress stream open must survive `Poll::Pending`.
     opening_bi: Option<OpeningBi>,
     /// Monotonic origin used by the sans-I/O core.
     started: Instant,
-    /// Whether connection shutdown has been observed or locally requested.
-    closed: bool,
-    /// Whether the single terminal connection event was returned.
-    reported_closed: bool,
-    /// Forces stream and connection closure to begin a fresh driver event batch.
-    batch: BatchGate,
 }
 
 /// A quinn operation failed.
@@ -154,36 +166,50 @@ impl QuinnBackend {
     /// stream identifiers rather than from a role flag.
     pub fn new(quic: quinn::Connection) -> Self {
         let (to_driver, events) = mpsc::unbounded_channel();
-        let budget = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(INITIAL_BUDGET));
+        let budget = std::sync::Arc::new(ReadBudget::new(INITIAL_BUDGET));
 
         spawn_acceptor(quic.clone(), to_driver.clone(), budget.clone());
 
         Self {
             quic,
-            streams: Streams::new(),
-            released: VecDeque::new(),
+            lifecycle: Lifecycle::new(),
             events,
             _to_driver: to_driver,
             budget,
             opening_uni: None,
             opening_bi: None,
             started: Instant::now(),
-            closed: false,
-            reported_closed: false,
-            batch: BatchGate::new(),
         }
     }
 
     fn fail(error: impl core::fmt::Display) -> QuinnError {
         QuinnError(error.to_string())
     }
+
+    /// Latches shutdown while preserving only work already queued at this instant.
+    fn latch_external_shutdown(&mut self) {
+        if self.lifecycle.is_closed() {
+            return;
+        }
+        let mut queued = Vec::new();
+        loop {
+            match self.events.try_recv() {
+                Ok(Incoming::Closed) => break,
+                Ok(event) => queued.push(event),
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+        self.lifecycle.latch_external_shutdown(queued);
+    }
 }
 
 /// Accepts everything the peer opens, for as long as the connection lives.
 fn spawn_acceptor(
     quic: quinn::Connection,
-    to_driver: mpsc::UnboundedSender<Incoming>,
-    budget: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    to_driver: mpsc::UnboundedSender<Incoming<quinn::SendStream, StopSender>>,
+    budget: std::sync::Arc<ReadBudget>,
 ) {
     let uni = quic.clone();
     let uni_sender = to_driver.clone();
@@ -235,7 +261,7 @@ fn spawn_acceptor(
 fn spawn_send_observer(
     stopped: impl Future<Output = Result<Option<quinn::VarInt>, quinn::StoppedError>> + Send + 'static,
     stream: StreamId,
-    to_driver: mpsc::UnboundedSender<Incoming>,
+    to_driver: mpsc::UnboundedSender<Incoming<quinn::SendStream, StopSender>>,
 ) {
     tokio::spawn(async move {
         match stopped.await {
@@ -265,34 +291,27 @@ fn spawn_send_observer(
 fn spawn_reader(
     mut recv: quinn::RecvStream,
     mut stop: Option<StopReceiver>,
-    to_driver: mpsc::UnboundedSender<Incoming>,
-    budget: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    to_driver: mpsc::UnboundedSender<Incoming<quinn::SendStream, StopSender>>,
+    budget: std::sync::Arc<ReadBudget>,
 ) {
     let stream = to_stream_id(recv.id());
     tokio::spawn(async move {
         loop {
             // Read-ahead is bounded by the credit the layer has extended. Without this the
             // channel below is an unbounded buffer a fast peer controls.
-            while budget.load(std::sync::atomic::Ordering::Acquire) == 0 {
-                if let Some(receiver) = stop.as_mut() {
-                    tokio::select! {
-                        signal = receiver => {
-                            stop = None;
-                            match signal {
-                                Ok(code) if recv.stop(varint(code)).is_ok() => {
-                                    let _ = to_driver.send(Incoming::RecvStopped { stream, code });
-                                    return;
-                                }
-                                _ => continue,
-                            }
+            while budget.bytes.load(Ordering::Acquire) == 0 {
+                match wait_for_budget(&budget, stop.as_mut(), &to_driver).await {
+                    BudgetWake::Stop(signal) => {
+                        stop = None;
+                        if let Ok(code) = signal
+                            && recv.stop(varint(code)).is_ok()
+                        {
+                            let _ = to_driver.send(Incoming::RecvStopped { stream, code });
+                            return;
                         }
-                        _ = tokio::task::yield_now() => {}
                     }
-                } else {
-                    tokio::task::yield_now().await;
-                }
-                if to_driver.is_closed() {
-                    return;
+                    BudgetWake::Available => {}
+                    BudgetWake::DriverGone => return,
                 }
             }
 
@@ -317,10 +336,7 @@ fn spawn_reader(
             match read {
                 Ok(Some(chunk)) => {
                     let len = chunk.bytes.len() as u64;
-                    budget.fetch_sub(
-                        len.min(budget.load(std::sync::atomic::Ordering::Acquire)),
-                        std::sync::atomic::Ordering::AcqRel,
-                    );
+                    budget.take(len);
                     if to_driver
                         .send(Incoming::Data {
                             stream,
@@ -380,93 +396,30 @@ impl QuicConnection for QuinnBackend {
     const RETAINS_BUFFERS: bool = false;
 
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Result<QuicEvent, Self::Error>> {
-        if self.reported_closed {
-            self.batch.pending();
-            return Poll::Pending;
-        }
-
         loop {
-            if self.closed {
-                if self.batch.take_boundary() {
+            match self.lifecycle.next() {
+                Step::Event(event) => {
+                    if matches!(event, QuicEvent::Closed { .. }) {
+                        self.events.close();
+                        while self.events.try_recv().is_ok() {}
+                    }
+                    return Poll::Ready(Ok(event));
+                }
+                Step::Boundary => {
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
-                self.streams.clear();
-                self.released.clear();
-                self.reported_closed = true;
-                self.batch.emitted();
-                return Poll::Ready(Ok(QuicEvent::Closed { code: None }));
-            }
-
-            if let Some(closed) = self.streams.pending_close() {
-                let release_owed = self
-                    .released
-                    .iter()
-                    .any(|(stream, _)| *stream == closed.stream);
-                if !release_owed {
-                    if self.batch.take_boundary() {
-                        cx.waker().wake_by_ref();
+                Step::NeedInput => match self.events.poll_recv(cx) {
+                    Poll::Pending => {
+                        self.lifecycle.pending();
                         return Poll::Pending;
                     }
-                    let closed = self.streams.pop_close().expect("the close just observed");
-                    self.batch.emitted();
-                    return Poll::Ready(Ok(QuicEvent::StreamClosed {
-                        stream: closed.stream,
-                        rx_code: closed.rx_code,
-                        tx_code: closed.tx_code,
-                    }));
-                }
-            }
-
-            // Releases normally go first because they free the layer's buffers. A ready
-            // close may pass releases for other streams, however: only bytes accepted on
-            // the closing stream have to precede that stream's close.
-            if let Some((stream, bytes)) = self.released.pop_front() {
-                self.batch.emitted();
-                return Poll::Ready(Ok(QuicEvent::Released {
-                    stream,
-                    bytes,
-                    delivered: true,
-                }));
-            }
-
-            match self.events.poll_recv(cx) {
-                Poll::Pending => {
-                    self.batch.pending();
+                    Poll::Ready(None) => self.lifecycle.push(Incoming::Closed),
+                    Poll::Ready(Some(event)) => self.lifecycle.push(event),
+                },
+                Step::Finished => {
+                    self.lifecycle.pending();
                     return Poll::Pending;
-                }
-                Poll::Ready(None) | Poll::Ready(Some(Incoming::Closed)) => {
-                    self.closed = true;
-                }
-                Poll::Ready(Some(Incoming::Data { stream, bytes, fin })) => {
-                    if fin {
-                        self.streams.finish_recv(stream, None);
-                    }
-                    self.batch.emitted();
-                    return Poll::Ready(Ok(QuicEvent::Data { stream, bytes, fin }));
-                }
-                Poll::Ready(Some(Incoming::Accepted { stream, send, stop })) => {
-                    self.streams.insert_bidi(stream, send, stop);
-                    self.batch.emitted();
-                    return Poll::Ready(Ok(QuicEvent::Accepted { stream }));
-                }
-                Poll::Ready(Some(Incoming::Reset { stream, code })) => {
-                    if self.streams.finish_recv(stream, Some(code)) {
-                        self.batch.emitted();
-                        return Poll::Ready(Ok(QuicEvent::Reset { stream, code }));
-                    }
-                }
-                Poll::Ready(Some(Incoming::RecvStopped { stream, code })) => {
-                    self.streams.finish_recv(stream, Some(code));
-                }
-                Poll::Ready(Some(Incoming::StopSending { stream, code })) => {
-                    if self.streams.finish_send(stream, Some(code)) {
-                        self.batch.emitted();
-                        return Poll::Ready(Ok(QuicEvent::StopSending { stream, code }));
-                    }
-                }
-                Poll::Ready(Some(Incoming::SendStopped { stream, code })) => {
-                    self.streams.finish_send(stream, code);
                 }
             }
         }
@@ -477,12 +430,19 @@ impl QuicConnection for QuinnBackend {
         cx: &mut Context<'_>,
         source: &mut S,
     ) -> Poll<Result<(), Self::Error>> {
-        let streams = &mut self.streams;
-        let released = &mut self.released;
-        let to_driver = self._to_driver.clone();
+        if self.lifecycle.is_closed() {
+            cx.waker().wake_by_ref();
+            return Poll::Ready(Ok(()));
+        }
+
+        let lifecycle = &mut self.lifecycle;
+        let mut connection_lost = false;
 
         while source.write_next(&mut |stream, slices, fin| {
-            if streams.send_mut(stream).is_none() {
+            if connection_lost {
+                return WriteOutcome::Gone;
+            }
+            if lifecycle.send_mut(stream).is_none() {
                 return WriteOutcome::Gone;
             }
 
@@ -491,15 +451,15 @@ impl QuicConnection for QuinnBackend {
             // end it was never told about.
             let total: usize = slices.iter().map(|s| s.len()).sum();
             if total == 0 {
-                if fin && !streams.send_finished(stream) {
-                    let result = streams
+                if fin && !lifecycle.send_finished(stream) {
+                    let result = lifecycle
                         .send_mut(stream)
                         .expect("the send was just observed")
                         .finish();
                     if result.is_err() {
                         return WriteOutcome::Gone;
                     }
-                    streams.finish_send(stream, None);
+                    lifecycle.finish_send(stream, None);
                 }
                 return WriteOutcome::Accepted(0);
             }
@@ -513,7 +473,7 @@ impl QuicConnection for QuinnBackend {
             };
 
             let write = Pin::new(
-                streams
+                lifecycle
                     .send_mut(stream)
                     .expect("the send was just observed"),
             )
@@ -521,16 +481,16 @@ impl QuicConnection for QuinnBackend {
             match write {
                 Poll::Pending => WriteOutcome::Blocked,
                 Poll::Ready(Err(quinn::WriteError::Stopped(code))) => {
-                    streams.finish_send(stream, Some(ErrorCode::new(code.into_inner())));
+                    lifecycle.finish_send(stream, Some(ErrorCode::new(code.into_inner())));
                     WriteOutcome::Gone
                 }
                 Poll::Ready(Err(quinn::WriteError::ConnectionLost(_))) => {
-                    let _ = to_driver.send(Incoming::Closed);
+                    connection_lost = true;
                     WriteOutcome::Gone
                 }
                 Poll::Ready(Err(quinn::WriteError::ClosedStream)) => WriteOutcome::Gone,
                 Poll::Ready(Err(quinn::WriteError::ZeroRttRejected)) => {
-                    streams.finish_send(stream, Some(ErrorCode::new(0x102)));
+                    lifecycle.finish_send(stream, Some(ErrorCode::new(0x102)));
                     WriteOutcome::Gone
                 }
                 Poll::Ready(Ok(written)) => {
@@ -538,24 +498,25 @@ impl QuicConnection for QuinnBackend {
                         // Reported on acceptance, which is sound only because quinn
                         // copied: see `RETAINS_BUFFERS`. A transport that borrowed the
                         // bytes instead would have to wait for the peer.
-                        released.push_back((stream, written as u64));
+                        lifecycle.release(stream, written as u64);
                     }
-                    if fin && written == total && !streams.send_finished(stream) {
-                        let result = streams
+                    if fin && written == total && !lifecycle.send_finished(stream) {
+                        let result = lifecycle
                             .send_mut(stream)
                             .expect("the send was just observed")
                             .finish();
                         if result.is_err() {
                             return WriteOutcome::Gone;
                         }
-                        streams.finish_send(stream, None);
+                        lifecycle.finish_send(stream, None);
                     }
                     WriteOutcome::Accepted(written)
                 }
             }
         }) {}
 
-        if self.closed {
+        if connection_lost {
+            self.latch_external_shutdown();
             cx.waker().wake_by_ref();
         }
         Poll::Ready(Ok(()))
@@ -582,7 +543,7 @@ impl QuicConnection for QuinnBackend {
             Poll::Ready(Ok(send)) => {
                 self.opening_uni = None;
                 let stream = to_stream_id(send.id());
-                self.streams.insert_uni(stream, send);
+                self.lifecycle.insert_uni(stream, send);
                 Poll::Ready(Ok(stream))
             }
         }
@@ -604,7 +565,7 @@ impl QuicConnection for QuinnBackend {
                 let stream = to_stream_id(send.id());
                 let (stop, receive_stop) = oneshot::channel();
                 let stopped = send.stopped();
-                self.streams.insert_bidi(stream, send, stop);
+                self.lifecycle.insert_bidi(stream, send, stop);
                 spawn_send_observer(stopped, stream, self._to_driver.clone());
                 // The receiving half must be read, not dropped: quinn turns a dropped
                 // receiving half into STOP_SENDING, so the peer's answer would be reset
@@ -621,21 +582,21 @@ impl QuicConnection for QuinnBackend {
     }
 
     fn reset(&mut self, stream: StreamId, code: ErrorCode) -> Result<(), Self::Error> {
-        if self.streams.send_finished(stream) {
+        if self.lifecycle.send_finished(stream) {
             return Ok(());
         }
         let reset = self
-            .streams
+            .lifecycle
             .send_mut(stream)
             .map(|send| send.reset(varint(code)));
         if matches!(reset, Some(Ok(()))) {
-            self.streams.finish_send(stream, Some(code));
+            self.lifecycle.finish_send(stream, Some(code));
         }
         Ok(())
     }
 
     fn stop_sending(&mut self, stream: StreamId, code: ErrorCode) -> Result<(), Self::Error> {
-        if let Some(stop) = self.streams.take_stop(stream) {
+        if let Some(stop) = self.lifecycle.take_stop(stream) {
             let _ = stop.send(code);
         }
         Ok(())
@@ -648,15 +609,14 @@ impl QuicConnection for QuinnBackend {
         // once for the connection; this adapter has one connection-wide pool, so account for
         // only the connection-level report.
         if stream.is_none() {
-            self.budget
-                .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+            self.budget.add(bytes);
         }
         Ok(())
     }
 
     fn close(&mut self, code: ErrorCode, reason: &[u8]) -> Result<(), Self::Error> {
-        if !self.closed {
-            self.closed = true;
+        if !self.lifecycle.is_closed() {
+            self.latch_external_shutdown();
             self.quic.close(varint(code), reason);
         }
         Ok(())
@@ -669,4 +629,41 @@ impl QuicConnection for QuinnBackend {
 
 fn varint(code: ErrorCode) -> quinn::VarInt {
     quinn::VarInt::from_u64(code.get()).unwrap_or_else(|_| quinn::VarInt::from_u32(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn zero_budget_wait_can_be_interrupted_by_receive_stop() {
+        let budget = ReadBudget::new(0);
+        let (stop, mut receive_stop) = oneshot::channel();
+        let (to_driver, _events) = mpsc::unbounded_channel::<()>();
+        let code = ErrorCode::new(0x11);
+
+        stop.send(code).expect("the stop receiver is live");
+        assert!(matches!(
+            wait_for_budget(&budget, Some(&mut receive_stop), &to_driver).await,
+            BudgetWake::Stop(Ok(actual)) if actual == code
+        ));
+    }
+
+    #[tokio::test]
+    async fn extending_zero_budget_wakes_a_parked_reader() {
+        let budget = std::sync::Arc::new(ReadBudget::new(0));
+        let waiting = std::sync::Arc::clone(&budget);
+        let (to_driver, _events) = mpsc::unbounded_channel::<()>();
+        let waiter = tokio::spawn(async move { wait_for_budget(&waiting, None, &to_driver).await });
+
+        tokio::task::yield_now().await;
+        budget.add(1);
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .expect("budget wake should not hang")
+                .expect("budget waiter should not panic"),
+            BudgetWake::Available
+        ));
+    }
 }
