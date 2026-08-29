@@ -98,6 +98,7 @@ submodules. [`../../running.md`](../../running.md) states the requirement in ful
 | [19-qmux-h3-candidate-c-fixed-header-work](19-qmux-h3-candidate-c-fixed-header-work.md) | 2026-08-28 | `c188758` against `c7c95d9` | C1–C3 removed **20 mallocs and 3 reallocs**, but timing was inconsistent and failed both-substrate gates — reverted |
 | [20-qmux-h3-candidate-d-event-queue](20-qmux-h3-candidate-d-event-queue.md) | 2026-08-28 | `6bff8ee` | Pops remain **23 = 23 fill iterations**, including 16 empty; queue-local options cannot reduce the registered count — closed |
 | [21-qmux-h3-combined-final-matrix](21-qmux-h3-combined-final-matrix.md) | 2026-08-28 | `0984e1c` against `364dbb2` | Final binaries are hash-identical to the merged predecessor; fresh 16-case QMux/H3 ÷ H2 ratios range from **0.845× to 2.063×** |
+| [22-qmux-h3-at-8-mib](22-qmux-h3-at-8-mib.md) | 2026-08-29 | `cae8330` | At 8 MiB, QMux/H3 is **1.182× over a duplex and 0.919× over a socket** |
 
 Still outstanding, in the order they are worth doing:
 

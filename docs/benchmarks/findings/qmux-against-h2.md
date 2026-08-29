@@ -1,7 +1,8 @@
 # What HTTP/3 over QMux costs against HTTP/2
 
 **Current measurement:** [`21-qmux-h3-combined-final-matrix`](../data/xeon-8370c-azure/21-qmux-h3-combined-final-matrix.md)
-— Xeon 8573C, three duplex and two socket passes, ratios formed within each pass. Runs
+plus the new [`22-qmux-h3-at-8-mib`](../data/xeon-8370c-azure/22-qmux-h3-at-8-mib.md)
+point — Xeon 8573C, ratios formed within each pass. Runs
 [`16`](../data/xeon-8370c-azure/16-qmux-h3-baseline-and-pump-attribution.md) through
 [`20`](../data/xeon-8370c-azure/20-qmux-h3-candidate-d-event-queue.md) provide current counts,
 attribution, and rejected-candidate evidence. Runs
@@ -21,11 +22,14 @@ mechanism study; their absolute timings are not controls across the Azure CPU mi
 | body 1 KiB | 1.780× | 1.236× |
 | body 64 KiB | 1.508× | **1.005×** |
 | body 1 MiB | 1.222× | **0.845×** |
+| body 8 MiB | 1.182× | **0.919×** |
 
-Over a socket, QMux/H3 reaches parity near 64 KiB and is 15.5% faster at 1 MiB because it still
-writes far less often: 67 writes versus HTTP/2's 189. For empty and concurrent work it remains
-roughly 1.8–2.1× slower. The final branch's benchmark binaries are hash-identical to merged PR #45,
-so this work claims no production speedup.
+Over a socket, QMux/H3 reaches parity near 64 KiB, is 15.5% faster at 1 MiB, and remains 8.1%
+faster at 8 MiB because it writes far less often. At 8 MiB the count is 515 writes against
+HTTP/2's 1,410, with effectively identical reads. The advantage narrows rather than widening
+between the separately measured 1 MiB and 8 MiB sessions, so no single constant marginal ratio
+describes the whole large-body range. For empty and concurrent work QMux/H3 remains roughly
+1.8–2.1× slower.
 
 Four evidence-driven candidates were investigated. Removing duplicate open/transmit pumps cut reads and
 pumps from 73/70 to 40/37 but missed the socket timing gate. Safe delivery transfer removed 160
