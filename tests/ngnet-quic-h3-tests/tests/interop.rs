@@ -39,7 +39,10 @@ async fn a_bare_quic_handshake_completes_against_quinn() {
     let (quinn_endpoint, address) = quinn_listener(&credentials);
 
     let accepting = tokio::spawn(async move {
-        let incoming = quinn_endpoint.accept().await.expect("an incoming connection");
+        let incoming = quinn_endpoint
+            .accept()
+            .await
+            .expect("an incoming connection");
         let connection = incoming.await.expect("a completed handshake");
         // Hold the endpoint open for the length of the test.
         (connection, quinn_endpoint)
@@ -64,11 +67,10 @@ async fn a_bare_quic_handshake_completes_against_quinn() {
         .expect("the acceptor task");
 
     assert_eq!(
-        peer.handshake_data()
-            .and_then(|d| d
-                .downcast::<quinn::crypto::rustls::HandshakeData>()
-                .ok()
-                .and_then(|d| d.protocol.clone())),
+        peer.handshake_data().and_then(|d| d
+            .downcast::<quinn::crypto::rustls::HandshakeData>()
+            .ok()
+            .and_then(|d| d.protocol.clone())),
         Some(H3_ALPN.to_vec()),
         "both ends must have negotiated the same application protocol; without one \
          configured on quinn this fails for a reason that has nothing to do with QUIC"
@@ -117,9 +119,12 @@ async fn an_http3_request_completes_from_this_stack_to_quinn() {
     let expected = body.clone();
 
     tokio::spawn(async move {
-        let incoming = quinn_endpoint.accept().await.expect("an incoming connection");
+        let incoming = quinn_endpoint
+            .accept()
+            .await
+            .expect("an incoming connection");
         let connection = incoming.await.expect("a completed handshake");
-        let backend = ngnet_h3_tests::quic_backend::QuinnBackend::new(connection);
+        let backend = ngnet_h3_quinn::QuinnBackend::new(connection);
         let served = ngnet_h3::http::serve(backend, move |request| {
             let body = body.clone();
             async move {
@@ -187,9 +192,7 @@ async fn an_http3_request_completes_from_quinn_to_this_stack() {
     let expected = body.clone();
 
     tokio::spawn(async move {
-        let backend = ngnet_quic_h3::accept(&server)
-            .await
-            .expect("accepting");
+        let backend = ngnet_quic_h3::accept(&server).await.expect("accepting");
         let served = ngnet_h3::http::serve(backend, move |request| {
             let body = body.clone();
             async move {
@@ -219,7 +222,7 @@ async fn an_http3_request_completes_from_quinn_to_this_stack() {
     .expect("quinn must not hang")
     .expect("quinn must complete a handshake with ngtcp2");
 
-    let backend = ngnet_h3_tests::quic_backend::QuinnBackend::new(connection);
+    let backend = ngnet_h3_quinn::QuinnBackend::new(connection);
     let (sender, driver) =
         ngnet_h3::http::handshake::<_, Payload>(backend).expect("starting the quinn client");
     tokio::spawn(async move {
@@ -261,9 +264,7 @@ async fn a_multi_packet_payload_crosses_to_quinn_byte_for_byte() {
     let expected = body.clone();
 
     tokio::spawn(async move {
-        let backend = ngnet_quic_h3::accept(&server)
-            .await
-            .expect("accepting");
+        let backend = ngnet_quic_h3::accept(&server).await.expect("accepting");
         let served = ngnet_h3::http::serve(backend, move |request| {
             let body = body.clone();
             async move {
@@ -293,7 +294,7 @@ async fn a_multi_packet_payload_crosses_to_quinn_byte_for_byte() {
     .expect("quinn must not hang")
     .expect("a connection");
 
-    let backend = ngnet_h3_tests::quic_backend::QuinnBackend::new(connection);
+    let backend = ngnet_h3_quinn::QuinnBackend::new(connection);
     let (sender, driver) =
         ngnet_h3::http::handshake::<_, Payload>(backend).expect("starting the client");
     tokio::spawn(async move {

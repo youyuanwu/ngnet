@@ -1,0 +1,21 @@
+[package]
+name = "ngnet-h3-quinn"
+version = "0.0.1"
+description = "Quinn transport adapter for ngnet-h3"
+readme = "README.md"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# This crate is the intentional join between the transport-independent HTTP/3 layer and
+# Quinn. It starts from an established connection, but adapting Quinn's per-stream async API
+# into ngnet-h3's connection-level event stream requires Tokio tasks and a channel.
+[dependencies]
+ngnet-h3.workspace = true
+bytes.workspace = true
+quinn.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true

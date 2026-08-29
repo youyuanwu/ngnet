@@ -16,7 +16,8 @@ Design notes, the invariants the test suite pins, and the tracked backlog live i
 | [`ngnet-h2-tests`](tests/ngnet-h2-tests) | Not published. Drives `ngnet-h2` over a real async transport, so the wrapper needs no runtime dependency of its own. |
 | [`ngnet-h3`](crates/ngnet-h3) | Published at 0.0.x — the API is still expected to change, so every release is a breaking one; see [`docs/h3/pending-work.md`](docs/h3/pending-work.md). Safe, sans-I/O API driving an HTTP/3 client or server connection over QUIC streams the caller owns — plus an optional asynchronous `http`/`http-body` client and server built on it (default `http` feature). No QUIC or TLS of its own. |
 | [`ngnet-h3-sys`](crates/ngnet-h3-sys) | Published alongside `ngnet-h3`. Raw FFI bindings. Builds libnghttp3 from source and generates bindings with `bindgen`. |
-| [`ngnet-h3-tests`](tests/ngnet-h3-tests) | Not published. Drives `ngnet-h3` over a real QUIC connection using [quinn](https://github.com/quinn-rs/quinn), so the wrapper needs no transport dependency of its own. Contains the reference `QuicConnection` implementation. |
+| [`ngnet-h3-quinn`](crates/ngnet-h3-quinn) | Not published. Implements `ngnet-h3`'s transport trait for an established [Quinn](https://github.com/quinn-rs/quinn) connection while leaving endpoint and TLS policy to the caller. |
+| [`ngnet-h3-tests`](tests/ngnet-h3-tests) | Not published. Drives both the sans-I/O core and the asynchronous `ngnet-h3-quinn` adapter over real Quinn connections, so transport integration coverage does not widen `ngnet-h3` itself. |
 | [`ngnet-quic`](crates/ngnet-quic) | Published at 0.0.x — the API is still expected to change, so every release is a breaking one; see [`docs/quic/pending-work.md`](docs/quic/pending-work.md). Safe API driving a QUIC client or server. A sans-I/O state machine, and behind the default-on `endpoint` feature an asynchronous layer that owns a UDP socket and every connection on it, with the socket and clock as seams a caller implements and a ready-made pair for tokio behind an optional feature. Servers can validate client addresses before committing state. TLS is a backend seam with a default-on OpenSSL implementation. |
 | [`ngnet-quic-sys`](crates/ngnet-quic-sys) | Published alongside `ngnet-quic`. Raw FFI bindings to [ngtcp2](https://github.com/ngtcp2/ngtcp2), the QUIC transport. Builds libngtcp2 from source with `bindgen`, plus its OpenSSL crypto helper behind a default-on `crypto-ossl` feature. |
 | [`ngnet-quic-tests`](tests/ngnet-quic-tests) | Not published. Drives `ngnet-quic` through real TLS handshakes and real stream data, in process and over loopback UDP, so the wrapper needs no certificate or runtime dependency of its own. |
@@ -43,7 +44,7 @@ for you and you write `http::Request` and `http::Response` instead. What it stil
 does not do is supply QUIC: you bring an *established* connection behind the
 `QuicConnection` trait, so choosing a QUIC library, authenticating the peer and
 negotiating `h3` remain yours. `ngnet-h3-tests` has a working implementation of
-that trait over quinn to copy.
+that setup using the reusable `ngnet-h3-quinn` adapter.
 
 Server push is absent because nghttp3 does not implement it.
 
@@ -250,8 +251,9 @@ This repo vendors four upstream C libraries as git submodules:
 
 `nghttp3` depends on no QUIC transport and on no TLS library — it is a state
 machine over stream bytes — and neither does `ngnet-h3`. Choosing a QUIC
-implementation is left to the caller; the integration tests happen to use quinn,
-and that choice reaches no crate but `ngnet-h3-tests`.
+implementation is left to the caller. Quinn support lives in the separate
+`ngnet-h3-quinn` adapter and reaches `ngnet-h3-tests` and the benchmark crate,
+but never the transport-independent `ngnet-h3` dependency graph.
 
 `ngtcp2` is vendored as a step towards a second QUIC backend, and is not wired
 into `ngnet-h3` yet. It draws the same line one layer down: libngtcp2 itself

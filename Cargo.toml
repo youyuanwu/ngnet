@@ -6,6 +6,7 @@ members = [
     "crates/ngnet-h2-sys",
     "crates/ngnet-h3-sys",
     "crates/ngnet-h3",
+    "crates/ngnet-h3-quinn",
     "crates/ngnet-quic-sys",
     "crates/ngnet-quic",
     "crates/ngnet-quic-h3",
@@ -68,6 +69,9 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
+# Upstream HTTP/3 comparison stack used only by `ngnet-bench`.
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 # The comparison target. `client` and `server` give both conn builders; `http2` is the
 # protocol under test; `http1` is off, so nothing HTTP/1 is pulled in.
 hyper = { version = "1", features = ["client", "server", "http2"] }
@@ -82,6 +86,9 @@ ngnet-h2 = { path = "crates/ngnet-h2", version = "0.0.1" }
 ngnet-h2-sys = { path = "crates/ngnet-h2-sys", version = "0.0.1" }
 ngnet-h3 = { path = "crates/ngnet-h3", version = "0.0.1" }
 ngnet-h3-sys = { path = "crates/ngnet-h3-sys", version = "0.0.1" }
+# The external-transport adapter: Quinn stays out of `ngnet-h3` while callers get a reusable
+# implementation instead of copying the former integration-test backend.
+ngnet-h3-quinn = { path = "crates/ngnet-h3-quinn" }
 ngnet-quic-sys = { path = "crates/ngnet-quic-sys", version = "0.0.1", default-features = false }
 ngnet-quic = { path = "crates/ngnet-quic", version = "0.0.1" }
 # The QMux pair. Unrelated to the QUIC crates above despite the similar name: QMux is a
@@ -89,19 +96,19 @@ ngnet-quic = { path = "crates/ngnet-quic", version = "0.0.1" }
 # reaches the other.
 ngnet-qmux-sys = { path = "crates/ngnet-qmux-sys" }
 ngnet-qmux = { path = "crates/ngnet-qmux" }
-# The two crates allowed to depend on both an HTTP/3 state machine and a transport family,
-# and the only places those families meet. Keeping the adapters here rather than in either
-# side is what lets a caller take HTTP/3 without a transport implementation, or a transport
-# without an HTTP/3 state machine; a workspace test asserts that no other crate joins them,
-# and that neither transport family reaches the other.
+# The two adapters for transport families implemented in this workspace. Keeping the joins
+# here rather than in either side is what lets a caller take HTTP/3 without a transport
+# implementation, or a transport without an HTTP/3 state machine; a workspace test asserts
+# that neither transport family reaches the other.
 ngnet-quic-h3 = { path = "crates/ngnet-quic-h3", version = "0.0.1" }
 ngnet-qmux-h3 = { path = "crates/ngnet-qmux-h3" }
 ngnet-util = { path = "crates/ngnet-util" }
 # Build-time only, and only for the `crypto-ossl` feature of `ngnet-quic-sys`:
 # it locates the system OpenSSL that ngtcp2's crypto helper is compiled against.
 pkg-config = "0.3"
-# The QUIC implementation the HTTP/3 integration tests run over. Test-only: `ngnet-h3`
-# itself depends on nothing but its own `-sys` crate, and a test asserts as much.
+# The QUIC implementation used by the standalone `ngnet-h3-quinn` adapter and its integration
+# tests. `ngnet-h3` itself still depends on nothing but its own `-sys` crate, and a test
+# asserts as much.
 #
 # `platform-verifier` is off, and with it `rustls-native-certs`: the tests trust exactly one
 # self-signed certificate they generated themselves, so reading the host's trust store would

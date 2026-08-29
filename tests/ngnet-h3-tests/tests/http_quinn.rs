@@ -20,8 +20,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use ngnet_h3::http::{Cancelled, IncomingBody, handshake, serve};
+use ngnet_h3_quinn::QuinnBackend;
 use ngnet_h3_tests::Tuning;
-use ngnet_h3_tests::quic_backend::QuinnBackend;
 
 /// A single-chunk body, since `http-body-util` is not a dependency here either.
 struct Payload {

@@ -1,7 +1,7 @@
 [package]
 name = "ngnet-bench"
 version = "0.1.0"
-description = "Criterion benchmarks for this workspace's HTTP/2 and HTTP/3-over-QMux stacks: ngnet-h2 against hyper, ngnet-h2 against ngnet-qmux-h3, and completion I/O against readiness I/O"
+description = "Criterion benchmarks for ngnet HTTP stacks and their comparison implementations"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -32,6 +32,7 @@ ngnet-h2 = { workspace = true, features = ["tokio", "completion"] }
 ngnet-qmux-h3.workspace = true
 ngnet-qmux = { workspace = true, features = ["tokio"] }
 ngnet-h3.workspace = true
+ngnet-h3-quinn.workspace = true
 tokio.workspace = true
 # The completion runtime under test. Its `criterion` feature adds the `AsyncExecutor` impl
 # for compio's `Runtime`, so `b.to_async(&compio_runtime)` drives it exactly as the tokio
@@ -44,6 +45,12 @@ http-body.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+# The direct comparison requested for the Quinn adapter. Both stacks use the same workspace
+# Quinn version and the fixtures below give them identical endpoints and workloads.
+h3.workspace = true
+h3-quinn.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
@@ -91,4 +98,12 @@ harness = false
 
 [[bench]]
 name = "transport_shared_body"
+harness = false
+
+[[bench]]
+name = "quinn_serial_latency"
+harness = false
+
+[[bench]]
+name = "quinn_body_throughput"
 harness = false

@@ -13,6 +13,19 @@ constants shared between the arms. Where a value is matched, the constant is wri
 sides rather than each side being given a literal of its own, so a change to a matched value
 cannot reach one stack and miss the other.
 
+## The Quinn HTTP/3 comparison
+
+`quinn_serial_latency` and `quinn_body_throughput` compare `ngnet-h3-quinn` with upstream
+`h3-quinn`. Both arms resolve to Quinn 0.11 and run on separate single-thread Tokio runtimes.
+The shared fixture builder gives both the same loopback endpoint shape, self-signed certificate,
+rustls configuration, `h3` ALPN, request headers, echo response, and full response drain. Each
+connection is established and warmed before Criterion times it.
+
+HTTP-layer defaults are not forced equal because the two implementations do not expose the same
+settings: upstream `h3` uses stateless QPACK while `ngnet-h3` delegates QPACK to nghttp3. Those
+differences are part of the implementations under comparison, not transport knobs the harness
+can match without changing one stack's normal behavior.
+
 ## The HTTP/2 comparison: `ngnet-h2` against hyper
 
 Both stacks are pinned to libnghttp2's defaults, since `ngnet-h2`'s async layer advertises

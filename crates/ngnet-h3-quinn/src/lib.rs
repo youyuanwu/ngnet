@@ -1,13 +1,12 @@
-//! A [`QuicConnection`] over quinn.
+//! A [`QuicConnection`] implementation backed by [Quinn](quinn).
 //!
-//! The second implementation of the backend trait, and the one that matters for the claim
-//! that the trait is not shaped around any single QUIC library: the first
-//! ([`ngnet_h3::http::testing::loopback`]) shares its author's assumptions, and this one has
-//! to live with quinn's.
+//! `ngnet-h3` owns HTTP/3 protocol state but deliberately owns no QUIC implementation.
+//! This crate is the adapter between that transport-independent API and an established
+//! [`quinn::Connection`]. Endpoint creation, TLS configuration, certificate verification,
+//! ALPN negotiation, and socket ownership remain with the caller.
 //!
-//! It sits alongside the sans-I/O harness in this crate's `lib.rs` rather than replacing it.
-//! That harness drives the core directly and is what proves the *core* works over a real
-//! connection; this drives the async layer. Deleting either would lose real coverage.
+//! Pass [`QuinnBackend::new`] to [`ngnet_h3::http::handshake`] or
+//! [`ngnet_h3::http::serve`] after Quinn has completed the QUIC handshake.
 //!
 //! # What quinn makes easy, and what it does not
 //!
@@ -29,6 +28,9 @@
 //! must be reachable before the stream is announced; release may be reported on acceptance
 //! only because quinn copies; and a reader task that exits quietly leaves the driver waiting
 //! for an end that will never come.
+
+#![deny(missing_docs)]
+#![deny(unsafe_code)]
 
 use core::future::Future;
 use core::pin::Pin;
@@ -53,6 +55,17 @@ const READ_CHUNK: usize = 64 * 1024;
 /// bound here the memory limit moves out of QUIC and into the process, where a fast peer can
 /// exhaust it.
 const INITIAL_BUDGET: u64 = 256 * 1024;
+
+type OpeningUni = Pin<
+    Box<dyn Future<Output = Result<quinn::SendStream, quinn::ConnectionError>> + Send + 'static>,
+>;
+type OpeningBi = Pin<
+    Box<
+        dyn Future<Output = Result<(quinn::SendStream, quinn::RecvStream), quinn::ConnectionError>>
+            + Send
+            + 'static,
+    >,
+>;
 
 /// Something that happened on a quinn connection.
 enum Incoming {
@@ -87,6 +100,10 @@ pub struct QuinnBackend {
     finished: Vec<i64>,
     /// How many more bytes the reader tasks may deliver.
     budget: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// An in-progress stream open must survive `Poll::Pending`.
+    opening_uni: Option<OpeningUni>,
+    /// An in-progress stream open must survive `Poll::Pending`.
+    opening_bi: Option<OpeningBi>,
     started: Instant,
     closed: bool,
 }
@@ -106,7 +123,8 @@ impl core::error::Error for QuinnError {}
 impl QuinnBackend {
     /// Wraps an established connection, spawning the tasks that read from it.
     ///
-    /// `is_client` decides which side opens what; both roles read and accept the same way.
+    /// Both HTTP/3 roles use the same adapter; stream direction and ownership come from Quinn's
+    /// stream identifiers rather than from a role flag.
     pub fn new(quic: quinn::Connection) -> Self {
         let (to_driver, events) = mpsc::unbounded_channel();
         let budget = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(INITIAL_BUDGET));
@@ -121,6 +139,8 @@ impl QuinnBackend {
             _to_driver: to_driver,
             finished: Vec::new(),
             budget,
+            opening_uni: None,
+            opening_bi: None,
             started: Instant::now(),
             closed: false,
         }
@@ -357,12 +377,18 @@ impl QuicConnection for QuinnBackend {
     fn poll_open_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<StreamId, Self::Error>> {
         // `open_uni` borrows the connection, so it cannot be held across polls without
         // self-reference. `quinn::Connection` is cheap to clone, so the future owns one.
-        let quic = self.quic.clone();
-        let mut opening = Box::pin(async move { quic.open_uni().await });
+        let opening = self.opening_uni.get_or_insert_with(|| {
+            let quic = self.quic.clone();
+            Box::pin(async move { quic.open_uni().await })
+        });
         match opening.as_mut().poll(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(error)) => Poll::Ready(Err(Self::fail(error))),
+            Poll::Ready(Err(error)) => {
+                self.opening_uni = None;
+                Poll::Ready(Err(Self::fail(error)))
+            }
             Poll::Ready(Ok(send)) => {
+                self.opening_uni = None;
                 let stream = to_stream_id(send.id());
                 self.sends.insert(stream.get(), send);
                 Poll::Ready(Ok(stream))
@@ -371,12 +397,18 @@ impl QuicConnection for QuinnBackend {
     }
 
     fn poll_open_bi(&mut self, cx: &mut Context<'_>) -> Poll<Result<StreamId, Self::Error>> {
-        let quic = self.quic.clone();
-        let mut opening = Box::pin(async move { quic.open_bi().await });
+        let opening = self.opening_bi.get_or_insert_with(|| {
+            let quic = self.quic.clone();
+            Box::pin(async move { quic.open_bi().await })
+        });
         match opening.as_mut().poll(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(error)) => Poll::Ready(Err(Self::fail(error))),
+            Poll::Ready(Err(error)) => {
+                self.opening_bi = None;
+                Poll::Ready(Err(Self::fail(error)))
+            }
             Poll::Ready(Ok((send, recv))) => {
+                self.opening_bi = None;
                 let stream = to_stream_id(send.id());
                 self.sends.insert(stream.get(), send);
                 // The receiving half must be read, not dropped: quinn turns a dropped
@@ -403,13 +435,16 @@ impl QuicConnection for QuinnBackend {
         Ok(())
     }
 
-    fn extend_credit(&mut self, _stream: Option<StreamId>, bytes: u64) -> Result<(), Self::Error> {
+    fn extend_credit(&mut self, stream: Option<StreamId>, bytes: u64) -> Result<(), Self::Error> {
         // No window update: quinn issues those itself when a chunk is read. What this does
         // is advance the reader tasks' own budget, which is a different limit — see
-        // `INITIAL_BUDGET`. Writing this as an empty function would discard the only bound
-        // on how far the adapter may run ahead of the layer.
-        self.budget
-            .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+        // `INITIAL_BUDGET`. The driver reports every consumed byte once for its stream and
+        // once for the connection; this adapter has one connection-wide pool, so account for
+        // only the connection-level report.
+        if stream.is_none() {
+            self.budget
+                .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+        }
         Ok(())
     }
 

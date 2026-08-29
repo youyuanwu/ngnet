@@ -8,9 +8,9 @@ This workspace publishes seven crates as one release set:
 | Safe wrappers | `ngnet-h2`, `ngnet-h3`, `ngnet-quic` |
 | HTTP/3 adapter | `ngnet-quic-h3` |
 
-The QMux, axum, util, test and benchmark crates have `publish = false` and are not part of
-this release. The root manifest gives every publishable workspace dependency both a `path`
-and a `version`: local builds use the path, while Cargo removes it from the published
+The Quinn adapter, QMux, axum, util, test and benchmark crates have `publish = false` and are
+not part of this release. The root manifest gives every publishable workspace dependency both
+a `path` and a `version`: local builds use the path, while Cargo removes it from the published
 manifest and keeps the registry version.
 
 ## Before packaging

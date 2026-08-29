@@ -6,6 +6,11 @@ they measure syscall and scheduling behaviour rather than anything a network wou
 family measures CPU time or memory: Criterion reports wall-clock, so a stack burning more CPU
 for the same wall time looks identical here.
 
+The Quinn HTTP/3 benches also use loopback, but over UDP with QUIC encryption and congestion
+control active. They compare two complete implementations on one transport under a controlled
+local workload; they do not predict internet latency, loss recovery, multi-core scaling, or
+tail behaviour under load.
+
 Read them as a measure of **protocol, wrapper and syscall CPU work**, and nothing else.
 
 - **The duplex removes the kernel.** No syscalls, no sockets, no network. Real-world

@@ -1,6 +1,6 @@
 # Benchmarks
 
-`tests/ngnet-bench` holds two [Criterion](https://bheisler.github.io/criterion.rs/)
+`tests/ngnet-bench` holds three [Criterion](https://bheisler.github.io/criterion.rs/)
 benchmark families, which answer different questions and must not be read as one:
 
 - **The duplex family** — this stack against [hyper](https://hyper.rs) and against
@@ -9,6 +9,9 @@ benchmark families, which answer different questions and must not be read as one
   deletes the kernel entirely.
 - **The real-socket family** — four arms over real loopback TCP, varying the HTTP
   implementation, the protocol *and* the I/O model. The `transport_*` benches.
+- **The Quinn HTTP/3 family** — two arms over real loopback UDP with the same Quinn, rustls,
+  Tokio, ALPN, certificate, request, echo, and body drain. It varies the HTTP/3 implementation
+  and adapter: `ngnet-h3` + `ngnet-h3-quinn` against upstream `h3` + `h3-quinn`.
 
 Between them they fill in the whole matrix of stack against I/O model:
 
@@ -68,9 +71,9 @@ layer, the record-size difference, the warm-up asymmetry, and QMux's unidirectio
 spending connection credit where HTTP/2's control frames do not — are on
 [`controls.md`](controls.md), each with the direction it pushes.
 
-## Three groups carry no QMux arm, for two different reasons
+## Three original groups carry no QMux arm, for two different reasons
 
-Six of the nine Criterion groups gained a QMux arm. The three that did not are listed here
+Six of the original nine Criterion groups gained a QMux arm. The three that did not are listed here
 together, and the reasons are kept apart on purpose: one is an absence of anything to compare,
 the other is a defect this stack cannot currently get past. Filing them under one explanation
 would make a known bug look like a design boundary.
@@ -85,7 +88,7 @@ Note that the two `shared_body` groups are single-**protocol** rather than singl
 carry a `hyper-tokio` arm as a drift control, so "one stack is missing" is not what is being
 said about them.
 
-In both families, latency comes from Criterion's per-iteration timing, and throughput is
+Across all families, latency comes from Criterion's per-iteration timing, and throughput is
 derived by putting a known number of requests or bytes in each iteration and declaring it
 with `Throughput::Elements` / `Throughput::Bytes`.
 
@@ -138,6 +141,8 @@ HTTP/2 arm and an HTTP/3-over-QMux arm.
 | [`transport_concurrent_throughput`](cases/transport-concurrent-throughput.md) | socket | stack × protocol × I/O model × N | requests/sec |
 | [`transport_body_throughput`](cases/transport-body-throughput.md) | socket | stack × protocol × I/O model × body ∈ {0, 1 KiB, 64 KiB, 1 MiB, 8 MiB} | MB/s |
 | [`transport_shared_body`](cases/transport-shared-body.md) | socket | body strategy × I/O model × body — HTTP/2 only | MB/s |
+| [`quinn_serial_latency`](cases/quinn-serial-latency.md) | Quinn loopback | HTTP/3 implementation | latency of one empty-body exchange |
+| [`quinn_body_throughput`](cases/quinn-body-throughput.md) | Quinn loopback | HTTP/3 implementation × body ∈ {16 KiB, 1 MiB} | MB/s |
 
 ## The findings so far
 
