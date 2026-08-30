@@ -1161,7 +1161,18 @@ where
             // its second datagram -- without it, a bulk transfer stops after the first.
             let fired = this.inner.rearm(cx) == Poll::Ready(());
 
-            if !read && !fired && !this.inner.has_pending() {
+            // A detached connection consumes inbound datagrams in another task. Once this
+            // pass has routed a receive batch, yield so the waker delivery triggered can run
+            // before this endpoint drains another batch into the same bounded queue. Wake
+            // ourselves as well: a batch that stopped at `datagrams_per_pass` may have left
+            // the socket readable without observing `Pending`, so no socket edge is obliged
+            // to schedule the continuation.
+            if read {
+                cx.waker().wake_by_ref();
+                break;
+            }
+
+            if !fired && !this.inner.has_pending() {
                 break;
             }
         }

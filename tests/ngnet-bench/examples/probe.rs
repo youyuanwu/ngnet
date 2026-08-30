@@ -79,12 +79,29 @@ fn rss_kib() -> Option<u64> {
 #[cfg(feature = "diagnostics")]
 fn emit_diagnostics(exchange: usize, scope: &str) {
     let attempts = ngnet_quic::diagnostics::take_attempts();
+    let mut staged = 0u64;
+    let mut accepted = 0u64;
+    let mut partial_allowance = 0u64;
     for (attempt_index, attempt) in attempts.iter().enumerate() {
         assert!(
             attempt.accepted_prefix <= attempt.prepared_backing_capacity
-                && attempt.prepared_backing_capacity <= attempt.offered_bytes,
+                && attempt.prepared_backing_capacity
+                    <= attempt.offered_bytes.min(attempt.sampled_payload_limit),
             "diagnostic attempt invariant failed at exchange {exchange}, attempt {attempt_index}"
         );
+        staged = staged.saturating_add(attempt.prepared_backing_capacity);
+        accepted = accepted.saturating_add(attempt.accepted_prefix);
+        if attempt.accepted_prefix < attempt.prepared_backing_capacity
+            || (attempt.accepted_prefix == 0 && attempt.offered_bytes > 0)
+        {
+            partial_allowance = partial_allowance.saturating_add(attempt.sampled_payload_limit);
+        }
+        if attempt.prepared_backing_capacity < attempt.offered_bytes {
+            assert!(
+                !attempt.fin_offered,
+                "diagnostic attempt {attempt_index} attached FIN before the true final suffix"
+            );
+        }
         eprintln!(
             "PROBE-DIAGNOSTIC exchange={exchange} attempt={attempt_index} sequence={} \
              connection_id={} role={:?} direction={} stream_id={} stream_offset={} \
@@ -109,6 +126,11 @@ fn emit_diagnostics(exchange: usize, scope: &str) {
             attempt.outcome,
         );
     }
+    assert!(
+        staged <= accepted.saturating_add(partial_allowance),
+        "diagnostic aggregate staging bound failed at exchange {exchange}: staged={staged}, \
+         accepted={accepted}, partial_allowance={partial_allowance}"
+    );
     for event in ngnet_quic::diagnostics::take_liveness_events() {
         eprintln!(
             "PROBE-LIVENESS exchange={exchange} sequence={} connection_id={} role={:?} \
@@ -321,6 +343,9 @@ fn main() {
                                 "wrong-content"
                             }
                         );
+                        if mode == Mode::Diagnostic {
+                            emit_diagnostics(exchange, "failure");
+                        }
                         flush_stderr();
                         panic!("exchange {exchange} response was not exact");
                     }

@@ -337,9 +337,27 @@ where
         let frame = frame.expect("a body frame");
         if let Some(data) = frame.data_ref() {
             let end = total.saturating_add(data.len());
-            exact &= expected
-                .get(total..end)
-                .is_some_and(|range| range == data.as_ref());
+            let expected_range = expected.get(total..end);
+            if exact && !expected_range.is_some_and(|range| range == data.as_ref()) {
+                let mismatch = expected_range
+                    .and_then(|range| {
+                        range
+                            .iter()
+                            .zip(data.iter())
+                            .position(|(expected, actual)| expected != actual)
+                    })
+                    .map_or(total, |offset| total + offset);
+                let frame_offset = mismatch.saturating_sub(total);
+                let actual_end = (frame_offset + 16).min(data.len());
+                let expected_end = (mismatch + 16).min(expected.len());
+                eprintln!(
+                    "checked body first differs at byte {mismatch}; frame={total}..{end}; \
+                     expected={:?}; actual={:?}",
+                    &expected[mismatch..expected_end],
+                    &data[frame_offset..actual_end],
+                );
+                exact = false;
+            }
             total = end;
         }
     }

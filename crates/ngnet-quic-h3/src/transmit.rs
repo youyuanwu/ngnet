@@ -71,6 +71,11 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
                     produced_len = Some(len);
                     if accepted > 0 {
                         released = Some((id, accepted));
+                    } else {
+                        // The packet carried only transport work. Let it reach the peer and
+                        // wait for an enabling event before offering the same stream prefix
+                        // again; retrying inside this pass cannot create stream capacity.
+                        blocked = true;
                     }
                     H3WriteOutcome::Accepted(accepted)
                 }

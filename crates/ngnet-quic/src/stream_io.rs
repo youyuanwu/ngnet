@@ -95,6 +95,15 @@ impl StagedVec {
     }
 }
 
+/// Maps caller finality onto the prefix actually staged for this native call.
+fn stream_flags(fin: bool, staged_complete: bool) -> u32 {
+    if fin && staged_complete {
+        sys::NGTCP2_WRITE_STREAM_FLAG_FIN
+    } else {
+        sys::NGTCP2_WRITE_STREAM_FLAG_NONE
+    }
+}
+
 impl<S: Session> Conn<'_, S> {
     /// Opens a bidirectional stream.
     ///
@@ -207,30 +216,24 @@ impl<S: Session> Conn<'_, S> {
         let offered = ranges
             .iter()
             .fold(0usize, |total, range| total.saturating_add(range.len()));
-        #[cfg(feature = "diagnostics")]
         let sampled_payload_limit = self.max_tx_udp_payload_size();
         #[cfg(feature = "diagnostics")]
         let stream_offset = self.retained_next_offset(stream);
 
+        let production_staging_limit = sampled_payload_limit;
         #[cfg(feature = "diagnostics")]
-        let (staged, staged_complete) =
-            if let Some(limit) = crate::diagnostics::test_staging_limit() {
-                self.retained_mut()
-                    .stage_many_bounded(stream, ranges, limit)
-            } else {
-                (self.retained_mut().stage_many(stream, ranges), true)
-            };
+        let staging_limit = crate::diagnostics::test_staging_limit()
+            .map_or(production_staging_limit, |test_limit| {
+                production_staging_limit.min(test_limit)
+            });
         #[cfg(not(feature = "diagnostics"))]
-        let staged = self.retained_mut().stage_many(stream, ranges);
+        let staging_limit = production_staging_limit;
+        let (staged, staged_complete) =
+            self.retained_mut()
+                .stage_many_bounded(stream, ranges, staging_limit);
         #[cfg(feature = "diagnostics")]
         let effective_fin = fin && staged_complete;
-        #[cfg(not(feature = "diagnostics"))]
-        let effective_fin = fin;
-        let flags = if effective_fin {
-            sys::NGTCP2_WRITE_STREAM_FLAG_FIN
-        } else {
-            sys::NGTCP2_WRITE_STREAM_FLAG_NONE
-        };
+        let flags = stream_flags(fin, staged_complete);
         #[cfg(feature = "diagnostics")]
         let prepared_backing_capacity = staged.map_or(0, |(_, len)| len);
 
@@ -678,6 +681,28 @@ mod tests {
 
     fn ts(nanos: u64) -> Timestamp {
         Timestamp::from_nanos(nanos).unwrap()
+    }
+
+    #[test]
+    fn fin_is_only_attached_to_the_true_final_suffix() {
+        assert_eq!(
+            stream_flags(true, true),
+            sys::NGTCP2_WRITE_STREAM_FLAG_FIN,
+            "an empty FIN and a complete final suffix must carry FIN"
+        );
+        assert_eq!(
+            stream_flags(true, false),
+            sys::NGTCP2_WRITE_STREAM_FLAG_NONE,
+            "a bounded prefix omitting a caller suffix must suppress FIN"
+        );
+        assert_eq!(
+            stream_flags(false, true),
+            sys::NGTCP2_WRITE_STREAM_FLAG_NONE
+        );
+        assert_eq!(
+            stream_flags(false, false),
+            sys::NGTCP2_WRITE_STREAM_FLAG_NONE
+        );
     }
 
     #[test]

@@ -49,7 +49,7 @@ pub struct Attempt {
     pub prepared_backing_capacity: u64,
     /// Prefix accepted by ngtcp2.
     pub accepted_prefix: u64,
-    /// Whether the caller marked this complete offer final.
+    /// Whether FIN was handed to ngtcp2 with this staged prefix.
     pub fin_offered: bool,
     /// Whether a non-empty offer accepted no bytes.
     pub zero_acceptance: bool,
@@ -486,10 +486,12 @@ pub fn is_armed() -> bool {
     armed()
 }
 
-/// Sets a deterministic pre-native staging limit for diagnostic tests.
+/// Sets a deterministic stricter pre-native staging limit for diagnostic tests.
 ///
-/// `None` preserves production staging behavior. This control exists only with the
-/// non-default diagnostics feature and is reset by [`reset`].
+/// Production always bounds borrowing staging by the sampled path payload limit. `Some`
+/// further lowers that bound so tests can force exact slice boundaries; `None` preserves the
+/// production limit. This control exists only with the non-default diagnostics feature and
+/// is reset by [`reset`].
 #[doc(hidden)]
 pub fn set_test_staging_limit(limit: Option<usize>) {
     let value = limit
