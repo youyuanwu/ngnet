@@ -314,7 +314,7 @@ impl Retained {
         stream: StreamId,
         ranges: &[IoSlice<'_>],
     ) -> Option<(*const u8, usize)> {
-        self.stage_many_bounded(stream, ranges, usize::MAX).0
+        self.stage_many_bounded_inner(stream, ranges, usize::MAX).0
     }
 
     /// Stages at most `limit` bytes and reports whether the complete offer was staged.

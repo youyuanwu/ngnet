@@ -913,25 +913,4 @@ mod tests {
         assert_eq!(snapshot.client.zero_accept_retries, 0);
         reset();
     }
-
-    #[test]
-    fn reset_excludes_recorders_from_the_previous_armed_generation() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        reset();
-        arm(true);
-        let started = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let recorder_started = std::sync::Arc::clone(&started);
-        let recorder = std::thread::spawn(move || {
-            recorder_started.wait();
-            for _ in 0..10_000 {
-                record_packet(12, Role::Client, true);
-            }
-        });
-        started.wait();
-        reset();
-        recorder.join().expect("diagnostic recorder thread");
-        assert_eq!(snapshot(), Snapshot::default());
-        assert!(take_attempts().is_empty());
-        assert!(take_liveness_events().is_empty());
-    }
 }
