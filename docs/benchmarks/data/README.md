@@ -50,6 +50,7 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [22-qmux-h3-at-8-mib](xeon-8370c-azure/22-qmux-h3-at-8-mib.md) | xeon-8370c-azure | 2026-08-29 | New 8 MiB point — **1.182× duplex, 0.919× socket** | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
 | [23-ngnet-h3-quinn-vs-h3-quinn](xeon-8370c-azure/23-ngnet-h3-quinn-vs-h3-quinn.md) | xeon-8370c-azure | 2026-08-29 | Quinn-matched comparison — **2.684× empty, 1.463× at 16 KiB, 1.129× at 1 MiB** | — |
 | [24-ngnet-h3-quinn-lifecycle](xeon-8370c-azure/24-ngnet-h3-quinn-lifecycle.md) | xeon-8370c-azure | 2026-08-29 | Bounded Quinn lifecycle cleanup — **−24.50% adjusted empty serial, 223,968 → 7,300 KiB aged RSS** | — |
+| [25-ngtcp2-quic-stack-comparison](xeon-8370c-azure/25-ngtcp2-quic-stack-comparison.md) | xeon-8370c-azure | 2026-08-30 | ngtcp2/OpenSSL against Quinn/rustls — **1.513× empty, 1.401× at 1 KiB; larger bodies unstable** | — |
 
 Runs [`08`](xeon-8370c-azure/08-qmux-against-h2.md) and
 [`09`](xeon-8370c-azure/09-qmux-h2-mechanisms.md) are the first cross-protocol comparison and its

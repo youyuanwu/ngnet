@@ -235,6 +235,19 @@ impl<S: Session> NgtcpConnection<S> {
                     self.shared.push(Recorded::StopSending(id, code));
                 }
                 Observed::Closed(id, reason) => {
+                    // ngtcp2 never restores peer stream credit automatically. A completed
+                    // peer-opened stream frees one concurrent-stream slot, so grant it back
+                    // here before the peer reaches the advertised lifetime total and stalls.
+                    if id.initiator() != self.local {
+                        match id.directionality() {
+                            Directionality::Bidirectional => {
+                                self.detached.conn.extend_max_streams_bidi(1);
+                            }
+                            Directionality::Unidirectional => {
+                                self.detached.conn.extend_max_streams_uni(1);
+                            }
+                        }
+                    }
                     self.shared
                         .push(Recorded::Closed(id, reason.receiving(), reason.sending()));
                 }
