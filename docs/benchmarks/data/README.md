@@ -10,7 +10,7 @@ what the run does and does not establish.
 | Machine | Status | Runs |
 | --- | --- | --- |
 | [`legacy-dev-host`](legacy-dev-host/) | **Retired, unavailable.** Every measurement taken before 2026-08-16. Noisy: unchanged control arms drifted 5–15% within a session. | 4 |
-| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current VM; historical machine label and recorded spec are Intel Xeon Platinum 8370C. Runs 12–23 report 8573C, while run 24 reports 8370C again; Azure migration timing is unknown, so absolute figures across runs are not controlled. | 28 |
+| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current VM; historical machine label and recorded spec are Intel Xeon Platinum 8370C. Runs 12–23 report 8573C, while runs 24 and 29 report 8370C again; Azure migration timing is unknown, so absolute figures across runs are not controlled. | 29 |
 
 **Absolute figures from different machines must never be tabulated together.** Nothing here
 is normalised for CPU model, kernel or io_uring implementation, and those are exactly the
@@ -54,6 +54,7 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [26-ngtcp2-phase1-diagnostics](xeon-8370c-azure/26-ngtcp2-phase1-diagnostics.md) | xeon-8370c-azure | 2026-08-30 | Diagnostic foundation — **1 MiB failure reproduced; whole-remainder preparation measured** | — |
 | [27-ngtcp2-packet-bounded-staging](xeon-8370c-azure/27-ngtcp2-packet-bounded-staging.md) | xeon-8370c-azure | 2026-08-30 | Packet-bounded borrowing repair — **persistent 1 MiB exactness and memory qualification** | — |
 | [28-ngtcp2-stream-first-gate](xeon-8370c-azure/28-ngtcp2-stream-first-gate.md) | xeon-8370c-azure | 2026-08-30 | Stream-first ordering — **attribution gate unsatisfied; deferred unchanged** | — |
+| [29-ngtcp2-residual-eligibility](xeon-8370c-azure/29-ngtcp2-residual-eligibility.md) | xeon-8370c-azure | 2026-08-30 | Residual partition — **all candidates deferred; no promotion pending** | — |
 
 Runs [`08`](xeon-8370c-azure/08-qmux-against-h2.md) and
 [`09`](xeon-8370c-azure/09-qmux-h2-mechanisms.md) are the first cross-protocol comparison and its

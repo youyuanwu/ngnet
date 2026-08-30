@@ -113,6 +113,7 @@ requirement in full.
 | [26-ngtcp2-phase1-diagnostics](26-ngtcp2-phase1-diagnostics.md) | 2026-08-30 | Phase 1 after `fcab0aa` | Diagnostic foundation — **1 MiB failure reproduced; 16 KiB prepares 7.58–17.13× accepted bytes** |
 | [27-ngtcp2-packet-bounded-staging](27-ngtcp2-packet-bounded-staging.md) | 2026-08-30 | `9010a5b` | Packet-bounded borrowing repair — **125/250/500 × 1 MiB exact with bounded RSS** |
 | [28-ngtcp2-stream-first-gate](28-ngtcp2-stream-first-gate.md) | 2026-08-30 | `383082f` | Stream-first packet production — **not attributable with current diagnostics; deferred unchanged** |
+| [29-ngtcp2-residual-eligibility](29-ngtcp2-residual-eligibility.md) | 2026-08-30 | `6a7af57` | Residual partition — **all six candidates deferred; no stable attributed gap beyond drift** |
 
 Still outstanding, in the order they are worth doing:
 
