@@ -110,6 +110,13 @@ pub(crate) struct ConnectionInner {
     pub(crate) failure: Option<Error>,
     /// Woken when the connection becomes established, closes, or has work.
     pub(crate) wakers: Vec<Waker>,
+    /// Woken only when a full detached outbound queue regains capacity.
+    ///
+    /// This is deliberately separate from inbound/work wakers. A detached producer that
+    /// parks because the queue is full must be released by queue removal even when no
+    /// packet arrives and no timer fires, while unrelated queue removals must not create
+    /// repeated retries.
+    pub(crate) capacity_wakers: Vec<Waker>,
     /// Work the driver should do on this connection.
     pub(crate) commands: VecDeque<Command>,
     /// Datagrams the endpoint routed here, waiting for whoever drives the connection.
@@ -315,7 +322,19 @@ impl ConnectionShared {
 
     /// Takes the next datagram this connection wants sent.
     pub(crate) fn take_outbound(&self) -> Option<Vec<u8>> {
-        self.lock().outbound.pop_front()
+        let mut inner = self.lock();
+        let was_full = inner.outbound.len() == DATAGRAM_QUEUE;
+        let datagram = inner.outbound.pop_front();
+        let wakers = if was_full && datagram.is_some() {
+            core::mem::take(&mut inner.capacity_wakers)
+        } else {
+            Vec::new()
+        };
+        drop(inner);
+        for waker in wakers {
+            waker.wake();
+        }
+        datagram
     }
 
     /// Whether this connection's owner has finished with it.
@@ -403,6 +422,14 @@ impl ConnectionShared {
         let mut inner = self.lock();
         if !inner.wakers.iter().any(|w| w.will_wake(waker)) {
             inner.wakers.push(waker.clone());
+        }
+    }
+
+    /// Registers a producer waiting specifically for detached outbound queue capacity.
+    pub(crate) fn register_capacity(&self, waker: &Waker) {
+        let mut inner = self.lock();
+        if !inner.capacity_wakers.iter().any(|w| w.will_wake(waker)) {
+            inner.capacity_wakers.push(waker.clone());
         }
     }
 
@@ -582,7 +609,10 @@ mod tests {
         ));
         let taken = shared.take_commands();
         assert_eq!(taken.len(), 2);
-        assert!(shared.take_commands().is_empty(), "commands were taken twice");
+        assert!(
+            shared.take_commands().is_empty(),
+            "commands were taken twice"
+        );
     }
 
     #[test]
@@ -622,5 +652,55 @@ mod tests {
         shared.wake_all();
         assert!(first.0.load(Ordering::Acquire));
         assert!(second.0.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn removing_from_a_full_outbound_queue_wakes_one_capacity_retry() {
+        struct Counting(AtomicU64);
+        impl std::task::Wake for Counting {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let shared = ConnectionShared::new(EndpointShared::new());
+        for byte in 0..DATAGRAM_QUEUE {
+            shared.queue_outbound(vec![byte as u8]);
+        }
+        assert!(
+            !shared.outbound_has_room(),
+            "the seam must sustain a full queue"
+        );
+
+        let counter = Arc::new(Counting(AtomicU64::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        shared.register_capacity(&waker);
+        shared.register_capacity(&waker);
+        assert_eq!(
+            shared.lock().capacity_wakers.len(),
+            1,
+            "one parked producer must have one registration"
+        );
+
+        assert_eq!(shared.take_outbound(), Some(vec![0]));
+        assert_eq!(
+            counter.0.load(Ordering::Relaxed),
+            1,
+            "the full-to-available transition must enable exactly one retry"
+        );
+        assert_eq!(shared.lock().capacity_wakers.len(), 0);
+
+        assert_eq!(shared.take_outbound(), Some(vec![1]));
+        assert_eq!(
+            counter.0.load(Ordering::Relaxed),
+            1,
+            "removal while already available must not enable another retry"
+        );
+        assert_eq!(shared.outbound_len(), DATAGRAM_QUEUE - 2);
+        assert_eq!(
+            shared.dropped_inbound(),
+            0,
+            "the quiesced inbound side did not drop"
+        );
     }
 }

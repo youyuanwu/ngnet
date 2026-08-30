@@ -285,6 +285,9 @@ impl<S: Session> NgtcpConnection<S> {
                 if let Err(err) = pump::produce(&mut self.detached, &mut self.state) {
                     return Poll::Ready(Err(err));
                 }
+                if !self.detached.outbound_has_room() {
+                    self.detached.register_outbound_capacity(cx.waker());
+                }
                 Poll::Ready(Ok(stream_id(id)))
             }
             // The peer's limit, not a failure. The layer is content to wait, and has no
@@ -368,7 +371,13 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
         if self.state.closed {
             return Poll::Ready(Err(pump::ended()));
         }
-        transmit::drain(&mut self.detached, &self.shared, &mut self.state, source)?;
+        transmit::drain(
+            &mut self.detached,
+            &self.shared,
+            &mut self.state,
+            source,
+            cx,
+        )?;
         let _ = pump::poll_timer(&self.detached, &mut self.state, cx);
         Poll::Ready(Ok(()))
     }

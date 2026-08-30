@@ -91,6 +91,9 @@ pub(crate) fn pump<S: Session>(
     // Then send what is owed. Acknowledgements and probes come from here, not from the
     // stream-writing path, so a connection with nothing to say still says it.
     produce(detached, state)?;
+    if !detached.outbound_has_room() {
+        detached.register_outbound_capacity(cx.waker());
+    }
     Ok(())
 }
 

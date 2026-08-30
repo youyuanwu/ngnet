@@ -2,7 +2,7 @@
 
 use ngnet_h3::http::{StreamSource, WriteOutcome as H3WriteOutcome};
 use ngnet_quic::endpoint::DetachedConnection;
-use ngnet_quic::{ErrorKind as QuicErrorKind, StreamId, StreamWrite, Session};
+use ngnet_quic::{ErrorKind as QuicErrorKind, Session, StreamId, StreamWrite};
 
 use crate::connection::{Shared, State};
 use crate::error::{Error, Result};
@@ -18,6 +18,7 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
     shared: &Shared,
     state: &mut State,
     source: &mut Src,
+    cx: &core::task::Context<'_>,
 ) -> Result<()> {
     let mut failure: Option<Error> = None;
 
@@ -28,6 +29,7 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
         // for the stream bytes in it, so re-offering them would send them twice and
         // discarding it would lose them until a retransmission timer noticed.
         if !detached.outbound_has_room() {
+            detached.register_outbound_capacity(cx.waker());
             break;
         }
 

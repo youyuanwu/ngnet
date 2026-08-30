@@ -272,8 +272,10 @@ where
 }
 
 /// What [`EndpointBuilder::build`] produces: a handle and the one driver that serves it.
-pub type Built<Sock, Clk, B> =
-    (Endpoint<<B as TlsBackend>::Session>, EndpointDriver<Sock, Clk, B>);
+pub type Built<Sock, Clk, B> = (
+    Endpoint<<B as TlsBackend>::Session>,
+    EndpointDriver<Sock, Clk, B>,
+);
 
 /// Connections handed over to callers who drive them themselves.
 ///
@@ -456,6 +458,15 @@ impl<S: Session> DetachedConnection<S> {
     /// Registers a waker to be woken when a datagram arrives for this connection.
     pub fn register(&self, waker: &core::task::Waker) {
         self.shared.register(waker);
+    }
+
+    /// Registers a waker for a full outbound queue becoming writable.
+    ///
+    /// Unlike [`register`](Self::register), this registration is consumed only by the
+    /// full-to-available transition. A detached producer should call it after observing a
+    /// full queue and retry once when woken.
+    pub fn register_outbound_capacity(&self, waker: &core::task::Waker) {
+        self.shared.register_capacity(waker);
     }
 
     /// How many inbound datagrams were dropped because this connection was not keeping up.
@@ -928,7 +939,12 @@ where
     }
 
     /// Decides what a first packet has earned, and acts on it.
-    fn begin(&mut self, datagram: &[u8], packet: &crate::accept::InitialPacket, source: SocketAddr) {
+    fn begin(
+        &mut self,
+        datagram: &[u8],
+        packet: &crate::accept::InitialPacket,
+        source: SocketAddr,
+    ) {
         #[cfg(feature = "tls-ossl")]
         let (original, retried) = {
             use super::validate::Decision;
