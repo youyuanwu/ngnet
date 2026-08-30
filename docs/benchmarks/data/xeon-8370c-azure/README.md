@@ -3,7 +3,7 @@
 **Status: historical Azure-VM label; current captures use the migrated CPU described below.**
 Runs have been collected in this directory since 2026-08-16.
 
-**First run:** 2026-08-16 · **Last run:** 2026-08-29
+**First run:** 2026-08-16 · **Last run:** 2026-08-30
 
 ## Hardware and system
 
@@ -112,6 +112,7 @@ requirement in full.
 | [25-ngtcp2-quic-stack-comparison](25-ngtcp2-quic-stack-comparison.md) | 2026-08-30 | working tree based on `7422956` | ngtcp2/OpenSSL against Quinn/rustls — **1.513× empty, 1.401× at 1 KiB; larger bodies unstable** |
 | [26-ngtcp2-phase1-diagnostics](26-ngtcp2-phase1-diagnostics.md) | 2026-08-30 | Phase 1 after `fcab0aa` | Diagnostic foundation — **1 MiB failure reproduced; 16 KiB prepares 7.58–17.13× accepted bytes** |
 | [27-ngtcp2-packet-bounded-staging](27-ngtcp2-packet-bounded-staging.md) | 2026-08-30 | `9010a5b` | Packet-bounded borrowing repair — **125/250/500 × 1 MiB exact with bounded RSS** |
+| [28-ngtcp2-stream-first-gate](28-ngtcp2-stream-first-gate.md) | 2026-08-30 | `383082f` | Stream-first packet production — **not attributable with current diagnostics; deferred unchanged** |
 
 Still outstanding, in the order they are worth doing:
 
