@@ -56,13 +56,21 @@ The endpoint's own driver avoids all of this by producing datagrams every pass r
 whether the application wrote anything. This crate has to do the same, from wherever it is
 called.
 
+That order remains transport-first. The diagnostics can count packets produced by the
+standalone transport pass and packets produced while accepting stream data, but cannot say
+whether a standalone packet could have carried a simultaneously pending stream prefix.
+Inspecting `StreamSource` first would itself change the order because the trait has no
+non-consuming pending-data query. The stream-first candidate was therefore deferred without
+a source change; the evidence and missing attribution are in
+[`run 28`](../benchmarks/data/xeon-8370c-azure/28-ngtcp2-stream-first-gate.md).
+
 `QuicConnection::poll_flush` is therefore immediate here. The ngtcp2 connection does not keep a
 QMux-style byte-stream output buffer: pumping has already handed its datagrams to the endpoint,
 so there is no deferred output for a suspension hook to discharge. The explicit implementation
 is still required so the HTTP/3 driver can make the same progress guarantee for every
-transport, without a silent default. It was statically audited for this change; this host's
-OpenSSL 3.0.13 cannot build the crate because `ngnet-quic-sys` requires OpenSSL 3.5 or newer, so
-CI compilation remains required.
+transport, without a silent default. The adapter is compiled by the targeted release suites,
+both workspace test modes, full all-target clippy, and its warning-denying Rust documentation
+build.
 
 ## A stream's close needs a batch of its own
 
@@ -94,8 +102,29 @@ acknowledgement would hold every in-flight byte *twice* — once in nghttp3's bu
 in the retained copy — for no benefit, because nghttp3 does not retransmit. QUIC does, out of
 the copy.
 
+The borrowed copy is packet-bounded. One call stages at most ngtcp2's current maximum transmit
+UDP payload; if that prefix omits any caller suffix, FIN is withheld until the true final
+prefix. A zero-byte final write remains valid. ngtcp2 may accept less than the staged prefix,
+so the complete packet-sized backing remains stable until the accepted bytes are acknowledged
+or the stream closes. The stream's cumulative retention offset survives a temporarily empty
+chunk queue and is forgotten only on stream close.
+
 `RETAINS_BUFFERS` is `false`, which matches: this transport does not read through the
-caller's memory.
+HTTP/3 layer's memory. `QuicEvent::Released` therefore still reports acceptance, while
+ngtcp2's acknowledgement releases the transport-owned backing.
+
+## Backpressure retries require new information
+
+The detached outbound queue is bounded at 64 datagrams. Before producing, the adapter
+atomically observes capacity or registers its waker while the queue remains full. The first
+full-to-available transition consumes that registration; later removals do not create
+duplicate retries.
+
+A stream-write call that produces a transport-only datagram while accepting zero stream bytes
+ends the current drain. It does not immediately reoffer the same prefix against unchanged
+state: the connection waits for inbound work, a timer, restored queue capacity, or another
+recorded enabling event. This keeps liveness without spinning or repeatedly staging the same
+offer.
 
 ## Peer-opened unidirectional streams are not announced
 

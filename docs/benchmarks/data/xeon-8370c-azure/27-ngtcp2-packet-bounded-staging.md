@@ -2,7 +2,7 @@
 
 **Machine:** historical [`xeon-8370c-azure`](README.md) label; CPU 3
 **Date:** 2026-08-30
-**Source:** `9010a5b` (Phase 2 implementation; documentation follows)
+**Source:** `e4815f7` (complete Phase 2 implementation; documentation follows)
 **Purpose:** correctness/resource qualification and stable-origin characterization
 **Exclusions:** no failed, slow, or signalled system-under-test attempt was excluded
 

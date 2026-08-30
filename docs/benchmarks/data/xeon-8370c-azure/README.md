@@ -56,30 +56,22 @@ in every run.
 
 ## Arms this machine can run
 
-All ten bench targets. `cargo bench -p ngnet-bench -- --test` completes with `Success` for
+All twelve bench targets. `cargo bench -p ngnet-bench -- --test` completes with `Success` for
 every arm, including `compio-push` and `compio-shared`, which abort unless they obtain
 `DriverType::IoUring` — so io_uring is genuinely available here and not silently falling back
 to a polling driver.
 
 `ngnet-bench` needs the `crates/ngnet-h2-sys/vendor/nghttp2`,
-`crates/ngnet-h3-sys/vendor/nghttp3` (with its nested `lib/sfparse`) and
-`crates/ngnet-qmux-sys/vendor/dwnx` submodules, and it still needs **neither
-`crates/ngnet-quic-sys/vendor/ngtcp2` nor OpenSSL ≥ 3.5**, which belong to
-`ngnet-quic-sys` and are reached by no arm in the suite:
-`cargo bench -p ngnet-bench` builds with the pinned toolchain, a C compiler, CMake and
-libclang, plus those three submodules. [`../../running.md`](../../running.md) states the
-requirement in full.
+`crates/ngnet-h3-sys/vendor/nghttp3` (with its nested `lib/sfparse`),
+`crates/ngnet-qmux-sys/vendor/dwnx`, and `crates/ngnet-quic-sys/vendor/ngtcp2` submodules.
+The complete ngtcp2 HTTP/3 arm also requires OpenSSL 3.5 or newer. The pinned toolchain, a C
+compiler, CMake, and libclang are common prerequisites.
+[`../../running.md`](../../running.md) states the current requirement in full.
 
-> **Editorial note, 2026-08-17.** The paragraph above previously read that `ngnet-bench`
-> "depends on `ngnet-h2` alone, so it needs neither the ngtcp2/nghttp3 submodules nor
-> OpenSSL ≥ 3.5". That was true of runs 01–03 and of every measurement recorded on this page,
-> and it stopped being true when the HTTP/3-over-QMux arms were added: the crate now compiles
-> nghttp3 and dwnx as well. The OpenSSL half of the claim is unchanged and still holds. The
-> paragraph is corrected rather than annotated in place because it describes what a reader has
-> to install *today* to reproduce anything here, and a stale prerequisite list is a build
-> failure rather than a historical curiosity. Nothing else on this page has been touched, and
-> in particular no run, number or verdict below has been altered — runs 01–03 were taken
-> before the QMux arms existed and their submodule requirement really was the smaller one.
+> **Historical prerequisite note.** Runs 01–03 predate both the QMux and QUIC-stack families
+> and needed fewer submodules; runs through 24 did not reach ngtcp2/OpenSSL. The list above is
+> intentionally the requirement for the current twelve-target suite, including the ngtcp2 arm,
+> rather than the smaller environment in which those historical runs were captured.
 
 ## Runs
 
@@ -111,7 +103,7 @@ requirement in full.
 | [24-ngnet-h3-quinn-lifecycle](24-ngnet-h3-quinn-lifecycle.md) | 2026-08-29 | `bd83f18` against `7da1866` | Bounded Quinn lifecycle cleanup — **−24.50% adjusted empty serial, 223,968 → 7,300 KiB aged RSS** |
 | [25-ngtcp2-quic-stack-comparison](25-ngtcp2-quic-stack-comparison.md) | 2026-08-30 | working tree based on `7422956` | ngtcp2/OpenSSL against Quinn/rustls — **1.513× empty, 1.401× at 1 KiB; larger bodies unstable** |
 | [26-ngtcp2-phase1-diagnostics](26-ngtcp2-phase1-diagnostics.md) | 2026-08-30 | Phase 1 after `fcab0aa` | Diagnostic foundation — **1 MiB failure reproduced; 16 KiB prepares 7.58–17.13× accepted bytes** |
-| [27-ngtcp2-packet-bounded-staging](27-ngtcp2-packet-bounded-staging.md) | 2026-08-30 | `9010a5b` | Packet-bounded borrowing repair — **125/250/500 × 1 MiB exact with bounded RSS** |
+| [27-ngtcp2-packet-bounded-staging](27-ngtcp2-packet-bounded-staging.md) | 2026-08-30 | `e4815f7` | Packet-bounded borrowing repair — **125/250/500 × 1 MiB exact with bounded RSS** |
 | [28-ngtcp2-stream-first-gate](28-ngtcp2-stream-first-gate.md) | 2026-08-30 | `383082f` | Stream-first packet production — **not attributable with current diagnostics; deferred unchanged** |
 | [29-ngtcp2-residual-eligibility](29-ngtcp2-residual-eligibility.md) | 2026-08-30 | `6a7af57` | Residual partition — **all six candidates deferred; no stable attributed gap beyond drift** |
 

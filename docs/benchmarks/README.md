@@ -1,6 +1,6 @@
 # Benchmarks
 
-`tests/ngnet-bench` holds three [Criterion](https://bheisler.github.io/criterion.rs/)
+`tests/ngnet-bench` holds four [Criterion](https://bheisler.github.io/criterion.rs/)
 benchmark families, which answer different questions and must not be read as one:
 
 - **The duplex family** — this stack against [hyper](https://hyper.rs) and against
@@ -180,3 +180,10 @@ QMux/H3 is now measured against HTTP/2 in runs
 [`16`](data/xeon-8370c-azure/16-qmux-h3-baseline-and-pump-attribution.md), and
 [`21`](data/xeon-8370c-azure/21-qmux-h3-combined-final-matrix.md). Run 21 is the current
 post-PR-45 comparison; the earlier runs remain historical mechanism evidence.
+
+The ngtcp2/OpenSSL stack is recorded in runs
+[`25`–`29`](data/xeon-8370c-azure/README.md#runs). Run 27 is the accepted
+packet-bounded correctness/resource origin: 125 exact 16 KiB and 1 MiB exchanges are active
+regressions, and fresh 125/250/500 × 1 MiB processes satisfy its RSS envelope. Runs 28 and 29
+defer packet-order and residual optimization candidates without source changes; they are
+limitations and attribution records, not implemented performance gains.

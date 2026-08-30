@@ -155,8 +155,12 @@ impl<S: Session> Conn<'_, S> {
     /// retransmit, and requires the bytes stay intact "until
     /// `acked_stream_data_offset` indicates that they are acknowledged by a remote endpoint
     /// or the stream is closed" (`ngtcp2.h:5244-5248`). Since `data` is an ordinary borrow
-    /// the caller may reuse immediately, this crate copies the accepted portion and holds
-    /// it until then. [`Conn::retained_bytes`] reports how much is currently held.
+    /// the caller may reuse immediately, this crate first copies a prefix into stable
+    /// storage and gives ngtcp2 that storage. The staged prefix is bounded by the connection's
+    /// current maximum transmit UDP payload. ngtcp2 may accept less than was staged, so the
+    /// complete packet-bounded backing allocation remains live until the accepted prefix is
+    /// acknowledged or the stream closes. [`Conn::retained_bytes`] reports accepted logical
+    /// bytes, not the complete backing capacity.
     ///
     /// # Errors
     ///
@@ -189,6 +193,11 @@ impl<S: Session> Conn<'_, S> {
     /// The ranges arrive as [`IoSlice`]s rather than `&[&[u8]]` so a vectored source — most
     /// obviously the HTTP/3 layer, whose body writes are already `IoSlice`s — can pass them
     /// through without first collecting them into a temporary vector.
+    ///
+    /// At most the current maximum transmit UDP payload is joined for one native call.
+    /// When that bound omits any caller suffix, FIN is withheld even if `fin` is true; the
+    /// caller re-offers the suffix and FIN accompanies only the true final prefix. Empty
+    /// final writes remain valid.
     ///
     /// # Errors
     ///

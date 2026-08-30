@@ -226,13 +226,15 @@ releasing it when the acknowledgement arrives or the stream closes. Each accepte
 retained at a fixed address — a borrowed write in its own `Box<[u8]>`, an owned one behind an
 `Arc` — because a growing `Vec` would reallocate and move bytes ngtcp2 still points at.
 
-The cost of the borrowing write is one copy of everything sent, held until acknowledged. That
+The cost of the borrowing write is one stable copy of each offered packet-sized prefix. That
 copy is the price of an ordinary `&[u8]` parameter whose safety does not depend on the caller
 having read a paragraph of documentation, and `Conn::write_stream` and `write_stream_vectored`
-keep it. `write_stream_vectored` now takes its ranges as `&[IoSlice]` rather than `&[&[u8]]`, so
-a vectored source — the HTTP/3 layer, whose body writes are already `IoSlice`s — passes them
-through without first collecting them into a temporary vector; the bytes still join *into* the
-single retained copy, so the byte count is unchanged.
+keep it. The staged prefix is bounded by the current maximum transmit UDP payload. ngtcp2 may
+accept less than was staged, so the tail of that packet-sized backing allocation remains until
+the accepted prefix is acknowledged or the stream closes; complete-body backing is never
+prepared. `write_stream_vectored` takes its ranges as `&[IoSlice]` rather than `&[&[u8]]`, so a
+vectored source — the HTTP/3 layer, whose body writes are already `IoSlice`s — passes them
+through without first collecting them into a temporary vector.
 
 ### The owned write hands the buffer over instead of copying
 
@@ -539,7 +541,11 @@ runtime.
 withdrawn: the connection has already accounted for the stream bytes in it, so offering them
 again would send them twice and discarding it loses them until a retransmission timer
 notices. So the producer asks for room *before* writing, and the bound is what it asks
-against.
+against. Observation and registration are one operation under the queue lock:
+`poll_outbound_capacity` either reports room or records the producer's waker while the queue
+is still full. Removing the first datagram from a full queue consumes that waker; later
+removals do not manufacture additional retries. This full-to-available wake is separate from
+the general inbound/work wake.
 
 ### Eviction needs the owner to say when it is done
 

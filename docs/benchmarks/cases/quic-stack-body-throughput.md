@@ -21,3 +21,8 @@ The packet-bounded retention repair and its first stable-origin qualification ar
 [run 27](../data/xeon-8370c-azure/27-ngtcp2-packet-bounded-staging.md). The failed predecessor
 remains a correctness reference rather than a large-body throughput baseline; run 27 therefore
 makes no before/after 1 MiB performance claim.
+
+[Run 28](../data/xeon-8370c-azure/28-ngtcp2-stream-first-gate.md) leaves packet production
+order unchanged because frame/coalescing eligibility is not observable, and
+[run 29](../data/xeon-8370c-azure/29-ngtcp2-residual-eligibility.md) defers all six residual
+candidates because recurring counts do not clear both drift and layer-attribution gates.

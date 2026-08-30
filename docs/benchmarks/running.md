@@ -240,6 +240,36 @@ increase across the three fresh runs. Each longer run must remain within that en
 the larger of 5% or 2 MiB. Preserve every complete RSS line and report
 `rss_kib=unavailable` when the host cannot provide it.
 
+### Validating the ngtcp2 HTTP/3 path
+
+The fixed large-body regressions are ordinary, non-ignored tests. Run them in release mode,
+then run the diagnostic invariant/allocation coverage:
+
+```sh
+cargo test -p ngnet-bench --test ngtcp2_fixture --release
+cargo test -p ngnet-bench --test ngtcp2_fixture --release --features diagnostics
+cargo test -p ngnet-quic --all-features
+cargo test -p ngnet-quic-h3-tests --test zero_alloc --release --all-features
+```
+
+Before merging a change to this path, also run both workspace feature modes, every clippy
+target, the workspace benchmark smoke, and warning-denying documentation for the changed
+public crates:
+
+```sh
+cargo test --workspace --all-features
+cargo test --workspace
+cargo clippy --workspace --all-features --all-targets -- -D warnings
+cargo bench --workspace -- --test
+RUSTDOCFLAGS="-D warnings" cargo doc \
+  -p ngnet-quic -p ngnet-quic-h3 --all-features --no-deps
+```
+
+The crate-scoped documentation command is deliberate. The broader workspace command also
+checks generated and private documentation outside this path; if it fails, record those
+warnings separately rather than weakening or omitting the warning-denying check for the
+changed QUIC crates.
+
 ## Recording a run
 
 Criterion's own output under `target/criterion/` is not committed: it is per-machine, it is

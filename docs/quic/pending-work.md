@@ -106,9 +106,23 @@ runner change fails with that message rather than somewhere inside CMake's symbo
 If the preview image becomes unreliable, split the OpenSSL-dependent steps into their own job
 rather than lowering the requirement — nothing older has 3.5.
 
-## Things not measured
+## What the current QUIC measurements do and do not cover
 
-There are no QUIC benchmarks.
+The benchmark suite has a three-arm loopback comparison for complete HTTP/3 stacks at empty
+and 1 KiB exchanges, plus fixed-count 16 KiB and 1 MiB probes. Runs
+[`25`–`29`](../benchmarks/data/xeon-8370c-azure/README.md#runs) record the original comparison,
+diagnostic failure, packet-bounded correctness/resource qualification, unchanged packet-order
+decision, and residual-candidate dispositions. The repaired path completes 125 exact
+sequential echoes at both large sizes, and fresh 125/250/500 × 1 MiB processes stayed within
+the recorded RSS envelope.
+
+Those measurements do not isolate the sans-I/O core from OpenSSL, the detached endpoint, the
+HTTP/3 adapter, or generic HTTP/3 work. The failed predecessor is not a large-body performance
+baseline, and noisy same-session origin timings do not support a before/after throughput
+claim. Packet ordering, detached buffer recycling, generic/Quinn scratch or task changes,
+timer reuse, syscall batching/coalescing, and crypto changes are all deferred rather than
+implemented; [run 29](../benchmarks/data/xeon-8370c-azure/29-ngtcp2-residual-eligibility.md)
+states the missing attribution for each.
 
 Interoperability is no longer wholly unverified, but it is worth being exact about what was
 established. `tests/ngnet-quic-h3-tests/tests/interop.rs` runs this crate against **quinn**,
