@@ -187,3 +187,7 @@ packet-bounded correctness/resource origin: 125 exact 16 KiB and 1 MiB exchanges
 regressions, and fresh 125/250/500 × 1 MiB processes satisfy its RSS envelope. Runs 28 and 29
 defer packet-order and residual optimization candidates without source changes; they are
 limitations and attribution records, not implemented performance gains.
+
+Run 25's remaining 1.513× empty and 1.401× 1 KiB gaps are still context. Getting within 10%
+of the alternative `ngnet-h3` transport was a stretch objective, not evidence that could
+waive correctness, drift, attribution, or throughput gates.
