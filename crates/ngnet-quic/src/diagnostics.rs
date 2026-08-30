@@ -677,16 +677,17 @@ pub fn record_release(_connection_id: u64, role: Role, bytes: usize) {
 
 /// Records one packet produced by the HTTP/3 transport adapter.
 #[doc(hidden)]
-pub fn record_packet(_connection_id: u64, role: Role, stream_carrying: bool) {
+pub fn record_packet(connection_id: u64, role: Role, stream_carrying: bool) {
     let Some(_guard) = recording_guard() else {
         return;
     };
-    let role = counters(role);
-    add(&role.produced_packets, 1);
+    let role_counters = counters(role);
+    add(&role_counters.produced_packets, 1);
     if stream_carrying {
-        add(&role.stream_carrying_packets, 1);
+        add(&role_counters.stream_carrying_packets, 1);
     } else {
-        add(&role.transport_only_packets, 1);
+        add(&role_counters.transport_only_packets, 1);
+        record_enabling(connection_id, role, "transport-packet");
     }
 }
 
@@ -716,6 +717,15 @@ pub fn record_wake_registration(_connection_id: u64, role: Role) {
         return;
     };
     add(&counters(role).wake_registrations, 1);
+}
+
+/// Records a connection future being polled again after it parked.
+#[doc(hidden)]
+pub fn record_driver_wake(connection_id: u64, role: Role) {
+    let Some(_guard) = recording_guard() else {
+        return;
+    };
+    record_enabling(connection_id, role, "driver-wake");
 }
 
 pub(crate) fn record_inbound_wakes(connection_id: u64, role: Role, count: usize) {

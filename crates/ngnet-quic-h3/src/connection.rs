@@ -111,6 +111,9 @@ pub(crate) struct State {
     /// Whether the previous pass parked on a full outbound queue.
     #[cfg(feature = "diagnostics")]
     pub(crate) capacity_parked: bool,
+    /// Whether the connection future most recently returned `Pending`.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) idle_parked: bool,
     /// Wakers waiting for a stream limit to rise.
     pub(crate) limit_wakers: Vec<Waker>,
     /// Streams this end opened, in the order they were opened, awaiting collection.
@@ -155,6 +158,8 @@ impl<S: Session> NgtcpConnection<S> {
                 sleeping_until: None,
                 #[cfg(feature = "diagnostics")]
                 capacity_parked: false,
+                #[cfg(feature = "diagnostics")]
+                idle_parked: false,
                 limit_wakers: Vec::new(),
                 opened_bidi: std::collections::VecDeque::new(),
                 opened_uni: std::collections::VecDeque::new(),
@@ -327,6 +332,13 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
     const RETAINS_BUFFERS: bool = false;
 
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Result<QuicEvent>> {
+        #[cfg(feature = "diagnostics")]
+        if core::mem::take(&mut self.state.idle_parked) {
+            ngnet_quic::diagnostics::record_driver_wake(
+                self.detached.conn.diagnostic_id(),
+                self.detached.conn.role(),
+            );
+        }
         pump::pump(&mut self.detached, &self.shared, &mut self.state, cx)?;
         self.collect();
 
@@ -362,10 +374,13 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
             cx.waker().wake_by_ref();
         }
         #[cfg(feature = "diagnostics")]
-        ngnet_quic::diagnostics::record_park(
-            self.detached.conn.diagnostic_id(),
-            self.detached.conn.role(),
-        );
+        {
+            self.state.idle_parked = true;
+            ngnet_quic::diagnostics::record_park(
+                self.detached.conn.diagnostic_id(),
+                self.detached.conn.role(),
+            );
+        }
         self.state.emitted_since_pending = false;
         Poll::Pending
     }
@@ -375,6 +390,13 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
         cx: &mut Context<'_>,
         source: &mut Src,
     ) -> Poll<Result<()>> {
+        #[cfg(feature = "diagnostics")]
+        if core::mem::take(&mut self.state.idle_parked) {
+            ngnet_quic::diagnostics::record_driver_wake(
+                self.detached.conn.diagnostic_id(),
+                self.detached.conn.role(),
+            );
+        }
         pump::pump(&mut self.detached, &self.shared, &mut self.state, cx)?;
         self.collect();
         if self.state.closed {

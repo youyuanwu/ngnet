@@ -135,6 +135,7 @@ async fn unarmed_and_armed_diagnostics_preserve_and_reconcile_echoes() {
         assert_eq!(attempt.direction, "outbound");
     }
 
+    let liveness = ngnet_quic::diagnostics::take_liveness_events();
     let snapshot = ngnet_quic::diagnostics::snapshot();
     for role in [snapshot.client, snapshot.server] {
         assert!(role.offered_bytes > 0);
@@ -142,6 +143,10 @@ async fn unarmed_and_armed_diagnostics_preserve_and_reconcile_echoes() {
         assert_eq!(
             role.produced_packets,
             role.transport_only_packets + role.stream_carrying_packets
+        );
+        assert_eq!(
+            role.zero_accept_retries_without_enable, 0,
+            "a blocked stream must wait for an enabling event before retrying: {liveness:#?}"
         );
         assert_eq!(role.inbound_drops, 0);
     }

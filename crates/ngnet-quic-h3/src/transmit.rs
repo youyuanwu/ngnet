@@ -21,6 +21,7 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
     cx: &core::task::Context<'_>,
 ) -> Result<()> {
     let mut failure: Option<Error> = None;
+    let mut blocked = false;
     #[cfg(feature = "diagnostics")]
     let role = detached.conn.role();
     #[cfg(feature = "diagnostics")]
@@ -80,7 +81,10 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
                     | StreamWrite::StreamBlocked
                     | StreamWrite::ConnectionBlocked
                     | StreamWrite::Idle,
-                ) => H3WriteOutcome::Blocked,
+                ) => {
+                    blocked = true;
+                    H3WriteOutcome::Blocked
+                }
                 // A stream whose write side is finished will never take more. Saying so lets
                 // the layer stop offering rather than retrying forever.
                 Err(err) if err.kind() == QuicErrorKind::StreamClosed => H3WriteOutcome::Gone,
@@ -113,6 +117,9 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
         if let Some(err) = failure.take() {
             state.closed = true;
             return Err(err);
+        }
+        if blocked {
+            break;
         }
         if !offered {
             break;
