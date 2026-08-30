@@ -33,6 +33,11 @@ ngnet-qmux-h3.workspace = true
 ngnet-qmux = { workspace = true, features = ["tokio"] }
 ngnet-h3.workspace = true
 ngnet-h3-quinn.workspace = true
+ngnet-quic = { workspace = true, features = ["tokio"] }
+ngnet-quic-h3.workspace = true
+# Reuse the established ngtcp2/OpenSSL endpoint and certificate harness rather than keeping
+# a second benchmark-only copy that could drift from the integration tests.
+ngnet-quic-h3-tests.workspace = true
 tokio.workspace = true
 # The completion runtime under test. Its `criterion` feature adds the `AsyncExecutor` impl
 # for compio's `Runtime`, so `b.to_async(&compio_runtime)` drives it exactly as the tokio
@@ -106,4 +111,15 @@ harness = false
 
 [[bench]]
 name = "quinn_body_throughput"
+harness = false
+
+# Three complete HTTP/3 stacks over loopback UDP. Unlike the Quinn-only pair above, these
+# vary the transport/TLS stack as well as the adapter and therefore support end-to-end
+# comparisons rather than attribution to one layer.
+[[bench]]
+name = "quic_stack_serial_latency"
+harness = false
+
+[[bench]]
+name = "quic_stack_body_throughput"
 harness = false

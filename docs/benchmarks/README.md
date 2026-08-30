@@ -12,6 +12,9 @@ benchmark families, which answer different questions and must not be read as one
 - **The Quinn HTTP/3 family** — two arms over real loopback UDP with the same Quinn, rustls,
   Tokio, ALPN, certificate, request, echo, and body drain. It varies the HTTP/3 implementation
   and adapter: `ngnet-h3` + `ngnet-h3-quinn` against upstream `h3` + `h3-quinn`.
+- **The QUIC-stack HTTP/3 family** — three arms over loopback UDP: the two Quinn stacks above
+  plus `ngnet-h3` + `ngnet-quic-h3` + ngtcp2/OpenSSL. This is an end-to-end transport-stack
+  comparison, not an adapter-only attribution.
 
 Between them they fill in the whole matrix of stack against I/O model:
 
@@ -143,6 +146,8 @@ HTTP/2 arm and an HTTP/3-over-QMux arm.
 | [`transport_shared_body`](cases/transport-shared-body.md) | socket | body strategy × I/O model × body — HTTP/2 only | MB/s |
 | [`quinn_serial_latency`](cases/quinn-serial-latency.md) | Quinn loopback | HTTP/3 implementation | latency of one empty-body exchange |
 | [`quinn_body_throughput`](cases/quinn-body-throughput.md) | Quinn loopback | HTTP/3 implementation × body ∈ {16 KiB, 1 MiB} | MB/s |
+| [`quic_stack_serial_latency`](cases/quic-stack-serial-latency.md) | QUIC loopback | HTTP/3 × QUIC × TLS stack | latency of one empty-body exchange |
+| [`quic_stack_body_throughput`](cases/quic-stack-body-throughput.md) | QUIC loopback | HTTP/3 × QUIC × TLS stack at 1 KiB | MB/s |
 
 ## The findings so far
 

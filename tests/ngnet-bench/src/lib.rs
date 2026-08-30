@@ -1,5 +1,5 @@
-//! Shared harness for this workspace's benchmark suite: `ngnet-h2` against `hyper`, and
-//! HTTP/2 against HTTP/3-over-QMux.
+//! Shared harness for this workspace's benchmark suite: `ngnet-h2` against `hyper`,
+//! HTTP/2 against HTTP/3-over-QMux, and HTTP/3 over Quinn or ngtcp2.
 //!
 //! The stacks are put on the same footing here so the individual benches carry no
 //! fairness logic of their own: identical workload, identical protocol settings, and a
@@ -76,6 +76,12 @@ use ngnet_h3::http::{
 use ngnet_h3_quinn::QuinnBackend;
 use ngnet_qmux::io::{TokioClock, TokioStream};
 use ngnet_qmux_h3::{HttpConfig, TransportConfig, connect_with, serve_with as qmux_serve_with};
+use ngnet_quic::OsslSession;
+use ngnet_quic::endpoint::Endpoint as NgtcpEndpoint;
+use ngnet_quic_h3_tests::{
+    Credentials as NgtcpCredentials, TEST_SERVER_NAME as NGTCP_SERVER_NAME,
+    client_endpoint as ngtcp_client_endpoint, server_endpoint as ngtcp_server_endpoint,
+};
 
 use hyper::client::conn::http2 as hyper_client;
 use hyper::server::conn::http2 as hyper_server;
@@ -1161,7 +1167,7 @@ impl NgnetQmuxH3 {
 const QUINN_WORKLOAD_URI: &str = "https://bench.local/bench";
 const H3_ALPN: &[u8] = b"h3";
 
-fn quinn_request_for(body: Bytes) -> http::Request<BenchBody> {
+fn quic_request_for(body: Bytes) -> http::Request<BenchBody> {
     http::Request::builder()
         .method(http::Method::POST)
         .uri(QUINN_WORKLOAD_URI)
@@ -1258,7 +1264,7 @@ async fn quinn_pair() -> (
     (connected, accepted, (client, server))
 }
 
-async fn ngnet_h3_quinn_echo(request: http::Request<H3IncomingBody>) -> http::Response<BenchBody> {
+async fn ngnet_h3_echo(request: http::Request<H3IncomingBody>) -> http::Response<BenchBody> {
     response_for(collect(request.into_body()).await)
 }
 
@@ -1275,7 +1281,7 @@ impl NgnetH3Quinn {
     pub async fn establish() -> Self {
         let (client_quic, server_quic, endpoints) = quinn_pair().await;
         let server_driver =
-            h3_serve(QuinnBackend::new(server_quic), ngnet_h3_quinn_echo).expect("ngnet server");
+            h3_serve(QuinnBackend::new(server_quic), ngnet_h3_echo).expect("ngnet server");
         let server = tokio::spawn(async move {
             server_driver.await.expect("the ngnet server driver");
         });
@@ -1299,7 +1305,7 @@ impl NgnetH3Quinn {
     pub async fn round_trip(&self, body: Bytes) -> usize {
         let response = self
             .handle
-            .send_request(quinn_request_for(body))
+            .send_request(quic_request_for(body))
             .await
             .expect("an ngnet response head");
         assert!(response.status().is_success());
@@ -1311,6 +1317,92 @@ impl Drop for NgnetH3Quinn {
     fn drop(&mut self) {
         self.client.abort();
         self.server.abort();
+    }
+}
+
+/// A persistent ngnet-h3 connection over ngtcp2 and OpenSSL.
+///
+/// This is an end-to-end stack comparison with [`NgnetH3Quinn`], not an adapter-only
+/// comparison: QUIC, TLS, endpoint driving, and transport integration all differ.
+pub struct NgnetNgtcpH3 {
+    handle: H3SendRequest<BenchBody>,
+    client: JoinHandle<()>,
+    server: JoinHandle<()>,
+    client_endpoint_driver: JoinHandle<()>,
+    server_endpoint_driver: JoinHandle<()>,
+    _endpoints: (NgtcpEndpoint<OsslSession>, NgtcpEndpoint<OsslSession>),
+}
+
+impl NgnetNgtcpH3 {
+    /// Establishes and warms an ngtcp2 client/server pair outside the measured closure.
+    pub async fn establish() -> Self {
+        let credentials = NgtcpCredentials::generate();
+        let (server_endpoint, server_endpoint_driver, address) =
+            ngtcp_server_endpoint(&credentials).await;
+        let (client_endpoint, client_endpoint_driver) =
+            ngtcp_client_endpoint(&credentials, 0xBEE5).await;
+
+        let server_endpoint_driver = tokio::spawn(async move {
+            server_endpoint_driver
+                .await
+                .expect("the ngtcp2 server endpoint driver");
+        });
+        let client_endpoint_driver = tokio::spawn(async move {
+            client_endpoint_driver
+                .await
+                .expect("the ngtcp2 client endpoint driver");
+        });
+
+        let accepting = server_endpoint.clone();
+        let server = tokio::spawn(async move {
+            let backend = ngnet_quic_h3::accept(&accepting)
+                .await
+                .expect("an ngtcp2 server connection");
+            let driver = h3_serve(backend, ngnet_h3_echo).expect("an ngtcp2 HTTP/3 server");
+            driver.await.expect("the ngtcp2 HTTP/3 server driver");
+        });
+
+        let backend = ngnet_quic_h3::connect(&client_endpoint, address, Some(NGTCP_SERVER_NAME))
+            .await
+            .expect("an ngtcp2 client connection");
+        let (handle, client_driver) =
+            h3_handshake::<_, BenchBody>(backend).expect("an ngtcp2 HTTP/3 client");
+        let client = tokio::spawn(async move {
+            client_driver
+                .await
+                .expect("the ngtcp2 HTTP/3 client driver");
+        });
+
+        let fixture = Self {
+            handle,
+            client,
+            server,
+            client_endpoint_driver,
+            server_endpoint_driver,
+            _endpoints: (client_endpoint, server_endpoint),
+        };
+        assert_eq!(fixture.round_trip(Bytes::new()).await, 0);
+        fixture
+    }
+
+    /// Sends one request and drains the echoed response body.
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        let response = self
+            .handle
+            .send_request(quic_request_for(body))
+            .await
+            .expect("an ngtcp2 response head");
+        assert!(response.status().is_success());
+        drain(response.into_body()).await
+    }
+}
+
+impl Drop for NgnetNgtcpH3 {
+    fn drop(&mut self) {
+        self.client.abort();
+        self.server.abort();
+        self.client_endpoint_driver.abort();
+        self.server_endpoint_driver.abort();
     }
 }
 

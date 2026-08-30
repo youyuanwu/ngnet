@@ -91,6 +91,7 @@ ngnet-h3-sys = { path = "crates/ngnet-h3-sys", version = "0.0.1" }
 ngnet-h3-quinn = { path = "crates/ngnet-h3-quinn" }
 ngnet-quic-sys = { path = "crates/ngnet-quic-sys", version = "0.0.1", default-features = false }
 ngnet-quic = { path = "crates/ngnet-quic", version = "0.0.1" }
+ngnet-quic-h3-tests = { path = "tests/ngnet-quic-h3-tests" }
 # The QMux pair. Unrelated to the QUIC crates above despite the similar name: QMux is a
 # different protocol over a different substrate, and a workspace test asserts neither family
 # reaches the other.

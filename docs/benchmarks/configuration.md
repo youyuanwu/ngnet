@@ -26,6 +26,28 @@ settings: upstream `h3` uses stateless QPACK while `ngnet-h3` delegates QPACK to
 differences are part of the implementations under comparison, not transport knobs the harness
 can match without changing one stack's normal behavior.
 
+## The three-stack QUIC comparison
+
+`quic_stack_serial_latency` and `quic_stack_body_throughput` retain both Quinn arms above and
+add `ngnet-quic-h3`, backed by ngtcp2 and OpenSSL. All three use loopback UDP, current-thread
+Tokio runtimes, the `h3` ALPN, generated certificate trust, persistent warmed connections, the
+same request and echo response, and a full body drain.
+
+The comparison intentionally does not claim to isolate one layer:
+
+- `ngnet-h3-quinn` against `ngnet-quic-h3` holds `ngnet-h3` fixed but changes the QUIC
+  implementation, TLS implementation, endpoint driver, and adapter.
+- `ngnet-h3-quinn` against upstream `h3-quinn` holds Quinn and rustls fixed while changing the
+  HTTP/3 implementation and adapter.
+- `ngnet-quic-h3` against upstream `h3-quinn` changes the complete HTTP/3, QUIC, TLS, and
+  adapter stack.
+
+Each stack uses its production transport defaults. Matching them by changing flow-control,
+stream-count, acknowledgement, pacing, or congestion settings would answer a different
+configuration study rather than which default stack performs better today. The body case is
+limited to 1 KiB because repeated 16 KiB ngtcp2 exchanges can stall or close and repeated
+1 MiB exchanges can crash in native code; the Quinn-only target retains both larger sizes.
+
 ## The HTTP/2 comparison: `ngnet-h2` against hyper
 
 Both stacks are pinned to libnghttp2's defaults, since `ngnet-h2`'s async layer advertises
