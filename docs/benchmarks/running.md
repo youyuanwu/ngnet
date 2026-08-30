@@ -2,10 +2,10 @@
 
 ## What has to be in place first
 
-The benchmark crate builds three C libraries from source, and the set grew when the
-HTTP/3-over-QMux arms landed. A checkout that used to be sufficient no longer is, so this
-section is the first thing to check when `cargo bench -p ngnet-bench` fails before it runs
-anything.
+The benchmark crate builds four native libraries from source, and the set grew when the
+HTTP/3-over-QMux and ngtcp2 arms landed. A checkout that used to be sufficient no longer is,
+so this section is the first thing to check when `cargo bench -p ngnet-bench` fails before it
+runs anything.
 
 | Submodule | Reached through | Needed by |
 | --- | --- | --- |
@@ -32,7 +32,11 @@ By hand, if `just` is not installed — or is older than 1.27, which cannot pars
 `error: Unknown attribute 'doc'` before running anything:
 
 ```sh
-git submodule update --init crates/ngnet-h2-sys/vendor/nghttp2 crates/ngnet-h3-sys/vendor/nghttp3 crates/ngnet-qmux-sys/vendor/dwnx
+git submodule update --init \
+  crates/ngnet-h2-sys/vendor/nghttp2 \
+  crates/ngnet-h3-sys/vendor/nghttp3 \
+  crates/ngnet-qmux-sys/vendor/dwnx \
+  crates/ngnet-quic-sys/vendor/ngtcp2
 git -C crates/ngnet-h3-sys/vendor/nghttp3 submodule update --init lib/sfparse
 
 # The equivalent of `just submodules-status`:
