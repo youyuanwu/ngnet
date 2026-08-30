@@ -528,7 +528,12 @@ Not symmetric, for reasons that are not symmetric.
 **Inbound**, past its bound, the endpoint drops. It reads one socket on behalf of every
 connection, so waiting for a slow consumer would starve the rest. A dropped datagram is a
 lost packet, which QUIC recovers from and which a full socket buffer would have produced a
-layer lower anyway. The count is exposed rather than hidden.
+layer lower anyway. The count is exposed rather than hidden. A receive batch handed to a
+detached connection also ends the current endpoint poll: the endpoint schedules itself again
+and yields to the connection owner it just woke, rather than draining as many as eight batches
+into the same 64-datagram queue before that owner can run. The bound and overflow rule remain;
+ordinary persistent transfers avoid manufacturing loss through one task monopolising the
+runtime.
 
 **Outbound**, dropping is not available. A datagram that has been produced cannot be
 withdrawn: the connection has already accounted for the stream bytes in it, so offering them
@@ -596,6 +601,13 @@ for as long as it lives — a `Box<[u8]>` for a borrowed write, copied in; or, f
 handed over through `write_stream_owned`, the caller's `OwnedBytes` handle kept alive so no copy
 is made. Either way the address does not move.
 
+The borrowing path samples the connection's current maximum transmit UDP payload immediately
+before each write and copies no more than that many caller bytes. Multiple slices keep their
+order in one fixed-address chunk. If the bound omits any caller suffix, the native call does
+not receive FIN; FIN accompanies only a staged prefix containing the true final suffix,
+including the empty-body case. The accepted count remains ngtcp2's accepted prefix, so the
+HTTP/3 layer reoffers every unaccepted byte once.
+
 ngtcp2 routinely accepts *less* than it is offered — a packet fills, and the remainder comes
 back as a separate write. Shrinking the allocation to the accepted prefix is the obvious
 tidy-up and is a use-after-free: the address ngtcp2 was given must stay valid, and
@@ -606,3 +618,9 @@ would pass either way since freed memory usually still reads back correctly.
 So the accepted *length* is recorded separately from the allocation, and the tail beyond it
 is left allocated until the chunk is released. That wastes at most one packet's worth per
 outstanding chunk. The test that guards it asserts the address.
+
+An acknowledgement may empty the current chunk queue without ending the stream. Retention
+therefore preserves the stream's cumulative next offset until the stream-close callback
+forgets the entry. Resetting that offset when the queue happened to empty made a later
+cumulative acknowledgement appear to cover newly staged data and released an address ngtcp2
+still retained; large transfers exposed the resulting corruption and release-build crash.

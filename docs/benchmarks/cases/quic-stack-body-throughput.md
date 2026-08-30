@@ -16,3 +16,8 @@ guard. A successful single body is not qualification: the required stress point 
 exact sequential exchanges, and 1 MiB additionally uses fresh 125/250/500-process RSS
 sampling. See [Running the benchmarks](../running.md#fixed-count-ngtcp2-probe-modes) for the
 separate unarmed timing and armed diagnostic procedures.
+
+The packet-bounded retention repair and its first stable-origin qualification are recorded in
+[run 27](../data/xeon-8370c-azure/27-ngtcp2-packet-bounded-staging.md). The failed predecessor
+remains a correctness reference rather than a large-body throughput baseline; run 27 therefore
+makes no before/after 1 MiB performance claim.

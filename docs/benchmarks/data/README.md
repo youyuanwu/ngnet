@@ -52,6 +52,7 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [24-ngnet-h3-quinn-lifecycle](xeon-8370c-azure/24-ngnet-h3-quinn-lifecycle.md) | xeon-8370c-azure | 2026-08-29 | Bounded Quinn lifecycle cleanup — **−24.50% adjusted empty serial, 223,968 → 7,300 KiB aged RSS** | — |
 | [25-ngtcp2-quic-stack-comparison](xeon-8370c-azure/25-ngtcp2-quic-stack-comparison.md) | xeon-8370c-azure | 2026-08-30 | ngtcp2/OpenSSL against Quinn/rustls — **1.513× empty, 1.401× at 1 KiB; larger bodies unstable** | — |
 | [26-ngtcp2-phase1-diagnostics](xeon-8370c-azure/26-ngtcp2-phase1-diagnostics.md) | xeon-8370c-azure | 2026-08-30 | Diagnostic foundation — **1 MiB failure reproduced; whole-remainder preparation measured** | — |
+| [27-ngtcp2-packet-bounded-staging](xeon-8370c-azure/27-ngtcp2-packet-bounded-staging.md) | xeon-8370c-azure | 2026-08-30 | Packet-bounded borrowing repair — **persistent 1 MiB exactness and memory qualification** | — |
 
 Runs [`08`](xeon-8370c-azure/08-qmux-against-h2.md) and
 [`09`](xeon-8370c-azure/09-qmux-h2-mechanisms.md) are the first cross-protocol comparison and its

@@ -151,6 +151,11 @@ holding the layer's bytes until acknowledgement, reporting release on write woul
 QUIC still points at for retransmission, and reporting it on acknowledgement while the copy
 exists would hold every in-flight byte twice.
 
+The copy is packet-bounded: each attempt stages at most the path's sampled maximum transmit UDP
+payload, suppresses FIN when that prefix omits a caller suffix, and reports only ngtcp2's
+accepted prefix. The remaining cost is therefore one stable packet-sized allocation per
+accepted write, not one allocation as large as the caller's outstanding body.
+
 The crate now has an ownership-taking write — `Conn::write_stream_owned`, taking an
 `OwnedBytes` — that retains without a copy. The HTTP/3 layer does not use it.
 

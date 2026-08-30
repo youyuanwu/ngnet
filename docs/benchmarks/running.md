@@ -186,6 +186,10 @@ contains one record per transport offer plus cumulative client/server snapshots:
 prepared backing, accepted, retained, released, packet, timer, wake, retry, park, queue,
 drop, and overflow observations. A field the safe transport cannot currently distinguish,
 such as retransmission attribution, is printed as `unavailable`, never as a guessed zero.
+The probe rejects an attempt unless prepared backing is no greater than
+`min(offered, sampled_payload_limit)`, rejects FIN on a truncated staged prefix, and checks
+aggregate staged bytes against accepted progress plus one sampled limit for every
+partial/zero-accept attempt.
 RSS is read from `/proc/self/status` after readiness, after complete exchanges, and after
 the final drain; non-Linux hosts print `rss_kib=unavailable`.
 
