@@ -32,8 +32,16 @@ pub(crate) fn pump<S: Session>(
     state: &mut State,
     cx: &mut Context<'_>,
 ) -> Result<()> {
-    detached.register(cx.waker());
-
+    #[cfg(feature = "diagnostics")]
+    let role = detached.conn.role();
+    #[cfg(feature = "diagnostics")]
+    let connection_id = detached.conn.diagnostic_id();
+    #[cfg(feature = "diagnostics")]
+    if detached.register(cx.waker()) {
+        ngnet_quic::diagnostics::record_wake_registration(connection_id, role);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = detached.register(cx.waker());
     // Read first. The lock is never held across a call into the connection: ngtcp2 invokes
     // this crate's handlers synchronously from inside `read_pkt`, and those handlers take
     // the same lock to record what they saw.
@@ -90,10 +98,7 @@ pub(crate) fn pump<S: Session>(
 
     // Then send what is owed. Acknowledgements and probes come from here, not from the
     // stream-writing path, so a connection with nothing to say still says it.
-    produce(detached, state)?;
-    if !detached.outbound_has_room() {
-        detached.register_outbound_capacity(cx.waker());
-    }
+    produce(detached, state, Some(cx.waker()))?;
     Ok(())
 }
 
@@ -101,11 +106,28 @@ pub(crate) fn pump<S: Session>(
 pub(crate) fn produce<S: Session>(
     detached: &mut DetachedConnection<S>,
     state: &mut State,
+    capacity_waker: Option<&core::task::Waker>,
 ) -> Result<()> {
+    #[cfg(feature = "diagnostics")]
+    if state.capacity_parked
+        && capacity_waker.is_some_and(|waker| detached.poll_outbound_capacity(waker))
+    {
+        ngnet_quic::diagnostics::record_retry(detached.conn.diagnostic_id(), detached.conn.role());
+        state.capacity_parked = false;
+    }
+
     // Bounded so a connection that always has something to say cannot keep this pass from
     // returning.
     for _ in 0..64 {
-        if !detached.outbound_has_room() {
+        let ready = match capacity_waker {
+            Some(waker) => detached.poll_outbound_capacity(waker),
+            None => detached.outbound_has_room(),
+        };
+        if !ready {
+            #[cfg(feature = "diagnostics")]
+            {
+                state.capacity_parked = true;
+            }
             break;
         }
         let now = detached.now();
@@ -118,6 +140,12 @@ pub(crate) fn produce<S: Session>(
         match detached.conn.write_pkt(&mut datagram, now) {
             Ok(WriteOutcome::Datagram { len }) => {
                 datagram.truncate(len);
+                #[cfg(feature = "diagnostics")]
+                ngnet_quic::diagnostics::record_packet(
+                    detached.conn.diagnostic_id(),
+                    detached.conn.role(),
+                    false,
+                );
                 detached.send(datagram);
             }
             Ok(WriteOutcome::Blocked | WriteOutcome::Idle) => {
@@ -157,6 +185,11 @@ pub(crate) fn poll_timer<S: Session>(
     if state.sleeping_until != Some(deadline) {
         state.sleeping = Some(detached.sleep_until(deadline));
         state.sleeping_until = Some(deadline);
+        #[cfg(feature = "diagnostics")]
+        ngnet_quic::diagnostics::record_timer_rearm(
+            detached.conn.diagnostic_id(),
+            detached.conn.role(),
+        );
     }
 
     let Some(sleep) = state.sleeping.as_mut() else {
@@ -166,6 +199,11 @@ pub(crate) fn poll_timer<S: Session>(
         Poll::Ready(()) => {
             state.sleeping = None;
             state.sleeping_until = None;
+            #[cfg(feature = "diagnostics")]
+            ngnet_quic::diagnostics::record_timer_fire(
+                detached.conn.diagnostic_id(),
+                detached.conn.role(),
+            );
             Poll::Ready(())
         }
         Poll::Pending => Poll::Pending,

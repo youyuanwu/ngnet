@@ -242,6 +242,8 @@ impl<S: Session> ConnBuilder<S> {
             _rand_ctx: rand_ctx,
             path,
             role: self.role,
+            #[cfg(feature = "diagnostics")]
+            diagnostic_id: crate::diagnostics::next_connection_id(),
             scid,
             retained: Retained::default(),
         };
@@ -320,6 +322,8 @@ pub struct Conn<'h, S: Session> {
     /// Copied by ngtcp2, but kept so the connection can report its own path.
     path: Box<PathStorage>,
     role: Role,
+    #[cfg(feature = "diagnostics")]
+    diagnostic_id: u64,
     scid: ConnectionId,
     /// Copies of stream data ngtcp2 has accepted but the peer has not acknowledged.
     ///
@@ -364,6 +368,13 @@ impl<'h, S: Session> Conn<'h, S> {
     /// The role this endpoint plays.
     pub fn role(&self) -> Role {
         self.role
+    }
+
+    /// Process-local identity used to correlate feature-gated diagnostics.
+    #[cfg(feature = "diagnostics")]
+    #[doc(hidden)]
+    pub fn diagnostic_id(&self) -> u64 {
+        self.diagnostic_id
     }
 
     /// This endpoint's source connection ID.
@@ -497,6 +508,18 @@ impl<'h, S: Session> Conn<'h, S> {
     /// grow, which is the honest signal that memory is being held on its behalf.
     pub fn retained_bytes(&self) -> usize {
         self.retained.bytes_held()
+    }
+
+    /// Complete backing capacity kept alive for accepted stream prefixes.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn retained_backing_capacity(&self) -> usize {
+        self.retained.backing_bytes_held()
+    }
+
+    /// Offset at which another accepted write for `stream` would begin.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn retained_next_offset(&self, stream: crate::StreamId) -> u64 {
+        self.retained.next_offset(stream)
     }
 
     /// The retention map, for the write path and the acknowledgement callback.

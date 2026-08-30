@@ -12,6 +12,7 @@ anything.
 | `crates/ngnet-h2-sys/vendor/nghttp2` | `ngnet-h2-sys` | every HTTP/2 arm |
 | `crates/ngnet-h3-sys/vendor/nghttp3` **and its nested `lib/sfparse`** | `ngnet-h3-sys` | every QMux arm |
 | `crates/ngnet-qmux-sys/vendor/dwnx` | `ngnet-qmux-sys` | every QMux arm |
+| `crates/ngnet-quic-sys/vendor/ngtcp2` | `ngnet-quic-sys` | the complete ngtcp2 HTTP/3 arm |
 
 `nghttp3/lib/sfparse` is not optional and is not a test dependency: the structured-field
 parser is part of the library, and nghttp3 does not compile without it. "Clone
@@ -38,22 +39,16 @@ git -C crates/ngnet-h3-sys/vendor/nghttp3 submodule update --init lib/sfparse
 git submodule status --recursive
 ```
 
-Building those three needs a C compiler, CMake 3.14 or newer, and libclang for `bindgen`.
+Building those four needs a C compiler, CMake 3.14 or newer, and libclang for `bindgen`.
 
-**What is still not needed is OpenSSL 3.5 or newer.** That requirement belongs to
-`ngnet-quic-sys`, which builds ngtcp2 and drives its handshake through OpenSSL's QUIC TLS API,
-and no arm in this suite reaches it — `crates/ngnet-quic-sys/vendor/ngtcp2` need not be
-checked out to run the
-benchmarks at all. This is worth stating rather than leaving implicit, because the naive
-reading of "the benchmarks now cover HTTP/3" is that they must have acquired a QUIC transport
-and therefore a TLS stack with an unusually new OpenSSL floor. They have not: QMux runs over
-the same loopback TCP connection the HTTP/2 arms use, and the QMux arms are unencrypted. On a
-host whose OpenSSL predates 3.5, `cargo bench -p ngnet-bench` works and
-`cargo bench --workspace` does not; prefer the `-p` form for that reason alone.
+The complete ngtcp2 HTTP/3 arm **does** require OpenSSL 3.5 or newer. `ngnet-quic-sys`
+builds ngtcp2 and drives its handshake through OpenSSL's QUIC TLS API. A host without that
+toolchain may still run targets that do not reach `ngnet-quic-sys`, but it cannot build the
+workspace-wide smoke check, the QUIC-stack Criterion targets, or the ngtcp2 probe. Report
+that as a host limitation rather than substituting another TLS or QUIC implementation.
 
-`cargo tree -p ngnet-bench --prefix none | grep '^ngnet-.*-sys' | sort -u` is the check that
-settles the question on any given day, rather than trusting this table. It lists exactly the
-three `-sys` crates above, and `ngnet-quic-sys` is not among them.
+`cargo tree -p ngnet-bench --prefix none | grep '^ngnet-.*-sys' | sort -u` settles the
+dependency set for the current checkout rather than relying on this table.
 
 ## The commands
 
@@ -146,7 +141,8 @@ fixture and runs a single workload in a loop:
 ```sh
 cargo build --example probe -p ngnet-bench --release
 
-# arm      = h2-duplex | h2-socket | qmux-duplex | qmux-socket
+# arm      = h2-duplex | h2-socket | qmux-duplex | qmux-socket |
+#            ngnet-h3-quinn | ngnet-quic-h3 | h3-quinn
 # workload = body <bytes> | concurrent <streams>
 taskset -c 3 ./target/release/examples/probe qmux-socket body 1048576 300
 
@@ -155,10 +151,90 @@ strace -c -f  ./target/release/examples/probe qmux-socket body 1048576 300
 perf record -F 4000 -g -- ./target/release/examples/probe qmux-duplex body 0 150000
 ```
 
-It prints `PROBE-READY` on stderr once the connection is established and warmed, so a trace can be
-started against a steady state. It is not a benchmark and its wall-clock output is not a result;
+It prints `PROBE-READY` on stderr once the connection is established and one explicit empty
+exchange has warmed the persistent connection. Fixture-internal setup stays outside this
+boundary as well. The explicit warm-up keeps a large-body failure after readiness, where the
+supervisor can classify it. It is not a benchmark until calibrated as described below;
 [`data/xeon-8370c-azure/09-qmux-h2-mechanisms.md`](data/xeon-8370c-azure/09-qmux-h2-mechanisms.md)
 is what it produced and how far it was checked.
+
+### Fixed-count ngtcp2 probe modes
+
+The `ngnet-quic-h3` arm accepts body sizes `0`, `1024`, `16384`, and `1048576`. Its default
+mode is an **unarmed timing run**:
+
+```sh
+cargo build -p ngnet-bench --example probe --release
+taskset -c 3 ./target/release/examples/probe ngnet-quic-h3 body 16384 125 timing
+```
+
+Only `PROBE-METADATA`, `PROBE-READY`, `PROBE-TIMING`, and `PROBE-DONE` are emitted. Setup and
+warm-up precede readiness; the measured interval contains no progress, diagnostic,
+allocation-sampling, or RSS work. `PROBE-TIMING` reports two-direction application bytes and
+elapsed nanoseconds.
+
+Diagnostic mode is a separate feature-enabled process built from the same checkout:
+
+```sh
+cargo build -p ngnet-bench --example probe --release --features diagnostics
+taskset -c 3 ./target/release/examples/probe ngnet-quic-h3 body 16384 125 diagnostic
+```
+
+The non-default `diagnostics` feature is additive and remains unarmed until after
+`PROBE-READY`. Armed output is line-flushed only after a fully drained exact response. It
+contains one record per transport offer plus cumulative client/server snapshots: offered,
+prepared backing, accepted, retained, released, packet, timer, wake, retry, park, queue,
+drop, and overflow observations. A field the safe transport cannot currently distinguish,
+such as retransmission attribution, is printed as `unavailable`, never as a guessed zero.
+RSS is read from `/proc/self/status` after readiness, after complete exchanges, and after
+the final drain; non-Linux hosts print `rss_kib=unavailable`.
+
+The probe gives each exchange a body-scaled timeout (2 seconds plus 3 seconds per started
+MiB), reports the last completed exchange before timing out, and checks every response
+length. Run it under an outer supervisor as well, because a native signal cannot be caught
+reliably by Rust:
+
+```sh
+# 125 x 1 MiB: 60 seconds setup allowance plus 125 x 5 seconds.
+timeout --signal=TERM --kill-after=5s 685s \
+  taskset -c 3 ./target/release/examples/probe \
+  ngnet-quic-h3 body 1048576 125 diagnostic
+status=$?
+printf 'probe_exit=%s\n' "$status"
+```
+
+Record exit `0`, `124` (outer timeout), or `128 + signal`, the final
+`PROBE-PROGRESS`, and the final complete snapshot. Never exclude a stalled, signalled,
+wrong-length, or unexpectedly dropped run from correctness results.
+
+### Calibrating 1 KiB timing
+
+Before treating fixed-count probe throughput as a phase guard, compare its 1 KiB
+per-exchange time with Criterion in one pinned, otherwise idle session. Build once, then run
+three interleaved pairs:
+
+```sh
+cargo build -p ngnet-bench --bench quic_stack_body_throughput --example probe --release
+
+# Repeat this Criterion/probe pair three times without rebuilding.
+taskset -c 3 cargo bench -p ngnet-bench --bench quic_stack_body_throughput -- \
+  'quic_stack_body_throughput/ngnet-quic-h3/1024'
+taskset -c 3 ./target/release/examples/probe ngnet-quic-h3 body 1024 10000 timing
+```
+
+Divide each probe's `elapsed_ns` by 10,000. The calibration passes only when the median
+probe value is within 5% of the median Criterion `time` estimate and neither three-run set
+spans more than 5% of its own median. Otherwise the probe remains a correctness and
+diagnostic instrument; its throughput must not gate a phase.
+
+### Persistent memory envelope
+
+Use fresh diagnostic processes for three 125-exchange 1 MiB runs, then fresh 250- and
+500-exchange runs. For each process, take the post-warm-up `boundary=ready` sample and the
+largest completed-exchange/final sample. The 125-run envelope is the largest post-warm-up
+increase across the three fresh runs. Each longer run must remain within that envelope plus
+the larger of 5% or 2 MiB. Preserve every complete RSS line and report
+`rss_kib=unavailable` when the host cannot provide it.
 
 ## Recording a run
 

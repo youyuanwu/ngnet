@@ -102,6 +102,9 @@ mod stream;
 mod time;
 mod validate;
 
+#[cfg(feature = "diagnostics")]
+pub mod diagnostics;
+
 #[cfg(feature = "endpoint")]
 pub mod endpoint;
 

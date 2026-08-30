@@ -412,7 +412,26 @@ pub(crate) unsafe extern "C" fn stream_close2_cb(
     // A closed stream will never be retransmitted, so anything still held for it is dead
     // weight -- and ngtcp2's own contract says retention ends at close as well as at
     // acknowledgement.
+    #[cfg(feature = "diagnostics")]
+    let backing_before = bridge.retained.backing_bytes_held();
     bridge.retained.forget(id);
+    #[cfg(feature = "diagnostics")]
+    {
+        // SAFETY: ngtcp2 supplied its live connection to this callback.
+        let role = if unsafe { sys::ngtcp2_conn_is_server(_conn) } != 0 {
+            crate::Role::Server
+        } else {
+            crate::Role::Client
+        };
+        let backing_after = bridge.retained.backing_bytes_held();
+        crate::diagnostics::record_retained(
+            role,
+            bridge.retained.bytes_held(),
+            backing_after,
+            0,
+            backing_before.saturating_sub(backing_after),
+        );
+    }
 
     // Each direction reports a code only when the flag says one was set. A direction without
     // one closed cleanly, which is not the same as closing with code zero.
@@ -489,7 +508,26 @@ pub(crate) unsafe extern "C" fn acked_stream_data_offset_cb(
 
     // Releasing the retained copy is the point of this callback, and it happens whether or
     // not the application registered a handler: the memory is held on its behalf either way.
+    #[cfg(feature = "diagnostics")]
+    let backing_before = bridge.retained.backing_bytes_held();
     bridge.retained.acknowledge(id, offset, datalen);
+    #[cfg(feature = "diagnostics")]
+    {
+        // SAFETY: ngtcp2 supplied its live connection to this callback.
+        let role = if unsafe { sys::ngtcp2_conn_is_server(_conn) } != 0 {
+            crate::Role::Server
+        } else {
+            crate::Role::Client
+        };
+        let backing_after = bridge.retained.backing_bytes_held();
+        crate::diagnostics::record_retained(
+            role,
+            bridge.retained.bytes_held(),
+            backing_after,
+            datalen,
+            backing_before.saturating_sub(backing_after),
+        );
+    }
 
     if let Some(handler) = bridge.handlers.on_acked_stream_data.as_mut() {
         handler(id, datalen);

@@ -242,6 +242,11 @@ fn turn(drivers: &mut [Pin<Box<Driver>>], clock: &SharedClock, cx: &mut Context<
 
 #[test]
 fn a_produce_pass_allocates_one_buffer_per_datagram() {
+    #[cfg(feature = "diagnostics")]
+    {
+        ngnet_quic::diagnostics::reset();
+        assert!(!ngnet_quic::diagnostics::is_armed());
+    }
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
     let credentials = Credentials::generate();
@@ -271,6 +276,7 @@ fn a_produce_pass_allocates_one_buffer_per_datagram() {
         {
             client_conn = Some(r.expect("the client handshake failed"));
         }
+
         if let Some(conn) = client_conn.as_mut() {
             let _ = conn.poll_event(&mut cx);
         }
@@ -348,4 +354,22 @@ fn a_produce_pass_allocates_one_buffer_per_datagram() {
          it is supposed to allocate exactly one owned buffer per datagram and nothing besides"
     );
     eprintln!("produce pass queued {datagrams} datagram(s), allocated {allocations} time(s)");
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
+fn feature_enabled_unarmed_diagnostic_checks_allocate_nothing() {
+    ngnet_quic::diagnostics::reset();
+    let ((armed, snapshot), allocations) = count_allocations(|| {
+        (
+            ngnet_quic::diagnostics::is_armed(),
+            ngnet_quic::diagnostics::snapshot(),
+        )
+    });
+    assert!(!armed);
+    assert_eq!(snapshot, ngnet_quic::diagnostics::Snapshot::default());
+    assert_eq!(
+        allocations, 0,
+        "feature-enabled unarmed diagnostic checks must not allocate"
+    );
 }

@@ -108,6 +108,9 @@ pub(crate) struct State {
     pub(crate) sleeping: Option<Sleep>,
     /// The deadline that sleep is for.
     pub(crate) sleeping_until: Option<Timestamp>,
+    /// Whether the previous pass parked on a full outbound queue.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) capacity_parked: bool,
     /// Wakers waiting for a stream limit to rise.
     pub(crate) limit_wakers: Vec<Waker>,
     /// Streams this end opened, in the order they were opened, awaiting collection.
@@ -150,6 +153,8 @@ impl<S: Session> NgtcpConnection<S> {
                 emitted_since_pending: false,
                 sleeping: None,
                 sleeping_until: None,
+                #[cfg(feature = "diagnostics")]
+                capacity_parked: false,
                 limit_wakers: Vec::new(),
                 opened_bidi: std::collections::VecDeque::new(),
                 opened_uni: std::collections::VecDeque::new(),
@@ -206,7 +211,7 @@ impl<S: Session> NgtcpConnection<S> {
     #[doc(hidden)]
     pub fn produce_pass_for_test(&mut self) -> Result<usize> {
         let before = self.detached.outbound_len_for_test();
-        pump::produce(&mut self.detached, &mut self.state)?;
+        pump::produce(&mut self.detached, &mut self.state, None)?;
         Ok(self.detached.outbound_len_for_test() - before)
     }
 
@@ -282,11 +287,10 @@ impl<S: Session> NgtcpConnection<S> {
         match opened {
             Ok(id) => {
                 // Whatever the open produced still has to reach the peer.
-                if let Err(err) = pump::produce(&mut self.detached, &mut self.state) {
+                if let Err(err) =
+                    pump::produce(&mut self.detached, &mut self.state, Some(cx.waker()))
+                {
                     return Poll::Ready(Err(err));
-                }
-                if !self.detached.outbound_has_room() {
-                    self.detached.register_outbound_capacity(cx.waker());
                 }
                 Poll::Ready(Ok(stream_id(id)))
             }
@@ -357,6 +361,11 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
         if pump::poll_timer(&self.detached, &mut self.state, cx).is_ready() {
             cx.waker().wake_by_ref();
         }
+        #[cfg(feature = "diagnostics")]
+        ngnet_quic::diagnostics::record_park(
+            self.detached.conn.diagnostic_id(),
+            self.detached.conn.role(),
+        );
         self.state.emitted_since_pending = false;
         Poll::Pending
     }
@@ -403,7 +412,7 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
             .conn
             .reset_stream(id, ApplicationErrorCode::new(code.get()))
             .map_err(Error::transport)?;
-        pump::produce(&mut self.detached, &mut self.state)
+        pump::produce(&mut self.detached, &mut self.state, None)
     }
 
     fn stop_sending(&mut self, stream: H3StreamId, code: ErrorCode) -> Result<()> {
@@ -412,7 +421,7 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
             .conn
             .stop_sending(id, ApplicationErrorCode::new(code.get()))
             .map_err(Error::transport)?;
-        pump::produce(&mut self.detached, &mut self.state)
+        pump::produce(&mut self.detached, &mut self.state, None)
     }
 
     fn extend_credit(&mut self, stream: Option<H3StreamId>, bytes: u64) -> Result<()> {

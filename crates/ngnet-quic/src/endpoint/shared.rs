@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
+use crate::Role;
 use crate::cid::ConnectionId;
 use crate::error::{ApplicationErrorCode, CloseError};
 use crate::handlers::StreamCloseReason;
@@ -86,6 +87,12 @@ pub(crate) struct ConnectionShared {
     /// make no progress until something unrelated woke the driver, and on a quiescent
     /// connection the next such thing is the idle timeout, which closes it.
     endpoint: Arc<EndpointShared>,
+    /// Which side owns this connection, for scoped diagnostics.
+    #[cfg(feature = "diagnostics")]
+    role: Role,
+    /// Process-local connection identity shared with the detached owner.
+    #[cfg(feature = "diagnostics")]
+    diagnostic_id: AtomicU64,
     inner: Mutex<ConnectionInner>,
     /// Whether the connection is finished, readable without taking the lock.
     ///
@@ -198,9 +205,15 @@ pub(crate) enum Command {
 
 impl ConnectionShared {
     /// A fresh shared state belonging to `endpoint`.
-    pub(crate) fn new(endpoint: Arc<EndpointShared>) -> Arc<Self> {
+    pub(crate) fn new(endpoint: Arc<EndpointShared>, role: Role) -> Arc<Self> {
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = role;
         Arc::new(Self {
             endpoint,
+            #[cfg(feature = "diagnostics")]
+            role,
+            #[cfg(feature = "diagnostics")]
+            diagnostic_id: AtomicU64::new(0),
             inner: Mutex::default(),
             closed: AtomicBool::new(false),
             established: AtomicBool::new(false),
@@ -217,6 +230,16 @@ impl ConnectionShared {
     /// already failing and refusing to look at its state helps nobody.
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, ConnectionInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn bind_diagnostic_id(&self, id: u64) {
+        self.diagnostic_id.store(id, Ordering::Release);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn diagnostic_id(&self) -> u64 {
+        self.diagnostic_id.load(Ordering::Acquire)
     }
 
     /// Records something a handler observed.
@@ -272,10 +295,27 @@ impl ConnectionShared {
         let mut inner = self.lock();
         if inner.inbound.len() >= DATAGRAM_QUEUE {
             inner.dropped += 1;
+            #[cfg(feature = "diagnostics")]
+            crate::diagnostics::record_inbound_queue(
+                self.diagnostic_id(),
+                self.role,
+                inner.inbound.len(),
+                true,
+            );
             return false;
         }
         inner.inbound.push_back(datagram);
         let wakers = core::mem::take(&mut inner.wakers);
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::diagnostics::record_inbound_queue(
+                self.diagnostic_id(),
+                self.role,
+                inner.inbound.len(),
+                false,
+            );
+            crate::diagnostics::record_inbound_wakes(self.diagnostic_id(), self.role, wakers.len());
+        }
         drop(inner);
         for waker in wakers {
             waker.wake();
@@ -285,7 +325,16 @@ impl ConnectionShared {
 
     /// Takes the next datagram the endpoint routed here.
     pub(crate) fn take_inbound(&self) -> Option<Vec<u8>> {
-        self.lock().inbound.pop_front()
+        let mut inner = self.lock();
+        let datagram = inner.inbound.pop_front();
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::record_inbound_queue(
+            self.diagnostic_id(),
+            self.role,
+            inner.inbound.len(),
+            false,
+        );
+        datagram
     }
 
     /// How many inbound datagrams have been dropped for want of room.
@@ -304,9 +353,39 @@ impl ConnectionShared {
         self.lock().outbound.len() < DATAGRAM_QUEUE
     }
 
+    /// Atomically observes outbound capacity or registers the producer for its return.
+    ///
+    /// Holding the one queue lock across both operations closes the lost-wakeup window
+    /// between a separate "full?" check and waker registration.
+    pub(crate) fn outbound_ready_or_register(&self, waker: &Waker) -> bool {
+        let mut inner = self.lock();
+        if inner.outbound.len() < DATAGRAM_QUEUE {
+            return true;
+        }
+        if !inner
+            .capacity_wakers
+            .iter()
+            .any(|registered| registered.will_wake(waker))
+        {
+            inner.capacity_wakers.push(waker.clone());
+            #[cfg(feature = "diagnostics")]
+            crate::diagnostics::record_capacity_registration(self.diagnostic_id(), self.role);
+        }
+        false
+    }
+
     /// Queues a datagram for the endpoint to send.
     pub(crate) fn queue_outbound(&self, datagram: Vec<u8>) {
-        self.lock().outbound.push_back(datagram);
+        let mut inner = self.lock();
+        inner.outbound.push_back(datagram);
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::record_outbound_queue(
+            self.diagnostic_id(),
+            self.role,
+            inner.outbound.len(),
+            false,
+        );
+        drop(inner);
         self.endpoint.wake_driver();
     }
 
@@ -330,6 +409,22 @@ impl ConnectionShared {
         } else {
             Vec::new()
         };
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::diagnostics::record_outbound_queue(
+                self.diagnostic_id(),
+                self.role,
+                inner.outbound.len(),
+                was_full && datagram.is_some(),
+            );
+            if was_full && datagram.is_some() {
+                crate::diagnostics::record_capacity_wakes(
+                    self.diagnostic_id(),
+                    self.role,
+                    wakers.len(),
+                );
+            }
+        }
         drop(inner);
         for waker in wakers {
             waker.wake();
@@ -418,19 +513,13 @@ impl ConnectionShared {
     }
 
     /// Registers a waker to be woken when something changes.
-    pub(crate) fn register(&self, waker: &Waker) {
+    pub(crate) fn register(&self, waker: &Waker) -> bool {
         let mut inner = self.lock();
         if !inner.wakers.iter().any(|w| w.will_wake(waker)) {
             inner.wakers.push(waker.clone());
+            return true;
         }
-    }
-
-    /// Registers a producer waiting specifically for detached outbound queue capacity.
-    pub(crate) fn register_capacity(&self, waker: &Waker) {
-        let mut inner = self.lock();
-        if !inner.capacity_wakers.iter().any(|w| w.will_wake(waker)) {
-            inner.capacity_wakers.push(waker.clone());
-        }
+        false
     }
 
     /// Wakes everything waiting on this connection.
@@ -580,7 +669,7 @@ mod tests {
     fn the_first_failure_is_the_one_reported() {
         // A connection that fails and is then torn down should report what actually went
         // wrong, not the teardown that followed from it.
-        let shared = ConnectionShared::new(EndpointShared::new());
+        let shared = ConnectionShared::new(EndpointShared::new(), Role::Client);
         shared.fail(Error::new(ErrorKind::HandshakeRejected, "first"));
         shared.fail(Error::new(ErrorKind::DriverGone, "second"));
         assert_eq!(shared.failure().kind(), ErrorKind::HandshakeRejected);
@@ -590,7 +679,7 @@ mod tests {
     fn an_idle_close_is_reported_as_a_timeout_rather_than_a_peer_close() {
         // The distinction a caller acts on: nothing refused anything, and the peer may not
         // know the connection is over.
-        let shared = ConnectionShared::new(EndpointShared::new());
+        let shared = ConnectionShared::new(EndpointShared::new(), Role::Client);
         let close = crate::error::CloseError::idle_for_test();
         shared.fail_with_close(close);
         assert_eq!(shared.failure().kind(), ErrorKind::IdleTimeout);
@@ -598,7 +687,7 @@ mod tests {
 
     #[test]
     fn commands_are_taken_in_order() {
-        let shared = ConnectionShared::new(EndpointShared::new());
+        let shared = ConnectionShared::new(EndpointShared::new(), Role::Client);
         shared.push(Command::Reset(
             StreamId::new(0).expect("valid"),
             ApplicationErrorCode::new(1),
@@ -629,7 +718,7 @@ mod tests {
             }
         }
 
-        let shared = ConnectionShared::new(EndpointShared::new());
+        let shared = ConnectionShared::new(EndpointShared::new(), Role::Client);
         let first = Arc::new(Counting(AtomicBool::new(false)));
         let waker = Waker::from(Arc::clone(&first));
         shared.register(&waker);
@@ -663,7 +752,7 @@ mod tests {
             }
         }
 
-        let shared = ConnectionShared::new(EndpointShared::new());
+        let shared = ConnectionShared::new(EndpointShared::new(), Role::Client);
         for byte in 0..DATAGRAM_QUEUE {
             shared.queue_outbound(vec![byte as u8]);
         }
@@ -674,8 +763,8 @@ mod tests {
 
         let counter = Arc::new(Counting(AtomicU64::new(0)));
         let waker = Waker::from(Arc::clone(&counter));
-        shared.register_capacity(&waker);
-        shared.register_capacity(&waker);
+        assert!(!shared.outbound_ready_or_register(&waker));
+        assert!(!shared.outbound_ready_or_register(&waker));
         assert_eq!(
             shared.lock().capacity_wakers.len(),
             1,
@@ -701,6 +790,32 @@ mod tests {
             shared.dropped_inbound(),
             0,
             "the quiesced inbound side did not drop"
+        );
+    }
+
+    #[test]
+    fn capacity_restored_before_registration_is_observed_without_a_lost_wake() {
+        let shared = ConnectionShared::new(EndpointShared::new(), Role::Client);
+        for _ in 0..DATAGRAM_QUEUE {
+            shared.queue_outbound(vec![0]);
+        }
+        assert!(
+            !shared.outbound_has_room(),
+            "the producer's earlier observation sees full"
+        );
+
+        // This is the interleaving the old check-then-register pair lost: the endpoint
+        // removes one after the producer's observation but before it can park.
+        assert!(shared.take_outbound().is_some());
+
+        let waker = Waker::noop();
+        assert!(
+            shared.outbound_ready_or_register(waker),
+            "the atomic recheck must let the producer retry immediately"
+        );
+        assert!(
+            shared.lock().capacity_wakers.is_empty(),
+            "a ready producer must not leave a stale registration"
         );
     }
 }

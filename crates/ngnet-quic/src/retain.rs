@@ -444,6 +444,28 @@ impl Retained {
             .map(|c| c.len)
             .sum()
     }
+
+    /// Complete backing capacity still kept alive, across every stream.
+    ///
+    /// Unlike [`bytes_held`](Self::bytes_held), this does not shorten a partially accepted
+    /// chunk to its logical prefix. ngtcp2 still points into the original allocation, so
+    /// this is the resident staging quantity diagnostics must report.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn backing_bytes_held(&self) -> usize {
+        self.streams
+            .values()
+            .flat_map(|stream| stream.chunks.iter())
+            .map(|chunk| chunk.data.len())
+            .sum()
+    }
+
+    /// Offset at which another accepted write for `stream` would begin.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn next_offset(&self, stream: StreamId) -> u64 {
+        self.streams
+            .get(&stream.get())
+            .map_or(0, |entry| entry.next_offset)
+    }
 }
 
 #[cfg(test)]
@@ -476,9 +498,11 @@ mod tests {
     #[test]
     fn an_empty_owned_write_stages_nothing() {
         let mut retained = Retained::default();
-        assert!(retained
-            .stage_owned(sid(0), OwnedBytes::new(Vec::new()))
-            .is_none());
+        assert!(
+            retained
+                .stage_owned(sid(0), OwnedBytes::new(Vec::new()))
+                .is_none()
+        );
         assert_eq!(retained.bytes_held(), 0);
     }
 
@@ -603,6 +627,12 @@ mod tests {
         retained.stage_many(sid(0), &[IoSlice::new(&[1, 2, 3, 4, 5, 6, 7, 8])]);
         retained.commit(sid(0), 3);
         assert_eq!(retained.bytes_held(), 3);
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(
+            retained.backing_bytes_held(),
+            8,
+            "the complete prepared allocation remains resident"
+        );
 
         let (ptr, len) = retained.last_pointer(sid(0)).unwrap();
         // SAFETY: the chunk is alive.

@@ -322,6 +322,30 @@ where
     total
 }
 
+/// Reads a body while comparing every chunk with an expected byte sequence.
+///
+/// Unlike collecting, this adds no body-sized allocation. It is used by fixed-count
+/// correctness probes, not Criterion's measured closure.
+async fn drain_checked<B>(mut body: B, expected: &[u8]) -> (usize, bool)
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: Debug,
+{
+    let mut total = 0usize;
+    let mut exact = true;
+    while let Some(frame) = poll_fn(|context| Pin::new(&mut body).poll_frame(context)).await {
+        let frame = frame.expect("a body frame");
+        if let Some(data) = frame.data_ref() {
+            let end = total.saturating_add(data.len());
+            exact &= expected
+                .get(total..end)
+                .is_some_and(|range| range == data.as_ref());
+            total = end;
+        }
+    }
+    (total, exact && total == expected.len())
+}
+
 /// Reads a whole received body into contiguous bytes, so a server can echo it back. Both
 /// servers do exactly this, so neither is doing less work than the other.
 async fn collect<B>(mut body: B) -> Bytes
@@ -1394,6 +1418,21 @@ impl NgnetNgtcpH3 {
             .expect("an ngtcp2 response head");
         assert!(response.status().is_success());
         drain(response.into_body()).await
+    }
+
+    /// Sends one request and verifies the echoed response byte for byte while draining it.
+    ///
+    /// This is the fixed-count correctness-probe path. It deliberately compares streaming
+    /// chunks in place rather than collecting another body-sized buffer.
+    pub async fn round_trip_checked(&self, body: Bytes) -> (usize, bool) {
+        let expected = body.clone();
+        let response = self
+            .handle
+            .send_request(quic_request_for(body))
+            .await
+            .expect("an ngtcp2 response head");
+        assert!(response.status().is_success());
+        drain_checked(response.into_body(), &expected).await
     }
 }
 

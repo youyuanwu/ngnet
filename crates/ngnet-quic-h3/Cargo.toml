@@ -9,14 +9,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# No feature table, deliberately.
-#
-# `ngnet-h3` and `ngnet-quic` each gate their async layer behind a feature, because each is
-# usable as a bare state machine without it. This crate is nothing *but* the join between
-# those two async layers: with either one disabled it has no reason to exist and would not
-# compile. A feature that can only ever be on is a lie in a manifest, so there is none.
-#
-# It does depend on both crates' default features, which is where those async layers live.
+[features]
+default = []
+# Additive and deliberately non-default. The implementation delegates storage to
+# `ngnet-quic`, so one arming state covers transport, endpoint, and adapter observations.
+diagnostics = ["ngnet-quic/diagnostics"]
+
 [dependencies]
 ngnet-h3.workspace = true
 ngnet-quic.workspace = true

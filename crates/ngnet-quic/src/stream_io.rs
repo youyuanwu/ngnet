@@ -207,9 +207,56 @@ impl<S: Session> Conn<'_, S> {
         // The bytes handed to ngtcp2 must outlive this call -- see the note above -- so a
         // copy is staged first and *that* is what ngtcp2 is given a pointer to. Several
         // ranges become one staged chunk, which is why a single vector suffices below.
-        let staged = self.retained_mut().stage_many(stream, ranges);
+        #[cfg(feature = "diagnostics")]
+        let role = self.role();
+        #[cfg(feature = "diagnostics")]
+        let offered = ranges
+            .iter()
+            .fold(0usize, |total, range| total.saturating_add(range.len()));
+        #[cfg(feature = "diagnostics")]
+        let sampled_payload_limit = self.max_tx_udp_payload_size();
+        #[cfg(feature = "diagnostics")]
+        let stream_offset = self.retained_next_offset(stream);
 
-        self.submit_one_vec(dest, stream, StagedVec::new(staged), flags, now)
+        let staged = self.retained_mut().stage_many(stream, ranges);
+        #[cfg(feature = "diagnostics")]
+        let prepared_backing_capacity = staged.map_or(0, |(_, len)| len);
+
+        let outcome = self.submit_one_vec(dest, stream, StagedVec::new(staged), flags, now);
+        #[cfg(feature = "diagnostics")]
+        if let Ok(outcome) = outcome {
+            let accepted = match outcome {
+                StreamWrite::Datagram { accepted, .. } => accepted,
+                _ => 0,
+            };
+            let category = match outcome {
+                StreamWrite::Datagram { .. } => crate::diagnostics::AttemptOutcome::Datagram,
+                StreamWrite::StreamBlocked => crate::diagnostics::AttemptOutcome::StreamBlocked,
+                StreamWrite::ConnectionBlocked => {
+                    crate::diagnostics::AttemptOutcome::ConnectionBlocked
+                }
+                StreamWrite::Blocked => crate::diagnostics::AttemptOutcome::Blocked,
+                StreamWrite::Idle => crate::diagnostics::AttemptOutcome::Idle,
+            };
+            crate::diagnostics::record_attempt(crate::diagnostics::Attempt {
+                sequence: 0,
+                connection_id: self.diagnostic_id(),
+                role,
+                direction: "outbound",
+                stream_id: stream.get(),
+                stream_offset,
+                offered_bytes: offered as u64,
+                sampled_payload_limit: sampled_payload_limit as u64,
+                prepared_backing_capacity: prepared_backing_capacity as u64,
+                accepted_prefix: accepted as u64,
+                fin_offered: fin,
+                zero_acceptance: offered > 0 && accepted == 0,
+                logical_retained_bytes: self.retained_bytes() as u64,
+                retained_backing_capacity: self.retained_backing_capacity() as u64,
+                outcome: category,
+            });
+        }
+        outcome
     }
 
     /// Writes a buffer whose ownership the caller hands over, retaining it without a copy.
@@ -255,6 +302,15 @@ impl<S: Session> Conn<'_, S> {
         // The handle is cloned into retention -- an `Arc` bump, not a copy of the bytes --
         // and *that* is what ngtcp2 is given a pointer into, so the address survives the call
         // even if the caller drops the original the instant it returns.
+        #[cfg(feature = "diagnostics")]
+        let role = self.role();
+        #[cfg(feature = "diagnostics")]
+        let sampled_payload_limit = self.max_tx_udp_payload_size();
+        #[cfg(feature = "diagnostics")]
+        let offered = data.len();
+        #[cfg(feature = "diagnostics")]
+        let stream_offset = self.retained_next_offset(stream);
+
         let staged = self.retained_mut().stage_owned(stream, data.clone());
 
         let outcome = self.submit_one_vec(dest, stream, StagedVec::new(staged), flags, now)?;
@@ -266,6 +322,35 @@ impl<S: Session> Conn<'_, S> {
             StreamWrite::Datagram { accepted, .. } => accepted,
             _ => 0,
         };
+        #[cfg(feature = "diagnostics")]
+        {
+            let category = match outcome {
+                StreamWrite::Datagram { .. } => crate::diagnostics::AttemptOutcome::Datagram,
+                StreamWrite::StreamBlocked => crate::diagnostics::AttemptOutcome::StreamBlocked,
+                StreamWrite::ConnectionBlocked => {
+                    crate::diagnostics::AttemptOutcome::ConnectionBlocked
+                }
+                StreamWrite::Blocked => crate::diagnostics::AttemptOutcome::Blocked,
+                StreamWrite::Idle => crate::diagnostics::AttemptOutcome::Idle,
+            };
+            crate::diagnostics::record_attempt(crate::diagnostics::Attempt {
+                sequence: 0,
+                connection_id: self.diagnostic_id(),
+                role,
+                direction: "outbound",
+                stream_id: stream.get(),
+                stream_offset,
+                offered_bytes: offered as u64,
+                sampled_payload_limit: sampled_payload_limit as u64,
+                prepared_backing_capacity: offered as u64,
+                accepted_prefix: taken as u64,
+                fin_offered: fin,
+                zero_acceptance: offered > 0 && taken == 0,
+                logical_retained_bytes: self.retained_bytes() as u64,
+                retained_backing_capacity: self.retained_backing_capacity() as u64,
+                outcome: category,
+            });
+        }
         let _accepted_prefix = data.split_to(taken);
         Ok(OwnedWrite {
             outcome,

@@ -110,6 +110,7 @@ requirement in full.
 | [23-ngnet-h3-quinn-vs-h3-quinn](23-ngnet-h3-quinn-vs-h3-quinn.md) | 2026-08-29 | `feature/ngnet-h3-quinn` based on `eeddf04` | Quinn-matched HTTP/3 comparison: **2.684× empty, 1.463× at 16 KiB, 1.129× at 1 MiB** |
 | [24-ngnet-h3-quinn-lifecycle](24-ngnet-h3-quinn-lifecycle.md) | 2026-08-29 | `bd83f18` against `7da1866` | Bounded Quinn lifecycle cleanup — **−24.50% adjusted empty serial, 223,968 → 7,300 KiB aged RSS** |
 | [25-ngtcp2-quic-stack-comparison](25-ngtcp2-quic-stack-comparison.md) | 2026-08-30 | working tree based on `7422956` | ngtcp2/OpenSSL against Quinn/rustls — **1.513× empty, 1.401× at 1 KiB; larger bodies unstable** |
+| [26-ngtcp2-phase1-diagnostics](26-ngtcp2-phase1-diagnostics.md) | 2026-08-30 | Phase 1 after `fcab0aa` | Diagnostic foundation — **1 MiB failure reproduced; 16 KiB prepares 7.58–17.13× accepted bytes** |
 
 Still outstanding, in the order they are worth doing:
 

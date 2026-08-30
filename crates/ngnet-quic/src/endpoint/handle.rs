@@ -456,17 +456,18 @@ impl<S: Session> DetachedConnection<S> {
     }
 
     /// Registers a waker to be woken when a datagram arrives for this connection.
-    pub fn register(&self, waker: &core::task::Waker) {
-        self.shared.register(waker);
+    pub fn register(&self, waker: &core::task::Waker) -> bool {
+        self.shared.register(waker)
     }
 
-    /// Registers a waker for a full outbound queue becoming writable.
+    /// Atomically checks for outbound room or registers for it to return.
     ///
-    /// Unlike [`register`](Self::register), this registration is consumed only by the
-    /// full-to-available transition. A detached producer should call it after observing a
-    /// full queue and retry once when woken.
-    pub fn register_outbound_capacity(&self, waker: &core::task::Waker) {
-        self.shared.register_capacity(waker);
+    /// Returns `true` when the caller may produce immediately. If it returns `false`, the
+    /// supplied waker was registered while the queue was still full and is consumed by the
+    /// next full-to-available transition. Observation and registration share the queue
+    /// lock, so capacity cannot return unnoticed between them.
+    pub fn poll_outbound_capacity(&self, waker: &core::task::Waker) -> bool {
+        self.shared.outbound_ready_or_register(waker)
     }
 
     /// How many inbound datagrams were dropped because this connection was not keeping up.
@@ -594,7 +595,7 @@ impl<S: Session> Endpoint<S> {
     /// if it never answered, [`ErrorKind::Socket`] if the socket failed, and
     /// [`ErrorKind::DriverGone`] if the driver is not running.
     pub fn connect(&self, remote: SocketAddr, server_name: Option<&str>) -> Connecting {
-        let shared = ConnectionShared::new(Arc::clone(&self.shared));
+        let shared = ConnectionShared::new(Arc::clone(&self.shared), crate::Role::Client);
         if self.shared.is_gone() {
             shared.fail(Error::new(
                 ErrorKind::DriverGone,
@@ -632,7 +633,7 @@ impl<S: Session> Endpoint<S> {
     /// datagrams that match no connection. What it stops doing is reading and writing this
     /// connection's protocol state, because that admits exactly one owner.
     pub fn connect_detached(&self, remote: SocketAddr, server_name: Option<&str>) -> Detaching<S> {
-        let shared = ConnectionShared::new(Arc::clone(&self.shared));
+        let shared = ConnectionShared::new(Arc::clone(&self.shared), crate::Role::Client);
         shared.request_detach();
         if self.shared.is_gone() {
             shared.fail(Error::new(
@@ -984,7 +985,7 @@ where
         #[cfg(not(feature = "tls-ossl"))]
         let (original, retried) = (packet.dcid, false);
 
-        let shared = ConnectionShared::new(Arc::clone(&self.shared));
+        let shared = ConnectionShared::new(Arc::clone(&self.shared), crate::Role::Server);
         // An endpoint whose caller asked for detached accepts hands over every connection it
         // accepts, once each is established. The request is made on the endpoint rather than
         // per connection because a server does not know what is coming before it arrives.
