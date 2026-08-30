@@ -314,13 +314,43 @@ impl Retained {
         stream: StreamId,
         ranges: &[IoSlice<'_>],
     ) -> Option<(*const u8, usize)> {
-        let total: usize = ranges.iter().map(|r| r.len()).sum();
+        self.stage_many_bounded(stream, ranges, usize::MAX).0
+    }
+
+    /// Stages at most `limit` bytes and reports whether the complete offer was staged.
+    ///
+    /// Used only by deterministic diagnostic tests until the packet-bounded behavior is
+    /// evaluated as a production candidate.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn stage_many_bounded(
+        &mut self,
+        stream: StreamId,
+        ranges: &[IoSlice<'_>],
+        limit: usize,
+    ) -> (Option<(*const u8, usize)>, bool) {
+        self.stage_many_bounded_inner(stream, ranges, limit)
+    }
+
+    fn stage_many_bounded_inner(
+        &mut self,
+        stream: StreamId,
+        ranges: &[IoSlice<'_>],
+        limit: usize,
+    ) -> (Option<(*const u8, usize)>, bool) {
+        let offered = ranges
+            .iter()
+            .fold(0usize, |total, range| total.saturating_add(range.len()));
+        let total = offered.min(limit);
         if total == 0 {
-            return None;
+            return (None, offered == 0);
         }
         let mut buffer = Vec::with_capacity(total);
         for range in ranges {
-            buffer.extend_from_slice(range);
+            let remaining = total - buffer.len();
+            if remaining == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&range[..range.len().min(remaining)]);
         }
         let entry = self.streams.entry(stream.get()).or_default();
         let chunk = Chunk {
@@ -332,7 +362,7 @@ impl Retained {
         };
         let (ptr, len) = chunk.data.ptr_and_len();
         entry.chunks.push_back(chunk);
-        Some((ptr, len))
+        (Some((ptr, len)), total == offered)
     }
 
     /// Retains an owned buffer without copying it, and returns a pointer to hand to ngtcp2.
@@ -638,6 +668,55 @@ mod tests {
         // SAFETY: the chunk is alive.
         let held = unsafe { core::slice::from_raw_parts(ptr, len) };
         assert_eq!(held, &[1, 2, 3]);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn bounded_staging_covers_zero_prefix_boundary_and_complete_offers() {
+        let stream = sid(0);
+        let ranges = [
+            IoSlice::new(&[1, 2, 3]),
+            IoSlice::new(&[4, 5]),
+            IoSlice::new(&[6, 7, 8]),
+        ];
+
+        let mut zero = Retained::default();
+        let (staged, complete) = zero.stage_many_bounded(stream, &ranges, 0);
+        assert!(staged.is_none());
+        assert!(!complete);
+
+        let mut prefix = Retained::default();
+        let (staged, complete) = prefix.stage_many_bounded(stream, &ranges, 2);
+        let (pointer, len) = staged.expect("two-byte prefix");
+        assert_eq!(len, 2);
+        // SAFETY: the retained chunk remains alive in `prefix`.
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(pointer, len) },
+            &[1, 2]
+        );
+        assert!(!complete);
+
+        let mut boundary = Retained::default();
+        let (staged, complete) = boundary.stage_many_bounded(stream, &ranges, 5);
+        let (pointer, len) = staged.expect("slice-boundary prefix");
+        assert_eq!(len, 5);
+        // SAFETY: the retained chunk remains alive in `boundary`.
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(pointer, len) },
+            &[1, 2, 3, 4, 5]
+        );
+        assert!(!complete);
+
+        let mut complete_stage = Retained::default();
+        let (staged, complete) = complete_stage.stage_many_bounded(stream, &ranges, 8);
+        let (pointer, len) = staged.expect("complete offer");
+        assert_eq!(len, 8);
+        // SAFETY: the retained chunk remains alive in `complete_stage`.
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(pointer, len) },
+            &[1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert!(complete);
     }
 
     #[test]

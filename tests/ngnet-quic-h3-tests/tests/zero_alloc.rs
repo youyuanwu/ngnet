@@ -361,6 +361,11 @@ fn a_produce_pass_allocates_one_buffer_per_datagram() {
 fn feature_enabled_unarmed_diagnostic_checks_allocate_nothing() {
     ngnet_quic::diagnostics::reset();
     let ((armed, snapshot), allocations) = count_allocations(|| {
+        ngnet_quic::diagnostics::record_packet(1, ngnet_quic::Role::Client, true);
+        ngnet_quic::diagnostics::record_release(1, ngnet_quic::Role::Client, 7);
+        ngnet_quic::diagnostics::record_timer_rearm(1, ngnet_quic::Role::Client);
+        ngnet_quic::diagnostics::record_wake_registration(1, ngnet_quic::Role::Client);
+        ngnet_quic::diagnostics::record_park(1, ngnet_quic::Role::Client);
         (
             ngnet_quic::diagnostics::is_armed(),
             ngnet_quic::diagnostics::snapshot(),

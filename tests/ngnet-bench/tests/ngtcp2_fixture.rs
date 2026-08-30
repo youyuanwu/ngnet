@@ -91,6 +91,7 @@ async fn unarmed_and_armed_diagnostics_preserve_and_reconcile_echoes() {
     );
     assert!(ngnet_quic::diagnostics::take_attempts().is_empty());
 
+    ngnet_quic::diagnostics::set_test_staging_limit(Some(1024));
     ngnet_quic::diagnostics::arm(true);
 
     let body = Bytes::from(vec![0x6d; 16 * 1024]);
@@ -112,9 +113,10 @@ async fn unarmed_and_armed_diagnostics_preserve_and_reconcile_echoes() {
         "the armed fixture recorded no attempts"
     );
     assert!(
-        attempts.iter().any(|attempt| attempt.accepted_prefix > 0
-            && attempt.accepted_prefix < attempt.offered_bytes),
-        "a 16 KiB body must exercise native partial acceptance"
+        attempts
+            .iter()
+            .any(|attempt| attempt.offered_bytes > attempt.prepared_backing_capacity),
+        "the deterministic staging limit must truncate an offer"
     );
     assert!(
         attempts.iter().any(|attempt| attempt.fin_offered),
@@ -123,6 +125,13 @@ async fn unarmed_and_armed_diagnostics_preserve_and_reconcile_echoes() {
     for attempt in attempts {
         assert!(attempt.accepted_prefix <= attempt.prepared_backing_capacity);
         assert!(attempt.prepared_backing_capacity <= attempt.offered_bytes);
+        assert!(attempt.prepared_backing_capacity <= 1024);
+        if attempt.prepared_backing_capacity < attempt.offered_bytes {
+            assert!(
+                !attempt.fin_offered,
+                "a truncated diagnostic offer must suppress FIN"
+            );
+        }
         assert_eq!(attempt.direction, "outbound");
     }
 

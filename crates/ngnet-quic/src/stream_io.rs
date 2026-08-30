@@ -198,12 +198,6 @@ impl<S: Session> Conn<'_, S> {
             ));
         }
 
-        let flags = if fin {
-            sys::NGTCP2_WRITE_STREAM_FLAG_FIN
-        } else {
-            sys::NGTCP2_WRITE_STREAM_FLAG_NONE
-        };
-
         // The bytes handed to ngtcp2 must outlive this call -- see the note above -- so a
         // copy is staged first and *that* is what ngtcp2 is given a pointer to. Several
         // ranges become one staged chunk, which is why a single vector suffices below.
@@ -218,7 +212,25 @@ impl<S: Session> Conn<'_, S> {
         #[cfg(feature = "diagnostics")]
         let stream_offset = self.retained_next_offset(stream);
 
+        #[cfg(feature = "diagnostics")]
+        let (staged, staged_complete) =
+            if let Some(limit) = crate::diagnostics::test_staging_limit() {
+                self.retained_mut()
+                    .stage_many_bounded(stream, ranges, limit)
+            } else {
+                (self.retained_mut().stage_many(stream, ranges), true)
+            };
+        #[cfg(not(feature = "diagnostics"))]
         let staged = self.retained_mut().stage_many(stream, ranges);
+        #[cfg(feature = "diagnostics")]
+        let effective_fin = fin && staged_complete;
+        #[cfg(not(feature = "diagnostics"))]
+        let effective_fin = fin;
+        let flags = if effective_fin {
+            sys::NGTCP2_WRITE_STREAM_FLAG_FIN
+        } else {
+            sys::NGTCP2_WRITE_STREAM_FLAG_NONE
+        };
         #[cfg(feature = "diagnostics")]
         let prepared_backing_capacity = staged.map_or(0, |(_, len)| len);
 
@@ -249,7 +261,7 @@ impl<S: Session> Conn<'_, S> {
                 sampled_payload_limit: sampled_payload_limit as u64,
                 prepared_backing_capacity: prepared_backing_capacity as u64,
                 accepted_prefix: accepted as u64,
-                fin_offered: fin,
+                fin_offered: effective_fin,
                 zero_acceptance: offered > 0 && accepted == 0,
                 logical_retained_bytes: self.retained_bytes() as u64,
                 retained_backing_capacity: self.retained_backing_capacity() as u64,

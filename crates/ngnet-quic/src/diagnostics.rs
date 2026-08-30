@@ -318,6 +318,7 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 static OVERFLOWED: AtomicBool = AtomicBool::new(false);
 static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+static TEST_STAGING_LIMIT: AtomicU64 = AtomicU64::new(u64::MAX);
 static ROLES: [AtomicRole; 2] = [AtomicRole::new(), AtomicRole::new()];
 static RECORDING_GATE: RwLock<()> = RwLock::new(());
 static LAST_ENABLING: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
@@ -453,6 +454,7 @@ pub fn reset() {
     }
     OVERFLOWED.store(false, Ordering::Relaxed);
     NEXT_SEQUENCE.store(1, Ordering::Relaxed);
+    TEST_STAGING_LIMIT.store(u64::MAX, Ordering::Relaxed);
     LAST_ENABLING
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -482,6 +484,23 @@ pub fn arm(enabled: bool) {
 /// Whether recording is currently armed.
 pub fn is_armed() -> bool {
     armed()
+}
+
+/// Sets a deterministic pre-native staging limit for diagnostic tests.
+///
+/// `None` preserves production staging behavior. This control exists only with the
+/// non-default diagnostics feature and is reset by [`reset`].
+#[doc(hidden)]
+pub fn set_test_staging_limit(limit: Option<usize>) {
+    let value = limit
+        .and_then(|limit| u64::try_from(limit).ok())
+        .unwrap_or(u64::MAX);
+    TEST_STAGING_LIMIT.store(value, Ordering::Relaxed);
+}
+
+pub(crate) fn test_staging_limit() -> Option<usize> {
+    let limit = TEST_STAGING_LIMIT.load(Ordering::Relaxed);
+    (limit != u64::MAX).then(|| usize::try_from(limit).unwrap_or(usize::MAX))
 }
 
 /// Returns current aggregate observations.
@@ -893,5 +912,26 @@ mod tests {
         assert_eq!(snapshot.client.zero_acceptances, 2);
         assert_eq!(snapshot.client.zero_accept_retries, 0);
         reset();
+    }
+
+    #[test]
+    fn reset_excludes_recorders_from_the_previous_armed_generation() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset();
+        arm(true);
+        let started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let recorder_started = std::sync::Arc::clone(&started);
+        let recorder = std::thread::spawn(move || {
+            recorder_started.wait();
+            for _ in 0..10_000 {
+                record_packet(12, Role::Client, true);
+            }
+        });
+        started.wait();
+        reset();
+        recorder.join().expect("diagnostic recorder thread");
+        assert_eq!(snapshot(), Snapshot::default());
+        assert!(take_attempts().is_empty());
+        assert!(take_liveness_events().is_empty());
     }
 }
