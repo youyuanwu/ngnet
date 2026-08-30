@@ -147,8 +147,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc \
 
 The broader `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps`
 remains host/repository-limited by pre-existing rustdoc warnings in generated
-`ngnet-h2-sys` bindings and private intra-doc links in `ngnet-bench`; the Phase 2 QUIC API
-documentation command above passes.
+`ngnet-h2-sys` bindings and broken intra-doc links in the private `ngnet-h2-tests` crate; the
+Phase 2 QUIC API documentation command above passes.
 
 Matched repair/predecessor empty and 1 KiB measurements were not collected: the predecessor
 branch was deleted after its intermediate PR closed, and switching this execution checkout
