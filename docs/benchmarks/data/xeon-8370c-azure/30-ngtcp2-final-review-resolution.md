@@ -4,7 +4,8 @@
 **Date:** 2026-08-30
 **Source:** `d8d9d90` (initial fixes), `3c9c305` (complete unarmed callback isolation),
 `8ae2a1c` (independent final-review reproduction), and `0b4f8e3` (extended-timeout/final
-quarantine source; measured from its identical pre-commit working tree)
+quarantine source), followed by `8964a97` (final supervised-test and disclosure polish;
+validated from its identical pre-commit working tree)
 **Base:** `24874f3`
 **Purpose:** resolve final-review timing, liveness, failure-evidence, and memory findings
 **Exclusions:** no system-under-test failure was excluded or replaced

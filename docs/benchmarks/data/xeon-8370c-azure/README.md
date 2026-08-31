@@ -106,7 +106,7 @@ compiler, CMake, and libclang are common prerequisites.
 | [27-ngtcp2-packet-bounded-staging](27-ngtcp2-packet-bounded-staging.md) | 2026-08-30 | unrecoverable working tree based on `e4815f7`; later represented by `9010a5b` | Packet-bounded borrowing repair — **historical 125/250/500 × 1 MiB exact with sampled RSS** |
 | [28-ngtcp2-stream-first-gate](28-ngtcp2-stream-first-gate.md) | 2026-08-30 | `383082f` | Stream-first packet production — **not attributable with current diagnostics; deferred unchanged** |
 | [29-ngtcp2-residual-eligibility](29-ngtcp2-residual-eligibility.md) | 2026-08-30 | `6a7af57` | Residual partition — **all six candidates deferred; no stable attributed gap beyond drift** |
-| [30-ngtcp2-final-review-resolution](30-ngtcp2-final-review-resolution.md) | 2026-08-30 | `d8d9d90` through `0b4f8e3` | Final-review evidence — **final calibration passes; release repetition remains flaky at 15 s and 60 s; 3 diagnostic timeouts preserved; RSS/stability gate unmet** |
+| [30-ngtcp2-final-review-resolution](30-ngtcp2-final-review-resolution.md) | 2026-08-30 | `d8d9d90` through `8964a97` | Final-review evidence — **final calibration passes; release repetition remains flaky at 15 s and 60 s; 3 diagnostic timeouts preserved; RSS/stability gate unmet** |
 
 Still outstanding, in the order they are worth doing:
 
