@@ -168,12 +168,9 @@ async fn ngtcp2_fixture_reuses_more_than_the_initial_stream_limit() {
     let fixture = establish_fixture().await;
 
     for exchange in 0..125 {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            fixture.round_trip(Bytes::new()),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("exchange {exchange} stalled after stream credit ran out"));
+        tokio::time::timeout(exchange_timeout(0), fixture.round_trip(Bytes::new()))
+            .await
+            .unwrap_or_else(|_| panic!("exchange {exchange} stalled after stream credit ran out"));
     }
 }
 

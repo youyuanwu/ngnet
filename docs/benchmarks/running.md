@@ -320,9 +320,11 @@ above. Then run the active diagnostic invariant/allocation coverage:
 
 ```sh
 cargo test -p ngnet-bench --test ngtcp2_fixture --release
-cargo test -p ngnet-bench --test ngtcp2_fixture --release \
+timeout --signal=TERM --kill-after=5s 900s \
+  cargo test -p ngnet-bench --test ngtcp2_fixture --release \
   ngtcp2_fixture_repeats_16_kib_exactly -- --ignored --exact --nocapture
-cargo test -p ngnet-bench --test ngtcp2_fixture --release \
+timeout --signal=TERM --kill-after=5s 900s \
+  cargo test -p ngnet-bench --test ngtcp2_fixture --release \
   ngtcp2_fixture_repeats_1_mib_exactly -- --ignored --exact --nocapture
 cargo test -p ngnet-bench --test ngtcp2_fixture --release --features diagnostics
 cargo test -p ngnet-quic --all-features

@@ -201,12 +201,17 @@ copies into storage that is already there.
 allocations. Where a copy would not allocate, a structural test over a named region is the
 mechanism, as it is for the decrypt bridge.
 
-## `ngnet-quic-h3-tests::exchange` fails occasionally under load
+## Workspace/live-loopback tests fail occasionally under load
 
 Observed once in four `cargo test --workspace --all-features` runs, and not reproduced in nine
 attempts afterwards — six of the suite alone, three of the whole workspace. The suite binds real
 sockets on `127.0.0.1:0`, so it is not a port collision; the ephemeral port is chosen by the
 kernel and is unique per test.
+
+Final review later observed one unspecified failure in ten default-feature workspace runs,
+followed by nine clean workspace runs and clean focused live-loopback/fixture repetitions.
+Without the test identity it cannot be joined to the earlier exchange failure or the known
+ngtcp2 repetition stalls, so it remains a separate disclosed workspace-stability limitation.
 
 Recorded rather than fixed because it is worth being explicit that this is known. A test that
 fails one run in four and passes the next nine trains everyone who sees it to press retry, and

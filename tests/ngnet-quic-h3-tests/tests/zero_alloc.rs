@@ -263,7 +263,9 @@ fn turn(drivers: &mut [Pin<Box<Driver>>], clock: &SharedClock, cx: &mut Context<
 #[test]
 fn a_produce_pass_allocates_one_buffer_per_datagram() {
     #[cfg(feature = "diagnostics")]
-    let _diagnostics_guard = DIAGNOSTICS_TEST_LOCK.lock().unwrap();
+    let _diagnostics_guard = DIAGNOSTICS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     #[cfg(feature = "diagnostics")]
     {
         ngnet_quic::diagnostics::reset();
@@ -381,7 +383,9 @@ fn a_produce_pass_allocates_one_buffer_per_datagram() {
 #[test]
 fn a_drain_pass_never_allocates_the_complete_large_offer() {
     #[cfg(feature = "diagnostics")]
-    let _diagnostics_guard = DIAGNOSTICS_TEST_LOCK.lock().unwrap();
+    let _diagnostics_guard = DIAGNOSTICS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     #[cfg(feature = "diagnostics")]
     {
         ngnet_quic::diagnostics::reset();
@@ -510,7 +514,9 @@ fn a_drain_pass_never_allocates_the_complete_large_offer() {
 #[cfg(feature = "diagnostics")]
 #[test]
 fn feature_enabled_unarmed_diagnostic_checks_allocate_nothing() {
-    let _diagnostics_guard = DIAGNOSTICS_TEST_LOCK.lock().unwrap();
+    let _diagnostics_guard = DIAGNOSTICS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     ngnet_quic::diagnostics::reset();
     let ((armed, snapshot), allocations) = count_allocations(|| {
         ngnet_quic::diagnostics::record_packet(1, ngnet_quic::Role::Client, true);

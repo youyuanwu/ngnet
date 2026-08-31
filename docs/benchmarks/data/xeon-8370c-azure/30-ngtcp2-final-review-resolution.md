@@ -76,8 +76,8 @@ release repetitions were predetermined. Six completed, while repetitions 3 and 4
 about 30 seconds because both HTTP/3 drivers reported that the QUIC connection had ended and
 the next response head returned `Closed`. The failure is therefore not repaired by extending
 the Rust timeout. The live 16 KiB/1 MiB repetition tests are ignored in ordinary workspace
-runs and remain explicit supervised diagnostics until focused S9 scheduling research resolves
-the production liveness defect.
+runs and remain explicit supervised diagnostics until focused research resolves the deferred
+outer HTTP/3 sendability-generation scheduling change (review finding S9).
 
 ## Predetermined 1 KiB calibration
 
@@ -116,6 +116,8 @@ source may use the calibrated instrument with fresh controls.
 The fixed schedule was three fresh processes at each of 125, 250, and 500 × 1 MiB. Each
 exchange had the 15-second release diagnostic timeout; each process used the documented
 `60 + 5 × count` outer timeout. Values are sampled `VmRSS`, not kernel `VmHWM`.
+This set and the focused investigation below predate the later 60/90-second fixture-bound
+change; the final-source table records a separate complete schedule.
 
 | Run | Exchanges | Ready | Maximum sampled | Final | Increase | Exit / completion |
 | ---: | ---: | ---: | ---: | ---: | ---: | --- |
@@ -182,7 +184,7 @@ retries without an enabling event, zero drops, zero queue-capacity parks, and no
 The final trace includes repeated `DriverWake → Retry(enabling=unavailable) →
 Park(transport-blocked)` sequences, followed eventually by an inbound event. This localizes
 the observation to unproductive outer repolling but does not establish a safe minimal
-production fix; enforcing a sendability generation would be the separately deferred S9
+production fix; enforcing a sendability generation would be that separately deferred
 scheduling redesign.
 
 The three reproduced diagnostic timeouts across the initial, focused, and final-source sets
@@ -224,6 +226,12 @@ workspace modes, all-target warning-denying clippy, benchmark smoke, changed-cra
 warning-denying rustdoc, targeted core diagnostics, representative zero-allocation coverage,
 rustfmt, and diff checks successfully.
 
+An independent final reviewer also ran the default-feature workspace command ten times at
+HEAD and observed one unspecified test failure followed by nine clean runs. The reviewer did
+not retain a test identity and could not reproduce it in six live-loopback-crate or eight
+fixture-only follow-ups. The single-command PASS above is valid for that invocation, but is
+not presented as repeated workspace-stability evidence.
+
 The first all-feature workspace attempt failed to compile because the new terminal-retention
 test lacked a `StreamId` import; the corrected exact command passed. The first clippy attempt
 found one needless borrow, and the first post-change benchmark smoke emitted one unused
@@ -231,7 +239,8 @@ test-import warning; both corrections and successful reruns are included rather 
 
 ## Disposition
 
-S9 remains deferred: no production packet-order or sendability-generation scheduling change
-is included. The new failures make that candidate suitable for focused follow-up research,
-but this resolution preserves evidence rather than guessing at a scheduler redesign. The six
-run-29 optimization candidates and all other report-only consider findings remain deferred.
+The outer HTTP/3 sendability-generation scheduling change (review finding S9) remains
+deferred: no production packet-order or generation-gate change is included. The new failures
+make that candidate suitable for focused follow-up research, but this resolution preserves
+evidence rather than guessing at a scheduler redesign. The six run-29 optimization candidates
+and all other report-only consider findings remain deferred.

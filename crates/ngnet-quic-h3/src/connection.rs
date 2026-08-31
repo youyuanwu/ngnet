@@ -465,6 +465,7 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
 
     fn close(&mut self, code: ErrorCode, reason: &[u8]) -> Result<()> {
         if self.state.closed {
+            self.detached.release();
             return Ok(());
         }
 

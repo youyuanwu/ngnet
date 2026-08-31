@@ -2,7 +2,8 @@
 
 **Machine:** historical [`xeon-8370c-azure`](README.md) label; CPU 3
 **Date:** 2026-08-30
-**Source:** `feature/ngtcp2-h3-performance_phase1` working tree after `fcab0aa`
+**Source:** historical `feature/ngtcp2-h3-performance_phase1` working tree after dangling
+commit `fcab0aa`; identical tree is durably represented by reachable commit `8515702`
 **Purpose:** correctness and mechanism diagnosis, not a timing comparison
 **Exclusions:** no failing system-under-test result was excluded
 
@@ -11,8 +12,8 @@
 The detached producer previously had no wake tied specifically to a full outbound queue
 regaining capacity. The Phase 1 seam fills the 64-datagram queue with inbound and timers
 quiesced, registers the same producer twice, removes two datagrams, and observes exactly one
-wake on the full-to-available transition and none on the second removal. The repair is
-`fcab0aa`; the deterministic test is
+wake on the full-to-available transition and none on the second removal. The repair's reachable equivalent is
+`8515702`; the deterministic test is
 `removing_from_a_full_outbound_queue_wakes_one_capacity_retry` in
 `crates/ngnet-quic/src/endpoint/shared.rs`.
 
