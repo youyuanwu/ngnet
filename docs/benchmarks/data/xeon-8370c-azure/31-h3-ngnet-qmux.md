@@ -2,7 +2,7 @@
 
 **Machine:** [`xeon-8370c-azure`](README.md)
 **Date:** 2026-08-31
-**Commit:** `87a2cff67af74bb8ee130e9ff97eec4fff8f1901`
+**Commit:** `acb7574` (diagnostic reconciliation review fix included)
 **Cases:** QMux duplex/socket serial latency and body throughput; focused adapter diagnostics
 **Repetitions:** three pinned, interleaved fixed-count timing rounds at 1 MiB; Criterion
 surveys used 20 serial samples or 10 body samples
@@ -94,14 +94,14 @@ Each value is elapsed milliseconds for 100 complete exchanges.
 
 | Round | ngnet duplex | hyperium duplex | ngnet socket | hyperium socket |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 62.657 | 58.318 | 152.509 | 140.557 |
-| 2 | 62.068 | 60.181 | 131.841 | 140.603 |
-| 3 | 73.616 | 61.593 | 137.158 | 153.217 |
-| median | 62.657 | 60.181 | 137.158 | 140.603 |
+| 1 | 90.852 | 64.699 | 156.004 | 184.349 |
+| 2 | 71.124 | 71.934 | 133.221 | 144.609 |
+| 3 | 64.788 | 66.823 | 127.162 | 161.087 |
+| median | 71.124 | 66.823 | 133.221 | 161.087 |
 
-The median hyperium delta is −3.95% on duplex and +2.51% on sockets. Those deltas are smaller
-than the within-arm ranges on this shared VM (5.6–18.6%), so the controlled result is
-**inconclusive/noisy**, not a stable winner.
+The median hyperium delta is −6.05% on duplex and +20.92% on sockets. Those deltas do not
+clear the within-arm ranges on this shared VM (10.8–40.2% relative to each arm's minimum), so
+the controlled result remains **inconclusive/noisy**, not a stable winner.
 
 ## Focused adapter diagnostics
 
@@ -113,7 +113,7 @@ without the feature. Both substrates produced the same one-exchange 1 MiB struct
 | lower read calls / bytes | 399 / 2,100,021 | 399 / 2,100,021 |
 | lower write calls / bytes | 190 / 2,100,028 | 190 / 2,100,028 |
 | adapter polls / driver polls | 251 / 148 | 251 / 148 |
-| pump attempts / productive turns | 399 / 185 | 399 / 185 |
+| pump attempts / productive / no-progress | 399 / 185 / 214 | 399 / 185 / 214 |
 | routed events | 237 | 237 |
 | stream / connection credit applications | 160 / 160 | 160 / 160 |
 | waiter registrations / delivered wakes | 74 / 74 | 74 / 74 |
