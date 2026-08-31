@@ -114,3 +114,28 @@ pub(crate) enum DirectionTerminal {
 pub(crate) fn close_reason(code: u64, reason: &[u8]) -> CloseReason {
     CloseReason::application(code, reason)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_terminal_has_a_stable_public_driver_classification() {
+        assert_eq!(
+            ConnectionTerminal::Application(17).driver_error().kind(),
+            ErrorKind::ApplicationClose { error_code: 17 }
+        );
+        assert_eq!(
+            ConnectionTerminal::Internal("invariant".into())
+                .driver_error()
+                .kind(),
+            ErrorKind::Internal
+        );
+        assert_eq!(
+            ConnectionTerminal::Undefined(Error::undefined("lower"))
+                .driver_error()
+                .kind(),
+            ErrorKind::Undefined
+        );
+    }
+}

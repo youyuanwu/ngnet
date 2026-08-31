@@ -1057,4 +1057,51 @@ mod tests {
         });
         assert!(!core.streams.contains_key(&id));
     }
+
+    #[test]
+    fn immediate_open_error_latches_terminal_and_fans_out_waiters() {
+        let mut core = make_core(4);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(
+            core.lower
+                .poll_close(&mut cx, &CloseReason::application(9, b"closed")),
+            Poll::Ready(Ok(()))
+        ));
+
+        let accept = Arc::new(Count::default());
+        let opener = Arc::new(Count::default());
+        core.accept_uni = Some(Waker::from(Arc::clone(&accept)));
+        core.openers.get_mut(&0).expect("root opener").uni = Some(Waker::from(Arc::clone(&opener)));
+        let mut effects = Effects::default();
+        assert!(core.open(0, OpenKind::Uni, waker, &mut effects).is_err());
+        assert!(core.terminal.is_some());
+        assert!(effects.discard_all);
+        for wake in effects.wakes {
+            wake.wake();
+        }
+        assert_eq!(accept.0.load(Ordering::SeqCst), 1);
+        assert_eq!(opener.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn closed_send_reconciliation_is_stream_scoped_without_an_event() {
+        let mut core = make_core(4);
+        let id = stream(0);
+        core.streams.insert(
+            id,
+            StreamState {
+                send_handle: true,
+                ..StreamState::default()
+            },
+        );
+        let mut effects = Effects::default();
+        assert!(matches!(
+            core.reconcile_closed_send(id, &mut effects),
+            Ok(DirectionTerminal::Closed)
+        ));
+        assert_eq!(core.stream_error(id, true), Some(DirectionTerminal::Closed));
+        assert!(core.terminal.is_none());
+        assert!(!effects.discard_all);
+    }
 }

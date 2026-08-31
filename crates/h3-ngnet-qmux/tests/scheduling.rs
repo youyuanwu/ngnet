@@ -355,3 +355,59 @@ fn framed_send_resumes_after_local_output_ceiling_is_flushed() {
     );
     assert_eq!(&received[received.len() - expected.len()..], expected);
 }
+
+#[test]
+fn local_output_drain_wakes_the_parked_framed_sender() {
+    let (mut client, mut client_driver, mut server, mut server_driver) =
+        common::pair(Config::new());
+    let client_task = async {
+        let mut stream = common::open_bidi(&mut client).await;
+        let mut discovery = Bytes::from_static(b"x");
+        std::future::poll_fn(|cx| {
+            quic::SendStreamUnframed::poll_send(&mut stream, cx, &mut discovery)
+        })
+        .await
+        .expect("discovery byte");
+        stream
+    };
+    let server_task = async { common::accept_bidi(&mut server).await };
+    let (mut stream, _server_stream) = common::run_pair(
+        client_task,
+        &mut client_driver,
+        server_task,
+        &mut server_driver,
+    );
+
+    let (driver_count, driver_waker) = counting_context();
+    let (sender_count, sender_waker) = counting_context();
+    let mut driver_cx = Context::from_waker(&driver_waker);
+    let mut sender_cx = Context::from_waker(&sender_waker);
+    assert!(matches!(
+        std::pin::Pin::new(&mut client_driver).poll(&mut driver_cx),
+        Poll::Pending
+    ));
+
+    quic::SendStream::send_data(
+        &mut stream,
+        Frame::Data(Bytes::from(vec![0x7b; 200 * 1024])),
+    )
+    .expect("retain framed body");
+    assert!(matches!(
+        quic::SendStream::poll_ready(&mut stream, &mut sender_cx),
+        Poll::Pending
+    ));
+    assert_eq!(sender_count.get(), 0);
+    assert!(
+        driver_count.get() > 0,
+        "sender scheduled the central driver"
+    );
+
+    assert!(matches!(
+        std::pin::Pin::new(&mut client_driver).poll(&mut driver_cx),
+        Poll::Pending
+    ));
+    assert!(
+        sender_count.get() > 0,
+        "draining the local output ceiling wakes the specifically parked sender"
+    );
+}

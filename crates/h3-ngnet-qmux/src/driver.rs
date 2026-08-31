@@ -43,7 +43,7 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> Future for Driver<S, C, B> {
         if let Some(displaced) = displaced {
             displaced.wake();
         }
-        let lower_ready = this.shared.lower_wake.take_ready();
+        let _ = this.shared.lower_wake.take_ready();
         let mut effects = Effects::default();
 
         this.shared.lower_wake.begin_defer();
@@ -76,9 +76,6 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> Future for Driver<S, C, B> {
                 }
             } else {
                 effects = core.drive_turn(&this.shared.lower_wake);
-                if lower_ready {
-                    core.wake_all_senders(&mut effects);
-                }
                 if let Some(terminal) = core.terminal.clone() {
                     let error = terminal.driver_error();
                     core.driver_error = Some(error.clone());

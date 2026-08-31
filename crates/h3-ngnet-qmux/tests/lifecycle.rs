@@ -191,11 +191,12 @@ fn synchronous_close_preserves_first_reason_and_driver_completes_delivery() {
         {
             peer_code = Some(error_code);
         }
-        if local_complete && peer_code.is_some() {
+        if local_complete && peer_code.is_some() && peer_driver_done {
             break;
         }
     }
     assert!(local_complete);
+    assert!(peer_driver_done);
     assert_eq!(peer_code, Some(Code::H3_NO_ERROR.value()));
 }
 
