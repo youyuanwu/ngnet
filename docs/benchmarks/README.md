@@ -25,10 +25,10 @@ Between them they fill in the whole matrix of stack against I/O model:
 | --- | --- | --- | --- |
 | **`ngnet-h2`** (HTTP/2) | `ngnet-h2` | `ngnet-h2-tokio` | `ngnet-h2-compio` |
 | **`ngnet-qmux-h3`** (HTTP/3 over QMux) | `ngnet-qmux-h3` | `ngnet-qmux-h3-tokio` | n/a — no completion byte stream for QMux |
-| **hyperium `h3` over QMux** | `h3-ngnet-qmux` | `h3-ngnet-qmux-tokio` | n/a — no completion byte stream for QMux |
+| **hyperium `h3` over QMux** | `h3-ngnet-qmux` | `h3-ngnet-qmux` | n/a — no completion byte stream for QMux |
 | **hyper** (HTTP/2) | `hyper` | `hyper-tokio` | n/a — hyper has no completion transport |
 
-Neither empty cell is an omission. hyper's connection types are built on tokio's
+The empty cells are not omissions. hyper's connection types are built on tokio's
 readiness-based `AsyncRead`/`AsyncWrite`, so there is no hyper-on-io_uring arm to run.
 `ngnet-qmux` ships a byte-stream adapter for tokio and none for a completion runtime, and
 supplying one would be a piece of transport engineering rather than benchmark infrastructure —

@@ -426,12 +426,6 @@ fn the_hyperium_qmux_adapter_has_the_exact_direct_dependencies() {
         "h3-ngnet-qmux must directly join bytes, hyperium h3, and ngnet-qmux only.\n{tree}"
     );
 
-    for required in ["h3", "ngnet-qmux"] {
-        assert!(
-            contains_at_word_boundary(&tree, required),
-            "{required} is missing from h3-ngnet-qmux.\n{tree}"
-        );
-    }
     for forbidden in [
         "ngnet-h3",
         "ngnet-quic",
@@ -634,13 +628,13 @@ fn no_other_protocol_stack_or_tls_reaches_qmux() {
 /// rest of the workspace from growing into QMux. Both crates are unpublished and expected to
 /// churn with the draft, so anything depending on them inherits that churn.
 ///
-/// `ngnet-qmux-h3` is deliberately absent from the list, and its absence is the whole point of
+/// The two QMux/H3 adapters are deliberately absent from the list, and that absence is the whole point of
 /// the list being spelled out crate by crate rather than derived from workspace membership.
 /// The join is new, unpublished and expected to churn alongside QMux itself, so it is allowed
 /// to take the dependency; every crate that predates QMux is not. Adding a member here is the
 /// deliberate act that decides which side of that line a new crate falls on, and
-/// `the_qmux_adapter_depends_on_both_families` above asserts the exception is a real crate
-/// joining two real families rather than a hole in the check.
+/// the two positive adapter checks above assert each exception is a real join rather than a
+/// hole in the check.
 #[test]
 fn no_existing_crate_reaches_qmux() {
     for crate_name in [

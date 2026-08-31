@@ -69,6 +69,9 @@ cargo clippy -p ngnet-quic --no-default-features --all-targets -- -D warnings
 cargo clippy -p ngnet-quic --features tokio   --all-targets -- -D warnings
 cargo clippy -p ngnet-quic --no-default-features --features endpoint --all-targets -- -D warnings
 cargo clippy -p ngnet-quic-h3                 --all-targets -- -D warnings
+cargo clippy -p ngnet-qmux                    --all-targets -- -D warnings
+cargo clippy -p ngnet-qmux --no-default-features --all-targets -- -D warnings
+cargo clippy -p ngnet-qmux --all-features     --all-targets -- -D warnings
 cargo clippy -p ngnet-qmux-h3 -p ngnet-qmux-h3-tests --all-targets -- -D warnings
 cargo clippy -p h3-ngnet-qmux -p h3-ngnet-qmux-tests --all-targets -- -D warnings
 cargo clippy -p h3-ngnet-qmux --features diagnostics --all-targets -- -D warnings
@@ -113,6 +116,8 @@ cargo doc --no-deps -p ngnet-quic-tests
 cargo doc --no-deps -p ngnet-quic-h3
 cargo doc --no-deps -p ngnet-quic-h3-tests
 cargo doc --no-deps -p ngnet-qmux
+cargo doc --no-deps -p ngnet-qmux --no-default-features
+cargo doc --no-deps -p ngnet-qmux --all-features
 cargo doc --no-deps -p ngnet-qmux-h3
 cargo doc --no-deps -p ngnet-qmux-h3-tests
 cargo doc --no-deps -p h3-ngnet-qmux

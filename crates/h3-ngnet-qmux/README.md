@@ -1,7 +1,7 @@
 # h3-ngnet-qmux
 
 `h3-ngnet-qmux` implements hyperium H3's per-stream QUIC traits over an
-already-established [`ngnet-qmux`](https://docs.rs/ngnet-qmux) asynchronous
+already-established [`ngnet-qmux`](../ngnet-qmux) asynchronous
 connection. It is unpublished while QMux remains an evolving draft.
 
 ## Ownership and progress

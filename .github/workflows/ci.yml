@@ -143,7 +143,7 @@ jobs:
       - name: Test (hyperium QMux adapter diagnostics)
         run: cargo test -p h3-ngnet-qmux --features diagnostics
 
-      # Sixteen configurations that differ only in a package and its features, so they are one
+      # Nineteen configurations that differ only in a package and its features, so they are one
       # step iterating a list rather than ten near-identical steps. The list is the whole
       # point of the step: a configuration is added by adding a line, and the reason it
       # exists is written directly above it, where a reader looking at the entry will find
@@ -246,7 +246,7 @@ jobs:
           client policy layer                      | -p ngnet-util
           CONFIGURATIONS
 
-      # Twenty-four invocations that differ only in packages and features, collapsed the same
+      # Twenty-seven invocations that differ only in packages and features, collapsed the same
       # way as clippy above, and for the same reasons -- including that a `strategy.matrix`
       # would put each on its own runner and rebuild the C libraries for every one.
       #

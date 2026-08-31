@@ -9,9 +9,9 @@
 //!   workload = body | concurrent
 //!   param    = body size in bytes, or stream count
 //!
-//! The QUIC arms support `body` only. Diagnostic mode is supported only by
-//! `ngnet-quic-h3 body` and additionally requires `--features diagnostics`; timing mode is
-//! always unarmed.
+//! The QUIC arms support `body` only. Diagnostic mode is supported by `ngnet-quic-h3 body`,
+//! `h3-qmux-duplex body`, and `h3-qmux-socket body`, and additionally requires
+//! `--features diagnostics`; timing mode is always unarmed.
 
 use std::hint::black_box;
 use std::io::Write;

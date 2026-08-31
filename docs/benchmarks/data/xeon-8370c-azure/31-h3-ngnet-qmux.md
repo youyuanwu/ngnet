@@ -100,7 +100,7 @@ Each value is elapsed milliseconds for 100 complete exchanges.
 | median | 71.124 | 66.823 | 133.221 | 161.087 |
 
 The median hyperium delta is −6.05% on duplex and +20.92% on sockets. Those deltas do not
-clear the within-arm ranges on this shared VM (10.8–40.2% relative to each arm's minimum), so
+clear the within-arm ranges on this shared VM (11.2–40.2% relative to each arm's minimum), so
 the controlled result remains **inconclusive/noisy**, not a stable winner.
 
 ## Focused adapter diagnostics
