@@ -114,7 +114,8 @@ and 1 KiB exchanges, plus fixed-count 16 KiB and 1 MiB probes. Runs
 diagnostic failure, packet-bounded correctness/resource qualification, unchanged packet-order
 decision, and residual-candidate dispositions. The repaired path completes 125 exact
 sequential echoes at both large sizes. Final-review run 30 records ten passing predetermined
-exact 1 MiB repetitions but also two fresh diagnostic timeouts, so it explicitly leaves
+exact 1 MiB repetitions but also three diagnostic timeouts across its initial, focused, and
+final-source sets, so it explicitly leaves
 persistent-stability and RSS-envelope qualification unmet.
 
 Those measurements do not isolate the sans-I/O core from OpenSSL, the detached endpoint, the

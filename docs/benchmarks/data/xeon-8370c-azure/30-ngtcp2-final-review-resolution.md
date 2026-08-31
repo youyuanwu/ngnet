@@ -2,8 +2,8 @@
 
 **Machine:** historical [`xeon-8370c-azure`](README.md) label; CPU 3
 **Date:** 2026-08-30
-**Source:** `d8d9d90` (final-review source/test fixes; measurements were collected from the
-identical release source immediately before that local commit)
+**Source:** `d8d9d90` (initial final-review source/test fixes) and `3c9c305` (complete
+feature-enabled/unarmed callback isolation)
 **Base:** `24874f3`
 **Purpose:** resolve final-review timing, liveness, failure-evidence, and memory findings
 **Exclusions:** no system-under-test failure was excluded or replaced
@@ -62,12 +62,28 @@ run as three fixed Criterion/probe pairs without source edits.
 | 2 | 116.96 µs | 1,224,527,378 ns | 122.4527378 µs | 0 / 0 |
 | 3 | 118.49 µs | 1,279,327,001 ns | 127.9327001 µs | 0 / 0 |
 
-Criterion's point-estimate median is 117.00 µs and its three-pass span is 1.308%. The probe
+For the initial `d8d9d90` source, Criterion's point-estimate median is 117.00 µs and its
+three-pass span is 1.308%. The probe
 median is 122.4527378 µs, 4.660% above Criterion and inside the 5% agreement limit, but the
 probe's own span is 5.529%. Calibration therefore **fails** the predeclared maximum 5% span.
-All fixed-count probe timing — including runs 27 and 29 — remains report-only and ungated.
 
-## Predetermined fresh RSS processes
+Mandatory implementation review then found that unarmed acknowledgement/close callbacks still
+traversed retained storage. Commit `3c9c305` guarded that preparation and reran the complete
+predetermined calibration:
+
+| Pass | Criterion estimate | Probe elapsed | Probe per exchange | Exit |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 117.84 µs | 1,187,623,956 ns | 118.7623956 µs | 0 / 0 |
+| 2 | 121.48 µs | 1,208,802,010 ns | 120.8802010 µs | 0 / 0 |
+| 3 | 119.42 µs | 1,191,434,130 ns | 119.1434130 µs | 0 / 0 |
+
+The final-source Criterion median is 119.42 µs with a 3.048% span. The probe median is
+119.1434130 µs with a 1.778% span and differs from Criterion by 0.232%. The final-source
+calibration therefore **passes** every 5% gate. Runs 27 and 29 remain historical,
+asymmetric/uncalibrated timing and report-only; future timing from `3c9c305` or an identical
+source may use the calibrated instrument with fresh controls.
+
+## Initial predetermined fresh RSS processes (`d8d9d90`)
 
 The fixed schedule was three fresh processes at each of 125, 250, and 500 × 1 MiB. Each
 exchange had the 15-second release diagnostic timeout; each process used the documented
@@ -95,6 +111,30 @@ Run 4's failure snapshot had no inbound drop or overflow and reported 4,119
 zero-accept retries without a true enabling event in its observed intervals. The timeout path
 successfully emitted RSS and coherent snapshots before panic.
 
+## Final-source fresh RSS processes (`3c9c305`)
+
+Because the callback isolation fix changes feature-enabled execution, the complete nine-process
+schedule was rerun from `3c9c305` rather than assuming the initial table still qualified:
+
+| Run | Exchanges | Ready | Maximum sampled | Final | Increase | Exit / completion |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 125 | 14,012 KiB | 19,716 KiB | unavailable | 5,704 KiB | **101 / timeout at exchange 2; last completed 1** |
+| 2 | 125 | 13,964 KiB | 20,256 KiB | 17,464 KiB | 6,292 KiB | 0 / 125 |
+| 3 | 125 | 13,848 KiB | 18,056 KiB | 14,492 KiB | 4,208 KiB | 0 / 125 |
+| 4 | 250 | 14,088 KiB | 21,048 KiB | 18,196 KiB | 6,960 KiB | 0 / 250 |
+| 5 | 250 | 13,896 KiB | 21,572 KiB | 18,392 KiB | 7,676 KiB | 0 / 250 |
+| 6 | 250 | 13,960 KiB | 20,892 KiB | 18,448 KiB | 6,932 KiB | 0 / 250 |
+| 7 | 500 | 13,868 KiB | 20,772 KiB | 17,344 KiB | 6,904 KiB | 0 / 500 |
+| 8 | 500 | 13,816 KiB | 20,704 KiB | 18,668 KiB | 6,888 KiB | 0 / 500 |
+| 9 | 500 | 13,872 KiB | 22,424 KiB | 21,332 KiB | 8,552 KiB | 0 / 500 |
+
+Run 1 reported zero drops and no overflow but 1,664 zero-accept retries without an enabling
+event before timing out. With only two completed 125 runs, no qualifying three-run envelope
+exists. Even a non-qualifying provisional envelope from the largest observed 125 increase
+(6,292 + 2,048 = 8,340 KiB) would be exceeded by run 9's 8,552 KiB increase. The final-source
+stability/RSS criterion is therefore **unmet for both completion and memory**, with no failed
+process omitted or replaced.
+
 ## Focused stall investigation
 
 After run 4 failed, five additional 250 × 1 MiB diagnostic processes were predetermined with
@@ -117,7 +157,8 @@ the observation to unproductive outer repolling but does not establish a safe mi
 production fix; enforcing a sendability generation would be the separately deferred S9
 scheduling redesign.
 
-The two reproduced diagnostic timeouts are durable correctness/stability evidence. The
+The three reproduced diagnostic timeouts across the initial, focused, and final-source sets
+are durable correctness/stability evidence. The
 checkout may be described as passing ten predetermined exact fixture repetitions, but not as
 unconditionally stable under the armed persistent diagnostic workload.
 
@@ -139,7 +180,8 @@ unconditionally stable under the armed persistent diagnostic workload.
 
 After the fixes:
 
-- targeted diagnostics: 318 `ngnet-quic` tests, 3 `zero_alloc` tests, 2 probe tests, and 5
+- targeted diagnostics: 318 initial `ngnet-quic` tests, 257 callback-fix `ngnet-quic` tests,
+  3 `zero_alloc` tests, 2 probe tests, and 5
   diagnostic fixture tests passed;
 - `cargo test --workspace --all-features`: 1,627 passed, 1 ignored;
 - `cargo test --workspace`: 1,611 passed, 1 ignored;
@@ -148,6 +190,11 @@ After the fixes:
 - warning-denying `ngnet-quic`/`ngnet-quic-h3` documentation passed;
 - changed Rust files passed direct rustfmt checking and the branch diff passed
   `git diff --check`.
+
+After implementation review identified unarmed callback traversal, the callback fix reran both
+workspace modes, all-target warning-denying clippy, benchmark smoke, changed-crate
+warning-denying rustdoc, targeted core diagnostics, representative zero-allocation coverage,
+rustfmt, and diff checks successfully.
 
 The first all-feature workspace attempt failed to compile because the new terminal-retention
 test lacked a `StreamId` import; the corrected exact command passed. The first clippy attempt

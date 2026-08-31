@@ -184,11 +184,12 @@ post-PR-45 comparison; the earlier runs remain historical mechanism evidence.
 The ngtcp2/OpenSSL stack is recorded in runs
 [`25`–`30`](data/xeon-8370c-azure/README.md#runs). Run 27 is historical packet-bounded
 correctness/resource evidence: 125 exact 16 KiB and 1 MiB exchanges remain active regressions.
-Final-review run 30 records that ten predetermined exact 1 MiB repetitions passed, while two
-fresh diagnostic processes timed out; the current checkout therefore does not carry an
-unqualified persistent-stability or RSS-envelope claim. Runs 28 and 29 defer packet-order and
-residual optimization candidates without source changes; they are limitations and attribution
-records, not implemented performance gains.
+Final-review run 30 records that ten predetermined exact 1 MiB repetitions and the final
+1 KiB calibration passed, while three diagnostic processes across the initial, focused, and
+final-source sets timed out; the current checkout therefore does not carry an unqualified
+persistent-stability or RSS-envelope claim. Runs 28 and 29 defer packet-order and residual
+optimization candidates without source changes; they are limitations and attribution records,
+not implemented performance gains.
 
 Run 25's 1.513× empty and 1.401× 1 KiB gaps are historical pre-repair context, not the final
 remaining gap. Getting within 10% of the alternative `ngnet-h3` transport was a stretch
