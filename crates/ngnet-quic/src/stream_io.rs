@@ -219,36 +219,43 @@ impl<S: Session> Conn<'_, S> {
         // The bytes handed to ngtcp2 must outlive this call -- see the note above -- so a
         // copy is staged first and *that* is what ngtcp2 is given a pointer to. Several
         // ranges become one staged chunk, which is why a single vector suffices below.
-        #[cfg(feature = "diagnostics")]
-        let role = self.role();
-        #[cfg(feature = "diagnostics")]
-        let offered = ranges
-            .iter()
-            .fold(0usize, |total, range| total.saturating_add(range.len()));
         let sampled_payload_limit = self.max_tx_udp_payload_size();
         #[cfg(feature = "diagnostics")]
-        let stream_offset = self.retained_next_offset(stream);
+        let diagnostic_context = crate::diagnostics::is_armed().then(|| {
+            (
+                self.role(),
+                ranges
+                    .iter()
+                    .fold(0usize, |total, range| total.saturating_add(range.len())),
+                self.retained_next_offset(stream),
+            )
+        });
 
         let production_staging_limit = sampled_payload_limit;
         #[cfg(feature = "diagnostics")]
-        let staging_limit = crate::diagnostics::test_staging_limit()
-            .map_or(production_staging_limit, |test_limit| {
-                production_staging_limit.min(test_limit)
-            });
+        let staging_limit = if diagnostic_context.is_some() {
+            crate::diagnostics::test_staging_limit()
+                .map_or(production_staging_limit, |test_limit| {
+                    production_staging_limit.min(test_limit)
+                })
+        } else {
+            production_staging_limit
+        };
         #[cfg(not(feature = "diagnostics"))]
         let staging_limit = production_staging_limit;
         let (staged, staged_complete) =
             self.retained_mut()
                 .stage_many_bounded(stream, ranges, staging_limit);
-        #[cfg(feature = "diagnostics")]
-        let effective_fin = fin && staged_complete;
         let flags = stream_flags(fin, staged_complete);
         #[cfg(feature = "diagnostics")]
-        let prepared_backing_capacity = staged.map_or(0, |(_, len)| len);
+        let prepared_backing_capacity =
+            diagnostic_context.map(|_| staged.map_or(0, |(_, len)| len));
 
         let outcome = self.submit_one_vec(dest, stream, StagedVec::new(staged), flags, now);
         #[cfg(feature = "diagnostics")]
-        if let Ok(outcome) = outcome {
+        if let (Some((role, offered, stream_offset)), Some(outcome)) =
+            (diagnostic_context, outcome.as_ref().ok().copied())
+        {
             let accepted = match outcome {
                 StreamWrite::Datagram { accepted, .. } => accepted,
                 _ => 0,
@@ -271,9 +278,9 @@ impl<S: Session> Conn<'_, S> {
                 stream_offset,
                 offered_bytes: offered as u64,
                 sampled_payload_limit: sampled_payload_limit as u64,
-                prepared_backing_capacity: prepared_backing_capacity as u64,
+                prepared_backing_capacity: prepared_backing_capacity.unwrap_or(0) as u64,
                 accepted_prefix: accepted as u64,
-                fin_offered: effective_fin,
+                fin_offered: fin && staged_complete,
                 zero_acceptance: offered > 0 && accepted == 0,
                 logical_retained_bytes: self.retained_bytes() as u64,
                 retained_backing_capacity: self.retained_backing_capacity() as u64,
@@ -327,13 +334,14 @@ impl<S: Session> Conn<'_, S> {
         // and *that* is what ngtcp2 is given a pointer into, so the address survives the call
         // even if the caller drops the original the instant it returns.
         #[cfg(feature = "diagnostics")]
-        let role = self.role();
-        #[cfg(feature = "diagnostics")]
-        let sampled_payload_limit = self.max_tx_udp_payload_size();
-        #[cfg(feature = "diagnostics")]
-        let offered = data.len();
-        #[cfg(feature = "diagnostics")]
-        let stream_offset = self.retained_next_offset(stream);
+        let diagnostic_context = crate::diagnostics::is_armed().then(|| {
+            (
+                self.role(),
+                self.max_tx_udp_payload_size(),
+                data.len(),
+                self.retained_next_offset(stream),
+            )
+        });
 
         let staged = self.retained_mut().stage_owned(stream, data.clone());
 
@@ -347,7 +355,7 @@ impl<S: Session> Conn<'_, S> {
             _ => 0,
         };
         #[cfg(feature = "diagnostics")]
-        {
+        if let Some((role, sampled_payload_limit, offered, stream_offset)) = diagnostic_context {
             let category = match outcome {
                 StreamWrite::Datagram { .. } => crate::diagnostics::AttemptOutcome::Datagram,
                 StreamWrite::StreamBlocked => crate::diagnostics::AttemptOutcome::StreamBlocked,

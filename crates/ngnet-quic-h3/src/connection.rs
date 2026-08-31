@@ -482,10 +482,17 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
         ) {
             Ok(len) if len > 0 => {
                 datagram.truncate(len);
-                self.detached.send(datagram);
+                self.detached.send_close(datagram);
             }
-            Ok(_) => {}
-            Err(err) => return Err(Error::transport(err)),
+            Ok(_) => {
+                datagram.clear();
+                self.state.scratch = datagram;
+            }
+            Err(err) => {
+                datagram.clear();
+                self.state.scratch = datagram;
+                return Err(Error::transport(err));
+            }
         }
         self.state.closed = true;
         self.detached.release();

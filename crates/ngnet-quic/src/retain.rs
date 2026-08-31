@@ -750,6 +750,40 @@ mod tests {
     }
 
     #[test]
+    fn fixed_limit_staging_scales_exactly_with_controlled_input() {
+        fn staged_total(size: usize, limit: usize) -> usize {
+            let stream = sid(0);
+            let body = vec![0x5a; size];
+            let mut retained = Retained::default();
+            let mut offset = 0;
+            let mut staged_total = 0;
+
+            while offset < body.len() {
+                let offer = [IoSlice::new(&body[offset..])];
+                let (staged, complete) = retained.stage_many_bounded(stream, &offer, limit);
+                let (_, staged) = staged.expect("a non-empty controlled prefix");
+                assert_eq!(complete, offset + staged == body.len());
+                retained.commit(stream, staged);
+                offset += staged;
+                staged_total += staged;
+            }
+
+            assert_eq!(retained.bytes_held(), size);
+            staged_total
+        }
+
+        let one = staged_total(64 * 1024, 1024);
+        let two = staged_total(128 * 1024, 1024);
+        assert_eq!(one, 64 * 1024);
+        assert_eq!(two, 128 * 1024);
+        assert_eq!(
+            two,
+            one * 2,
+            "doubling controlled input must exactly double packet-bounded staging"
+        );
+    }
+
+    #[test]
     fn a_partial_acceptance_leaves_the_address_ngtcp2_was_given_alone() {
         // The one ngtcp2 actually cares about. It keeps the pointer it was handed until the
         // accepted bytes are acknowledged, so shrinking the allocation to fit the accepted

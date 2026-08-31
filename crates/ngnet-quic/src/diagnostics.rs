@@ -66,6 +66,10 @@ pub struct Attempt {
 pub enum LivenessKind {
     /// Something occurred that can make a parked write retry meaningful.
     EnablingEvent,
+    /// The local adapter produced output; this does not make a retry sendable.
+    LocalProduction,
+    /// A task was polled again; the wake alone does not prove external progress.
+    DriverWake,
     /// A path stopped retrying until another event.
     Park,
     /// A previously parked path attempted progress again.
@@ -96,11 +100,11 @@ pub struct LivenessEvent {
 /// Aggregate observations for one endpoint role.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RoleSnapshot {
-    /// Bytes offered across stream-write attempts.
+    /// QUIC stream bytes offered across writes, including HTTP/3 framing and control data.
     pub offered_bytes: u64,
     /// Complete backing capacity prepared across attempts.
     pub prepared_backing_capacity: u64,
-    /// Bytes accepted across attempts.
+    /// QUIC stream bytes accepted across writes, including HTTP/3 framing and control data.
     pub accepted_bytes: u64,
     /// Non-empty attempts accepting no bytes.
     pub zero_acceptances: u64,
@@ -112,7 +116,7 @@ pub struct RoleSnapshot {
     pub retained_backing_capacity: u64,
     /// Highest complete retained backing capacity.
     pub retained_backing_high_water: u64,
-    /// Bytes released back to the HTTP/3 layer after copying.
+    /// QUIC stream bytes released back to HTTP/3 after copying.
     pub release_event_bytes: u64,
     /// Bytes acknowledged by the peer.
     pub acknowledged_bytes: u64,
@@ -156,6 +160,13 @@ pub struct RoleSnapshot {
     pub outbound_queue_high_water: u64,
     /// Full-to-available outbound queue transitions.
     pub outbound_capacity_transitions: u64,
+    /// Inbound datagrams deliberately discarded when an owner marked a connection terminal.
+    pub terminal_discarded_inbound: u64,
+    /// Outbound datagrams deliberately discarded at terminal transition.
+    ///
+    /// The detached endpoint preserves queued output, including CONNECTION_CLOSE, so this
+    /// is expected to remain zero.
+    pub terminal_discarded_outbound: u64,
 }
 
 /// A process-wide snapshot.
@@ -169,6 +180,22 @@ pub struct Snapshot {
     pub overflowed: bool,
     /// Packet retransmission attribution is not exposed by the current safe ngtcp2 API.
     pub retransmissions_available: bool,
+}
+
+/// One exclusive interval observation.
+///
+/// Cumulative counters, attempts, liveness events, and overflow state are drained at one
+/// instant while recorders are excluded. Live gauges remain at their current values, and
+/// each high-water mark is re-seeded from its corresponding live gauge for the next
+/// interval. Cross-interval zero-accept wait/enabling state is preserved.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DrainedDiagnostics {
+    /// Counter and live-gauge values for the completed interval.
+    pub snapshot: Snapshot,
+    /// Stream-write attempts recorded during the interval.
+    pub attempts: Vec<Attempt>,
+    /// Liveness events recorded during the interval.
+    pub liveness: Vec<LivenessEvent>,
 }
 
 struct AtomicRole {
@@ -202,6 +229,8 @@ struct AtomicRole {
     outbound_queue_depth: AtomicU64,
     outbound_queue_high_water: AtomicU64,
     outbound_capacity_transitions: AtomicU64,
+    terminal_discarded_inbound: AtomicU64,
+    terminal_discarded_outbound: AtomicU64,
 }
 
 impl AtomicRole {
@@ -237,6 +266,8 @@ impl AtomicRole {
             outbound_queue_depth: AtomicU64::new(0),
             outbound_queue_high_water: AtomicU64::new(0),
             outbound_capacity_transitions: AtomicU64::new(0),
+            terminal_discarded_inbound: AtomicU64::new(0),
+            terminal_discarded_outbound: AtomicU64::new(0),
         }
     }
 
@@ -272,6 +303,8 @@ impl AtomicRole {
             &self.outbound_queue_depth,
             &self.outbound_queue_high_water,
             &self.outbound_capacity_transitions,
+            &self.terminal_discarded_inbound,
+            &self.terminal_discarded_outbound,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -310,6 +343,61 @@ impl AtomicRole {
             outbound_queue_depth: load(&self.outbound_queue_depth),
             outbound_queue_high_water: load(&self.outbound_queue_high_water),
             outbound_capacity_transitions: load(&self.outbound_capacity_transitions),
+            terminal_discarded_inbound: load(&self.terminal_discarded_inbound),
+            terminal_discarded_outbound: load(&self.terminal_discarded_outbound),
+        }
+    }
+
+    fn drain_interval(&self) -> RoleSnapshot {
+        let take = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed);
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+
+        let logical_retained_bytes = load(&self.logical_retained_bytes);
+        let retained_backing_capacity = load(&self.retained_backing_capacity);
+        let inbound_queue_depth = load(&self.inbound_queue_depth);
+        let outbound_queue_depth = load(&self.outbound_queue_depth);
+
+        RoleSnapshot {
+            offered_bytes: take(&self.offered_bytes),
+            prepared_backing_capacity: take(&self.prepared_backing_capacity),
+            accepted_bytes: take(&self.accepted_bytes),
+            zero_acceptances: take(&self.zero_acceptances),
+            logical_retained_bytes,
+            logical_retained_high_water: self
+                .logical_retained_high_water
+                .swap(logical_retained_bytes, Ordering::Relaxed),
+            retained_backing_capacity,
+            retained_backing_high_water: self
+                .retained_backing_high_water
+                .swap(retained_backing_capacity, Ordering::Relaxed),
+            release_event_bytes: take(&self.release_event_bytes),
+            acknowledged_bytes: take(&self.acknowledged_bytes),
+            released_backing_capacity: take(&self.released_backing_capacity),
+            transport_only_packets: take(&self.transport_only_packets),
+            stream_carrying_packets: take(&self.stream_carrying_packets),
+            produced_packets: take(&self.produced_packets),
+            timer_rearms: take(&self.timer_rearms),
+            timer_fires: take(&self.timer_fires),
+            wake_registrations: take(&self.wake_registrations),
+            inbound_wakes: take(&self.inbound_wakes),
+            capacity_registrations: take(&self.capacity_registrations),
+            capacity_wakes: take(&self.capacity_wakes),
+            retries: take(&self.retries),
+            parks: take(&self.parks),
+            zero_accept_retries: take(&self.zero_accept_retries),
+            zero_accept_retries_without_enable: take(&self.zero_accept_retries_without_enable),
+            inbound_queue_depth,
+            inbound_queue_high_water: self
+                .inbound_queue_high_water
+                .swap(inbound_queue_depth, Ordering::Relaxed),
+            inbound_drops: take(&self.inbound_drops),
+            outbound_queue_depth,
+            outbound_queue_high_water: self
+                .outbound_queue_high_water
+                .swap(outbound_queue_depth, Ordering::Relaxed),
+            outbound_capacity_transitions: take(&self.outbound_capacity_transitions),
+            terminal_discarded_inbound: take(&self.terminal_discarded_inbound),
+            terminal_discarded_outbound: take(&self.terminal_discarded_outbound),
         }
     }
 }
@@ -325,6 +413,8 @@ static LAST_ENABLING: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
 static ATTEMPTS: Mutex<Vec<Attempt>> = Mutex::new(Vec::new());
 static LIVENESS: Mutex<Vec<LivenessEvent>> = Mutex::new(Vec::new());
 static ZERO_WAITING: Mutex<BTreeMap<(u64, i64, u64), u64>> = Mutex::new(BTreeMap::new());
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn role_index(role: Role) -> usize {
     match role {
@@ -506,6 +596,9 @@ pub(crate) fn test_staging_limit() -> Option<usize> {
 }
 
 /// Returns current aggregate observations.
+///
+/// This is a point read only. Use [`drain`] when counters, attempts, and liveness must
+/// describe one coherent interval.
 pub fn snapshot() -> Snapshot {
     let _guard = RECORDING_GATE
         .read()
@@ -519,6 +612,9 @@ pub fn snapshot() -> Snapshot {
 }
 
 /// Removes and returns stream-write attempts recorded since the previous call.
+///
+/// This is not coherent with separate calls to [`snapshot`] or
+/// [`take_liveness_events`]. Use [`drain`] for reconciliation.
 pub fn take_attempts() -> Vec<Attempt> {
     let _guard = RECORDING_GATE
         .read()
@@ -527,11 +623,35 @@ pub fn take_attempts() -> Vec<Attempt> {
 }
 
 /// Removes and returns liveness events recorded since the previous call.
+///
+/// This is not coherent with separate calls to [`snapshot`] or [`take_attempts`]. Use
+/// [`drain`] for reconciliation.
 pub fn take_liveness_events() -> Vec<LivenessEvent> {
     let _guard = RECORDING_GATE
         .read()
         .unwrap_or_else(|error| error.into_inner());
     core::mem::take(&mut *LIVENESS.lock().unwrap_or_else(|error| error.into_inner()))
+}
+
+/// Exclusively drains one coherent diagnostic interval.
+///
+/// Recorders cannot interleave between the snapshot and event drains. Cumulative counters
+/// reset to zero. Live retained-byte and queue-depth gauges keep their current values, while
+/// their high-water marks start the next interval at those live values.
+pub fn drain() -> DrainedDiagnostics {
+    let _guard = RECORDING_GATE
+        .write()
+        .unwrap_or_else(|error| error.into_inner());
+    DrainedDiagnostics {
+        snapshot: Snapshot {
+            client: ROLES[0].drain_interval(),
+            server: ROLES[1].drain_interval(),
+            overflowed: OVERFLOWED.swap(false, Ordering::Relaxed),
+            retransmissions_available: false,
+        },
+        attempts: core::mem::take(&mut *ATTEMPTS.lock().unwrap_or_else(|error| error.into_inner())),
+        liveness: core::mem::take(&mut *LIVENESS.lock().unwrap_or_else(|error| error.into_inner())),
+    }
 }
 
 pub(crate) fn record_attempt(mut attempt: Attempt) {
@@ -689,7 +809,15 @@ pub fn record_packet(connection_id: u64, role: Role, stream_carrying: bool) {
         add(&role_counters.stream_carrying_packets, 1);
     } else {
         add(&role_counters.transport_only_packets, 1);
-        record_enabling(connection_id, role, "transport-packet");
+        push_liveness(
+            connection_id,
+            role,
+            LivenessKind::LocalProduction,
+            "transport-packet",
+            None,
+            None,
+            None,
+        );
     }
 }
 
@@ -727,7 +855,15 @@ pub fn record_driver_wake(connection_id: u64, role: Role) {
     let Some(_guard) = recording_guard() else {
         return;
     };
-    record_enabling(connection_id, role, "driver-wake");
+    push_liveness(
+        connection_id,
+        role,
+        LivenessKind::DriverWake,
+        "driver-wake",
+        None,
+        None,
+        None,
+    );
 }
 
 pub(crate) fn record_inbound_wakes(connection_id: u64, role: Role, count: usize) {
@@ -836,11 +972,23 @@ pub(crate) fn record_outbound_queue(
     }
 }
 
+pub(crate) fn record_terminal_inventory(
+    role: Role,
+    inbound_discarded: usize,
+    outbound_discarded: usize,
+) {
+    let Some(_guard) = recording_guard() else {
+        return;
+    };
+    let role = counters(role);
+    role.inbound_queue_depth.store(0, Ordering::Relaxed);
+    add(&role.terminal_discarded_inbound, inbound_discarded as u64);
+    add(&role.terminal_discarded_outbound, outbound_discarded as u64);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn enabled_but_unarmed_hooks_change_nothing() {
@@ -923,6 +1071,71 @@ mod tests {
         let snapshot = snapshot();
         assert_eq!(snapshot.client.zero_acceptances, 2);
         assert_eq!(snapshot.client.zero_accept_retries, 0);
+        reset();
+    }
+
+    #[test]
+    fn local_output_and_driver_wakes_do_not_enable_zero_accept_retries() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset();
+        arm(true);
+        let attempt = |accepted_prefix| Attempt {
+            sequence: 0,
+            connection_id: 77,
+            role: Role::Client,
+            direction: "outbound",
+            stream_id: 0,
+            stream_offset: 0,
+            offered_bytes: 8,
+            sampled_payload_limit: 1200,
+            prepared_backing_capacity: 8,
+            accepted_prefix,
+            fin_offered: false,
+            zero_acceptance: accepted_prefix == 0,
+            logical_retained_bytes: 0,
+            retained_backing_capacity: 0,
+            outcome: AttemptOutcome::Datagram,
+        };
+
+        record_attempt(attempt(0));
+        record_packet(77, Role::Client, false);
+        record_driver_wake(77, Role::Client);
+        record_attempt(attempt(0));
+
+        let drained = drain();
+        assert_eq!(drained.snapshot.client.zero_accept_retries, 1);
+        assert_eq!(
+            drained.snapshot.client.zero_accept_retries_without_enable,
+            1
+        );
+        assert!(drained.liveness.iter().any(|event| {
+            event.kind == LivenessKind::LocalProduction && event.reason == "transport-packet"
+        }));
+        assert!(drained.liveness.iter().any(|event| {
+            event.kind == LivenessKind::DriverWake && event.reason == "driver-wake"
+        }));
+        reset();
+    }
+
+    #[test]
+    fn drain_preserves_live_gauges_and_reseeds_high_water_marks() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset();
+        arm(true);
+        record_retained(Role::Server, 7, 16, 0, 0);
+        record_inbound_queue(1, Role::Server, 3, false);
+
+        let first = drain();
+        assert_eq!(first.snapshot.server.logical_retained_bytes, 7);
+        assert_eq!(first.snapshot.server.logical_retained_high_water, 7);
+        assert_eq!(first.snapshot.server.inbound_queue_depth, 3);
+        assert_eq!(first.snapshot.server.inbound_queue_high_water, 3);
+
+        let second = drain();
+        assert_eq!(second.snapshot.server.logical_retained_bytes, 7);
+        assert_eq!(second.snapshot.server.logical_retained_high_water, 7);
+        assert_eq!(second.snapshot.server.inbound_queue_depth, 3);
+        assert_eq!(second.snapshot.server.inbound_queue_high_water, 3);
         reset();
     }
 }

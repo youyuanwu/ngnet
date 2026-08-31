@@ -530,6 +530,12 @@ impl<'h, S: Session> Conn<'h, S> {
 
 impl<S: Session> Drop for Conn<'_, S> {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        if crate::diagnostics::is_armed() {
+            let released_backing = self.retained.backing_bytes_held();
+            crate::diagnostics::record_retained(self.role, 0, 0, 0, released_backing);
+        }
+
         // Order matters, though for a narrower reason than it once did. The connection is
         // destroyed first, while the TLS session is still alive, because `ngtcp2_conn_del`
         // releases the key material the session produced -- and it does that by calling the
@@ -626,6 +632,8 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use crate::rand::test_support::CountingEntropy;
+    #[cfg(feature = "diagnostics")]
+    use crate::stream::StreamId;
     use crate::tls::Backend;
     use crate::tls_ossl::OsslBackend;
 
@@ -652,6 +660,35 @@ mod tests {
         for _ in 0..8 {
             drop(client_conn(Handlers::new()).unwrap());
         }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn dropping_a_connection_closes_its_retained_backing_inventory() {
+        use std::io::IoSlice;
+
+        let _guard = crate::diagnostics::TEST_LOCK.lock().unwrap();
+        crate::diagnostics::reset();
+        crate::diagnostics::arm(true);
+
+        let mut conn = client_conn(Handlers::new()).unwrap();
+        let stream = StreamId::new(0).unwrap();
+        let bytes = [0x5a; 8];
+        conn.retained_mut()
+            .stage_many_bounded(stream, &[IoSlice::new(&bytes)], bytes.len());
+        conn.retained_mut().commit(stream, 4);
+        assert_eq!(conn.retained_backing_capacity(), bytes.len());
+        drop(conn);
+
+        crate::diagnostics::arm(false);
+        let terminal = crate::diagnostics::drain();
+        assert_eq!(terminal.snapshot.client.logical_retained_bytes, 0);
+        assert_eq!(terminal.snapshot.client.retained_backing_capacity, 0);
+        assert_eq!(
+            terminal.snapshot.client.released_backing_capacity,
+            bytes.len() as u64
+        );
+        crate::diagnostics::reset();
     }
 
     #[test]

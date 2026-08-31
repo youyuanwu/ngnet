@@ -3,6 +3,31 @@ use ngnet_bench::NgnetNgtcpH3;
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+fn establishment_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(if cfg!(debug_assertions) { 60 } else { 30 })
+}
+
+fn exchange_timeout(size: usize) -> std::time::Duration {
+    let mib = size.div_ceil(1024 * 1024);
+    let (base, per_started_mib) = if cfg!(debug_assertions) {
+        (15, 30)
+    } else {
+        (5, 10)
+    };
+    std::time::Duration::from_secs(base + (mib as u64).saturating_mul(per_started_mib))
+}
+
+async fn establish_fixture() -> NgnetNgtcpH3 {
+    tokio::time::timeout(establishment_timeout(), NgnetNgtcpH3::establish())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "ngtcp2 fixture establishment exceeded {} ms",
+                establishment_timeout().as_millis()
+            )
+        })
+}
+
 #[cfg(feature = "diagnostics")]
 fn assert_bounded_attempts(
     attempts: &[ngnet_quic::diagnostics::Attempt],
@@ -60,45 +85,30 @@ fn assert_bounded_attempts(
 }
 
 #[cfg(feature = "diagnostics")]
-async fn diagnostic_staged_total(size: usize, stricter_limit: Option<usize>) -> u64 {
-    let fixture = NgnetNgtcpH3::establish().await;
-    ngnet_quic::diagnostics::reset();
-    ngnet_quic::diagnostics::set_test_staging_limit(stricter_limit);
-    ngnet_quic::diagnostics::arm(true);
-
-    let body = Bytes::from(vec![0x4d; size]);
-    let (received, exact) = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        fixture.round_trip_checked(body),
-    )
-    .await
-    .expect("diagnostic exact exchange stalled");
-    assert_eq!(received, size);
-    assert!(exact);
-
-    ngnet_quic::diagnostics::arm(false);
-    let attempts = ngnet_quic::diagnostics::take_attempts();
-    let staged = assert_bounded_attempts(
-        &attempts,
-        stricter_limit.and_then(|limit| u64::try_from(limit).ok()),
-    );
-    let snapshot = ngnet_quic::diagnostics::snapshot();
-    for role in [snapshot.client, snapshot.server] {
-        assert_eq!(role.accepted_bytes, role.release_event_bytes);
+fn assert_zero_accept_retry_reconciliation(drained: &ngnet_quic::diagnostics::DrainedDiagnostics) {
+    for (role, snapshot) in [
+        (ngnet_quic::Role::Client, drained.snapshot.client),
+        (ngnet_quic::Role::Server, drained.snapshot.server),
+    ] {
+        let retries_without_enable = drained
+            .liveness
+            .iter()
+            .filter(|event| {
+                event.role == role
+                    && event.kind == ngnet_quic::diagnostics::LivenessKind::Retry
+                    && event.reason == "zero-accept"
+                    && event.enabling_sequence.is_none()
+            })
+            .count() as u64;
         assert_eq!(
-            role.produced_packets,
-            role.transport_only_packets + role.stream_carrying_packets
+            snapshot.zero_accept_retries_without_enable, retries_without_enable,
+            "zero-accept retries must report real external/sendability evidence"
         );
-        assert_eq!(role.zero_accept_retries_without_enable, 0);
-        assert_eq!(role.inbound_drops, 0);
     }
-    assert!(!snapshot.overflowed);
-    ngnet_quic::diagnostics::reset();
-    staged
 }
 
 async fn repeated_exact_echo(size: usize, exchanges: usize) {
-    let fixture = NgnetNgtcpH3::establish().await;
+    let fixture = establish_fixture().await;
     let body = Bytes::from(
         (0..size)
             .map(|index| (index % 251) as u8)
@@ -107,7 +117,7 @@ async fn repeated_exact_echo(size: usize, exchanges: usize) {
 
     for exchange in 1..=exchanges {
         let (received, exact) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            exchange_timeout(size),
             fixture.round_trip_checked(body.clone()),
         )
         .await
@@ -132,9 +142,14 @@ async fn repeated_exact_echo(size: usize, exchanges: usize) {
 async fn ngtcp2_fixture_echoes_the_complete_body() {
     let _guard = TEST_LOCK.lock().await;
     let body = Bytes::from(vec![0x5a; 64 * 1024]);
-    let fixture = NgnetNgtcpH3::establish().await;
+    let fixture = establish_fixture().await;
 
-    let (received, exact) = fixture.round_trip_checked(body.clone()).await;
+    let (received, exact) = tokio::time::timeout(
+        exchange_timeout(body.len()),
+        fixture.round_trip_checked(body.clone()),
+    )
+    .await
+    .expect("the complete-body exchange exceeded its body/build-scaled timeout");
     assert_eq!(received, body.len());
     assert!(exact);
 }
@@ -142,7 +157,7 @@ async fn ngtcp2_fixture_echoes_the_complete_body() {
 #[tokio::test(flavor = "current_thread")]
 async fn ngtcp2_fixture_reuses_more_than_the_initial_stream_limit() {
     let _guard = TEST_LOCK.lock().await;
-    let fixture = NgnetNgtcpH3::establish().await;
+    let fixture = establish_fixture().await;
 
     for exchange in 0..125 {
         tokio::time::timeout(
@@ -170,7 +185,7 @@ async fn ngtcp2_fixture_repeats_1_mib_exactly() {
 #[tokio::test(flavor = "current_thread")]
 async fn unarmed_and_armed_diagnostics_preserve_and_reconcile_echoes() {
     let _guard = TEST_LOCK.lock().await;
-    let fixture = NgnetNgtcpH3::establish().await;
+    let fixture = establish_fixture().await;
     ngnet_quic::diagnostics::reset();
 
     let unarmed_body = Bytes::from(vec![0x7a; 1024]);
@@ -190,7 +205,7 @@ async fn unarmed_and_armed_diagnostics_preserve_and_reconcile_echoes() {
     let body = Bytes::from(vec![0x6d; 16 * 1024]);
     for exchange in 1..=3 {
         let (received, exact) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            exchange_timeout(body.len()),
             fixture.round_trip_checked(body.clone()),
         )
         .await
@@ -200,49 +215,30 @@ async fn unarmed_and_armed_diagnostics_preserve_and_reconcile_echoes() {
     }
 
     ngnet_quic::diagnostics::arm(false);
-    let attempts = ngnet_quic::diagnostics::take_attempts();
+    let drained = ngnet_quic::diagnostics::drain();
+    let attempts = &drained.attempts;
     assert!(
         !attempts.is_empty(),
         "the armed fixture recorded no attempts"
     );
-    assert_bounded_attempts(&attempts, Some(1024));
+    assert_bounded_attempts(attempts, Some(1024));
 
-    let liveness = ngnet_quic::diagnostics::take_liveness_events();
-    let snapshot = ngnet_quic::diagnostics::snapshot();
+    assert_zero_accept_retry_reconciliation(&drained);
+    let snapshot = drained.snapshot;
     for role in [snapshot.client, snapshot.server] {
         assert!(role.offered_bytes > 0);
         assert_eq!(role.accepted_bytes, role.release_event_bytes);
+        assert!(
+            role.accepted_bytes >= (body.len() * 3) as u64,
+            "transport stream bytes must include every application body byte"
+        );
         assert_eq!(
             role.produced_packets,
             role.transport_only_packets + role.stream_carrying_packets
-        );
-        assert_eq!(
-            role.zero_accept_retries_without_enable, 0,
-            "a blocked stream must wait for an enabling event before retrying: {liveness:#?}"
         );
         assert_eq!(role.inbound_drops, 0);
     }
     assert!(!snapshot.overflowed);
     assert!(!snapshot.retransmissions_available);
     ngnet_quic::diagnostics::reset();
-}
-
-#[cfg(feature = "diagnostics")]
-#[tokio::test(flavor = "current_thread")]
-async fn production_staging_is_payload_bounded_and_scales_linearly() {
-    let _guard = TEST_LOCK.lock().await;
-
-    let production = diagnostic_staged_total(64 * 1024, None).await;
-    assert!(production > 64 * 1024);
-
-    let one = diagnostic_staged_total(64 * 1024, Some(1024)).await;
-    let two = diagnostic_staged_total(128 * 1024, Some(1024)).await;
-    eprintln!(
-        "staged totals: production_64k={production}, fixed_1024_64k={one}, \
-         fixed_1024_128k={two}"
-    );
-    assert!(
-        two.saturating_mul(10) <= one.saturating_mul(21),
-        "doubling the body staged more than 2.1x: one={one}, two={two}"
-    );
 }

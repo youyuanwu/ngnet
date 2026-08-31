@@ -379,6 +379,10 @@ fn a_drain_pass_never_allocates_the_complete_large_offer() {
     {
         ngnet_quic::diagnostics::reset();
         assert!(!ngnet_quic::diagnostics::is_armed());
+        // A stale diagnostic-only control must not be evaluated by a feature-enabled but
+        // unarmed representative drain. If the unarmed path consults it, the pass below can
+        // accept only one byte.
+        ngnet_quic::diagnostics::set_test_staging_limit(Some(1));
     }
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
@@ -474,6 +478,18 @@ fn a_drain_pass_never_allocates_the_complete_large_offer() {
         source.sent > 0 && source.sent < body_size,
         "one drain pass must accept a bounded prefix, not zero or the complete 1 MiB offer"
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        assert!(
+            source.sent > 1,
+            "an unarmed drain evaluated the diagnostic-only staging control"
+        );
+        assert_eq!(
+            ngnet_quic::diagnostics::snapshot(),
+            ngnet_quic::diagnostics::Snapshot::default(),
+            "the representative unarmed drain recorded diagnostics"
+        );
+    }
     assert!(
         allocations > 0,
         "the counted drain produced no retained chunks or datagrams"

@@ -445,6 +445,15 @@ impl<S: Session> DetachedConnection<S> {
         self.shared.queue_outbound(datagram);
     }
 
+    /// Queues a synchronous CONNECTION_CLOSE in the outbound queue's reserved final slot.
+    ///
+    /// A close cannot wait asynchronously for capacity. Normal production therefore leaves
+    /// one slot unused so this operation preserves both previously produced datagrams and
+    /// the fixed total queue bound.
+    pub fn send_close(&self, datagram: Vec<u8>) {
+        self.shared.queue_close_outbound(datagram);
+    }
+
     /// How many datagrams this connection has queued for the endpoint to send.
     ///
     /// Not a supported API: an allocation-counting test uses the difference across a send
