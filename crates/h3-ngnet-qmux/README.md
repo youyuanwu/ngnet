@@ -55,6 +55,8 @@ The off-by-default `diagnostics` feature adds an `ObservedStream<S>`, explicitly
 armed counters, snapshots, and interval drains. Default builds contain none of
 that path. A feature-enabled but unarmed build still pays arming checks and
 receive-gauge calculation sites; use it for diagnostics, not timing.
+Counters are process-global and aggregate every observed endpoint in the
+process; run one isolated diagnostic workload at a time.
 
 See [`docs/h3-ngnet-qmux/`](../../docs/h3-ngnet-qmux/) for design, invariants,
 and known limits.

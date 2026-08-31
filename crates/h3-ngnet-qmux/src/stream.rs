@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use bytes::{Buf, Bytes};
 use h3::quic::{self, StreamErrorIncoming, WriteBuf};
 use ngnet_qmux::StreamId;
-use ngnet_qmux::io::{AsyncByteStream, Clock, StreamWrite};
+use ngnet_qmux::io::{AsyncByteStream, Clock, OUTBOUND_CARRY, StreamWrite};
 
 use crate::error::{ConnectionTerminal, DirectionTerminal};
 use crate::state::{ABANDONED, Core, Effects, LowerWake};
@@ -145,7 +145,25 @@ fn direction_error(terminal: DirectionTerminal) -> StreamErrorIncoming {
             "operation attempted after the stream direction finished".into(),
         )
         .stream_error(),
+        DirectionTerminal::Closed => StreamErrorIncoming::Unknown(Box::new(
+            crate::Error::undefined("QMux closed the stream direction"),
+        )),
     }
+}
+
+fn closed_stream_error<S: AsyncByteStream, C: Clock>(
+    core: &mut Core<S, C>,
+    stream_id: StreamId,
+    effects: &mut Effects,
+) -> StreamErrorIncoming {
+    match core.reconcile_closed_send(stream_id, effects) {
+        Ok(terminal) => direction_error(terminal),
+        Err(terminal) => terminal.stream_error(),
+    }
+}
+
+fn waiting_for_output<S: AsyncByteStream, C: Clock>(core: &Core<S, C>) -> bool {
+    core.lower.queued_output() >= OUTBOUND_CARRY
 }
 
 /// A QMux-backed H3 sending stream.
@@ -219,7 +237,13 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> SendStream<S, C, B> {
                                     )
                                 }
                                 Ok(StreamWrite::Accepted(0)) => {
-                                    core.park_send(self.stream_id, false, cx.waker(), &mut effects);
+                                    core.park_send(
+                                        self.stream_id,
+                                        false,
+                                        waiting_for_output(core),
+                                        cx.waker(),
+                                        &mut effects,
+                                    );
                                     Step::Pending
                                 }
                                 Ok(StreamWrite::Accepted(accepted)) => {
@@ -236,6 +260,7 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> SendStream<S, C, B> {
                                         core.park_send(
                                             self.stream_id,
                                             false,
+                                            waiting_for_output(core),
                                             cx.waker(),
                                             &mut effects,
                                         );
@@ -245,15 +270,20 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> SendStream<S, C, B> {
                                     }
                                 }
                                 Ok(StreamWrite::Blocked) => {
-                                    core.park_send(self.stream_id, false, cx.waker(), &mut effects);
+                                    core.park_send(
+                                        self.stream_id,
+                                        false,
+                                        waiting_for_output(core),
+                                        cx.waker(),
+                                        &mut effects,
+                                    );
                                     Step::Pending
                                 }
-                                Ok(StreamWrite::Closed) => Step::Error(
-                                    ConnectionTerminal::Internal(
-                                        "QMux closed a live send direction".into(),
-                                    )
-                                    .stream_error(),
-                                ),
+                                Ok(StreamWrite::Closed) => Step::Error(closed_stream_error(
+                                    core,
+                                    self.stream_id,
+                                    &mut effects,
+                                )),
                                 Err(error) => {
                                     let terminal = ConnectionTerminal::from_lower(&error);
                                     effects.merge(core.fail(terminal.clone()));
@@ -362,16 +392,27 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> quic::SendStream<B> for SendStream<S,
                             Poll::Ready(Ok(()))
                         }
                         Ok(StreamWrite::Blocked) => {
-                            core.park_send(self.stream_id, true, cx.waker(), &mut effects);
+                            core.park_send(
+                                self.stream_id,
+                                true,
+                                waiting_for_output(core),
+                                cx.waker(),
+                                &mut effects,
+                            );
                             effects.continuation = true;
                             Poll::Pending
                         }
-                        Ok(StreamWrite::Accepted(_)) | Ok(StreamWrite::Closed) => {
+                        Ok(StreamWrite::Accepted(_)) => {
                             Poll::Ready(Err(ConnectionTerminal::Internal(
                                 "QMux returned an invalid result for an empty FIN".into(),
                             )
                             .stream_error()))
                         }
+                        Ok(StreamWrite::Closed) => Poll::Ready(Err(closed_stream_error(
+                            core,
+                            self.stream_id,
+                            &mut effects,
+                        ))),
                         Err(error) => {
                             let terminal = ConnectionTerminal::from_lower(&error);
                             effects.merge(core.fail(terminal.clone()));
@@ -448,7 +489,13 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> quic::SendStreamUnframed<B> for SendS
                     .stream_error()))
                 }
                 Ok(StreamWrite::Accepted(0)) | Ok(StreamWrite::Blocked) => {
-                    core.park_send(self.stream_id, false, cx.waker(), &mut effects);
+                    core.park_send(
+                        self.stream_id,
+                        false,
+                        waiting_for_output(core),
+                        cx.waker(),
+                        &mut effects,
+                    );
                     effects.continuation = true;
                     Poll::Pending
                 }
@@ -456,10 +503,9 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> quic::SendStreamUnframed<B> for SendS
                     effects.continuation = true;
                     Poll::Ready(Ok(accepted))
                 }
-                Ok(StreamWrite::Closed) => Poll::Ready(Err(ConnectionTerminal::Internal(
-                    "QMux closed a live send direction".into(),
-                )
-                .stream_error())),
+                Ok(StreamWrite::Closed) => {
+                    Poll::Ready(Err(closed_stream_error(core, self.stream_id, &mut effects)))
+                }
                 Err(error) => {
                     let terminal = ConnectionTerminal::from_lower(&error);
                     effects.merge(core.fail(terminal.clone()));
@@ -571,6 +617,9 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> quic::RecvStream for RecvStream<S, C,
                             Poll::Ready(Err(StreamErrorIncoming::StreamTerminated {
                                 error_code: code,
                             }))
+                        }
+                        Some(DirectionTerminal::Closed) => {
+                            Poll::Ready(Err(direction_error(DirectionTerminal::Closed)))
                         }
                         None => {
                             core.park_recv(self.stream_id, cx.waker(), &mut effects);

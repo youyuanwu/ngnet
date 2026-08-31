@@ -3,6 +3,11 @@
 //! The module is absent from default builds. Feature-enabled builds remain inert until
 //! [`arm`] is called; armed runs are diagnostic evidence and must not be mixed with default
 //! timing runs.
+//!
+//! Counters are process-global. Every observed stream and adapter connection in the process
+//! contributes to one interval, and `snapshot`, `drain`, or any [`LowerIoHandle`] observes
+//! that aggregate. Run one isolated diagnostic workload per process; handles are not
+//! per-connection accounting objects.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -10,7 +15,7 @@ use std::task::{Context, Poll};
 
 use ngnet_qmux::io::{AsyncByteStream, Written};
 
-/// A cumulative diagnostic snapshot.
+/// A cumulative process-wide diagnostic snapshot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     /// Lower read polls.
@@ -296,7 +301,7 @@ impl SwapZero for AtomicU64 {
     }
 }
 
-/// Handle proving that a QMux connection was built over [`ObservedStream`].
+/// Handle returned with an [`ObservedStream`] for controlling the process-wide interval.
 #[derive(Clone, Copy, Debug)]
 pub struct LowerIoHandle {
     _private: (),
@@ -308,7 +313,7 @@ impl LowerIoHandle {
         arm(enabled);
     }
 
-    /// Returns the combined lower and adapter snapshot.
+    /// Returns the combined process-wide lower and adapter snapshot.
     #[must_use]
     pub fn snapshot(self) -> Snapshot {
         snapshot()

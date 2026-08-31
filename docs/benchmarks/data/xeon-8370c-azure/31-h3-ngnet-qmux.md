@@ -122,11 +122,12 @@ without the feature. Both substrates produced the same one-exchange 1 MiB struct
 | final retained send / receive | 0 / 0 | 0 / 0 |
 | overflow / lower failures | false / 0 | false / 0 |
 
-These counters describe only `h3-ngnet-qmux`; the baseline exposes no matched internal counters.
-They therefore support adapter invariants and candidate generation, not a numerical attribution
-against `ngnet-qmux-h3`. The retained-send high-water is the caller-owned 1 MiB body plus H3
-framing, not a second body-sized copy. The receive high-water remains within the configured
-connection window.
+These process-global counters aggregate both observed endpoints in this one isolated probe and
+describe only `h3-ngnet-qmux`; the baseline exposes no matched internal counters. They therefore
+support adapter invariants and candidate generation, not a numerical attribution against
+`ngnet-qmux-h3`. The retained-send high-water is the caller-owned 1 MiB body plus H3 framing,
+not a second body-sized copy. The receive high-water remains within the configured connection
+window.
 
 ## What this establishes
 

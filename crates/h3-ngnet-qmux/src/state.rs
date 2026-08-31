@@ -47,6 +47,8 @@ pub(crate) struct StreamState {
     pub(crate) recv_waiter: Option<Waker>,
     pub(crate) send_waiter: Option<Waker>,
     pub(crate) finish_waiter: Option<Waker>,
+    pub(crate) send_waiting_output: bool,
+    pub(crate) finish_waiting_output: bool,
 }
 
 #[derive(Debug, Default)]
@@ -202,6 +204,7 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
         }
 
         let credit_before = self.lower.send_credit();
+        let queued_before = self.lower.queued_output();
         let mut routed = 0usize;
         while routed < ROUTE_BUDGET {
             let Some(event) = self.lower.try_next_event() else {
@@ -241,6 +244,9 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
 
         if self.terminal.is_none() && self.lower.send_credit() > credit_before {
             self.wake_all_senders(&mut effects);
+        }
+        if self.terminal.is_none() && self.lower.queued_output() < queued_before {
+            self.wake_output_senders(&mut effects);
         }
         if routed == ROUTE_BUDGET {
             effects.continuation = true;
@@ -468,11 +474,17 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
         if let Some(terminal) = &self.terminal {
             return Err(terminal.clone());
         }
-        let opened = match kind {
+        let opened = match match kind {
             OpenKind::Uni => self.lower.try_open_uni(),
             OpenKind::Bidi => self.lower.try_open_bidi(),
-        }
-        .map_err(|error| ConnectionTerminal::from_lower(&error))?;
+        } {
+            Ok(opened) => opened,
+            Err(error) => {
+                let terminal = ConnectionTerminal::from_lower(&error);
+                effects.merge(self.fail(terminal.clone()));
+                return Err(terminal);
+            }
+        };
 
         match opened {
             StreamOpen::Opened(stream_id) => {
@@ -533,6 +545,21 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
         for stream in self.streams.values_mut() {
             take_waiter(&mut stream.send_waiter, effects);
             take_waiter(&mut stream.finish_waiter, effects);
+            stream.send_waiting_output = false;
+            stream.finish_waiting_output = false;
+        }
+    }
+
+    pub(crate) fn wake_output_senders(&mut self, effects: &mut Effects) {
+        for stream in self.streams.values_mut() {
+            if stream.send_waiting_output {
+                take_waiter(&mut stream.send_waiter, effects);
+                stream.send_waiting_output = false;
+            }
+            if stream.finish_waiting_output {
+                take_waiter(&mut stream.finish_waiter, effects);
+                stream.finish_waiting_output = false;
+            }
         }
     }
 
@@ -560,17 +587,52 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
         })
     }
 
+    pub(crate) fn reconcile_closed_send(
+        &mut self,
+        stream_id: StreamId,
+        effects: &mut Effects,
+    ) -> Result<DirectionTerminal, ConnectionTerminal> {
+        for routed in 0..ROUTE_BUDGET {
+            if let Some(terminal) = &self.terminal {
+                return Err(terminal.clone());
+            }
+            if let Some(terminal) = self.stream_error(stream_id, true) {
+                return Ok(terminal);
+            }
+            let Some(event) = self.lower.try_next_event() else {
+                break;
+            };
+            effects.merge(self.route(event));
+            if routed + 1 == ROUTE_BUDGET {
+                effects.continuation = true;
+            }
+        }
+        if let Some(terminal) = &self.terminal {
+            return Err(terminal.clone());
+        }
+        if let Some(terminal) = self.stream_error(stream_id, true) {
+            return Ok(terminal);
+        }
+        if let Some(state) = self.streams.get_mut(&stream_id) {
+            state.send_terminal = Some(DirectionTerminal::Closed);
+        }
+        Ok(DirectionTerminal::Closed)
+    }
+
     pub(crate) fn park_send(
         &mut self,
         stream_id: StreamId,
         finish: bool,
+        waiting_output: bool,
         waker: &Waker,
         effects: &mut Effects,
     ) {
         if let Some(state) = self.streams.get_mut(&stream_id) {
             let slot = if finish {
+                state.finish_waiting_output = waiting_output;
                 &mut state.finish_waiter
             } else {
+                state.send_waiting_output = waiting_output;
                 &mut state.send_waiter
             };
             replace_waiter(slot, waker, effects);

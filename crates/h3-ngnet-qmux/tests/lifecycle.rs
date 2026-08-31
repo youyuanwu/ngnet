@@ -7,7 +7,7 @@ use bytes::Bytes;
 use h3::error::Code;
 use h3::proto::frame::Frame;
 use h3::quic::{self, SendStream as _};
-use h3_ngnet_qmux::from_qmux;
+use h3_ngnet_qmux::{ErrorKind, from_qmux};
 use ngnet_qmux::io::testing::{Fault, TestClock, stream_pair};
 use ngnet_qmux::io::{Config, Connection as QmuxConnection};
 
@@ -176,7 +176,13 @@ fn synchronous_close_preserves_first_reason_and_driver_completes_delivery() {
         if !peer_driver_done
             && let Poll::Ready(result) = std::pin::Pin::new(&mut server_driver).poll(&mut cx)
         {
-            assert!(result.is_err(), "peer driver reports the incoming close");
+            let error = result.expect_err("peer driver reports the incoming close");
+            assert_eq!(
+                error.kind(),
+                ErrorKind::ApplicationClose {
+                    error_code: Code::H3_NO_ERROR.value()
+                }
+            );
             peer_driver_done = true;
         }
         if peer_code.is_none()
@@ -208,10 +214,16 @@ fn lower_failure_fans_out_one_stable_connection_category_to_all_openers() {
 
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
-    assert!(matches!(
-        std::pin::Pin::new(&mut driver).poll(&mut cx),
-        Poll::Ready(Err(_))
-    ));
+    let first_driver_error = match std::pin::Pin::new(&mut driver).poll(&mut cx) {
+        Poll::Ready(Err(error)) => error,
+        _ => panic!("lower failure must complete the driver"),
+    };
+    assert_eq!(first_driver_error.kind(), ErrorKind::Undefined);
+    let stable_driver_error = match std::pin::Pin::new(&mut driver).poll(&mut cx) {
+        Poll::Ready(Err(error)) => error,
+        _ => panic!("driver failure must remain stable"),
+    };
+    assert_eq!(stable_driver_error.kind(), first_driver_error.kind());
     for result in [
         quic::OpenStreams::<Bytes>::poll_open_bidi(&mut first, &mut cx),
         quic::OpenStreams::<Bytes>::poll_open_bidi(&mut second, &mut cx),

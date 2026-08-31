@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use bytes::{Buf, Bytes};
+use h3::proto::frame::Frame;
 use h3::quic;
 use ngnet_qmux::io::Config;
 
@@ -325,4 +326,32 @@ fn two_credit_blocked_writers_retain_independent_waiters() {
     ));
     assert_eq!(first_count.get(), 0);
     assert_eq!(second_count.get(), 0);
+}
+
+#[test]
+fn framed_send_resumes_after_local_output_ceiling_is_flushed() {
+    let (mut client, mut client_driver, mut server, mut server_driver) =
+        common::pair(Config::new());
+    let expected = Bytes::from(vec![0x6d; 200 * 1024]);
+    let client_body = expected.clone();
+    let client_task = async {
+        let mut stream = common::open_bidi(&mut client).await;
+        quic::SendStream::send_data(&mut stream, Frame::Data(client_body))
+            .expect("retain framed body");
+        std::future::poll_fn(|cx| quic::SendStream::poll_ready(&mut stream, cx))
+            .await
+            .expect("local output drainage wakes retained send");
+        common::finish(&mut stream).await;
+    };
+    let server_task = async {
+        let mut stream = common::accept_bidi(&mut server).await;
+        common::receive_all(&mut stream).await
+    };
+    let (_, received) = common::run_pair(
+        client_task,
+        &mut client_driver,
+        server_task,
+        &mut server_driver,
+    );
+    assert_eq!(&received[received.len() - expected.len()..], expected);
 }

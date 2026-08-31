@@ -16,6 +16,10 @@ use crate::stream::{SendSlots, Shared, apply_effects};
 /// hyperium connection for as long as any connection or stream handle is in use. Hyperium's
 /// synchronous `close` records intent only; this future is what flushes the QMux close and
 /// shuts down the established byte stream.
+///
+/// A locally requested close resolves successfully once delivered. A peer application close,
+/// adapter invariant failure, or underlying QMux/byte-stream failure resolves with a stable
+/// [`crate::ErrorKind`] classification.
 #[must_use = "the QMux adapter makes no lower-I/O progress unless its driver is polled"]
 pub struct Driver<S: AsyncByteStream, C: Clock, B: Buf> {
     pub(crate) shared: Shared<S, C>,
@@ -63,7 +67,7 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> Future for Driver<S, C, B> {
                         Poll::Ready(Ok(()))
                     }
                     Poll::Ready(Err(error)) => {
-                        let error = Error::new(error.to_string());
+                        let error = Error::undefined(error.to_string());
                         core.driver_error = Some(error.clone());
                         core.driver_complete = true;
                         Poll::Ready(Err(error))
@@ -76,7 +80,7 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> Future for Driver<S, C, B> {
                     core.wake_all_senders(&mut effects);
                 }
                 if let Some(terminal) = core.terminal.clone() {
-                    let error = Error::new(format!("{terminal:?}"));
+                    let error = terminal.driver_error();
                     core.driver_error = Some(error.clone());
                     core.driver_complete = true;
                     Poll::Ready(Err(error))

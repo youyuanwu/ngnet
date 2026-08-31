@@ -41,7 +41,7 @@ use ngnet_qmux::io::{AsyncByteStream, Clock, Connection as QmuxConnection};
 
 pub use connection::{Connection, Observer, OpenStreams, Snapshot};
 pub use driver::Driver;
-pub use error::Error;
+pub use error::{Error, ErrorKind};
 pub use stream::{BidiStream, RecvStream, SendStream};
 
 use state::{Core, LowerWake};
@@ -132,8 +132,9 @@ where
 
 /// Adapts a QMux connection built over [`diagnostics::ObservedStream`].
 ///
-/// The handle is accepted as construction evidence and is also used by the caller to arm,
-/// snapshot, and drain the combined lower-I/O and adapter interval.
+/// The handle makes the observed construction explicit and can arm, snapshot, and drain the
+/// combined lower-I/O and adapter interval. Diagnostics are process-global: multiple handles
+/// address the same aggregate interval rather than one connection each.
 #[cfg(feature = "diagnostics")]
 #[must_use = "construction returns a driver which must be polled"]
 pub fn from_qmux_with_diagnostics<B, S, C>(
