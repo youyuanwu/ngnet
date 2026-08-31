@@ -31,6 +31,8 @@ pub struct Snapshot {
     pub adapter_polls: u64,
     /// Driver polls.
     pub driver_polls: u64,
+    /// Bounded pump turns making no routing progress.
+    pub no_progress_polls: u64,
     /// Bounded lower pump attempts.
     pub pump_attempts: u64,
     /// Pump turns routing at least one event.
@@ -81,6 +83,7 @@ struct Counters {
     lower_failures: AtomicU64,
     adapter_polls: AtomicU64,
     driver_polls: AtomicU64,
+    no_progress_polls: AtomicU64,
     pump_attempts: AtomicU64,
     productive_turns: AtomicU64,
     routed_events: AtomicU64,
@@ -120,6 +123,7 @@ static COUNTERS: Counters = counters!(
     lower_failures,
     adapter_polls,
     driver_polls,
+    no_progress_polls,
     pump_attempts,
     productive_turns,
     routed_events,
@@ -203,6 +207,7 @@ macro_rules! snapshot {
             lower_failures: COUNTERS.lower_failures.$load(Ordering::Relaxed),
             adapter_polls: COUNTERS.adapter_polls.$load(Ordering::Relaxed),
             driver_polls: COUNTERS.driver_polls.$load(Ordering::Relaxed),
+            no_progress_polls: COUNTERS.no_progress_polls.$load(Ordering::Relaxed),
             pump_attempts: COUNTERS.pump_attempts.$load(Ordering::Relaxed),
             productive_turns: COUNTERS.productive_turns.$load(Ordering::Relaxed),
             routed_events: COUNTERS.routed_events.$load(Ordering::Relaxed),
@@ -292,8 +297,10 @@ impl SwapZero for AtomicU64 {
 }
 
 /// Handle proving that a QMux connection was built over [`ObservedStream`].
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LowerIoHandle;
+#[derive(Clone, Copy, Debug)]
+pub struct LowerIoHandle {
+    _private: (),
+}
 
 impl LowerIoHandle {
     /// Enables or disables the shared interval.
@@ -320,7 +327,10 @@ pub struct ObservedStream<S> {
 
 /// Wraps a lower stream and returns its diagnostic handle.
 pub fn observe<S>(stream: S) -> (ObservedStream<S>, LowerIoHandle) {
-    (ObservedStream { inner: stream }, LowerIoHandle)
+    (
+        ObservedStream { inner: stream },
+        LowerIoHandle { _private: () },
+    )
 }
 
 impl<S: AsyncByteStream> AsyncByteStream for ObservedStream<S> {
@@ -379,6 +389,8 @@ pub(crate) fn pump(productive: bool) {
     add(&COUNTERS.pump_attempts, 1);
     if productive {
         add(&COUNTERS.productive_turns, 1);
+    } else {
+        add(&COUNTERS.no_progress_polls, 1);
     }
 }
 pub(crate) fn route(stream_scoped: bool) {

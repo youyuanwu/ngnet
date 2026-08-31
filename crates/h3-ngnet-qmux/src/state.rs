@@ -196,6 +196,8 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
     pub(crate) fn drive_turn(&mut self, lower_wake: &Arc<LowerWake>) -> Effects {
         let mut effects = Effects::default();
         if self.terminal.is_some() {
+            #[cfg(feature = "diagnostics")]
+            crate::diagnostics::pump(false);
             return effects;
         }
 
@@ -208,6 +210,8 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
             routed += 1;
             effects.merge(self.route(event));
             if self.terminal.is_some() {
+                #[cfg(feature = "diagnostics")]
+                crate::diagnostics::pump(true);
                 return effects;
             }
         }
@@ -280,6 +284,10 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
                         && let Err(error) = self.lower.extend_connection_credit(data.len() as u64)
                     {
                         return self.fail(ConnectionTerminal::from_lower(&error));
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    if !data.is_empty() {
+                        crate::diagnostics::connection_credit();
                     }
                     return effects;
                 }

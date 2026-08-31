@@ -227,6 +227,8 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> SendStream<S, C, B> {
                                     let complete = data.remaining() == 0;
                                     slots.retained_bytes =
                                         slots.retained_bytes.saturating_sub(accepted);
+                                    #[cfg(feature = "diagnostics")]
+                                    crate::diagnostics::send_gauge(slots.retained_bytes);
                                     if complete {
                                         slots.remove(self.stream_id);
                                         Step::Done

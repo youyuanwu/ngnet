@@ -136,7 +136,7 @@ fn emit_diagnostics(
             "PROBE-QMUX-DIAGNOSTIC exchange={exchange} scope={scope} \
              lower_read_calls={} lower_read_bytes={} lower_write_calls={} \
              lower_write_bytes={} lower_write_not_now={} lower_shutdown_calls={} \
-             lower_failures={} adapter_polls={} driver_polls={} pump_attempts={} \
+             lower_failures={} adapter_polls={} driver_polls={} no_progress_polls={} pump_attempts={} \
              productive_turns={} routed_events={} stream_events={} connection_events={} \
              stream_credit_applications={} connection_credit_applications={} \
              waiter_registrations={} waiter_replacements={} wake_deliveries={} \
@@ -152,6 +152,7 @@ fn emit_diagnostics(
             snapshot.lower_failures,
             snapshot.adapter_polls,
             snapshot.driver_polls,
+            snapshot.no_progress_polls,
             snapshot.pump_attempts,
             snapshot.productive_turns,
             snapshot.routed_events,
