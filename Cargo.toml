@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/h3-ngnet-qmux",
     "crates/ngnet-axum",
     "crates/ngnet-h2",
     "crates/ngnet-h2-sys",
@@ -69,7 +70,7 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
-# Upstream HTTP/3 comparison stack used only by `ngnet-bench`.
+# Upstream HTTP/3 stack used by the QMux adapter and as a benchmark comparison.
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 # The comparison target. `client` and `server` give both conn builders; `http2` is the
@@ -89,6 +90,7 @@ ngnet-h3-sys = { path = "crates/ngnet-h3-sys", version = "0.0.1" }
 # The external-transport adapter: Quinn stays out of `ngnet-h3` while callers get a reusable
 # implementation instead of copying the former integration-test backend.
 ngnet-h3-quinn = { path = "crates/ngnet-h3-quinn" }
+h3-ngnet-qmux = { path = "crates/h3-ngnet-qmux" }
 ngnet-quic-sys = { path = "crates/ngnet-quic-sys", version = "0.0.1", default-features = false }
 ngnet-quic = { path = "crates/ngnet-quic", version = "0.0.1" }
 ngnet-quic-h3-tests = { path = "tests/ngnet-quic-h3-tests" }

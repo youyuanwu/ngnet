@@ -490,6 +490,20 @@ pub enum StreamWrite {
     Closed,
 }
 
+/// What an immediate stream-open attempt did.
+///
+/// Unlike [`Connection::poll_open_bidi`] and [`Connection::poll_open_uni`], the immediate
+/// operations do not drive the connection and never park a waker. They are intended for an
+/// outer scheduler which owns one stable lower-I/O waiter and keeps independent waiters for
+/// each of its own open operations.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StreamOpen {
+    /// A stream was opened.
+    Opened(StreamId),
+    /// The peer has not currently granted another stream of this kind.
+    Blocked,
+}
+
 /// An asynchronous QMux connection over a caller-supplied byte stream.
 ///
 /// Created from a byte stream the caller has **already established**; this crate connects
@@ -967,21 +981,67 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
 
     fn poll_next_event_with(&mut self, cx: &mut Context<'_>, flush: Flush) -> Poll<Result<Event>> {
         let pumped = self.pump(cx, flush);
-        if let Some(event) = self.events.pop() {
-            if let Event::StreamData { data, .. } = &event {
-                // Delivery is what read-ahead is measured in: from here the bytes are the
-                // caller's, and the layer will read no further ahead than the caller has
-                // credited back. Counted on the way out rather than when the event was queued,
-                // because an event sitting in the queue is bounded by the protocol's window
-                // and one the caller is holding is bounded by nothing else.
-                self.read_ahead.delivered(data.len() as u64);
-            }
+        if let Some(event) = self.take_event() {
             return Poll::Ready(Ok(event));
         }
         match pumped {
             Ok(()) => Poll::Pending,
             Err(error) => Poll::Ready(Err(error)),
         }
+    }
+
+    /// Takes one already-decoded event without polling the byte stream.
+    ///
+    /// This is the drain half of the bounded adapter seam. An outer scheduler first drains
+    /// with this operation, applies its own queue limits, and only then calls
+    /// [`Connection::poll_next_event_bounded`] once. Because this function performs no lower
+    /// I/O, draining a backlog cannot admit another read batch behind the caller's back.
+    pub fn try_next_event(&mut self) -> Option<Event> {
+        self.take_event()
+    }
+
+    /// Polls for one event with at most one lower read batch.
+    ///
+    /// An event already in the decoded queue is returned before any byte-stream operation.
+    /// Otherwise the connection performs its bounded write work, issues at most one
+    /// [`AsyncByteStream::poll_read`](crate::io::AsyncByteStream::poll_read), performs the
+    /// trailing bounded write work caused by that read, and returns the first resulting event.
+    /// The read slice is at most one QMux maximum record, so one invocation admits at most one
+    /// such batch. Further decoded events remain available through
+    /// [`Connection::try_next_event`].
+    ///
+    /// Existing event and pump methods retain their draining read behavior. This method is for
+    /// an outer adapter which calls it no more than once per own scheduling turn.
+    ///
+    /// # Errors
+    ///
+    /// Reports the connection ending once all events decoded before it have been drained.
+    pub fn poll_next_event_bounded(&mut self, cx: &mut Context<'_>) -> Poll<Result<Event>> {
+        if let Some(event) = self.take_event() {
+            return Poll::Ready(Ok(event));
+        }
+
+        let pumped = self.pump_bounded(cx, Flush::Everything);
+        if let Some(event) = self.take_event() {
+            return Poll::Ready(Ok(event));
+        }
+        match pumped {
+            Ok(()) => Poll::Pending,
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+
+    fn take_event(&mut self) -> Option<Event> {
+        let event = self.events.pop()?;
+        if let Event::StreamData { data, .. } = &event {
+            // Delivery is what read-ahead is measured in: from here the bytes are the
+            // caller's, and the layer will read no further ahead than the caller has
+            // credited back. Counted on the way out rather than when the event was queued,
+            // because an event sitting in the queue is bounded by the protocol's window
+            // and one the caller is holding is bounded by nothing else.
+            self.read_ahead.delivered(data.len() as u64);
+        }
+        Some(event)
     }
 
     /// How many delivered bytes the caller has yet to report consuming.
@@ -993,6 +1053,16 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     #[must_use]
     pub const fn read_ahead(&self) -> u64 {
         self.read_ahead.outstanding()
+    }
+
+    /// Current connection-wide credit available for sending stream data.
+    ///
+    /// This is an observation only: it neither pumps the connection nor registers a waiter.
+    /// An outer scheduler can sample it across a bounded lower read to distinguish a
+    /// connection-window wake from an unrelated inbound record.
+    #[must_use]
+    pub fn send_credit(&self) -> u64 {
+        self.conn.max_data_left()
     }
 
     /// Opens a bidirectional stream.
@@ -1028,6 +1098,41 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     /// [`Connection::poll_open_uni`] without that scheduling proof.
     pub fn poll_open_uni_buffered(&mut self, cx: &mut Context<'_>) -> Poll<Result<StreamId>> {
         self.poll_open(cx, OpenKind::Uni, Flush::WhenFull)
+    }
+
+    /// Attempts to open a bidirectional stream without polling lower I/O or parking.
+    ///
+    /// # Errors
+    ///
+    /// Reports a connection ending or a state-machine failure.
+    pub fn try_open_bidi(&mut self) -> Result<StreamOpen> {
+        self.try_open(OpenKind::Bidi)
+    }
+
+    /// Attempts to open a unidirectional stream without polling lower I/O or parking.
+    ///
+    /// # Errors
+    ///
+    /// Reports a connection ending or a state-machine failure.
+    pub fn try_open_uni(&mut self) -> Result<StreamOpen> {
+        self.try_open(OpenKind::Uni)
+    }
+
+    fn try_open(&mut self, kind: OpenKind) -> Result<StreamOpen> {
+        if let Some(terminal) = &self.terminal {
+            return Err(terminal.error());
+        }
+        let opened = match kind {
+            OpenKind::Bidi => self.conn.open_bidi_stream(),
+            OpenKind::Uni => self.conn.open_uni_stream(),
+        }?;
+        match opened {
+            OpenOutcome::Opened(stream) => {
+                self.produce_pending = true;
+                Ok(StreamOpen::Opened(stream))
+            }
+            OpenOutcome::Blocked => Ok(StreamOpen::Blocked),
+        }
     }
 
     fn poll_open(
@@ -1335,6 +1440,24 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         }
         self.conn.shutdown_stream(stream, half, app_error_code)?;
         self.produce_pending = true;
+        Ok(())
+    }
+
+    /// The adapter-oriented pump: the ordinary bounded output work and no more than one read.
+    fn pump_bounded(&mut self, cx: &mut Context<'_>, flush: Flush) -> Result<()> {
+        #[cfg(debug_assertions)]
+        {
+            self.pump_calls += 1;
+        }
+        if let Some(terminal) = &self.terminal {
+            return Err(terminal.error());
+        }
+
+        self.write_side(cx, flush)?;
+        let _ = self.read_once(cx)?;
+        if self.produce_pending {
+            self.write_side(cx, flush)?;
+        }
         Ok(())
     }
 
@@ -1718,54 +1841,63 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     /// unread byte stream is backpressure the peer can feel, and it costs this side nothing to
     /// hold.
     fn read_side(&mut self, cx: &mut Context<'_>) -> Result<()> {
-        loop {
-            if self.read_ahead.is_exhausted() {
-                // No read is issued, so the byte stream registers nothing -- which is why the
-                // waker goes here instead, to be fired by the credit that makes room. A read
-                // issued anyway would deliver bytes the caller has no room for and defeat the
-                // bound; parking without registering anything would strand the connection.
-                self.signals.park_read_ahead(cx);
-                return Ok(());
-            }
+        while self.read_once(cx)? {
+            // The unbounded legacy path intentionally keeps draining an immediately ready
+            // source. The bounded adapter path calls `read_once` exactly once instead.
+        }
+        Ok(())
+    }
 
-            let filled = match self.stream.poll_read(cx, &mut self.inbound) {
-                Poll::Pending => return Ok(()),
-                Poll::Ready(Err(error)) => {
-                    return Err(self.fail_stream(error, "the byte stream failed while reading"));
-                }
-                Poll::Ready(Ok(0)) => return Err(self.ended()),
-                Poll::Ready(Ok(filled)) => filled.min(self.inbound.len()),
-            };
+    /// Attempts one lower read batch.
+    ///
+    /// `true` means a batch was processed and the legacy drain loop may ask for another.
+    /// `false` means reading is parked or the lower source is pending.
+    fn read_once(&mut self, cx: &mut Context<'_>) -> Result<bool> {
+        if self.read_ahead.is_exhausted() {
+            // No read is issued, so the byte stream registers nothing -- which is why the
+            // waker goes here instead, to be fired by the credit that makes room. A read
+            // issued anyway would deliver bytes the caller has no room for and defeat the
+            // bound; parking without registering anything would strand the connection.
+            self.signals.park_read_ahead(cx);
+            return Ok(false);
+        }
 
-            // The framer first. It is what latches the peer's close record, and the state
-            // machine may report that close before this chunk is exhausted -- so the record
-            // has to be in hand before the outcome below is acted on.
-            if let Err(error) = self.framer.consume(&self.inbound[..filled]) {
-                return Err(self.fail(error));
+        let filled = match self.stream.poll_read(cx, &mut self.inbound) {
+            Poll::Pending => return Ok(false),
+            Poll::Ready(Err(error)) => {
+                return Err(self.fail_stream(error, "the byte stream failed while reading"));
             }
+            Poll::Ready(Ok(0)) => return Err(self.ended()),
+            Poll::Ready(Ok(filled)) => filled.min(self.inbound.len()),
+        };
 
-            let now = self.clock.now();
-            // Sampled across the read because a MAX_DATA frame raises this and raises nothing
-            // else: dwnx applies it to the connection's send window and invokes no callback
-            // (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conn.c:1045-1056`), so a write
-            // parked on an exhausted
-            // connection window has no event to wait for and this comparison is its wakeup.
-            // Waking on any inbound bytes would have done as well, and would have spun a
-            // blocked writer once per record for as long as the peer kept sending.
-            let credit_before = self.conn.max_data_left();
-            let outcome = self.conn.read(&self.inbound[..filled], now);
-            if self.conn.max_data_left() > credit_before {
-                self.signals.wake_credit();
-            }
-            // Whatever arrived may have queued a response -- a window extension, a ping
-            // answer -- and the pump's trailing write pass is what sends it.
-            self.produce_pending = true;
+        // The framer first. It is what latches the peer's close record, and the state machine
+        // may report that close before this chunk is exhausted -- so the record has to be in
+        // hand before the outcome below is acted on.
+        if let Err(error) = self.framer.consume(&self.inbound[..filled]) {
+            return Err(self.fail(error));
+        }
 
-            match outcome {
-                Ok(ReadOutcome::Processed) => {}
-                Ok(ReadOutcome::PeerClosed) => return Err(self.peer_closed()),
-                Err(error) => return Err(self.fail(Error::from(error))),
-            }
+        let now = self.clock.now();
+        // Sampled across the read because a MAX_DATA frame raises this and raises nothing
+        // else: dwnx applies it to the connection's send window and invokes no callback
+        // (`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_conn.c:1045-1056`), so a write parked
+        // on an exhausted connection window has no event to wait for and this comparison is
+        // its wakeup. Waking on any inbound bytes would have done as well, and would have
+        // spun a blocked writer once per record for as long as the peer kept sending.
+        let credit_before = self.conn.max_data_left();
+        let outcome = self.conn.read(&self.inbound[..filled], now);
+        if self.conn.max_data_left() > credit_before {
+            self.signals.wake_credit();
+        }
+        // Whatever arrived may have queued a response -- a window extension, a ping answer
+        // -- and the pump's trailing write pass is what sends it.
+        self.produce_pending = true;
+
+        match outcome {
+            Ok(ReadOutcome::Processed) => Ok(true),
+            Ok(ReadOutcome::PeerClosed) => Err(self.peer_closed()),
+            Err(error) => Err(self.fail(Error::from(error))),
         }
     }
 
