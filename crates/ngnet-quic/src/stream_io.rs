@@ -95,6 +95,15 @@ impl StagedVec {
     }
 }
 
+/// Maps caller finality onto the prefix actually staged for this native call.
+fn stream_flags(fin: bool, staged_complete: bool) -> u32 {
+    if fin && staged_complete {
+        sys::NGTCP2_WRITE_STREAM_FLAG_FIN
+    } else {
+        sys::NGTCP2_WRITE_STREAM_FLAG_NONE
+    }
+}
+
 impl<S: Session> Conn<'_, S> {
     /// Opens a bidirectional stream.
     ///
@@ -146,8 +155,12 @@ impl<S: Session> Conn<'_, S> {
     /// retransmit, and requires the bytes stay intact "until
     /// `acked_stream_data_offset` indicates that they are acknowledged by a remote endpoint
     /// or the stream is closed" (`ngtcp2.h:5244-5248`). Since `data` is an ordinary borrow
-    /// the caller may reuse immediately, this crate copies the accepted portion and holds
-    /// it until then. [`Conn::retained_bytes`] reports how much is currently held.
+    /// the caller may reuse immediately, this crate first copies a prefix into stable
+    /// storage and gives ngtcp2 that storage. The staged prefix is bounded by the connection's
+    /// current maximum transmit UDP payload. ngtcp2 may accept less than was staged, so the
+    /// complete packet-bounded backing allocation remains live until the accepted prefix is
+    /// acknowledged or the stream closes. [`Conn::retained_bytes`] reports accepted logical
+    /// bytes, not the complete backing capacity.
     ///
     /// # Errors
     ///
@@ -181,6 +194,11 @@ impl<S: Session> Conn<'_, S> {
     /// obviously the HTTP/3 layer, whose body writes are already `IoSlice`s — can pass them
     /// through without first collecting them into a temporary vector.
     ///
+    /// At most the current maximum transmit UDP payload is joined for one native call.
+    /// When that bound omits any caller suffix, FIN is withheld even if `fin` is true; the
+    /// caller re-offers the suffix and FIN accompanies only the true final prefix. Empty
+    /// final writes remain valid.
+    ///
     /// # Errors
     ///
     /// Returns an error if ngtcp2 refuses; the connection is then unusable.
@@ -198,18 +216,78 @@ impl<S: Session> Conn<'_, S> {
             ));
         }
 
-        let flags = if fin {
-            sys::NGTCP2_WRITE_STREAM_FLAG_FIN
-        } else {
-            sys::NGTCP2_WRITE_STREAM_FLAG_NONE
-        };
-
         // The bytes handed to ngtcp2 must outlive this call -- see the note above -- so a
         // copy is staged first and *that* is what ngtcp2 is given a pointer to. Several
         // ranges become one staged chunk, which is why a single vector suffices below.
-        let staged = self.retained_mut().stage_many(stream, ranges);
+        let sampled_payload_limit = self.max_tx_udp_payload_size();
+        #[cfg(feature = "diagnostics")]
+        let diagnostic_context = crate::diagnostics::is_armed().then(|| {
+            (
+                self.role(),
+                ranges
+                    .iter()
+                    .fold(0usize, |total, range| total.saturating_add(range.len())),
+                self.retained_next_offset(stream),
+            )
+        });
 
-        self.submit_one_vec(dest, stream, StagedVec::new(staged), flags, now)
+        let production_staging_limit = sampled_payload_limit;
+        #[cfg(feature = "diagnostics")]
+        let staging_limit = if diagnostic_context.is_some() {
+            crate::diagnostics::test_staging_limit()
+                .map_or(production_staging_limit, |test_limit| {
+                    production_staging_limit.min(test_limit)
+                })
+        } else {
+            production_staging_limit
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let staging_limit = production_staging_limit;
+        let (staged, staged_complete) =
+            self.retained_mut()
+                .stage_many_bounded(stream, ranges, staging_limit);
+        let flags = stream_flags(fin, staged_complete);
+        #[cfg(feature = "diagnostics")]
+        let prepared_backing_capacity =
+            diagnostic_context.map(|_| staged.map_or(0, |(_, len)| len));
+
+        let outcome = self.submit_one_vec(dest, stream, StagedVec::new(staged), flags, now);
+        #[cfg(feature = "diagnostics")]
+        if let (Some((role, offered, stream_offset)), Some(outcome)) =
+            (diagnostic_context, outcome.as_ref().ok().copied())
+        {
+            let accepted = match outcome {
+                StreamWrite::Datagram { accepted, .. } => accepted,
+                _ => 0,
+            };
+            let category = match outcome {
+                StreamWrite::Datagram { .. } => crate::diagnostics::AttemptOutcome::Datagram,
+                StreamWrite::StreamBlocked => crate::diagnostics::AttemptOutcome::StreamBlocked,
+                StreamWrite::ConnectionBlocked => {
+                    crate::diagnostics::AttemptOutcome::ConnectionBlocked
+                }
+                StreamWrite::Blocked => crate::diagnostics::AttemptOutcome::Blocked,
+                StreamWrite::Idle => crate::diagnostics::AttemptOutcome::Idle,
+            };
+            crate::diagnostics::record_attempt(crate::diagnostics::Attempt {
+                sequence: 0,
+                connection_id: self.diagnostic_id(),
+                role,
+                direction: "outbound",
+                stream_id: stream.get(),
+                stream_offset,
+                offered_bytes: offered as u64,
+                sampled_payload_limit: sampled_payload_limit as u64,
+                prepared_backing_capacity: prepared_backing_capacity.unwrap_or(0) as u64,
+                accepted_prefix: accepted as u64,
+                fin_offered: fin && staged_complete,
+                zero_acceptance: offered > 0 && accepted == 0,
+                logical_retained_bytes: self.retained_bytes() as u64,
+                retained_backing_capacity: self.retained_backing_capacity() as u64,
+                outcome: category,
+            });
+        }
+        outcome
     }
 
     /// Writes a buffer whose ownership the caller hands over, retaining it without a copy.
@@ -255,6 +333,16 @@ impl<S: Session> Conn<'_, S> {
         // The handle is cloned into retention -- an `Arc` bump, not a copy of the bytes --
         // and *that* is what ngtcp2 is given a pointer into, so the address survives the call
         // even if the caller drops the original the instant it returns.
+        #[cfg(feature = "diagnostics")]
+        let diagnostic_context = crate::diagnostics::is_armed().then(|| {
+            (
+                self.role(),
+                self.max_tx_udp_payload_size(),
+                data.len(),
+                self.retained_next_offset(stream),
+            )
+        });
+
         let staged = self.retained_mut().stage_owned(stream, data.clone());
 
         let outcome = self.submit_one_vec(dest, stream, StagedVec::new(staged), flags, now)?;
@@ -266,6 +354,35 @@ impl<S: Session> Conn<'_, S> {
             StreamWrite::Datagram { accepted, .. } => accepted,
             _ => 0,
         };
+        #[cfg(feature = "diagnostics")]
+        if let Some((role, sampled_payload_limit, offered, stream_offset)) = diagnostic_context {
+            let category = match outcome {
+                StreamWrite::Datagram { .. } => crate::diagnostics::AttemptOutcome::Datagram,
+                StreamWrite::StreamBlocked => crate::diagnostics::AttemptOutcome::StreamBlocked,
+                StreamWrite::ConnectionBlocked => {
+                    crate::diagnostics::AttemptOutcome::ConnectionBlocked
+                }
+                StreamWrite::Blocked => crate::diagnostics::AttemptOutcome::Blocked,
+                StreamWrite::Idle => crate::diagnostics::AttemptOutcome::Idle,
+            };
+            crate::diagnostics::record_attempt(crate::diagnostics::Attempt {
+                sequence: 0,
+                connection_id: self.diagnostic_id(),
+                role,
+                direction: "outbound",
+                stream_id: stream.get(),
+                stream_offset,
+                offered_bytes: offered as u64,
+                sampled_payload_limit: sampled_payload_limit as u64,
+                prepared_backing_capacity: offered as u64,
+                accepted_prefix: taken as u64,
+                fin_offered: fin,
+                zero_acceptance: offered > 0 && taken == 0,
+                logical_retained_bytes: self.retained_bytes() as u64,
+                retained_backing_capacity: self.retained_backing_capacity() as u64,
+                outcome: category,
+            });
+        }
         let _accepted_prefix = data.split_to(taken);
         Ok(OwnedWrite {
             outcome,
@@ -581,6 +698,28 @@ mod tests {
 
     fn ts(nanos: u64) -> Timestamp {
         Timestamp::from_nanos(nanos).unwrap()
+    }
+
+    #[test]
+    fn fin_is_only_attached_to_the_true_final_suffix() {
+        assert_eq!(
+            stream_flags(true, true),
+            sys::NGTCP2_WRITE_STREAM_FLAG_FIN,
+            "an empty FIN and a complete final suffix must carry FIN"
+        );
+        assert_eq!(
+            stream_flags(true, false),
+            sys::NGTCP2_WRITE_STREAM_FLAG_NONE,
+            "a bounded prefix omitting a caller suffix must suppress FIN"
+        );
+        assert_eq!(
+            stream_flags(false, true),
+            sys::NGTCP2_WRITE_STREAM_FLAG_NONE
+        );
+        assert_eq!(
+            stream_flags(false, false),
+            sys::NGTCP2_WRITE_STREAM_FLAG_NONE
+        );
     }
 
     #[test]

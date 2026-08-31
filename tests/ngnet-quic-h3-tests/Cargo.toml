@@ -7,6 +7,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+diagnostics = ["ngnet-quic/diagnostics", "ngnet-quic-h3/diagnostics"]
+
 # This crate exists so `ngnet-quic-h3` can be exercised end to end -- over real loopback UDP,
 # and against quinn -- without the crate itself acquiring a test certificate generator, a
 # runtime, or a second QUIC implementation. A workspace test asserts what `ngnet-quic-h3`

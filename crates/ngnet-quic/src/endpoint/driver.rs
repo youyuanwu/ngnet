@@ -56,8 +56,7 @@ use super::socket::{AsyncUdpSocket, Sent};
 /// not would have to capture thread-bound state in order to produce values that are not,
 /// which is a shape nothing wants. Requiring it here is what lets the driver's own `Send`
 /// follow from its socket and clock rather than being blocked by this.
-pub(crate) type EntropyFactory =
-    Box<dyn Fn() -> Box<dyn crate::rand::EntropySource + Send> + Send>;
+pub(crate) type EntropyFactory = Box<dyn Fn() -> Box<dyn crate::rand::EntropySource + Send> + Send>;
 
 /// The largest datagram this endpoint will read or write.
 ///
@@ -233,11 +232,8 @@ where
         let Some(conn) = tracked.conn.as_ref() else {
             return;
         };
-        let mut identifiers: Vec<Vec<u8>> = conn
-            .scids()
-            .iter()
-            .map(|c| c.as_bytes().to_vec())
-            .collect();
+        let mut identifiers: Vec<Vec<u8>> =
+            conn.scids().iter().map(|c| c.as_bytes().to_vec()).collect();
         identifiers.push(conn.scid().as_bytes().to_vec());
         for id in identifiers {
             self.routes.insert(id, index);
@@ -587,10 +583,12 @@ where
                     }
                 }
             }
-            Ok(StreamWrite::StreamBlocked
-            | StreamWrite::ConnectionBlocked
-            | StreamWrite::Blocked
-            | StreamWrite::Idle) => {
+            Ok(
+                StreamWrite::StreamBlocked
+                | StreamWrite::ConnectionBlocked
+                | StreamWrite::Blocked
+                | StreamWrite::Idle,
+            ) => {
                 // Not an error and not the end. Requeue and try again once credit or the
                 // congestion window allows; treating any of these as "finished" is the
                 // classic QUIC stall.
@@ -641,9 +639,10 @@ where
         // Closing locally ends the connection, and nothing more will be read from it -- so
         // it becomes evictable once its close datagram has gone.
         tracked.finished = true;
-        tracked
-            .shared
-            .fail(Error::new(ErrorKind::LocallyClosed, "closed by this endpoint"));
+        tracked.shared.fail(Error::new(
+            ErrorKind::LocallyClosed,
+            "closed by this endpoint",
+        ));
     }
 
     /// Produces the next datagram a connection wants to send, if any.
@@ -788,10 +787,10 @@ where
         server_name: Option<&str>,
         shared: Arc<ConnectionShared>,
     ) -> Result<u64, Error> {
-        let local = self
-            .socket
-            .local_addr()
-            .map_err(|err| Error::new(ErrorKind::Socket, "the socket has no address").with_source(SocketError(err.to_string())))?;
+        let local = self.socket.local_addr().map_err(|err| {
+            Error::new(ErrorKind::Socket, "the socket has no address")
+                .with_source(SocketError(err.to_string()))
+        })?;
 
         let session = self
             .backend
@@ -810,6 +809,8 @@ where
         )
         .build(handlers_for(&shared))
         .map_err(Error::from)?;
+        #[cfg(feature = "diagnostics")]
+        shared.bind_diagnostic_id(conn.diagnostic_id());
 
         let index = self.next_index;
         self.next_index += 1;
@@ -836,10 +837,10 @@ where
         retried: bool,
         shared: Arc<ConnectionShared>,
     ) -> Result<u64, Error> {
-        let local = self
-            .socket
-            .local_addr()
-            .map_err(|err| Error::new(ErrorKind::Socket, "the socket has no address").with_source(SocketError(err.to_string())))?;
+        let local = self.socket.local_addr().map_err(|err| {
+            Error::new(ErrorKind::Socket, "the socket has no address")
+                .with_source(SocketError(err.to_string()))
+        })?;
 
         let session = self
             .backend
@@ -873,6 +874,8 @@ where
         .dcid(packet.scid)
         .build(handlers_for(&shared))
         .map_err(Error::from)?;
+        #[cfg(feature = "diagnostics")]
+        shared.bind_diagnostic_id(conn.diagnostic_id());
 
         let index = self.next_index;
         self.next_index += 1;
@@ -1026,8 +1029,6 @@ where
     pub(crate) fn has_pending(&self) -> bool {
         !self.outbox.is_empty() || self.connections.values().any(|t| t.pending.is_some())
     }
-
-
 }
 
 /// A socket failure, rendered as text so it can cross the error boundary.

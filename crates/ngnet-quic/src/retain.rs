@@ -293,15 +293,7 @@ pub(crate) struct Retained {
 }
 
 impl Retained {
-    /// Copies `data` and returns a pointer and length to hand to ngtcp2.
-    ///
-    /// The returned pointer stays valid until [`Retained::acknowledge`] covers it or
-    /// [`Retained::forget`] is called for the stream, which is exactly the contract ngtcp2
-    /// states.
-    ///
-    /// Returns `None` for empty input; ngtcp2 treats a zero-length write specially and
-    /// there is nothing to retain.
-    /// Copies one or more ranges as a single contiguous chunk, and returns a pointer to it.
+    /// Copies a bounded prefix of one or more ranges into one stable contiguous chunk.
     ///
     /// The ranges are concatenated rather than handed to ngtcp2 as a vector array. That
     /// sounds like it gives up something, and it does not: the copy has to happen regardless,
@@ -309,18 +301,32 @@ impl Retained {
     /// call. Copying into one chunk costs exactly what copying into several would, and
     /// leaves a single address and length to account for on acknowledgement instead of a set
     /// that ngtcp2 may accept a prefix of.
-    pub(crate) fn stage_many(
+    /// Stages at most `limit` bytes and reports whether the complete offer was staged.
+    ///
+    /// The borrowing write path samples the connection's maximum transmit UDP payload
+    /// immediately before calling this. Bounding the copy to one packet means an arbitrarily
+    /// large caller offer cannot create an arbitrarily large retained allocation when ngtcp2
+    /// can consume only a packet prefix.
+    pub(crate) fn stage_many_bounded(
         &mut self,
         stream: StreamId,
         ranges: &[IoSlice<'_>],
-    ) -> Option<(*const u8, usize)> {
-        let total: usize = ranges.iter().map(|r| r.len()).sum();
+        limit: usize,
+    ) -> (Option<(*const u8, usize)>, bool) {
+        let offered = ranges
+            .iter()
+            .fold(0usize, |total, range| total.saturating_add(range.len()));
+        let total = offered.min(limit);
         if total == 0 {
-            return None;
+            return (None, offered == 0);
         }
         let mut buffer = Vec::with_capacity(total);
         for range in ranges {
-            buffer.extend_from_slice(range);
+            let remaining = total - buffer.len();
+            if remaining == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&range[..range.len().min(remaining)]);
         }
         let entry = self.streams.entry(stream.get()).or_default();
         let chunk = Chunk {
@@ -332,14 +338,25 @@ impl Retained {
         };
         let (ptr, len) = chunk.data.ptr_and_len();
         entry.chunks.push_back(chunk);
-        Some((ptr, len))
+        (Some((ptr, len)), total == offered)
+    }
+
+    /// Unbounded convenience used only by retention unit tests whose subject is not packet
+    /// staging. Production borrowing writes always call [`Self::stage_many_bounded`].
+    #[cfg(test)]
+    fn stage_many(
+        &mut self,
+        stream: StreamId,
+        ranges: &[IoSlice<'_>],
+    ) -> Option<(*const u8, usize)> {
+        self.stage_many_bounded(stream, ranges, usize::MAX).0
     }
 
     /// Retains an owned buffer without copying it, and returns a pointer to hand to ngtcp2.
     ///
-    /// Unlike [`stage_many`](Self::stage_many), nothing is copied: the caller gave up
-    /// ownership, so the [`OwnedBytes`] handle is kept alive here and ngtcp2 is handed a
-    /// pointer straight into it. The returned pointer stays valid until
+    /// Unlike [`stage_many_bounded`](Self::stage_many_bounded), nothing is copied: the caller
+    /// gave up ownership, so the [`OwnedBytes`] handle is kept alive here and ngtcp2 is handed
+    /// a pointer straight into it. The returned pointer stays valid until
     /// [`acknowledge`](Self::acknowledge) covers it or [`forget`](Self::forget) is called,
     /// which is exactly ngtcp2's contract.
     ///
@@ -423,9 +440,11 @@ impl Retained {
                 break;
             }
         }
-        if entry.chunks.is_empty() && entry.next_offset <= acked_to {
-            self.streams.remove(&stream.get());
-        }
+        // Keep the stream entry even when every currently outstanding chunk was released.
+        // Acknowledgement does not mean the application has finished writing the stream.
+        // Removing the entry here would reset `next_offset` to zero if more data were staged
+        // later; the next acknowledgement (whose offset is still cumulative) would then
+        // appear to cover the new chunk and free a pointer ngtcp2 still retains.
     }
 
     /// Releases everything held for a stream, which a closed stream no longer needs.
@@ -443,6 +462,28 @@ impl Retained {
             .flat_map(|s| s.chunks.iter())
             .map(|c| c.len)
             .sum()
+    }
+
+    /// Complete backing capacity still kept alive, across every stream.
+    ///
+    /// Unlike [`bytes_held`](Self::bytes_held), this does not shorten a partially accepted
+    /// chunk to its logical prefix. ngtcp2 still points into the original allocation, so
+    /// this is the resident staging quantity diagnostics must report.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn backing_bytes_held(&self) -> usize {
+        self.streams
+            .values()
+            .flat_map(|stream| stream.chunks.iter())
+            .map(|chunk| chunk.data.len())
+            .sum()
+    }
+
+    /// Offset at which another accepted write for `stream` would begin.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn next_offset(&self, stream: StreamId) -> u64 {
+        self.streams
+            .get(&stream.get())
+            .map_or(0, |entry| entry.next_offset)
     }
 }
 
@@ -476,9 +517,11 @@ mod tests {
     #[test]
     fn an_empty_owned_write_stages_nothing() {
         let mut retained = Retained::default();
-        assert!(retained
-            .stage_owned(sid(0), OwnedBytes::new(Vec::new()))
-            .is_none());
+        assert!(
+            retained
+                .stage_owned(sid(0), OwnedBytes::new(Vec::new()))
+                .is_none()
+        );
         assert_eq!(retained.bytes_held(), 0);
     }
 
@@ -603,11 +646,141 @@ mod tests {
         retained.stage_many(sid(0), &[IoSlice::new(&[1, 2, 3, 4, 5, 6, 7, 8])]);
         retained.commit(sid(0), 3);
         assert_eq!(retained.bytes_held(), 3);
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(
+            retained.backing_bytes_held(),
+            8,
+            "the complete prepared allocation remains resident"
+        );
 
         let (ptr, len) = retained.last_pointer(sid(0)).unwrap();
         // SAFETY: the chunk is alive.
         let held = unsafe { core::slice::from_raw_parts(ptr, len) };
         assert_eq!(held, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn bounded_staging_covers_zero_prefix_boundary_and_complete_offers() {
+        let stream = sid(0);
+        let ranges = [
+            IoSlice::new(&[1, 2, 3]),
+            IoSlice::new(&[4, 5]),
+            IoSlice::new(&[6, 7, 8]),
+        ];
+
+        let mut zero = Retained::default();
+        let (staged, complete) = zero.stage_many_bounded(stream, &ranges, 0);
+        assert!(staged.is_none());
+        assert!(!complete);
+
+        let mut prefix = Retained::default();
+        let (staged, complete) = prefix.stage_many_bounded(stream, &ranges, 2);
+        let (pointer, len) = staged.expect("two-byte prefix");
+        assert_eq!(len, 2);
+        // SAFETY: the retained chunk remains alive in `prefix`.
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(pointer, len) },
+            &[1, 2]
+        );
+        assert!(!complete);
+
+        let mut boundary = Retained::default();
+        let (staged, complete) = boundary.stage_many_bounded(stream, &ranges, 5);
+        let (pointer, len) = staged.expect("slice-boundary prefix");
+        assert_eq!(len, 5);
+        // SAFETY: the retained chunk remains alive in `boundary`.
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(pointer, len) },
+            &[1, 2, 3, 4, 5]
+        );
+        assert!(!complete);
+
+        let mut complete_stage = Retained::default();
+        let (staged, complete) = complete_stage.stage_many_bounded(stream, &ranges, 8);
+        let (pointer, len) = staged.expect("complete offer");
+        assert_eq!(len, 8);
+        // SAFETY: the retained chunk remains alive in `complete_stage`.
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(pointer, len) },
+            &[1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert!(complete);
+    }
+
+    #[test]
+    fn bounded_staging_preserves_multi_slice_order_and_exact_reoffer() {
+        let stream = sid(0);
+        let bytes = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let first_offer = [
+            IoSlice::new(&bytes[..3]),
+            IoSlice::new(&bytes[3..5]),
+            IoSlice::new(&bytes[5..]),
+        ];
+        let mut retained = Retained::default();
+
+        let (first, complete) = retained.stage_many_bounded(stream, &first_offer, 5);
+        let (first_ptr, first_len) = first.expect("five-byte bounded prefix");
+        assert_eq!(first_len, 5);
+        // SAFETY: the retained chunk owns this allocation.
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(first_ptr, first_len) },
+            &bytes[..5]
+        );
+        assert!(!complete);
+        retained.commit(stream, first_len);
+
+        let second_offer = [IoSlice::new(&bytes[5..7]), IoSlice::new(&bytes[7..])];
+        let (second, complete) = retained.stage_many_bounded(stream, &second_offer, 5);
+        let (second_ptr, second_len) = second.expect("remaining suffix");
+        assert_eq!(second_len, 3);
+        // SAFETY: the retained chunk owns this allocation.
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(second_ptr, second_len) },
+            &bytes[5..]
+        );
+        assert!(complete);
+        retained.commit(stream, second_len);
+
+        assert_eq!(retained.bytes_held(), bytes.len());
+        let entry = retained.streams.get(&stream.get()).unwrap();
+        assert_eq!(entry.chunks[0].start, 0);
+        assert_eq!(entry.chunks[0].end(), 5);
+        assert_eq!(entry.chunks[1].start, 5);
+        assert_eq!(entry.chunks[1].end(), 8);
+    }
+
+    #[test]
+    fn fixed_limit_staging_scales_exactly_with_controlled_input() {
+        fn staged_total(size: usize, limit: usize) -> usize {
+            let stream = sid(0);
+            let body = vec![0x5a; size];
+            let mut retained = Retained::default();
+            let mut offset = 0;
+            let mut staged_total = 0;
+
+            while offset < body.len() {
+                let offer = [IoSlice::new(&body[offset..])];
+                let (staged, complete) = retained.stage_many_bounded(stream, &offer, limit);
+                let (_, staged) = staged.expect("a non-empty controlled prefix");
+                assert_eq!(complete, offset + staged == body.len());
+                retained.commit(stream, staged);
+                offset += staged;
+                staged_total += staged;
+            }
+
+            assert_eq!(retained.bytes_held(), size);
+            staged_total
+        }
+
+        let one = staged_total(64 * 1024, 1024);
+        let two = staged_total(128 * 1024, 1024);
+        assert_eq!(one, 64 * 1024);
+        assert_eq!(two, 128 * 1024);
+        assert_eq!(
+            two,
+            one * 2,
+            "doubling controlled input must exactly double packet-bounded staging"
+        );
     }
 
     #[test]
@@ -692,6 +865,31 @@ mod tests {
         retained.acknowledge(sid(0), 0, 4);
         assert_eq!(retained.bytes_held(), 10);
         retained.acknowledge(sid(0), 0, 10);
+        assert_eq!(retained.bytes_held(), 0);
+    }
+
+    #[test]
+    fn a_fully_acknowledged_prefix_does_not_reset_the_next_stream_offset() {
+        let stream = sid(0);
+        let mut retained = Retained::default();
+        retained.stage_many(stream, &[IoSlice::new(&[1, 2, 3, 4])]);
+        retained.commit(stream, 4);
+        retained.acknowledge(stream, 0, 4);
+        assert_eq!(retained.bytes_held(), 0);
+
+        retained.stage_many(stream, &[IoSlice::new(&[5, 6, 7])]);
+        retained.commit(stream, 3);
+        let entry = retained.streams.get(&stream.get()).unwrap();
+        assert_eq!(
+            entry.chunks.front().unwrap().start,
+            4,
+            "later data on an open stream must retain the cumulative stream offset"
+        );
+
+        // Replaying the earlier cumulative acknowledgement must not free this new chunk.
+        retained.acknowledge(stream, 0, 4);
+        assert_eq!(retained.bytes_held(), 3);
+        retained.acknowledge(stream, 4, 3);
         assert_eq!(retained.bytes_held(), 0);
     }
 

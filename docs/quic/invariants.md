@@ -94,6 +94,10 @@ functional test. So each is pinned:
 - `sending_owned_data_allocates_nothing_where_a_borrowed_send_allocates` — the owned write
   (`write_stream_owned`) against the borrowing one, where the difference in count is the proof;
   both retain until acknowledged.
+- `bounded_staging_covers_zero_prefix_boundary_and_complete_offers`,
+  `bounded_staging_preserves_multi_slice_order_and_exact_reoffer`, and
+  `a_fully_acknowledged_prefix_does_not_reset_the_next_stream_offset` — packet-bounded copying,
+  slice order, stable cumulative stream offsets, and acknowledgement safety.
 
 `the_initialisation_vector_is_stored_inline` and `the_owned_send_handle_still_has_the_shape_it_promised`
 live in `compat_surface.rs`: the first asserts `Iv` is at least as wide as the bytes it holds,
@@ -103,7 +107,21 @@ structural `the_decrypt_bridge_copies_nothing` above is for.
 
 An equivalent suite pins the HTTP/3 layer: `tests/ngnet-quic-h3-tests/tests/zero_alloc.rs`
 asserts a produce pass allocates one owned buffer per datagram and nothing besides, the one
-allocation forced by the endpoint's queue taking ownership.
+allocation forced by the endpoint's queue taking ownership. Its drain-scoped proof also
+offers 1 MiB and rejects any allocation larger than 64 KiB, while requiring actual accepted
+progress; the borrowing path may allocate packet-sized retained chunks but never the complete
+body offer.
+
+The `tests/ngnet-bench/tests/ngtcp2_fixture.rs` live repetition tests run 125 sequential exact
+echoes at both 16 KiB and 1 MiB under the documented supervisor. They are ignored in ordinary
+workspace runs while run 30's intermittent outer-driver liveness failure remains unresolved.
+With the additive `diagnostics` feature, the active fixture coverage checks every attempt's
+`accepted <= staged <= min(offered, sampled payload)`, FIN suppression on a truncated prefix,
+accepted/release and packet-category reconciliation, and real zero-progress retry/enabling
+event accounting. Fixed-limit scaling is deterministic retention coverage rather than a flaky
+live-loopback ratio gate. The feature-enabled but unarmed allocation test additionally pins
+that diagnostic hooks allocate nothing and return the default snapshot, and the representative
+drain test proves diagnostic-only staging work is not evaluated while unarmed.
 
 ## FFI — `crates/ngnet-quic/tests/versioned_ffi.rs`
 

@@ -7,6 +7,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+diagnostics = [
+    "ngnet-quic/diagnostics",
+    "ngnet-quic-h3/diagnostics",
+    "ngnet-quic-h3-tests/diagnostics",
+]
+
 # This crate exists so the comparison against a third-party HTTP/2 stack lives outside
 # `ngnet-h2`, which takes exactly one dependency and no dev-dependencies. Everything the
 # benches need is declared in the workspace and pulled in here, never there. The same

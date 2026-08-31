@@ -322,6 +322,44 @@ where
     total
 }
 
+async fn try_drain_checked<B>(mut body: B, expected: &[u8]) -> Result<(usize, bool), String>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: Debug,
+{
+    let mut total = 0usize;
+    let mut exact = true;
+    while let Some(frame) = poll_fn(|context| Pin::new(&mut body).poll_frame(context)).await {
+        let frame = frame.map_err(|error| format!("response body frame failed: {error:?}"))?;
+        if let Some(data) = frame.data_ref() {
+            let end = total.saturating_add(data.len());
+            let expected_range = expected.get(total..end);
+            if exact && !expected_range.is_some_and(|range| range == data.as_ref()) {
+                let mismatch = expected_range
+                    .and_then(|range| {
+                        range
+                            .iter()
+                            .zip(data.iter())
+                            .position(|(expected, actual)| expected != actual)
+                    })
+                    .map_or(total, |offset| total + offset);
+                let frame_offset = mismatch.saturating_sub(total);
+                let actual_end = (frame_offset + 16).min(data.len());
+                let expected_end = (mismatch + 16).min(expected.len());
+                eprintln!(
+                    "checked body first differs at byte {mismatch}; frame={total}..{end}; \
+                     expected={:?}; actual={:?}",
+                    &expected[mismatch..expected_end],
+                    &data[frame_offset..actual_end],
+                );
+                exact = false;
+            }
+            total = end;
+        }
+    }
+    Ok((total, exact && total == expected.len()))
+}
+
 /// Reads a whole received body into contiguous bytes, so a server can echo it back. Both
 /// servers do exactly this, so neither is doing less work than the other.
 async fn collect<B>(mut body: B) -> Bytes
@@ -1394,6 +1432,33 @@ impl NgnetNgtcpH3 {
             .expect("an ngtcp2 response head");
         assert!(response.status().is_success());
         drain(response.into_body()).await
+    }
+
+    /// Sends one request and verifies the echoed response byte for byte while draining it.
+    ///
+    /// This is the fixed-count correctness-probe path. It deliberately compares streaming
+    /// chunks in place rather than collecting another body-sized buffer.
+    pub async fn round_trip_checked(&self, body: Bytes) -> (usize, bool) {
+        self.try_round_trip_checked(body)
+            .await
+            .expect("an exact ngtcp2 round trip")
+    }
+
+    /// Sends one request and reports response-head/body failures without panicking.
+    pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
+        let expected = body.clone();
+        let response = self
+            .handle
+            .send_request(quic_request_for(body))
+            .await
+            .map_err(|error| format!("ngtcp2 response head failed: {error:?}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "ngtcp2 response status was not successful: {}",
+                response.status()
+            ));
+        }
+        try_drain_checked(response.into_body(), &expected).await
     }
 }
 

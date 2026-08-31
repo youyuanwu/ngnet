@@ -2,7 +2,7 @@
 
 use ngnet_h3::http::{StreamSource, WriteOutcome as H3WriteOutcome};
 use ngnet_quic::endpoint::DetachedConnection;
-use ngnet_quic::{ErrorKind as QuicErrorKind, StreamId, StreamWrite, Session};
+use ngnet_quic::{ErrorKind as QuicErrorKind, Session, StreamId, StreamWrite};
 
 use crate::connection::{Shared, State};
 use crate::error::{Error, Result};
@@ -18,8 +18,20 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
     shared: &Shared,
     state: &mut State,
     source: &mut Src,
+    cx: &core::task::Context<'_>,
 ) -> Result<()> {
     let mut failure: Option<Error> = None;
+    let mut blocked = false;
+    #[cfg(feature = "diagnostics")]
+    let role = detached.conn.role();
+    #[cfg(feature = "diagnostics")]
+    let connection_id = detached.conn.diagnostic_id();
+
+    #[cfg(feature = "diagnostics")]
+    if state.capacity_parked && detached.poll_outbound_capacity(cx.waker()) {
+        ngnet_quic::diagnostics::record_retry(connection_id, role);
+        state.capacity_parked = false;
+    }
 
     // Bounded so a layer with an endless supply cannot keep this pass from returning.
     for _ in 0..64 {
@@ -27,7 +39,11 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
         // that has been produced cannot be withdrawn: the connection has already accounted
         // for the stream bytes in it, so re-offering them would send them twice and
         // discarding it would lose them until a retransmission timer noticed.
-        if !detached.outbound_has_room() {
+        if !detached.poll_outbound_capacity(cx.waker()) {
+            #[cfg(feature = "diagnostics")]
+            {
+                state.capacity_parked = true;
+            }
             break;
         }
 
@@ -55,6 +71,11 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
                     produced_len = Some(len);
                     if accepted > 0 {
                         released = Some((id, accepted));
+                    } else {
+                        // The packet carried only transport work. Let it reach the peer and
+                        // wait for an enabling event before offering the same stream prefix
+                        // again; retrying inside this pass cannot create stream capacity.
+                        blocked = true;
                     }
                     H3WriteOutcome::Accepted(accepted)
                 }
@@ -65,7 +86,10 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
                     | StreamWrite::StreamBlocked
                     | StreamWrite::ConnectionBlocked
                     | StreamWrite::Idle,
-                ) => H3WriteOutcome::Blocked,
+                ) => {
+                    blocked = true;
+                    H3WriteOutcome::Blocked
+                }
                 // A stream whose write side is finished will never take more. Saying so lets
                 // the layer stop offering rather than retrying forever.
                 Err(err) if err.kind() == QuicErrorKind::StreamClosed => H3WriteOutcome::Gone,
@@ -78,6 +102,8 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
 
         if let Some(len) = produced_len {
             datagram.truncate(len);
+            #[cfg(feature = "diagnostics")]
+            ngnet_quic::diagnostics::record_packet(connection_id, role, released.is_some());
             detached.send(datagram);
         } else {
             // No datagram was produced, so this is untouched storage: keep it for reuse
@@ -89,11 +115,16 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
         // again. Reporting it here rather than on acknowledgement is what keeps a body in
         // flight from being held twice -- see `RETAINS_BUFFERS`.
         if let Some((stream, bytes)) = released.take() {
+            #[cfg(feature = "diagnostics")]
+            ngnet_quic::diagnostics::record_release(connection_id, role, bytes);
             shared.record_released(stream, bytes as u64);
         }
         if let Some(err) = failure.take() {
             state.closed = true;
             return Err(err);
+        }
+        if blocked {
+            break;
         }
         if !offered {
             break;

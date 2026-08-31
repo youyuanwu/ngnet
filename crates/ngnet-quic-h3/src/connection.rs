@@ -108,6 +108,12 @@ pub(crate) struct State {
     pub(crate) sleeping: Option<Sleep>,
     /// The deadline that sleep is for.
     pub(crate) sleeping_until: Option<Timestamp>,
+    /// Whether the previous pass parked on a full outbound queue.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) capacity_parked: bool,
+    /// Whether the connection future most recently returned `Pending`.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) idle_parked: bool,
     /// Wakers waiting for a stream limit to rise.
     pub(crate) limit_wakers: Vec<Waker>,
     /// Streams this end opened, in the order they were opened, awaiting collection.
@@ -150,6 +156,10 @@ impl<S: Session> NgtcpConnection<S> {
                 emitted_since_pending: false,
                 sleeping: None,
                 sleeping_until: None,
+                #[cfg(feature = "diagnostics")]
+                capacity_parked: false,
+                #[cfg(feature = "diagnostics")]
+                idle_parked: false,
                 limit_wakers: Vec::new(),
                 opened_bidi: std::collections::VecDeque::new(),
                 opened_uni: std::collections::VecDeque::new(),
@@ -206,7 +216,7 @@ impl<S: Session> NgtcpConnection<S> {
     #[doc(hidden)]
     pub fn produce_pass_for_test(&mut self) -> Result<usize> {
         let before = self.detached.outbound_len_for_test();
-        pump::produce(&mut self.detached, &mut self.state)?;
+        pump::produce(&mut self.detached, &mut self.state, None)?;
         Ok(self.detached.outbound_len_for_test() - before)
     }
 
@@ -282,7 +292,9 @@ impl<S: Session> NgtcpConnection<S> {
         match opened {
             Ok(id) => {
                 // Whatever the open produced still has to reach the peer.
-                if let Err(err) = pump::produce(&mut self.detached, &mut self.state) {
+                if let Err(err) =
+                    pump::produce(&mut self.detached, &mut self.state, Some(cx.waker()))
+                {
                     return Poll::Ready(Err(err));
                 }
                 Poll::Ready(Ok(stream_id(id)))
@@ -320,6 +332,13 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
     const RETAINS_BUFFERS: bool = false;
 
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Result<QuicEvent>> {
+        #[cfg(feature = "diagnostics")]
+        if core::mem::take(&mut self.state.idle_parked) {
+            ngnet_quic::diagnostics::record_driver_wake(
+                self.detached.conn.diagnostic_id(),
+                self.detached.conn.role(),
+            );
+        }
         pump::pump(&mut self.detached, &self.shared, &mut self.state, cx)?;
         self.collect();
 
@@ -354,6 +373,14 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
         if pump::poll_timer(&self.detached, &mut self.state, cx).is_ready() {
             cx.waker().wake_by_ref();
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            self.state.idle_parked = true;
+            ngnet_quic::diagnostics::record_park(
+                self.detached.conn.diagnostic_id(),
+                self.detached.conn.role(),
+            );
+        }
         self.state.emitted_since_pending = false;
         Poll::Pending
     }
@@ -363,12 +390,25 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
         cx: &mut Context<'_>,
         source: &mut Src,
     ) -> Poll<Result<()>> {
+        #[cfg(feature = "diagnostics")]
+        if core::mem::take(&mut self.state.idle_parked) {
+            ngnet_quic::diagnostics::record_driver_wake(
+                self.detached.conn.diagnostic_id(),
+                self.detached.conn.role(),
+            );
+        }
         pump::pump(&mut self.detached, &self.shared, &mut self.state, cx)?;
         self.collect();
         if self.state.closed {
             return Poll::Ready(Err(pump::ended()));
         }
-        transmit::drain(&mut self.detached, &self.shared, &mut self.state, source)?;
+        transmit::drain(
+            &mut self.detached,
+            &self.shared,
+            &mut self.state,
+            source,
+            cx,
+        )?;
         let _ = pump::poll_timer(&self.detached, &mut self.state, cx);
         Poll::Ready(Ok(()))
     }
@@ -394,7 +434,7 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
             .conn
             .reset_stream(id, ApplicationErrorCode::new(code.get()))
             .map_err(Error::transport)?;
-        pump::produce(&mut self.detached, &mut self.state)
+        pump::produce(&mut self.detached, &mut self.state, None)
     }
 
     fn stop_sending(&mut self, stream: H3StreamId, code: ErrorCode) -> Result<()> {
@@ -403,7 +443,7 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
             .conn
             .stop_sending(id, ApplicationErrorCode::new(code.get()))
             .map_err(Error::transport)?;
-        pump::produce(&mut self.detached, &mut self.state)
+        pump::produce(&mut self.detached, &mut self.state, None)
     }
 
     fn extend_credit(&mut self, stream: Option<H3StreamId>, bytes: u64) -> Result<()> {
@@ -424,6 +464,11 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
     }
 
     fn close(&mut self, code: ErrorCode, reason: &[u8]) -> Result<()> {
+        if self.state.closed {
+            self.detached.release();
+            return Ok(());
+        }
+
         // The close datagram is produced and queued here, synchronously. The HTTP/3 driver
         // calls this last and then returns, so a close that only recorded an intention would
         // never reach the peer, which would wait out its idle timeout instead.
@@ -442,10 +487,17 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
         ) {
             Ok(len) if len > 0 => {
                 datagram.truncate(len);
-                self.detached.send(datagram);
+                self.detached.send_close(datagram);
             }
-            Ok(_) => {}
-            Err(err) => return Err(Error::transport(err)),
+            Ok(_) => {
+                datagram.clear();
+                self.state.scratch = datagram;
+            }
+            Err(err) => {
+                datagram.clear();
+                self.state.scratch = datagram;
+                return Err(Error::transport(err));
+            }
         }
         self.state.closed = true;
         self.detached.release();

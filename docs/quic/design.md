@@ -226,13 +226,15 @@ releasing it when the acknowledgement arrives or the stream closes. Each accepte
 retained at a fixed address — a borrowed write in its own `Box<[u8]>`, an owned one behind an
 `Arc` — because a growing `Vec` would reallocate and move bytes ngtcp2 still points at.
 
-The cost of the borrowing write is one copy of everything sent, held until acknowledged. That
+The cost of the borrowing write is one stable copy of each offered packet-sized prefix. That
 copy is the price of an ordinary `&[u8]` parameter whose safety does not depend on the caller
 having read a paragraph of documentation, and `Conn::write_stream` and `write_stream_vectored`
-keep it. `write_stream_vectored` now takes its ranges as `&[IoSlice]` rather than `&[&[u8]]`, so
-a vectored source — the HTTP/3 layer, whose body writes are already `IoSlice`s — passes them
-through without first collecting them into a temporary vector; the bytes still join *into* the
-single retained copy, so the byte count is unchanged.
+keep it. The staged prefix is bounded by the current maximum transmit UDP payload. ngtcp2 may
+accept less than was staged, so the tail of that packet-sized backing allocation remains until
+the accepted prefix is acknowledged or the stream closes; complete-body backing is never
+prepared. `write_stream_vectored` takes its ranges as `&[IoSlice]` rather than `&[&[u8]]`, so a
+vectored source — the HTTP/3 layer, whose body writes are already `IoSlice`s — passes them
+through without first collecting them into a temporary vector.
 
 ### The owned write hands the buffer over instead of copying
 
@@ -528,19 +530,34 @@ Not symmetric, for reasons that are not symmetric.
 **Inbound**, past its bound, the endpoint drops. It reads one socket on behalf of every
 connection, so waiting for a slow consumer would starve the rest. A dropped datagram is a
 lost packet, which QUIC recovers from and which a full socket buffer would have produced a
-layer lower anyway. The count is exposed rather than hidden.
+layer lower anyway. The count is exposed rather than hidden. A receive batch handed to a
+detached connection also ends the current endpoint poll: the endpoint schedules itself again and
+yields after any read-active batch. That broader scheduling rule gives a detached connection
+owner a chance to run rather than draining as many as eight batches into its 64-datagram
+queue, and applies consistently when managed connections share the socket. The bound and
+overflow rule remain; ordinary persistent transfers avoid manufacturing loss through one
+task monopolising the runtime.
 
 **Outbound**, dropping is not available. A datagram that has been produced cannot be
 withdrawn: the connection has already accounted for the stream bytes in it, so offering them
 again would send them twice and discarding it loses them until a retransmission timer
 notices. So the producer asks for room *before* writing, and the bound is what it asks
-against.
+against. Observation and registration are one operation under the queue lock:
+`poll_outbound_capacity` either reports room or records the producer's waker while the queue
+is still full. Removing the first datagram from a full queue consumes that waker; later
+removals do not manufacture additional retries. This full-to-available wake is separate from
+the general inbound/work wake. The fixed total is 64 datagrams, with 63 available to normal
+production and one reserved for synchronous CONNECTION_CLOSE. The reserved close drains after
+existing output; it cannot overflow the queue or be lost when the owner marks the detached
+connection terminal.
 
 ### Eviction needs the owner to say when it is done
 
 The endpoint decides a managed connection is finished by asking whether it is draining. It
 cannot ask a detached one, because it does not hold it. So the owner marks it, and until then
-the routing entry stays. Guessing either way is a leak or a connection cut off mid-close.
+the routing entry stays. Marking terminal inventories and discards unread inbound datagrams,
+but preserves all outbound datagrams through socket drain before eviction. Guessing either
+way is a leak or a connection cut off mid-close.
 
 ### The clock travels with the connection
 
@@ -596,6 +613,13 @@ for as long as it lives — a `Box<[u8]>` for a borrowed write, copied in; or, f
 handed over through `write_stream_owned`, the caller's `OwnedBytes` handle kept alive so no copy
 is made. Either way the address does not move.
 
+The borrowing path samples the connection's current maximum transmit UDP payload immediately
+before each write and copies no more than that many caller bytes. Multiple slices keep their
+order in one fixed-address chunk. If the bound omits any caller suffix, the native call does
+not receive FIN; FIN accompanies only a staged prefix containing the true final suffix,
+including the empty-body case. The accepted count remains ngtcp2's accepted prefix, so the
+HTTP/3 layer reoffers every unaccepted byte once.
+
 ngtcp2 routinely accepts *less* than it is offered — a packet fills, and the remainder comes
 back as a separate write. Shrinking the allocation to the accepted prefix is the obvious
 tidy-up and is a use-after-free: the address ngtcp2 was given must stay valid, and
@@ -606,3 +630,9 @@ would pass either way since freed memory usually still reads back correctly.
 So the accepted *length* is recorded separately from the allocation, and the tail beyond it
 is left allocated until the chunk is released. That wastes at most one packet's worth per
 outstanding chunk. The test that guards it asserts the address.
+
+An acknowledgement may empty the current chunk queue without ending the stream. Retention
+therefore preserves the stream's cumulative next offset until the stream-close callback
+forgets the entry. Resetting that offset when the queue happened to empty made a later
+cumulative acknowledgement appear to cover newly staged data and released an address ngtcp2
+still retained; large transfers exposed the resulting corruption and release-build crash.

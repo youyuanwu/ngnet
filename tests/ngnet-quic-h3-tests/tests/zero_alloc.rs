@@ -44,6 +44,10 @@ thread_local! {
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
     /// Whether this thread is currently counting.
     static COUNTING: Cell<bool> = const { Cell::new(false) };
+    /// Allocations larger than the current threshold.
+    static LARGE: Cell<usize> = const { Cell::new(0) };
+    /// Only allocations strictly larger than this are counted in `LARGE`.
+    static LARGE_THRESHOLD: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
 struct Counting;
@@ -52,7 +56,7 @@ struct Counting;
 // thread-local and never affect the pointers returned.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        note();
+        note(layout.size());
         // SAFETY: forwarding the caller's own contract.
         unsafe { System.alloc(layout) }
     }
@@ -63,23 +67,26 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        note();
+        note(new_size);
         // SAFETY: forwarding the caller's own contract.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        note();
+        note(layout.size());
         // SAFETY: forwarding the caller's own contract.
         unsafe { System.alloc_zeroed(layout) }
     }
 }
 
 /// Records an allocation, if counting is armed.
-fn note() {
+fn note(size: usize) {
     COUNTING.with(|counting| {
         if counting.get() {
             ALLOCATIONS.with(|count| count.set(count.get() + 1));
+            if size > LARGE_THRESHOLD.with(Cell::get) {
+                LARGE.with(|count| count.set(count.get() + 1));
+            }
         }
     });
 }
@@ -87,14 +94,27 @@ fn note() {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
+#[cfg(feature = "diagnostics")]
+static DIAGNOSTICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Runs `f` with allocation counting armed, and reports how many were seen.
 fn count_allocations<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let (value, allocations, _) = count_allocations_larger_than(usize::MAX, f);
+    (value, allocations)
+}
+
+/// Runs `f` while counting all allocations and those above `threshold`.
+fn count_allocations_larger_than<T>(threshold: usize, f: impl FnOnce() -> T) -> (T, usize, usize) {
     ALLOCATIONS.with(|count| count.set(0));
+    LARGE.with(|count| count.set(0));
+    LARGE_THRESHOLD.with(|current| current.set(threshold));
     COUNTING.with(|counting| counting.set(true));
     let value = f();
     COUNTING.with(|counting| counting.set(false));
+    LARGE_THRESHOLD.with(|current| current.set(usize::MAX));
     let seen = ALLOCATIONS.with(Cell::get);
-    (value, seen)
+    let large = LARGE.with(Cell::get);
+    (value, seen, large)
 }
 
 /// A counter, adequate because these tests do not depend on unpredictability.
@@ -242,6 +262,15 @@ fn turn(drivers: &mut [Pin<Box<Driver>>], clock: &SharedClock, cx: &mut Context<
 
 #[test]
 fn a_produce_pass_allocates_one_buffer_per_datagram() {
+    #[cfg(feature = "diagnostics")]
+    let _diagnostics_guard = DIAGNOSTICS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    #[cfg(feature = "diagnostics")]
+    {
+        ngnet_quic::diagnostics::reset();
+        assert!(!ngnet_quic::diagnostics::is_armed());
+    }
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
     let credentials = Credentials::generate();
@@ -271,6 +300,7 @@ fn a_produce_pass_allocates_one_buffer_per_datagram() {
         {
             client_conn = Some(r.expect("the client handshake failed"));
         }
+
         if let Some(conn) = client_conn.as_mut() {
             let _ = conn.poll_event(&mut cx);
         }
@@ -348,4 +378,161 @@ fn a_produce_pass_allocates_one_buffer_per_datagram() {
          it is supposed to allocate exactly one owned buffer per datagram and nothing besides"
     );
     eprintln!("produce pass queued {datagrams} datagram(s), allocated {allocations} time(s)");
+}
+
+#[test]
+fn a_drain_pass_never_allocates_the_complete_large_offer() {
+    #[cfg(feature = "diagnostics")]
+    let _diagnostics_guard = DIAGNOSTICS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    #[cfg(feature = "diagnostics")]
+    {
+        ngnet_quic::diagnostics::reset();
+        assert!(!ngnet_quic::diagnostics::is_armed());
+        // A stale diagnostic-only control must not be evaluated by a feature-enabled but
+        // unarmed representative drain. If the unarmed path consults it, the pass below can
+        // accept only one byte.
+        ngnet_quic::diagnostics::set_test_staging_limit(Some(1));
+    }
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let credentials = Credentials::generate();
+
+    let caddr = "127.0.0.1:4563".parse().unwrap();
+    let saddr = "127.0.0.1:4564".parse().unwrap();
+    let clock = SharedClock::new();
+    let (cs, ss) = socket_pair(caddr, saddr);
+    let (client, cdrv) = build(Role::Client, cs, clock.clone(), &credentials);
+    let (server, sdrv) = build(Role::Server, ss, clock.clone(), &credentials);
+    let mut drivers: Vec<Pin<Box<Driver>>> = vec![Box::pin(cdrv), Box::pin(sdrv)];
+
+    let mut connecting = Box::pin(connect(&client, saddr, Some(TEST_SERVER_NAME)));
+    let mut accepting = Box::pin(accept(&server));
+    let mut client_conn: Option<NgtcpConnection<OsslSession>> = None;
+    let mut server_conn: Option<NgtcpConnection<OsslSession>> = None;
+    for _ in 0..1000 {
+        turn(&mut drivers, &clock, &mut cx);
+        if client_conn.is_none()
+            && let Poll::Ready(result) = connecting.as_mut().poll(&mut cx)
+        {
+            client_conn = Some(result.expect("the client handshake failed"));
+        }
+        if let Some(conn) = client_conn.as_mut() {
+            let _ = conn.poll_event(&mut cx);
+        }
+        if server_conn.is_none()
+            && let Poll::Ready(result) = accepting.as_mut().poll(&mut cx)
+        {
+            server_conn = Some(result.expect("the server accept failed"));
+        }
+        if client_conn.is_some() && server_conn.is_some() {
+            break;
+        }
+    }
+    let mut client_conn = client_conn.expect("a client connection");
+    let mut server_conn = server_conn.expect("a server connection");
+
+    // Settle the detached handshake flights and warm the first stream write outside the
+    // counted region. The allocation proof below is about the size of one large-body drain,
+    // not lazy connection or stream initialization.
+    for _ in 0..50 {
+        let _ = client_conn.poll_event(&mut cx);
+        let _ = server_conn.poll_event(&mut cx);
+        turn(&mut drivers, &clock, &mut cx);
+    }
+    let warm_stream = loop {
+        match client_conn.poll_open_uni(&mut cx) {
+            Poll::Ready(result) => break result.expect("opening a warm-up stream"),
+            Poll::Pending => turn(&mut drivers, &clock, &mut cx),
+        }
+    };
+    let mut warm = OneWrite {
+        stream: warm_stream,
+        payload: vec![0x3c; 16],
+        sent: 0,
+        done: false,
+    };
+    for _ in 0..50 {
+        let _ = client_conn.poll_transmit(&mut cx, &mut warm);
+        turn(&mut drivers, &clock, &mut cx);
+        let _ = server_conn.poll_event(&mut cx);
+        if warm.done {
+            break;
+        }
+    }
+    assert!(warm.done, "the warm-up stream write did not complete");
+
+    let stream = loop {
+        match client_conn.poll_open_uni(&mut cx) {
+            Poll::Ready(result) => break result.expect("opening a uni stream"),
+            Poll::Pending => turn(&mut drivers, &clock, &mut cx),
+        }
+    };
+    let body_size = 1024 * 1024;
+    let mut source = OneWrite {
+        stream,
+        payload: vec![0x5a; body_size],
+        sent: 0,
+        done: false,
+    };
+
+    // The transport must allocate one stable retained chunk per packet and one owned
+    // datagram buffer per packet. Both are bounded below 64 KiB. An allocation larger than
+    // that can only be the complete 1 MiB offer (the Phase 1 behavior), while a zero total
+    // would prove the drain did no work.
+    let (outcome, allocations, oversized) = count_allocations_larger_than(64 * 1024, || {
+        client_conn.poll_transmit(&mut cx, &mut source)
+    });
+    assert!(matches!(outcome, Poll::Ready(Ok(()))));
+    assert!(
+        source.sent > 0 && source.sent < body_size,
+        "one drain pass must accept a bounded prefix, not zero or the complete 1 MiB offer"
+    );
+    #[cfg(feature = "diagnostics")]
+    {
+        assert!(
+            source.sent > 1,
+            "an unarmed drain evaluated the diagnostic-only staging control"
+        );
+        assert_eq!(
+            ngnet_quic::diagnostics::snapshot(),
+            ngnet_quic::diagnostics::Snapshot::default(),
+            "the representative unarmed drain recorded diagnostics"
+        );
+    }
+    assert!(
+        allocations > 0,
+        "the counted drain produced no retained chunks or datagrams"
+    );
+    assert_eq!(
+        oversized, 0,
+        "a drain pass allocated storage larger than one datagram; the complete offer was staged"
+    );
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
+fn feature_enabled_unarmed_diagnostic_checks_allocate_nothing() {
+    let _diagnostics_guard = DIAGNOSTICS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    ngnet_quic::diagnostics::reset();
+    let ((armed, snapshot), allocations) = count_allocations(|| {
+        ngnet_quic::diagnostics::record_packet(1, ngnet_quic::Role::Client, true);
+        ngnet_quic::diagnostics::record_release(1, ngnet_quic::Role::Client, 7);
+        ngnet_quic::diagnostics::record_timer_rearm(1, ngnet_quic::Role::Client);
+        ngnet_quic::diagnostics::record_wake_registration(1, ngnet_quic::Role::Client);
+        ngnet_quic::diagnostics::record_park(1, ngnet_quic::Role::Client);
+        (
+            ngnet_quic::diagnostics::is_armed(),
+            ngnet_quic::diagnostics::snapshot(),
+        )
+    });
+    assert!(!armed);
+    assert_eq!(snapshot, ngnet_quic::diagnostics::Snapshot::default());
+    assert_eq!(
+        allocations, 0,
+        "feature-enabled unarmed diagnostic checks must not allocate"
+    );
 }

@@ -3,10 +3,11 @@
 //! Each server fully collects and echoes the same 1 KiB body. Throughput counts both
 //! directions; setup and warm-up remain outside the measured closures.
 //!
-//! The existing Quinn-only target retains its 16 KiB and 1 MiB cases. They are deliberately
-//! absent here: repeated 16 KiB exchanges can stall or close the current ngtcp2 path, while
-//! repeated 1 MiB exchanges can crash in native code. Including either point would prevent
-//! the multi-arm process from reliably producing a measurement.
+//! The existing Quinn-only target retains its 16 KiB and 1 MiB cases. They remain absent here
+//! because only 1 KiB has a calibrated, low-drift multi-arm performance protocol. The
+//! pre-repair ngtcp2 path stalled or crashed at the larger sizes; supervised exactness and
+//! diagnostic protocols cover them, with the flaky live repetition tests ignored until the
+//! outer-driver liveness failure is resolved.
 
 use std::hint::black_box;
 

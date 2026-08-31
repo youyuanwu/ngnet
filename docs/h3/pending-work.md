@@ -211,19 +211,21 @@ reuse, lookup changes, multi-slice writes, or reader pooling. **Revisit each onl
 function-level profile and its own fairness/lifecycle plan.** The failed release-coalescing
 gate is evidence against that specific implementation, not against all release-path work.
 
-### Repeated large bodies can crash the ngtcp2 integration
+### Historical pre-repair ngtcp2 large-body failures
 
 The three-stack loopback comparison added after run 24 could complete persistent empty and
-1 KiB exchanges through `ngnet-quic-h3`, but larger repeated bodies were not reliable.
-The 16 KiB arm completed five measured passes with very high variance, then stalled or closed
-during later warm-ups. Repeated 1 MiB echoes could terminate the optimized benchmark process
-with `SIGSEGV` during Criterion collection. A short standalone repetition could sometimes
-complete, so this is a native-path stability bug rather than a deterministic HTTP error.
+1 KiB exchanges through `ngnet-quic-h3`, but the then-current larger repeated bodies were not
+reliable. The 16 KiB arm completed five measured passes with very high variance, then stalled
+or closed during later warm-ups. Repeated 1 MiB echoes could terminate the optimized benchmark
+process with `SIGSEGV` during Criterion collection.
 
-The three-arm benchmark excludes both larger points explicitly rather than hanging or crashing
-before it can report any result. The existing Quinn-only benchmark still carries those sizes.
-**Settle this with a native backtrace under ASan or a debugger, then add repeated release-mode
-body regressions before restoring the ngtcp2 arms at 16 KiB and 1 MiB.**
+Run 27 historically found that packet-bounded staging and retention-offset fixes made its
+persistent exactness and diagnostic runs pass. Run 30 and final-review reproduction later
+observed both armed and unarmed release-mode stalls, so current persistent stability/RSS
+qualification is explicitly unmet. The three-arm benchmark still excludes both larger points;
+the existing Quinn-only benchmark carries them. Keep externally supervised exact/diagnostic
+protocols and restore larger Criterion points only after both liveness and calibrated
+measurement gates pass.
 
 ### Self-interop only
 

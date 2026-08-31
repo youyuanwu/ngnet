@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
+use crate::Role;
 use crate::cid::ConnectionId;
 use crate::error::{ApplicationErrorCode, CloseError};
 use crate::handlers::StreamCloseReason;
@@ -86,6 +87,12 @@ pub(crate) struct ConnectionShared {
     /// make no progress until something unrelated woke the driver, and on a quiescent
     /// connection the next such thing is the idle timeout, which closes it.
     endpoint: Arc<EndpointShared>,
+    /// Which side owns this connection, for scoped diagnostics.
+    #[cfg(feature = "diagnostics")]
+    role: Role,
+    /// Process-local connection identity shared with the detached owner.
+    #[cfg(feature = "diagnostics")]
+    diagnostic_id: AtomicU64,
     inner: Mutex<ConnectionInner>,
     /// Whether the connection is finished, readable without taking the lock.
     ///
@@ -110,6 +117,13 @@ pub(crate) struct ConnectionInner {
     pub(crate) failure: Option<Error>,
     /// Woken when the connection becomes established, closes, or has work.
     pub(crate) wakers: Vec<Waker>,
+    /// Woken only when a full detached outbound queue regains capacity.
+    ///
+    /// This is deliberately separate from inbound/work wakers. A detached producer that
+    /// parks because the queue is full must be released by queue removal even when no
+    /// packet arrives and no timer fires, while unrelated queue removals must not create
+    /// repeated retries.
+    pub(crate) capacity_wakers: Vec<Waker>,
     /// Work the driver should do on this connection.
     pub(crate) commands: VecDeque<Command>,
     /// Datagrams the endpoint routed here, waiting for whoever drives the connection.
@@ -119,6 +133,12 @@ pub(crate) struct ConnectionInner {
     pub(crate) inbound: VecDeque<Vec<u8>>,
     /// Datagrams the connection produced, waiting for the endpoint to send them.
     pub(crate) outbound: VecDeque<Vec<u8>>,
+    /// A synchronous CONNECTION_CLOSE waiting behind already-produced datagrams.
+    ///
+    /// Normal production leaves one queue slot reserved because `QuicConnection::close`
+    /// cannot return `Pending`. Keeping the close separate preserves FIFO order and the
+    /// total `DATAGRAM_QUEUE` bound without discarding an already-produced packet.
+    pub(crate) close_outbound: Option<Vec<u8>>,
     /// Identifiers minted and retired, for the endpoint's routing table.
     ///
     /// Separate from `observed` because the two have different readers: observations belong
@@ -156,6 +176,11 @@ pub(crate) enum RouteUpdate {
 /// to account for it. So the producer checks for room *before* producing, and this bound is
 /// what it checks against.
 pub(crate) const DATAGRAM_QUEUE: usize = 64;
+const OUTBOUND_DATA_QUEUE: usize = DATAGRAM_QUEUE - 1;
+
+fn outbound_depth(inner: &ConnectionInner) -> usize {
+    inner.outbound.len() + usize::from(inner.close_outbound.is_some())
+}
 
 /// Something a handle asked the driver to do to a connection.
 #[derive(Debug)]
@@ -191,9 +216,15 @@ pub(crate) enum Command {
 
 impl ConnectionShared {
     /// A fresh shared state belonging to `endpoint`.
-    pub(crate) fn new(endpoint: Arc<EndpointShared>) -> Arc<Self> {
+    pub(crate) fn new(endpoint: Arc<EndpointShared>, role: Role) -> Arc<Self> {
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = role;
         Arc::new(Self {
             endpoint,
+            #[cfg(feature = "diagnostics")]
+            role,
+            #[cfg(feature = "diagnostics")]
+            diagnostic_id: AtomicU64::new(0),
             inner: Mutex::default(),
             closed: AtomicBool::new(false),
             established: AtomicBool::new(false),
@@ -210,6 +241,16 @@ impl ConnectionShared {
     /// already failing and refusing to look at its state helps nobody.
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, ConnectionInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn bind_diagnostic_id(&self, id: u64) {
+        self.diagnostic_id.store(id, Ordering::Release);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn diagnostic_id(&self) -> u64 {
+        self.diagnostic_id.load(Ordering::Acquire)
     }
 
     /// Records something a handler observed.
@@ -265,10 +306,27 @@ impl ConnectionShared {
         let mut inner = self.lock();
         if inner.inbound.len() >= DATAGRAM_QUEUE {
             inner.dropped += 1;
+            #[cfg(feature = "diagnostics")]
+            crate::diagnostics::record_inbound_queue(
+                self.diagnostic_id(),
+                self.role,
+                inner.inbound.len(),
+                true,
+            );
             return false;
         }
         inner.inbound.push_back(datagram);
         let wakers = core::mem::take(&mut inner.wakers);
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::diagnostics::record_inbound_queue(
+                self.diagnostic_id(),
+                self.role,
+                inner.inbound.len(),
+                false,
+            );
+            crate::diagnostics::record_inbound_wakes(self.diagnostic_id(), self.role, wakers.len());
+        }
         drop(inner);
         for waker in wakers {
             waker.wake();
@@ -278,7 +336,16 @@ impl ConnectionShared {
 
     /// Takes the next datagram the endpoint routed here.
     pub(crate) fn take_inbound(&self) -> Option<Vec<u8>> {
-        self.lock().inbound.pop_front()
+        let mut inner = self.lock();
+        let datagram = inner.inbound.pop_front();
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::record_inbound_queue(
+            self.diagnostic_id(),
+            self.role,
+            inner.inbound.len(),
+            false,
+        );
+        datagram
     }
 
     /// How many inbound datagrams have been dropped for want of room.
@@ -294,28 +361,111 @@ impl ConnectionShared {
     /// timer notices. Neither is acceptable, so the only safe place to apply back pressure
     /// is before the connection is asked to write.
     pub(crate) fn outbound_has_room(&self) -> bool {
-        self.lock().outbound.len() < DATAGRAM_QUEUE
+        self.lock().outbound.len() < OUTBOUND_DATA_QUEUE
+    }
+
+    /// Atomically observes outbound capacity or registers the producer for its return.
+    ///
+    /// Holding the one queue lock across both operations closes the lost-wakeup window
+    /// between a separate "full?" check and waker registration.
+    pub(crate) fn outbound_ready_or_register(&self, waker: &Waker) -> bool {
+        let mut inner = self.lock();
+        if inner.outbound.len() < OUTBOUND_DATA_QUEUE {
+            return true;
+        }
+        if !inner
+            .capacity_wakers
+            .iter()
+            .any(|registered| registered.will_wake(waker))
+        {
+            inner.capacity_wakers.push(waker.clone());
+            #[cfg(feature = "diagnostics")]
+            crate::diagnostics::record_capacity_registration(self.diagnostic_id(), self.role);
+        }
+        false
     }
 
     /// Queues a datagram for the endpoint to send.
     pub(crate) fn queue_outbound(&self, datagram: Vec<u8>) {
-        self.lock().outbound.push_back(datagram);
+        let mut inner = self.lock();
+        assert!(
+            inner.outbound.len() < OUTBOUND_DATA_QUEUE,
+            "normal detached output exceeded its close-reserving queue bound"
+        );
+        inner.outbound.push_back(datagram);
+        #[cfg(feature = "diagnostics")]
+        let depth = outbound_depth(&inner);
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::record_outbound_queue(self.diagnostic_id(), self.role, depth, false);
+        drop(inner);
+        self.endpoint.wake_driver();
+    }
+
+    /// Queues the synchronous close in its reserved final slot.
+    pub(crate) fn queue_close_outbound(&self, datagram: Vec<u8>) {
+        let mut inner = self.lock();
+        if inner.close_outbound.is_some() {
+            return;
+        }
+        inner.close_outbound = Some(datagram);
+        let depth = outbound_depth(&inner);
+        assert!(
+            depth <= DATAGRAM_QUEUE,
+            "the close-reserving outbound queue exceeded its fixed bound"
+        );
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::record_outbound_queue(self.diagnostic_id(), self.role, depth, false);
+        drop(inner);
         self.endpoint.wake_driver();
     }
 
     /// Whether anything is still waiting to be sent for this connection.
     pub(crate) fn has_outbound(&self) -> bool {
-        !self.lock().outbound.is_empty()
+        let inner = self.lock();
+        !inner.outbound.is_empty() || inner.close_outbound.is_some()
     }
 
     /// How many datagrams are waiting to be sent for this connection.
     pub(crate) fn outbound_len(&self) -> usize {
-        self.lock().outbound.len()
+        outbound_depth(&self.lock())
     }
 
     /// Takes the next datagram this connection wants sent.
     pub(crate) fn take_outbound(&self) -> Option<Vec<u8>> {
-        self.lock().outbound.pop_front()
+        let mut inner = self.lock();
+        let was_full = inner.outbound.len() == OUTBOUND_DATA_QUEUE;
+        let datagram = inner
+            .outbound
+            .pop_front()
+            .or_else(|| inner.close_outbound.take());
+        let wakers = if was_full && datagram.is_some() {
+            core::mem::take(&mut inner.capacity_wakers)
+        } else {
+            Vec::new()
+        };
+        #[cfg(feature = "diagnostics")]
+        let depth = outbound_depth(&inner);
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::diagnostics::record_outbound_queue(
+                self.diagnostic_id(),
+                self.role,
+                depth,
+                was_full && datagram.is_some(),
+            );
+            if was_full && datagram.is_some() {
+                crate::diagnostics::record_capacity_wakes(
+                    self.diagnostic_id(),
+                    self.role,
+                    wakers.len(),
+                );
+            }
+        }
+        drop(inner);
+        for waker in wakers {
+            waker.wake();
+        }
+        datagram
     }
 
     /// Whether this connection's owner has finished with it.
@@ -329,7 +479,14 @@ impl ConnectionShared {
     /// the connection -- so without this its routing entry would live as long as the
     /// endpoint does.
     pub(crate) fn mark_terminal(&self) {
-        self.lock().terminal = true;
+        let mut inner = self.lock();
+        #[cfg(feature = "diagnostics")]
+        let inbound_discarded = inner.inbound.len();
+        inner.inbound.clear();
+        inner.terminal = true;
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::record_terminal_inventory(self.role, inbound_discarded, 0);
+        drop(inner);
         self.endpoint.wake_driver();
     }
 
@@ -399,11 +556,13 @@ impl ConnectionShared {
     }
 
     /// Registers a waker to be woken when something changes.
-    pub(crate) fn register(&self, waker: &Waker) {
+    pub(crate) fn register(&self, waker: &Waker) -> bool {
         let mut inner = self.lock();
         if !inner.wakers.iter().any(|w| w.will_wake(waker)) {
             inner.wakers.push(waker.clone());
+            return true;
         }
+        false
     }
 
     /// Wakes everything waiting on this connection.
@@ -553,7 +712,7 @@ mod tests {
     fn the_first_failure_is_the_one_reported() {
         // A connection that fails and is then torn down should report what actually went
         // wrong, not the teardown that followed from it.
-        let shared = ConnectionShared::new(EndpointShared::new());
+        let shared = ConnectionShared::new(EndpointShared::new(), Role::Client);
         shared.fail(Error::new(ErrorKind::HandshakeRejected, "first"));
         shared.fail(Error::new(ErrorKind::DriverGone, "second"));
         assert_eq!(shared.failure().kind(), ErrorKind::HandshakeRejected);
@@ -563,7 +722,7 @@ mod tests {
     fn an_idle_close_is_reported_as_a_timeout_rather_than_a_peer_close() {
         // The distinction a caller acts on: nothing refused anything, and the peer may not
         // know the connection is over.
-        let shared = ConnectionShared::new(EndpointShared::new());
+        let shared = ConnectionShared::new(EndpointShared::new(), Role::Client);
         let close = crate::error::CloseError::idle_for_test();
         shared.fail_with_close(close);
         assert_eq!(shared.failure().kind(), ErrorKind::IdleTimeout);
@@ -571,7 +730,7 @@ mod tests {
 
     #[test]
     fn commands_are_taken_in_order() {
-        let shared = ConnectionShared::new(EndpointShared::new());
+        let shared = ConnectionShared::new(EndpointShared::new(), Role::Client);
         shared.push(Command::Reset(
             StreamId::new(0).expect("valid"),
             ApplicationErrorCode::new(1),
@@ -582,7 +741,10 @@ mod tests {
         ));
         let taken = shared.take_commands();
         assert_eq!(taken.len(), 2);
-        assert!(shared.take_commands().is_empty(), "commands were taken twice");
+        assert!(
+            shared.take_commands().is_empty(),
+            "commands were taken twice"
+        );
     }
 
     #[test]
@@ -599,7 +761,7 @@ mod tests {
             }
         }
 
-        let shared = ConnectionShared::new(EndpointShared::new());
+        let shared = ConnectionShared::new(EndpointShared::new(), Role::Client);
         let first = Arc::new(Counting(AtomicBool::new(false)));
         let waker = Waker::from(Arc::clone(&first));
         shared.register(&waker);
@@ -622,5 +784,149 @@ mod tests {
         shared.wake_all();
         assert!(first.0.load(Ordering::Acquire));
         assert!(second.0.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn removing_from_a_full_outbound_queue_wakes_one_capacity_retry() {
+        struct Counting(AtomicU64);
+        impl std::task::Wake for Counting {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let shared = ConnectionShared::new(EndpointShared::new(), Role::Client);
+        for byte in 0..OUTBOUND_DATA_QUEUE {
+            shared.queue_outbound(vec![byte as u8]);
+        }
+        assert!(
+            !shared.outbound_has_room(),
+            "the seam must sustain a full queue"
+        );
+
+        let counter = Arc::new(Counting(AtomicU64::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        assert!(!shared.outbound_ready_or_register(&waker));
+        assert!(!shared.outbound_ready_or_register(&waker));
+        assert_eq!(
+            shared.lock().capacity_wakers.len(),
+            1,
+            "one parked producer must have one registration"
+        );
+
+        assert_eq!(shared.take_outbound(), Some(vec![0]));
+        assert_eq!(
+            counter.0.load(Ordering::Relaxed),
+            1,
+            "the full-to-available transition must enable exactly one retry"
+        );
+        assert_eq!(shared.lock().capacity_wakers.len(), 0);
+
+        assert_eq!(shared.take_outbound(), Some(vec![1]));
+        assert_eq!(
+            counter.0.load(Ordering::Relaxed),
+            1,
+            "removal while already available must not enable another retry"
+        );
+        assert_eq!(shared.outbound_len(), OUTBOUND_DATA_QUEUE - 2);
+        assert_eq!(
+            shared.dropped_inbound(),
+            0,
+            "the quiesced inbound side did not drop"
+        );
+    }
+
+    #[test]
+    fn capacity_restored_before_registration_is_observed_without_a_lost_wake() {
+        let shared = ConnectionShared::new(EndpointShared::new(), Role::Client);
+        for _ in 0..OUTBOUND_DATA_QUEUE {
+            shared.queue_outbound(vec![0]);
+        }
+        assert!(
+            !shared.outbound_has_room(),
+            "the producer's earlier observation sees full"
+        );
+
+        // This is the interleaving the old check-then-register pair lost: the endpoint
+        // removes one after the producer's observation but before it can park.
+        assert!(shared.take_outbound().is_some());
+
+        let waker = Waker::noop();
+        assert!(
+            shared.outbound_ready_or_register(waker),
+            "the atomic recheck must let the producer retry immediately"
+        );
+        assert!(
+            shared.lock().capacity_wakers.is_empty(),
+            "a ready producer must not leave a stale registration"
+        );
+    }
+
+    #[test]
+    fn a_close_queued_against_full_normal_output_preserves_the_total_bound_and_fifo() {
+        let shared = ConnectionShared::new(EndpointShared::new(), Role::Client);
+        for byte in 0..OUTBOUND_DATA_QUEUE {
+            shared.queue_outbound(vec![byte as u8]);
+        }
+        assert!(!shared.outbound_has_room());
+
+        shared.queue_close_outbound(vec![0xfe]);
+        shared.queue_close_outbound(vec![0xfd]);
+        assert_eq!(
+            shared.outbound_len(),
+            DATAGRAM_QUEUE,
+            "the reserved close must fill, not exceed, the fixed total bound"
+        );
+        assert!(shared.has_outbound());
+
+        for byte in 0..OUTBOUND_DATA_QUEUE {
+            assert_eq!(
+                shared.take_outbound(),
+                Some(vec![byte as u8]),
+                "previously produced output must stay ahead of CONNECTION_CLOSE"
+            );
+        }
+        assert_eq!(
+            shared.take_outbound(),
+            Some(vec![0xfe]),
+            "the first reserved close was lost or replaced by a duplicate"
+        );
+        assert!(!shared.has_outbound());
+        assert_eq!(shared.outbound_len(), 0);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn induced_drop_and_terminal_inventory_are_observable() {
+        let _guard = crate::diagnostics::TEST_LOCK.lock().unwrap();
+        crate::diagnostics::reset();
+        crate::diagnostics::arm(true);
+
+        let shared = ConnectionShared::new(EndpointShared::new(), Role::Client);
+        for byte in 0..(DATAGRAM_QUEUE + 2) {
+            let accepted = shared.deliver_inbound(vec![byte as u8]);
+            assert_eq!(accepted, byte < DATAGRAM_QUEUE);
+        }
+
+        let before_terminal = crate::diagnostics::drain();
+        assert_eq!(
+            before_terminal.snapshot.client.inbound_queue_depth,
+            DATAGRAM_QUEUE as u64
+        );
+        assert_eq!(
+            before_terminal.snapshot.client.inbound_queue_high_water,
+            DATAGRAM_QUEUE as u64
+        );
+        assert_eq!(before_terminal.snapshot.client.inbound_drops, 2);
+
+        shared.mark_terminal();
+        let terminal = crate::diagnostics::drain();
+        assert_eq!(terminal.snapshot.client.inbound_queue_depth, 0);
+        assert_eq!(
+            terminal.snapshot.client.terminal_discarded_inbound,
+            DATAGRAM_QUEUE as u64
+        );
+        assert_eq!(terminal.snapshot.client.terminal_discarded_outbound, 0);
+        crate::diagnostics::reset();
     }
 }

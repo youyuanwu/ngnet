@@ -106,9 +106,26 @@ runner change fails with that message rather than somewhere inside CMake's symbo
 If the preview image becomes unreliable, split the OpenSSL-dependent steps into their own job
 rather than lowering the requirement — nothing older has 3.5.
 
-## Things not measured
+## What the current QUIC measurements do and do not cover
 
-There are no QUIC benchmarks.
+The benchmark suite has a three-arm loopback comparison for complete HTTP/3 stacks at empty
+and 1 KiB exchanges, plus fixed-count 16 KiB and 1 MiB probes. Runs
+[`25`–`30`](../benchmarks/data/xeon-8370c-azure/README.md#runs) record the original comparison,
+diagnostic failure, packet-bounded correctness/resource qualification, unchanged packet-order
+decision, and residual-candidate dispositions. The repaired path completes 125 exact
+sequential echoes at both large sizes on many attempts. Final-review run 30 records its initial
+ten passing exact 1 MiB repetitions, nine later release test failures across seven of 35
+invocations, two failures in eight extended-timeout repetitions, and three
+diagnostic timeouts across its initial, focused, and final-source sets, so it explicitly leaves
+persistent-stability and RSS-envelope qualification unmet.
+
+Those measurements do not isolate the sans-I/O core from OpenSSL, the detached endpoint, the
+HTTP/3 adapter, or generic HTTP/3 work. The failed predecessor is not a large-body performance
+baseline, and noisy same-session origin timings do not support a before/after throughput
+claim. Packet ordering, detached buffer recycling, generic/Quinn scratch or task changes,
+timer reuse, syscall batching/coalescing, and crypto changes are all deferred rather than
+implemented; [run 29](../benchmarks/data/xeon-8370c-azure/29-ngtcp2-residual-eligibility.md)
+states the missing attribution for each.
 
 Interoperability is no longer wholly unverified, but it is worth being exact about what was
 established. `tests/ngnet-quic-h3-tests/tests/interop.rs` runs this crate against **quinn**,
@@ -151,6 +168,11 @@ holding the layer's bytes until acknowledgement, reporting release on write woul
 QUIC still points at for retransmission, and reporting it on acknowledgement while the copy
 exists would hold every in-flight byte twice.
 
+The copy is packet-bounded: each attempt stages at most the path's sampled maximum transmit UDP
+payload, suppresses FIN when that prefix omits a caller suffix, and reports only ngtcp2's
+accepted prefix. The remaining cost is therefore one stable packet-sized allocation per
+accepted write, not one allocation as large as the caller's outstanding body.
+
 The crate now has an ownership-taking write — `Conn::write_stream_owned`, taking an
 `OwnedBytes` — that retains without a copy. The HTTP/3 layer does not use it.
 
@@ -179,12 +201,17 @@ copies into storage that is already there.
 allocations. Where a copy would not allocate, a structural test over a named region is the
 mechanism, as it is for the decrypt bridge.
 
-## `ngnet-quic-h3-tests::exchange` fails occasionally under load
+## Workspace/live-loopback tests fail occasionally under load
 
 Observed once in four `cargo test --workspace --all-features` runs, and not reproduced in nine
 attempts afterwards — six of the suite alone, three of the whole workspace. The suite binds real
 sockets on `127.0.0.1:0`, so it is not a port collision; the ephemeral port is chosen by the
 kernel and is unique per test.
+
+Final review later observed one unspecified failure in ten default-feature workspace runs,
+followed by nine clean workspace runs and clean focused live-loopback/fixture repetitions.
+Without the test identity it cannot be joined to the earlier exchange failure or the known
+ngtcp2 repetition stalls, so it remains a separate disclosed workspace-stability limitation.
 
 Recorded rather than fixed because it is worth being explicit that this is known. A test that
 fails one run in four and passes the next nine trains everyone who sees it to press retry, and

@@ -14,7 +14,7 @@ default:
 
 # Check out exactly the submodules a build needs, and none of the ones it does not.
 #
-# All three vendored libraries declare nested submodules that only their own tests, tooling
+# All four vendored libraries declare nested submodules that only their own tests, tooling
 # and example applications use, so a `--recursive` checkout fetches several hundred megabytes
 # this repository never compiles:
 #

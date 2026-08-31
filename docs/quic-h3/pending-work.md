@@ -24,14 +24,22 @@ then stages its own copy, because ngtcp2 keeps the pointer it is handed until th
 acknowledges. So each body byte is written into a packet buffer and also held in a retained
 copy.
 
-The second copy is unavoidable given ngtcp2's contract. The first — from nghttp3's buffer
-into the packet — is not obviously avoidable either, since that is what serialising into a
-datagram means. This is noted because "one copy of every byte sent" is the figure recorded in
-`docs/quic/pending-work.md`, and a reader tracing an HTTP/3 body through the stack should
-know where each copy is rather than assuming there is only one.
+The retained copy is unavoidable given ngtcp2's contract. It is now bounded to one sampled
+maximum-UDP-payload prefix per attempt rather than the caller's complete outstanding body.
+The other copy — serialising nghttp3's bytes into the packet — is not obviously avoidable,
+since that is what constructing a datagram means.
 
-**What would settle it:** measurement. There are no benchmarks, so the cost is currently a
-description rather than a number.
+Run [`27`](../benchmarks/data/xeon-8370c-azure/27-ngtcp2-packet-bounded-staging.md) records
+historical staged backing, accepted progress, exactness, and sampled RSS. Final-review
+[`run 30`](../benchmarks/data/xeon-8370c-azure/30-ngtcp2-final-review-resolution.md) records
+fresh diagnostic timeouts, so current persistent stability and the RSS envelope remain unmet.
+Neither record isolates copy CPU cost from packet protection, endpoint, adapter, or generic
+HTTP/3 work.
+
+**What would settle the remaining copy:** route ownership-taking HTTP/3 buffers through
+`Conn::write_stream_owned`, change release to acknowledgement, and change
+`RETAINS_BUFFERS` to `true`, then measure against the accepted packet-bounded origin. That is
+a buffer-accounting change, not a drop-in optimization.
 
 ## A detached close is sent once, without retransmission
 
@@ -87,5 +95,26 @@ one socket on behalf of every connection and waiting for a slow consumer would s
 rest. `DetachedConnection::dropped_inbound` counts these, and `NgtcpConnection` exposes it.
 Nothing acts on the count.
 
-**What would settle it:** knowing whether it ever becomes non-zero under load, which needs a
-load test that does not exist.
+The persistent diagnostic workload now exercises 125/250/500 sequential 1 MiB exchanges.
+Before the endpoint yielded after each receive batch, one 1 MiB run recorded 73 unexpected
+drops. Later quiet-path processes reported zero drops, including the final-review attempts
+that timed out for a different reason. A deterministic induced-drop test now fills the
+64-datagram inbound queue, accounts for the expected discarded packets, and inventories the
+queued datagrams when the owner marks the connection terminal.
+
+**What would settle the broader network behavior:** a deliberately slow detached consumer and
+multiple connections sharing one socket, with loss recovery treated as the expected result
+rather than a benchmark invalidation.
+
+## Packet ordering and residual optimizations are deferred
+
+Transport-first pumping remains in place. Existing counters cannot establish that a
+standalone packet could have carried pending stream data, and the origin timing spread did
+not leave a predeclared target beyond drift.
+[Run 28](../benchmarks/data/xeon-8370c-azure/28-ngtcp2-stream-first-gate.md) records the
+unchanged decision.
+
+[Run 29](../benchmarks/data/xeon-8370c-azure/29-ngtcp2-residual-eligibility.md) observes linear
+owned-datagram, timer-rearm, and socket-call proxies, but no stable attributed timing gap.
+Detached recycling, timer reuse, syscall batching/additional coalescing, and crypto-path
+changes are therefore deferred/not evidenced, not implemented.

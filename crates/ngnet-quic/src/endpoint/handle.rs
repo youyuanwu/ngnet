@@ -272,8 +272,10 @@ where
 }
 
 /// What [`EndpointBuilder::build`] produces: a handle and the one driver that serves it.
-pub type Built<Sock, Clk, B> =
-    (Endpoint<<B as TlsBackend>::Session>, EndpointDriver<Sock, Clk, B>);
+pub type Built<Sock, Clk, B> = (
+    Endpoint<<B as TlsBackend>::Session>,
+    EndpointDriver<Sock, Clk, B>,
+);
 
 /// Connections handed over to callers who drive them themselves.
 ///
@@ -439,8 +441,22 @@ impl<S: Session> DetachedConnection<S> {
     }
 
     /// Queues a datagram for the endpoint to send, and wakes it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the caller did not first obtain capacity through
+    /// [`Self::poll_outbound_capacity`] or [`Self::outbound_has_room`].
     pub fn send(&self, datagram: Vec<u8>) {
         self.shared.queue_outbound(datagram);
+    }
+
+    /// Queues a synchronous CONNECTION_CLOSE in the outbound queue's reserved final slot.
+    ///
+    /// A close cannot wait asynchronously for capacity. Normal production therefore leaves
+    /// one slot unused so this operation preserves both previously produced datagrams and
+    /// the fixed total queue bound. Repeated calls preserve the first close.
+    pub fn send_close(&self, datagram: Vec<u8>) {
+        self.shared.queue_close_outbound(datagram);
     }
 
     /// How many datagrams this connection has queued for the endpoint to send.
@@ -454,8 +470,18 @@ impl<S: Session> DetachedConnection<S> {
     }
 
     /// Registers a waker to be woken when a datagram arrives for this connection.
-    pub fn register(&self, waker: &core::task::Waker) {
-        self.shared.register(waker);
+    pub fn register(&self, waker: &core::task::Waker) -> bool {
+        self.shared.register(waker)
+    }
+
+    /// Atomically checks for outbound room or registers for it to return.
+    ///
+    /// Returns `true` when the caller may produce immediately. If it returns `false`, the
+    /// supplied waker was registered while the queue was still full and is consumed by the
+    /// next full-to-available transition. Observation and registration share the queue
+    /// lock, so capacity cannot return unnoticed between them.
+    pub fn poll_outbound_capacity(&self, waker: &core::task::Waker) -> bool {
+        self.shared.outbound_ready_or_register(waker)
     }
 
     /// How many inbound datagrams were dropped because this connection was not keeping up.
@@ -583,7 +609,7 @@ impl<S: Session> Endpoint<S> {
     /// if it never answered, [`ErrorKind::Socket`] if the socket failed, and
     /// [`ErrorKind::DriverGone`] if the driver is not running.
     pub fn connect(&self, remote: SocketAddr, server_name: Option<&str>) -> Connecting {
-        let shared = ConnectionShared::new(Arc::clone(&self.shared));
+        let shared = ConnectionShared::new(Arc::clone(&self.shared), crate::Role::Client);
         if self.shared.is_gone() {
             shared.fail(Error::new(
                 ErrorKind::DriverGone,
@@ -621,7 +647,7 @@ impl<S: Session> Endpoint<S> {
     /// datagrams that match no connection. What it stops doing is reading and writing this
     /// connection's protocol state, because that admits exactly one owner.
     pub fn connect_detached(&self, remote: SocketAddr, server_name: Option<&str>) -> Detaching<S> {
-        let shared = ConnectionShared::new(Arc::clone(&self.shared));
+        let shared = ConnectionShared::new(Arc::clone(&self.shared), crate::Role::Client);
         shared.request_detach();
         if self.shared.is_gone() {
             shared.fail(Error::new(
@@ -928,7 +954,12 @@ where
     }
 
     /// Decides what a first packet has earned, and acts on it.
-    fn begin(&mut self, datagram: &[u8], packet: &crate::accept::InitialPacket, source: SocketAddr) {
+    fn begin(
+        &mut self,
+        datagram: &[u8],
+        packet: &crate::accept::InitialPacket,
+        source: SocketAddr,
+    ) {
         #[cfg(feature = "tls-ossl")]
         let (original, retried) = {
             use super::validate::Decision;
@@ -968,7 +999,7 @@ where
         #[cfg(not(feature = "tls-ossl"))]
         let (original, retried) = (packet.dcid, false);
 
-        let shared = ConnectionShared::new(Arc::clone(&self.shared));
+        let shared = ConnectionShared::new(Arc::clone(&self.shared), crate::Role::Server);
         // An endpoint whose caller asked for detached accepts hands over every connection it
         // accepts, once each is established. The request is made on the endpoint rather than
         // per connection because a server does not know what is coming before it arrives.
@@ -1144,7 +1175,18 @@ where
             // its second datagram -- without it, a bulk transfer stops after the first.
             let fired = this.inner.rearm(cx) == Poll::Ready(());
 
-            if !read && !fired && !this.inner.has_pending() {
+            // A detached connection consumes inbound datagrams in another task. Once this
+            // pass has routed a receive batch, yield so the waker delivery triggered can run
+            // before this endpoint drains another batch into the same bounded queue. Wake
+            // ourselves as well: a batch that stopped at `datagrams_per_pass` may have left
+            // the socket readable without observing `Pending`, so no socket edge is obliged
+            // to schedule the continuation.
+            if read {
+                cx.waker().wake_by_ref();
+                break;
+            }
+
+            if !fired && !this.inner.has_pending() {
                 break;
             }
         }

@@ -1,6 +1,6 @@
 # Benchmarks
 
-`tests/ngnet-bench` holds three [Criterion](https://bheisler.github.io/criterion.rs/)
+`tests/ngnet-bench` holds four [Criterion](https://bheisler.github.io/criterion.rs/)
 benchmark families, which answer different questions and must not be read as one:
 
 - **The duplex family** — this stack against [hyper](https://hyper.rs) and against
@@ -180,3 +180,18 @@ QMux/H3 is now measured against HTTP/2 in runs
 [`16`](data/xeon-8370c-azure/16-qmux-h3-baseline-and-pump-attribution.md), and
 [`21`](data/xeon-8370c-azure/21-qmux-h3-combined-final-matrix.md). Run 21 is the current
 post-PR-45 comparison; the earlier runs remain historical mechanism evidence.
+
+The ngtcp2/OpenSSL stack is recorded in runs
+[`25`–`30`](data/xeon-8370c-azure/README.md#runs). Run 27 is historical packet-bounded
+correctness/resource evidence. Final-review run 30 records that its initial ten predetermined
+exact 1 MiB repetitions and final 1 KiB calibration passed, but independent repetition failed
+seven of 35 release invocations (nine test failures), two of eight later extended-timeout
+repetitions, and three diagnostic processes across the initial, focused, and final-source sets
+timed out. The current checkout therefore does not carry an unqualified
+persistent-stability or RSS-envelope claim. Runs 28 and 29 defer packet-order and residual
+optimization candidates without source changes; they are limitations and attribution records,
+not implemented performance gains.
+
+Run 25's 1.513× empty and 1.401× 1 KiB gaps are historical pre-repair context, not the final
+remaining gap. Getting within 10% of the alternative `ngnet-h3` transport was a stretch
+objective, not evidence that could waive correctness, drift, attribution, or throughput gates.

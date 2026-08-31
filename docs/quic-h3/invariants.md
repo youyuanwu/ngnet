@@ -23,9 +23,23 @@ Checked by name: `thread`, `process`, `UdpSocket`, `TcpStream`.
 
 The required `QuicConnection::poll_flush` implementation returns ready because this adapter
 hands datagrams to the endpoint while pumping and retains no byte-stream output. There is no
-default fallback in the trait, so omitting the implementation is a compile error. This change
-was statically audited on the measurement host, whose OpenSSL 3.0.13 is older than the 3.5
-required by `ngnet-quic-sys`; CI must compile the adapter before merge.
+default fallback in the trait, so omitting the implementation is a compile error. The adapter
+is compiled by the targeted release suites, both workspace test modes, full all-target clippy,
+and its warning-denying Rust documentation build.
+
+## Borrowed stream writes stay packet-bounded
+
+The transport copies because ngtcp2 retains stream pointers, but a drain must never allocate
+the caller's complete large offer. The allocation suite offers 1 MiB, requires actual accepted
+progress, and rejects every allocation larger than 64 KiB. The fixed-count fixture separately
+keeps supervised 125 × 16 KiB and 125 × 1 MiB exact protocols. Their live-loopback tests are
+ignored while run 30's intermittent outer-driver liveness failure remains unresolved.
+
+Compiling diagnostics does not arm them. The feature-enabled unarmed allocation proof records
+representative packet, release, timer, wake, and park hooks and requires zero allocations plus
+the default snapshot. A separate integrated drain proof leaves a one-byte diagnostic-only
+staging control set while unarmed, requires actual multi-byte progress, and still requires the
+default snapshot; this catches range/retention traversal or behavior leaking into timing.
 
 ## Module files are flat
 

@@ -33,6 +33,9 @@ endpoint = []
 # anyone who has to. Implies `endpoint`, since there is nothing for it to plug into
 # otherwise.
 tokio = ["endpoint", "dep:tokio"]
+# Low-perturbation counters used by the benchmark probe and deterministic liveness tests.
+# Off by default so production builds contain neither the counters nor their arming checks.
+diagnostics = []
 
 # Exactly one *non-optional* dependency, as in `ngnet-h2` and `ngnet-h3`. A test fails the
 # build if that grows, and requires every optional one to be reachable only through a
