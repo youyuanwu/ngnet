@@ -32,7 +32,8 @@ and its warning-denying Rust documentation build.
 The transport copies because ngtcp2 retains stream pointers, but a drain must never allocate
 the caller's complete large offer. The allocation suite offers 1 MiB, requires actual accepted
 progress, and rejects every allocation larger than 64 KiB. The fixed-count fixture separately
-keeps 125 × 16 KiB and 125 × 1 MiB exact regressions active in debug and release.
+keeps supervised 125 × 16 KiB and 125 × 1 MiB exact protocols. Their live-loopback tests are
+ignored while run 30's intermittent outer-driver liveness failure remains unresolved.
 
 Compiling diagnostics does not arm them. The feature-enabled unarmed allocation proof records
 representative packet, release, timer, wake, and park hooks and requires zero allocations plus

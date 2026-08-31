@@ -94,6 +94,9 @@ fn note(size: usize) {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
+#[cfg(feature = "diagnostics")]
+static DIAGNOSTICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Runs `f` with allocation counting armed, and reports how many were seen.
 fn count_allocations<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let (value, allocations, _) = count_allocations_larger_than(usize::MAX, f);
@@ -260,6 +263,8 @@ fn turn(drivers: &mut [Pin<Box<Driver>>], clock: &SharedClock, cx: &mut Context<
 #[test]
 fn a_produce_pass_allocates_one_buffer_per_datagram() {
     #[cfg(feature = "diagnostics")]
+    let _diagnostics_guard = DIAGNOSTICS_TEST_LOCK.lock().unwrap();
+    #[cfg(feature = "diagnostics")]
     {
         ngnet_quic::diagnostics::reset();
         assert!(!ngnet_quic::diagnostics::is_armed());
@@ -375,6 +380,8 @@ fn a_produce_pass_allocates_one_buffer_per_datagram() {
 
 #[test]
 fn a_drain_pass_never_allocates_the_complete_large_offer() {
+    #[cfg(feature = "diagnostics")]
+    let _diagnostics_guard = DIAGNOSTICS_TEST_LOCK.lock().unwrap();
     #[cfg(feature = "diagnostics")]
     {
         ngnet_quic::diagnostics::reset();
@@ -503,6 +510,7 @@ fn a_drain_pass_never_allocates_the_complete_large_offer() {
 #[cfg(feature = "diagnostics")]
 #[test]
 fn feature_enabled_unarmed_diagnostic_checks_allocate_nothing() {
+    let _diagnostics_guard = DIAGNOSTICS_TEST_LOCK.lock().unwrap();
     ngnet_quic::diagnostics::reset();
     let ((armed, snapshot), allocations) = count_allocations(|| {
         ngnet_quic::diagnostics::record_packet(1, ngnet_quic::Role::Client, true);

@@ -5,9 +5,9 @@
 //!
 //! The existing Quinn-only target retains its 16 KiB and 1 MiB cases. They remain absent here
 //! because only 1 KiB has a calibrated, low-drift multi-arm performance protocol. The
-//! pre-repair ngtcp2 path stalled or crashed at the larger sizes; active exactness and
-//! diagnostic tests now cover them without turning that historical failure into a current
-//! performance claim.
+//! pre-repair ngtcp2 path stalled or crashed at the larger sizes; supervised exactness and
+//! diagnostic protocols cover them, with the flaky live repetition tests ignored until the
+//! outer-driver liveness failure is resolved.
 
 use std::hint::black_box;
 

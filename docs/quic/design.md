@@ -531,11 +531,12 @@ Not symmetric, for reasons that are not symmetric.
 connection, so waiting for a slow consumer would starve the rest. A dropped datagram is a
 lost packet, which QUIC recovers from and which a full socket buffer would have produced a
 layer lower anyway. The count is exposed rather than hidden. A receive batch handed to a
-detached connection also ends the current endpoint poll: the endpoint schedules itself again
-and yields to the connection owner it just woke, rather than draining as many as eight batches
-into the same 64-datagram queue before that owner can run. The bound and overflow rule remain;
-ordinary persistent transfers avoid manufacturing loss through one task monopolising the
-runtime.
+detached connection also ends the current endpoint poll: the endpoint schedules itself again and
+yields after any read-active batch. That broader scheduling rule gives a detached connection
+owner a chance to run rather than draining as many as eight batches into its 64-datagram
+queue, and applies consistently when managed connections share the socket. The bound and
+overflow rule remain; ordinary persistent transfers avoid manufacturing loss through one
+task monopolising the runtime.
 
 **Outbound**, dropping is not available. A datagram that has been produced cannot be
 withdrawn: the connection has already accounted for the stream bytes in it, so offering them

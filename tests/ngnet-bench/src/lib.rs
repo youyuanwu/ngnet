@@ -322,11 +322,7 @@ where
     total
 }
 
-/// Reads a body while comparing every chunk with an expected byte sequence.
-///
-/// Unlike collecting, this adds no body-sized allocation. It is used by fixed-count
-/// correctness probes, not Criterion's measured closure.
-async fn drain_checked<B>(mut body: B, expected: &[u8]) -> (usize, bool)
+async fn try_drain_checked<B>(mut body: B, expected: &[u8]) -> Result<(usize, bool), String>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: Debug,
@@ -334,7 +330,7 @@ where
     let mut total = 0usize;
     let mut exact = true;
     while let Some(frame) = poll_fn(|context| Pin::new(&mut body).poll_frame(context)).await {
-        let frame = frame.expect("a body frame");
+        let frame = frame.map_err(|error| format!("response body frame failed: {error:?}"))?;
         if let Some(data) = frame.data_ref() {
             let end = total.saturating_add(data.len());
             let expected_range = expected.get(total..end);
@@ -361,7 +357,7 @@ where
             total = end;
         }
     }
-    (total, exact && total == expected.len())
+    Ok((total, exact && total == expected.len()))
 }
 
 /// Reads a whole received body into contiguous bytes, so a server can echo it back. Both
@@ -1443,14 +1439,26 @@ impl NgnetNgtcpH3 {
     /// This is the fixed-count correctness-probe path. It deliberately compares streaming
     /// chunks in place rather than collecting another body-sized buffer.
     pub async fn round_trip_checked(&self, body: Bytes) -> (usize, bool) {
+        self.try_round_trip_checked(body)
+            .await
+            .expect("an exact ngtcp2 round trip")
+    }
+
+    /// Sends one request and reports response-head/body failures without panicking.
+    pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
         let expected = body.clone();
         let response = self
             .handle
             .send_request(quic_request_for(body))
             .await
-            .expect("an ngtcp2 response head");
-        assert!(response.status().is_success());
-        drain_checked(response.into_body(), &expected).await
+            .map_err(|error| format!("ngtcp2 response head failed: {error:?}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "ngtcp2 response status was not successful: {}",
+                response.status()
+            ));
+        }
+        try_drain_checked(response.into_body(), &expected).await
     }
 }
 

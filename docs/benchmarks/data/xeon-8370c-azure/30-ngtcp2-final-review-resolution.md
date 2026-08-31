@@ -48,8 +48,35 @@ run in full.
 | debug | 15.91; 18.98; 16.21; 15.78; 15.72 | `0,0,0,0,0`; all 125 responses exact |
 
 No exact-test repetition stalled, timed out, corrupted content, or terminated abnormally.
-This supports the active fixture regression; it does not override the diagnostic failures
-below.
+That statement describes this initial ten-process set only. Independent final review later
+repeated the same 15-second release timeout and reproduced the failures below, so the initial
+set does not support an unqualified active-fixture stability claim.
+
+### Independent final-review reproduction at the 15-second release timeout
+
+The Claude final reviewer ran 35 additional release invocations at the final-review HEAD:
+
+| Invocation set | Failures |
+| --- | --- |
+| Isolated 125 × 1 MiB exact test, 8 runs | 3 — exchanges 5, 6, and 6 |
+| Complete default-feature fixture, 12 runs | 3 — 16 KiB exchange 47; 1 MiB exchanges 12 and 0 |
+| Complete diagnostics-feature fixture, 15 runs | 3 in one invocation — 16 KiB exchange 26; 1 MiB exchange 73; warm-up response-head stall |
+
+The reviewer observed nine test failures across 35 release invocations; seven invocations
+failed, because one diagnostics-feature invocation failed three tests. The reviewer also
+ran the pre-final-review `24874f3` source eight times and observed the same signature once, so
+the stall predates the final-review fixes; final-review instrumentation did not create it.
+Four debug invocations with the then-current 45-second bound passed. These are
+system-under-test failures, not excluded timing outliers.
+
+The per-exchange bounds were then raised to 60 seconds in release and 90 seconds in debug to
+separate a too-short fixture deadline from the production failure. Eight additional isolated
+release repetitions were predetermined. Six completed, while repetitions 3 and 4 failed after
+about 30 seconds because both HTTP/3 drivers reported that the QUIC connection had ended and
+the next response head returned `Closed`. The failure is therefore not repaired by extending
+the Rust timeout. The live 16 KiB/1 MiB repetition tests are ignored in ordinary workspace
+runs and remain explicit supervised diagnostics until focused S9 scheduling research resolves
+the production liveness defect.
 
 ## Predetermined 1 KiB calibration
 
@@ -183,8 +210,8 @@ After the fixes:
 - targeted diagnostics: 318 initial `ngnet-quic` tests, 257 callback-fix `ngnet-quic` tests,
   3 `zero_alloc` tests, 2 probe tests, and 5
   diagnostic fixture tests passed;
-- `cargo test --workspace --all-features`: 1,627 passed, 1 ignored;
-- `cargo test --workspace`: 1,611 passed, 1 ignored;
+- final `cargo test --workspace --all-features`: 1,625 passed, 3 ignored;
+- final `cargo test --workspace`: 1,609 passed, 3 ignored;
 - all-target warning-denying clippy passed after one local needless-borrow correction;
 - workspace benchmark smoke passed after one test-only import warning correction;
 - warning-denying `ngnet-quic`/`ngnet-quic-h3` documentation passed;

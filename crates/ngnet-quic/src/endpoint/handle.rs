@@ -441,6 +441,11 @@ impl<S: Session> DetachedConnection<S> {
     }
 
     /// Queues a datagram for the endpoint to send, and wakes it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the caller did not first obtain capacity through
+    /// [`Self::poll_outbound_capacity`] or [`Self::outbound_has_room`].
     pub fn send(&self, datagram: Vec<u8>) {
         self.shared.queue_outbound(datagram);
     }
@@ -449,7 +454,7 @@ impl<S: Session> DetachedConnection<S> {
     ///
     /// A close cannot wait asynchronously for capacity. Normal production therefore leaves
     /// one slot unused so this operation preserves both previously produced datagrams and
-    /// the fixed total queue bound.
+    /// the fixed total queue bound. Repeated calls preserve the first close.
     pub fn send_close(&self, datagram: Vec<u8>) {
         self.shared.queue_close_outbound(datagram);
     }

@@ -7,6 +7,9 @@ subsequent committed representation of the repair, not proof of measured-tree id
 **Purpose:** historical correctness/resource qualification and report-only origin context
 **Exclusions:** no failed, slow, or signalled system-under-test attempt was excluded
 
+**Superseded status:** [run 30](30-ngtcp2-final-review-resolution.md) reproduces later armed
+and unarmed release-mode timeouts and withdraws current persistent-stability/RSS qualification.
+
 ## Repair
 
 The borrowing stream-write path now samples the current maximum transmit UDP payload and

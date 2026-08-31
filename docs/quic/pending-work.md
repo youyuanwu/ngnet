@@ -110,12 +110,13 @@ rather than lowering the requirement — nothing older has 3.5.
 
 The benchmark suite has a three-arm loopback comparison for complete HTTP/3 stacks at empty
 and 1 KiB exchanges, plus fixed-count 16 KiB and 1 MiB probes. Runs
-[`25`–`29`](../benchmarks/data/xeon-8370c-azure/README.md#runs) record the original comparison,
+[`25`–`30`](../benchmarks/data/xeon-8370c-azure/README.md#runs) record the original comparison,
 diagnostic failure, packet-bounded correctness/resource qualification, unchanged packet-order
 decision, and residual-candidate dispositions. The repaired path completes 125 exact
-sequential echoes at both large sizes. Final-review run 30 records ten passing predetermined
-exact 1 MiB repetitions but also three diagnostic timeouts across its initial, focused, and
-final-source sets, so it explicitly leaves
+sequential echoes at both large sizes on many attempts. Final-review run 30 records its initial
+ten passing exact 1 MiB repetitions, nine later release test failures across seven of 35
+invocations, two failures in eight extended-timeout repetitions, and three
+diagnostic timeouts across its initial, focused, and final-source sets, so it explicitly leaves
 persistent-stability and RSS-envelope qualification unmet.
 
 Those measurements do not isolate the sans-I/O core from OpenSSL, the detached endpoint, the

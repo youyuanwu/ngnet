@@ -112,9 +112,10 @@ offers 1 MiB and rejects any allocation larger than 64 KiB, while requiring actu
 progress; the borrowing path may allocate packet-sized retained chunks but never the complete
 body offer.
 
-The ordinary `tests/ngnet-bench/tests/ngtcp2_fixture.rs` regressions are active rather than
-ignored. They run 125 sequential exact echoes at both 16 KiB and 1 MiB in debug and release.
-With the additive `diagnostics` feature, the same fixture checks every attempt's
+The `tests/ngnet-bench/tests/ngtcp2_fixture.rs` live repetition tests run 125 sequential exact
+echoes at both 16 KiB and 1 MiB under the documented supervisor. They are ignored in ordinary
+workspace runs while run 30's intermittent outer-driver liveness failure remains unresolved.
+With the additive `diagnostics` feature, the active fixture coverage checks every attempt's
 `accepted <= staged <= min(offered, sampled payload)`, FIN suppression on a truncated prefix,
 accepted/release and packet-category reconciliation, and real zero-progress retry/enabling
 event accounting. Fixed-limit scaling is deterministic retention coverage rather than a flaky

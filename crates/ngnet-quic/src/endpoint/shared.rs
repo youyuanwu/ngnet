@@ -404,10 +404,9 @@ impl ConnectionShared {
     /// Queues the synchronous close in its reserved final slot.
     pub(crate) fn queue_close_outbound(&self, datagram: Vec<u8>) {
         let mut inner = self.lock();
-        assert!(
-            inner.close_outbound.is_none(),
-            "a detached connection queued more than one synchronous close"
-        );
+        if inner.close_outbound.is_some() {
+            return;
+        }
         inner.close_outbound = Some(datagram);
         let depth = outbound_depth(&inner);
         assert!(
@@ -872,6 +871,7 @@ mod tests {
         assert!(!shared.outbound_has_room());
 
         shared.queue_close_outbound(vec![0xfe]);
+        shared.queue_close_outbound(vec![0xfd]);
         assert_eq!(
             shared.outbound_len(),
             DATAGRAM_QUEUE,
@@ -889,7 +889,7 @@ mod tests {
         assert_eq!(
             shared.take_outbound(),
             Some(vec![0xfe]),
-            "the reserved close was lost"
+            "the first reserved close was lost or replaced by a duplicate"
         );
         assert!(!shared.has_outbound());
         assert_eq!(shared.outbound_len(), 0);

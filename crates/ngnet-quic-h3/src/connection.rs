@@ -464,6 +464,10 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
     }
 
     fn close(&mut self, code: ErrorCode, reason: &[u8]) -> Result<()> {
+        if self.state.closed {
+            return Ok(());
+        }
+
         // The close datagram is produced and queued here, synchronously. The HTTP/3 driver
         // calls this last and then returns, so a close that only recorded an intention would
         // never reach the peer, which would wait out its idle timeout instead.

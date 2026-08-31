@@ -43,9 +43,9 @@ impl Arm {
         }
     }
 
-    async fn round_trip_checked(&self, body: bytes::Bytes) -> (usize, bool) {
+    async fn round_trip_checked(&self, body: bytes::Bytes) -> Result<(usize, bool), String> {
         match self {
-            Arm::NgnetNgtcpH3(a) => a.round_trip_checked(body).await,
+            Arm::NgnetNgtcpH3(a) => a.try_round_trip_checked(body).await,
             _ => unreachable!("request validation restricts diagnostic mode to ngnet-quic-h3"),
         }
     }
@@ -76,9 +76,9 @@ fn flush_stderr() {
 fn exchange_timeout(body_size: usize) -> Duration {
     let mib = body_size.div_ceil(1024 * 1024);
     let (base, per_started_mib) = if cfg!(debug_assertions) {
-        (15, 30)
+        (15, 75)
     } else {
-        (5, 10)
+        (5, 55)
     };
     Duration::from_secs(base + (mib as u64).saturating_mul(per_started_mib))
 }
@@ -407,7 +407,19 @@ fn main() {
                         )
                         .await
                         {
-                            Ok(received) => received,
+                            Ok(Ok(received)) => received,
+                            Ok(Err(error)) => {
+                                let failure_rss = rss_kib();
+                                eprintln!(
+                                    "PROBE-FAIL exchange={exchange} last_completed={} \
+                                     reason=request-or-body error={error:?}",
+                                    exchange - 1,
+                                );
+                                emit_rss("failure-request-or-body", exchange, failure_rss);
+                                emit_diagnostics(exchange, "failure-request-or-body", None);
+                                flush_stderr();
+                                panic!("exchange {exchange} failed before an exact response");
+                            }
                             Err(_) => {
                                 let failure_rss = rss_kib();
                                 eprintln!(
@@ -507,9 +519,9 @@ mod tests {
     fn timeouts_scale_with_body_size_and_build_profile() {
         assert!(exchange_timeout(1024 * 1024) > exchange_timeout(0));
         if cfg!(debug_assertions) {
-            assert!(exchange_timeout(1024 * 1024) >= Duration::from_secs(45));
+            assert!(exchange_timeout(1024 * 1024) >= Duration::from_secs(90));
         } else {
-            assert!(exchange_timeout(1024 * 1024) >= Duration::from_secs(15));
+            assert!(exchange_timeout(1024 * 1024) >= Duration::from_secs(60));
         }
     }
 }

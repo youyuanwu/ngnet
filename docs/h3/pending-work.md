@@ -219,12 +219,13 @@ reliable. The 16 KiB arm completed five measured passes with very high variance,
 or closed during later warm-ups. Repeated 1 MiB echoes could terminate the optimized benchmark
 process with `SIGSEGV` during Criterion collection.
 
-Packet-bounded staging and retention-offset fixes subsequently made persistent exactness and
-diagnostic runs pass. The three-arm benchmark still excludes both larger points because they
-lack calibrated, low-drift performance qualification, not because the current exactness
-regressions are known to fail. The existing Quinn-only benchmark still carries those sizes.
-Keep the active repeated debug/release regressions and externally supervised diagnostic
-protocol; restore larger Criterion points only after their own calibrated measurement gate.
+Run 27 historically found that packet-bounded staging and retention-offset fixes made its
+persistent exactness and diagnostic runs pass. Run 30 and final-review reproduction later
+observed both armed and unarmed release-mode stalls, so current persistent stability/RSS
+qualification is explicitly unmet. The three-arm benchmark still excludes both larger points;
+the existing Quinn-only benchmark carries them. Keep externally supervised exact/diagnostic
+protocols and restore larger Criterion points only after both liveness and calibrated
+measurement gates pass.
 
 ### Self-interop only
 
