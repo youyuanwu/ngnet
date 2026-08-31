@@ -1133,6 +1133,7 @@ dependencies = [
  "compio",
  "criterion",
  "h3",
+ "h3-ngnet-qmux",
  "h3-quinn",
  "http",
  "http-body",

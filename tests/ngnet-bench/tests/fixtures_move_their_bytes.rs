@@ -12,7 +12,8 @@ use bytes::Bytes;
 
 use ngnet_bench::{
     CompioSharedSocket, CompioSocket, Hyper, NgnetH2, NgnetH2Shared, NgnetQmuxH3,
-    NgnetQmuxH3Socket, TokioSharedSocket, TokioSocket, body_of, compio_runtime,
+    NgnetQmuxH3Matched, NgnetQmuxH3MatchedSocket, NgnetQmuxH3Socket, TokioSharedSocket,
+    TokioSocket, UpstreamH3Qmux, UpstreamH3QmuxSocket, body_of, compio_runtime,
     current_thread_runtime,
 };
 
@@ -84,6 +85,26 @@ echoes_whole!(
 echoes_whole!(
     qmux_h3_socket_echoes_whole,
     NgnetQmuxH3Socket,
+    current_thread_runtime()
+);
+echoes_whole!(
+    matched_ngnet_qmux_h3_duplex_echoes_whole,
+    NgnetQmuxH3Matched,
+    current_thread_runtime()
+);
+echoes_whole!(
+    matched_ngnet_qmux_h3_socket_echoes_whole,
+    NgnetQmuxH3MatchedSocket,
+    current_thread_runtime()
+);
+echoes_whole!(
+    upstream_h3_qmux_duplex_echoes_whole,
+    UpstreamH3Qmux,
+    current_thread_runtime()
+);
+echoes_whole!(
+    upstream_h3_qmux_socket_echoes_whole,
+    UpstreamH3QmuxSocket,
     current_thread_runtime()
 );
 

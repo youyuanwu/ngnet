@@ -247,6 +247,17 @@ pub fn qmux_h3_config() -> HttpConfig {
         .qpack_max_dtable_capacity(HEADER_TABLE_SIZE as usize)
 }
 
+/// Comparison-only ngnet H3 configuration matched to hyperium H3's fixed QPACK setting.
+///
+/// Hyperium H3 0.0.8 exposes no dynamic-table-capacity control, so the matched QMux pair
+/// disables the ngnet side's dynamic table rather than silently comparing unlike state.
+pub fn qmux_h3_matched_config() -> HttpConfig {
+    HttpConfig::default()
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .max_field_section_size(MAX_HEADER_LIST_SIZE as u64)
+        .qpack_max_dtable_capacity(0)
+}
+
 // ---------------------------------------------------------------------------
 // Runtimes
 // ---------------------------------------------------------------------------
@@ -1188,13 +1199,275 @@ impl NgnetQmuxH3 {
     }
 
     /// Takes the server away without telling the client, so the next exchange fails.
-    ///
-    /// No benchmark calls this, and none should: an arm that could lose its peer mid-run
-    /// would be measuring something other than what it claims. It exists so the harness's own
-    /// test suite can show that a failed exchange ends the run rather than being quietly
-    /// recorded as a fast iteration — a property that can only be demonstrated by causing it.
     pub fn abandon_server(&self) {
         self.server.abort();
+    }
+}
+
+/// The ngnet H3-over-QMux duplex fixture with QPACK disabled to match hyperium H3.
+pub struct NgnetQmuxH3Matched {
+    handle: H3SendRequest<BenchBody>,
+    server: JoinHandle<()>,
+}
+
+impl NgnetQmuxH3Matched {
+    /// Establishes and warms the matched ngnet fixture.
+    pub async fn establish() -> Self {
+        let (client_io, server_io) = duplex(DUPLEX_CAPACITY);
+        let server = qmux_serve_with(
+            TokioStream::new(server_io),
+            TokioClock::new(),
+            qmux_h3_echo,
+            qmux_config(),
+            qmux_h3_matched_config(),
+        )
+        .expect("a matched ngnet server");
+        let server = tokio::spawn(async move {
+            let _ = server.await;
+        });
+        let (handle, connection) = connect_with::<_, _, BenchBody>(
+            TokioStream::new(client_io),
+            TokioClock::new(),
+            qmux_config(),
+            qmux_h3_matched_config(),
+        )
+        .expect("a matched ngnet client");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        qmux_warm_up(&handle).await;
+        Self { handle, server }
+    }
+
+    /// Sends one request body and drains its exact echo.
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        let response = self
+            .handle
+            .send_request(request_for(body))
+            .await
+            .expect("a matched ngnet response head");
+        assert!(response.status().is_success());
+        drain(response.into_body()).await
+    }
+
+    /// Takes away the matched ngnet server for failure-path tests.
+    pub fn abandon_server(&self) {
+        self.server.abort();
+    }
+}
+
+type UpstreamMemoryOpener =
+    h3_ngnet_qmux::OpenStreams<TokioStream<tokio::io::DuplexStream>, TokioClock, Bytes>;
+type UpstreamMemorySender = h3::client::SendRequest<UpstreamMemoryOpener, Bytes>;
+type UpstreamSocketOpener =
+    h3_ngnet_qmux::OpenStreams<TokioStream<TokioTcpStream>, TokioClock, Bytes>;
+type UpstreamSocketSender = h3::client::SendRequest<UpstreamSocketOpener, Bytes>;
+
+/// Pending peer accepts reserved by the benchmark adapter.
+pub const UPSTREAM_QMUX_PENDING_ACCEPTS: usize = MAX_CONCURRENT_STREAMS as usize;
+
+/// Rejects a workload that exceeds the adapter's pending-accept resource policy.
+///
+/// Benchmark targets call only serial round trips today. This guard is public so any future
+/// concurrent target and the fixture tests share one pre-wire admission rule.
+pub fn validate_upstream_qmux_concurrency(n: usize) {
+    assert!(
+        n <= UPSTREAM_QMUX_PENDING_ACCEPTS,
+        "a concurrency of {n} exceeds the {UPSTREAM_QMUX_PENDING_ACCEPTS} pending accepts \
+         reserved by the hyperium QMux fixture"
+    );
+}
+
+async fn upstream_h3_qmux_server<C>(connection: C)
+where
+    C: h3::quic::Connection<Bytes>,
+{
+    let mut builder = h3::server::builder();
+    builder.send_grease(false);
+    builder.max_field_section_size(MAX_HEADER_LIST_SIZE as u64);
+    let mut connection = builder
+        .build::<_, Bytes>(connection)
+        .await
+        .expect("an upstream H3 QMux server");
+    loop {
+        let resolver = match connection.accept().await {
+            Ok(Some(resolver)) => resolver,
+            Ok(None) | Err(_) => return,
+        };
+        let (_request, mut stream) = match resolver.resolve_request().await {
+            Ok(request) => request,
+            Err(_) => continue,
+        };
+        let mut body = BytesMut::new();
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(chunk)) => body.put(chunk),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        if stream
+            .send_response(
+                http::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(())
+                    .expect("an upstream H3 QMux response"),
+            )
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        if !body.is_empty() && stream.send_data(body.freeze()).await.is_err() {
+            continue;
+        }
+        let _ = stream.finish().await;
+    }
+}
+
+fn upstream_qmux_request_head() -> http::Request<()> {
+    http::Request::builder()
+        .method(http::Method::POST)
+        .uri(WORKLOAD_URI)
+        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+        .header("x-bench", "1")
+        .body(())
+        .expect("an upstream QMux request")
+}
+
+async fn upstream_qmux_round_trip<O>(
+    sender: &h3::client::SendRequest<O, Bytes>,
+    body: Bytes,
+) -> usize
+where
+    O: h3::quic::OpenStreams<Bytes> + Clone,
+{
+    let mut sender = sender.clone();
+    let mut stream = sender
+        .send_request(upstream_qmux_request_head())
+        .await
+        .expect("an upstream QMux request stream");
+    if !body.is_empty() {
+        stream
+            .send_data(body)
+            .await
+            .expect("upstream QMux request data");
+    }
+    stream.finish().await.expect("finish upstream QMux request");
+    let response = stream
+        .recv_response()
+        .await
+        .expect("an upstream QMux response head");
+    assert!(response.status().is_success());
+    let mut total = 0;
+    while let Some(chunk) = stream
+        .recv_data()
+        .await
+        .expect("upstream QMux response data")
+    {
+        total += chunk.remaining();
+    }
+    total
+}
+
+struct UpstreamQmuxTasks {
+    server_adapter: JoinHandle<()>,
+    server_h3: JoinHandle<()>,
+    client_adapter: JoinHandle<()>,
+    client_h3: JoinHandle<()>,
+}
+
+impl UpstreamQmuxTasks {
+    fn abandon_server(&self) {
+        self.server_h3.abort();
+        self.server_adapter.abort();
+    }
+}
+
+impl Drop for UpstreamQmuxTasks {
+    fn drop(&mut self) {
+        self.server_adapter.abort();
+        self.server_h3.abort();
+        self.client_adapter.abort();
+        self.client_h3.abort();
+    }
+}
+
+async fn upstream_memory_pair() -> (UpstreamMemorySender, UpstreamQmuxTasks) {
+    let (client_io, server_io) = duplex(DUPLEX_CAPACITY);
+    let server_lower = ngnet_qmux::io::Connection::server(
+        TokioStream::new(server_io),
+        TokioClock::new(),
+        qmux_config(),
+    )
+    .expect("an upstream server QMux connection");
+    let (server_connection, server_driver) = h3_ngnet_qmux::from_qmux_with_config::<Bytes, _, _>(
+        server_lower,
+        h3_ngnet_qmux::AdapterConfig::new().pending_accept_limit(UPSTREAM_QMUX_PENDING_ACCEPTS),
+    );
+    let server_adapter = tokio::spawn(async move {
+        let _ = server_driver.await;
+    });
+    let server_h3 = tokio::spawn(upstream_h3_qmux_server(server_connection));
+
+    let client_lower = ngnet_qmux::io::Connection::client(
+        TokioStream::new(client_io),
+        TokioClock::new(),
+        qmux_config(),
+    )
+    .expect("an upstream client QMux connection");
+    let (client_connection, client_driver) = h3_ngnet_qmux::from_qmux_with_config::<Bytes, _, _>(
+        client_lower,
+        h3_ngnet_qmux::AdapterConfig::new().pending_accept_limit(UPSTREAM_QMUX_PENDING_ACCEPTS),
+    );
+    let client_adapter = tokio::spawn(async move {
+        let _ = client_driver.await;
+    });
+    let mut builder = h3::client::builder();
+    builder.send_grease(false);
+    builder.max_field_section_size(MAX_HEADER_LIST_SIZE as u64);
+    let (mut client_connection, sender) = builder
+        .build(client_connection)
+        .await
+        .expect("an upstream H3 QMux client");
+    let client_h3 = tokio::spawn(async move {
+        let _ = poll_fn(|context| client_connection.poll_close(context)).await;
+    });
+    (
+        sender,
+        UpstreamQmuxTasks {
+            server_adapter,
+            server_h3,
+            client_adapter,
+            client_h3,
+        },
+    )
+}
+
+/// A persistent hyperium H3-over-QMux duplex fixture.
+pub struct UpstreamH3Qmux {
+    sender: UpstreamMemorySender,
+    tasks: UpstreamQmuxTasks,
+}
+
+impl UpstreamH3Qmux {
+    /// Establishes and warms the hyperium fixture outside the measured closure.
+    pub async fn establish() -> Self {
+        let (sender, tasks) = upstream_memory_pair().await;
+        let fixture = Self { sender, tasks };
+        assert_eq!(fixture.round_trip(Bytes::new()).await, 0);
+        fixture
+    }
+
+    /// Sends one request body and drains its exact echo.
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        upstream_qmux_round_trip(&self.sender, body).await
+    }
+
+    /// Takes away both server-side drivers.
+    pub fn abandon_server(&self) {
+        self.tasks.abandon_server();
     }
 }
 
@@ -1662,5 +1935,134 @@ impl NgnetQmuxH3Socket {
     /// Takes the server away without telling the client. See [`NgnetQmuxH3::abandon_server`].
     pub fn abandon_server(&self) {
         self.server.abort();
+    }
+}
+
+/// The ngnet H3-over-QMux socket fixture with QPACK disabled to match hyperium H3.
+pub struct NgnetQmuxH3MatchedSocket {
+    handle: H3SendRequest<BenchBody>,
+    server: JoinHandle<()>,
+}
+
+impl NgnetQmuxH3MatchedSocket {
+    /// Establishes and warms the matched ngnet socket fixture.
+    pub async fn establish() -> Self {
+        let (client_io, server_io) = tokio_socket_pair().await;
+        let server = qmux_serve_with(
+            TokioStream::new(server_io),
+            TokioClock::new(),
+            qmux_h3_echo,
+            qmux_config(),
+            qmux_h3_matched_config(),
+        )
+        .expect("a matched ngnet socket server");
+        let server = tokio::spawn(async move {
+            let _ = server.await;
+        });
+        let (handle, connection) = connect_with::<_, _, BenchBody>(
+            TokioStream::new(client_io),
+            TokioClock::new(),
+            qmux_config(),
+            qmux_h3_matched_config(),
+        )
+        .expect("a matched ngnet socket client");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        qmux_warm_up(&handle).await;
+        Self { handle, server }
+    }
+
+    /// Sends one body and drains its exact echo.
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        let response = self
+            .handle
+            .send_request(request_for(body))
+            .await
+            .expect("a matched ngnet socket response");
+        assert!(response.status().is_success());
+        drain(response.into_body()).await
+    }
+
+    /// Takes away the matched ngnet socket server.
+    pub fn abandon_server(&self) {
+        self.server.abort();
+    }
+}
+
+async fn upstream_socket_pair() -> (UpstreamSocketSender, UpstreamQmuxTasks) {
+    let (client_io, server_io) = tokio_socket_pair().await;
+    let server_lower = ngnet_qmux::io::Connection::server(
+        TokioStream::new(server_io),
+        TokioClock::new(),
+        qmux_config(),
+    )
+    .expect("an upstream socket server QMux connection");
+    let (server_connection, server_driver) = h3_ngnet_qmux::from_qmux_with_config::<Bytes, _, _>(
+        server_lower,
+        h3_ngnet_qmux::AdapterConfig::new().pending_accept_limit(UPSTREAM_QMUX_PENDING_ACCEPTS),
+    );
+    let server_adapter = tokio::spawn(async move {
+        let _ = server_driver.await;
+    });
+    let server_h3 = tokio::spawn(upstream_h3_qmux_server(server_connection));
+
+    let client_lower = ngnet_qmux::io::Connection::client(
+        TokioStream::new(client_io),
+        TokioClock::new(),
+        qmux_config(),
+    )
+    .expect("an upstream socket client QMux connection");
+    let (client_connection, client_driver) = h3_ngnet_qmux::from_qmux_with_config::<Bytes, _, _>(
+        client_lower,
+        h3_ngnet_qmux::AdapterConfig::new().pending_accept_limit(UPSTREAM_QMUX_PENDING_ACCEPTS),
+    );
+    let client_adapter = tokio::spawn(async move {
+        let _ = client_driver.await;
+    });
+    let mut builder = h3::client::builder();
+    builder.send_grease(false);
+    builder.max_field_section_size(MAX_HEADER_LIST_SIZE as u64);
+    let (mut client_connection, sender) = builder
+        .build(client_connection)
+        .await
+        .expect("an upstream H3 socket client");
+    let client_h3 = tokio::spawn(async move {
+        let _ = poll_fn(|context| client_connection.poll_close(context)).await;
+    });
+    (
+        sender,
+        UpstreamQmuxTasks {
+            server_adapter,
+            server_h3,
+            client_adapter,
+            client_h3,
+        },
+    )
+}
+
+/// A persistent hyperium H3-over-QMux loopback TCP fixture.
+pub struct UpstreamH3QmuxSocket {
+    sender: UpstreamSocketSender,
+    tasks: UpstreamQmuxTasks,
+}
+
+impl UpstreamH3QmuxSocket {
+    /// Establishes and warms the hyperium socket fixture.
+    pub async fn establish() -> Self {
+        let (sender, tasks) = upstream_socket_pair().await;
+        let fixture = Self { sender, tasks };
+        assert_eq!(fixture.round_trip(Bytes::new()).await, 0);
+        fixture
+    }
+
+    /// Sends one body and drains its exact echo.
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        upstream_qmux_round_trip(&self.sender, body).await
+    }
+
+    /// Takes away both server-side socket drivers.
+    pub fn abandon_server(&self) {
+        self.tasks.abandon_server();
     }
 }

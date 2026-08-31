@@ -38,6 +38,7 @@ ngnet-h2 = { workspace = true, features = ["tokio", "completion"] }
 # check in `tests/ngnet-workspace-tests/tests/dependency_graph.rs` lists library crates, so
 # nothing here widens what any shipped crate may reach.
 ngnet-qmux-h3.workspace = true
+h3-ngnet-qmux.workspace = true
 ngnet-qmux = { workspace = true, features = ["tokio"] }
 ngnet-h3.workspace = true
 ngnet-h3-quinn.workspace = true
@@ -130,4 +131,20 @@ harness = false
 
 [[bench]]
 name = "quic_stack_body_throughput"
+harness = false
+
+[[bench]]
+name = "qmux_h3_serial_latency"
+harness = false
+
+[[bench]]
+name = "qmux_h3_body_throughput"
+harness = false
+
+[[bench]]
+name = "qmux_h3_socket_serial_latency"
+harness = false
+
+[[bench]]
+name = "qmux_h3_socket_body_throughput"
 harness = false
