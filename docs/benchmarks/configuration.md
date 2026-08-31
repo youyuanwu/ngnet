@@ -45,8 +45,10 @@ The comparison intentionally does not claim to isolate one layer:
 Each stack uses its production transport defaults. Matching them by changing flow-control,
 stream-count, acknowledgement, pacing, or congestion settings would answer a different
 configuration study rather than which default stack performs better today. The body case is
-limited to 1 KiB because repeated 16 KiB ngtcp2 exchanges can stall or close and repeated
-1 MiB exchanges can crash in native code; the Quinn-only target retains both larger sizes.
+limited to 1 KiB because only that size has a calibrated, low-drift multi-arm performance
+protocol. The stalls and native crashes at 16 KiB/1 MiB describe the historical pre-repair
+path; active exactness and diagnostic tests cover the repaired path, while the Quinn-only
+Criterion target retains both larger sizes.
 
 ## The HTTP/2 comparison: `ngnet-h2` against hyper
 

@@ -10,7 +10,7 @@ what the run does and does not establish.
 | Machine | Status | Runs |
 | --- | --- | --- |
 | [`legacy-dev-host`](legacy-dev-host/) | **Retired, unavailable.** Every measurement taken before 2026-08-16. Noisy: unchanged control arms drifted 5–15% within a session. | 4 |
-| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current VM; historical machine label and recorded spec are Intel Xeon Platinum 8370C. Runs 12–23 report 8573C, while runs 24 and 29 report 8370C again; Azure migration timing is unknown, so absolute figures across runs are not controlled. | 29 |
+| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current VM; historical machine label and recorded spec are Intel Xeon Platinum 8370C. Runs 12–23 report 8573C, while runs 24, 29, and 30 report 8370C again; Azure migration timing is unknown, so absolute figures across runs are not controlled. | 30 |
 
 **Absolute figures from different machines must never be tabulated together.** Nothing here
 is normalised for CPU model, kernel or io_uring implementation, and those are exactly the
@@ -50,11 +50,12 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [22-qmux-h3-at-8-mib](xeon-8370c-azure/22-qmux-h3-at-8-mib.md) | xeon-8370c-azure | 2026-08-29 | New 8 MiB point — **1.182× duplex, 0.919× socket** | [QMux against HTTP/2](../findings/qmux-against-h2.md) |
 | [23-ngnet-h3-quinn-vs-h3-quinn](xeon-8370c-azure/23-ngnet-h3-quinn-vs-h3-quinn.md) | xeon-8370c-azure | 2026-08-29 | Quinn-matched comparison — **2.684× empty, 1.463× at 16 KiB, 1.129× at 1 MiB** | — |
 | [24-ngnet-h3-quinn-lifecycle](xeon-8370c-azure/24-ngnet-h3-quinn-lifecycle.md) | xeon-8370c-azure | 2026-08-29 | Bounded Quinn lifecycle cleanup — **−24.50% adjusted empty serial, 223,968 → 7,300 KiB aged RSS** | — |
-| [25-ngtcp2-quic-stack-comparison](xeon-8370c-azure/25-ngtcp2-quic-stack-comparison.md) | xeon-8370c-azure | 2026-08-30 | ngtcp2/OpenSSL against Quinn/rustls — **1.513× empty, 1.401× at 1 KiB; larger bodies unstable** | — |
+| [25-ngtcp2-quic-stack-comparison](xeon-8370c-azure/25-ngtcp2-quic-stack-comparison.md) | xeon-8370c-azure | 2026-08-30 | Historical pre-repair ngtcp2/OpenSSL context — **1.513× empty, 1.401× at 1 KiB; larger bodies were unstable** | — |
 | [26-ngtcp2-phase1-diagnostics](xeon-8370c-azure/26-ngtcp2-phase1-diagnostics.md) | xeon-8370c-azure | 2026-08-30 | Diagnostic foundation — **1 MiB failure reproduced; whole-remainder preparation measured** | — |
-| [27-ngtcp2-packet-bounded-staging](xeon-8370c-azure/27-ngtcp2-packet-bounded-staging.md) | xeon-8370c-azure | 2026-08-30 | Packet-bounded borrowing repair — **persistent 1 MiB exactness and memory qualification** | — |
+| [27-ngtcp2-packet-bounded-staging](xeon-8370c-azure/27-ngtcp2-packet-bounded-staging.md) | xeon-8370c-azure | 2026-08-30 | Packet-bounded borrowing repair — **historical exactness and sampled-RSS evidence** | — |
 | [28-ngtcp2-stream-first-gate](xeon-8370c-azure/28-ngtcp2-stream-first-gate.md) | xeon-8370c-azure | 2026-08-30 | Stream-first ordering — **attribution gate unsatisfied; deferred unchanged** | — |
 | [29-ngtcp2-residual-eligibility](xeon-8370c-azure/29-ngtcp2-residual-eligibility.md) | xeon-8370c-azure | 2026-08-30 | Residual partition — **all candidates deferred; no promotion pending** | — |
+| [30-ngtcp2-final-review-resolution](xeon-8370c-azure/30-ngtcp2-final-review-resolution.md) | xeon-8370c-azure | 2026-08-30 | Final-review resolution — **calibration fails; diagnostic stalls retained; RSS/stability criterion unmet** | — |
 
 Runs [`08`](xeon-8370c-azure/08-qmux-against-h2.md) and
 [`09`](xeon-8370c-azure/09-qmux-h2-mechanisms.md) are the first cross-protocol comparison and its

@@ -113,8 +113,9 @@ and 1 KiB exchanges, plus fixed-count 16 KiB and 1 MiB probes. Runs
 [`25`–`29`](../benchmarks/data/xeon-8370c-azure/README.md#runs) record the original comparison,
 diagnostic failure, packet-bounded correctness/resource qualification, unchanged packet-order
 decision, and residual-candidate dispositions. The repaired path completes 125 exact
-sequential echoes at both large sizes, and fresh 125/250/500 × 1 MiB processes stayed within
-the recorded RSS envelope.
+sequential echoes at both large sizes. Final-review run 30 records ten passing predetermined
+exact 1 MiB repetitions but also two fresh diagnostic timeouts, so it explicitly leaves
+persistent-stability and RSS-envelope qualification unmet.
 
 Those measurements do not isolate the sans-I/O core from OpenSSL, the detached endpoint, the
 HTTP/3 adapter, or generic HTTP/3 work. The failed predecessor is not a large-body performance

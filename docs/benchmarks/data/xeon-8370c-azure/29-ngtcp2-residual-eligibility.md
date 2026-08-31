@@ -35,15 +35,19 @@ taskset -c 3 ./target/release/examples/probe ngnet-quic-h3 body 1024 COUNT diagn
 ```
 
 Diagnostic mode was armed only after `PROBE-READY`. Timing mode called the same feature-gated
-hooks while unarmed. The invariant test
-`feature_enabled_unarmed_diagnostic_checks_allocate_nothing` separately verifies that unarmed
-hooks report the default snapshot and allocate nothing
+hooks while unarmed. The then-current invariant test
+`feature_enabled_unarmed_diagnostic_checks_allocate_nothing` verified only direct hook calls;
+it did not prove that the integrated stream path skipped range/retention traversals while
+unarmed. Final-review repair added that representative coverage
 ([`tests/ngnet-quic-h3-tests/tests/zero_alloc.rs:487-507`](../../../../tests/ngnet-quic-h3-tests/tests/zero_alloc.rs#L487-L507)).
 
 ## End-to-end timing and drift
 
-The three arms were rotated through the first, second, and third position across passes. Raw
-elapsed values cover only the fixed post-warm-up exchange loop.
+The three arms were rotated through the first, second, and third position across passes. The
+raw elapsed values cover only the fixed post-warm-up exchange loop, but the target performed
+byte-exact comparison while both controls only drained/counts bytes. The probe also lacked its
+required Criterion calibration. The tables are retained as historical observations, not
+comparable timing or an eligibility gate.
 
 | Count | Pass | `ngnet-quic-h3` ns | `ngnet-h3-quinn` ns | `h3-quinn` ns |
 | ---: | ---: | ---: | ---: | ---: |
@@ -69,20 +73,25 @@ The paired target-minus-impact gaps were 21.543, 55.199, and 24.287 µs at 125 e
 (median 24.287 µs), which is smaller than the 58.487 µs unchanged-control span. At 250 they
 were 110.862, -7.048, and 36.372 µs (median 36.372 µs): the sign changed, the arm ranges
 overlapped, and the target span was 94.966 µs despite the smaller 21.580 µs control span.
-There is therefore no stable adapter-specific gap that clears matched drift.
+The original analysis found no stable adapter-specific gap that cleared matched drift, but
+the asymmetric, uncalibrated timing means the stronger conclusion is simply that this timing
+set is ungated and non-comparable.
 
 The paired impact-minus-drift gaps were 56.960, 78.998, and 45.704 µs at 125 exchanges
 (median 56.960 µs), also smaller than the 58.487 µs control span. The 250-exchange differences
 were 41.475, 64.831, and 50.510 µs (median 50.510 µs), but no generic-driver or Quinn-handoff
-counter partitions that combined gap. The host noise and missing partition prevent an
+counter partitions that combined gap. The timing set cannot establish that gap. Independently, the missing partition prevents an
 eligibility claim.
 
 ## Scoped ngtcp2 observations
 
-The final cumulative diagnostic snapshots reconciled accepted bytes to release bytes,
-produced packets to transport-only plus stream-carrying packets, and reported zero inbound
-drops, zero zero-accept retries without an enabling event, and no counter overflow in every
-pass.
+The final cumulative diagnostic snapshots reconciled accepted transport stream bytes to
+release bytes, produced packets to transport-only plus stream-carrying packets, and reported
+zero inbound drops and no counter overflow in every pass. The historical
+zero-accept-retry-without-enable value is not liveness evidence: local transport packet
+production and generic driver wakes were then classified as enabling events, allowing the
+diagnostic to self-satisfy. Final-review repair separates local production/wakes from true
+inbound, timer-fire, and outbound-capacity enabling events.
 
 `produce` and stream `drain` hand each successful packet buffer to the detached endpoint
 queue. The send path therefore forces one owned allocation and one outbound queue handoff per
@@ -123,14 +132,19 @@ count. The required inbound-copy event count is **unavailable**.
 
 ## Socket-call observations
 
-`strace` was used only for counts, not timing conclusions. Its output was counted after
-`PROBE-READY` and stopped at `PROBE-DONE`:
+`strace` was used only for counts, not timing conclusions. The record originally described a
+post-`PROBE-READY`/pre-`PROBE-DONE` boundary:
 
 ```sh
 strace -f -qq \
   -e trace=sendto,sendmsg,sendmmsg,recvfrom,recvmsg,recvmmsg \
   taskset -c 3 ./target/release/examples/probe ARM body 1024 COUNT timing
 ```
+
+That command traces the complete process, and neither a marker-aware extraction command nor
+raw traces were retained. The exact boundary provenance is therefore unavailable; the table
+below is historical and must not be represented as independently reproducible post-ready
+counts.
 
 | Arm | Pass | 125 send calls | 250 send calls | Ratio | Interface |
 | --- | ---: | ---: | ---: | ---: | --- |
@@ -181,11 +195,11 @@ instrumented run.
 
 ## Decision
 
-No candidate satisfies every eligibility condition. Positive linear packet, timer-rearm, and
-socket-call counts are real observations, but they do not override the matched timing drift or
-the missing layer attribution. Generic `ngnet-h3`, detached endpoint/`ngnet-quic-h3`, and
-`ngnet-h3-quinn` task/channel work remain separate in the record; no source responsibility
-was moved to make a measurement.
+No candidate satisfies every eligibility condition. Positive linear packet and timer-rearm
+counts remain diagnostic observations, while socket-call boundary provenance and the timing
+gate are report-only limitations. None overrides missing layer attribution. Generic
+`ngnet-h3`, detached endpoint/`ngnet-quic-h3`, and `ngnet-h3-quinn` task/channel work remain
+separate in the record; no source responsibility was moved to make a measurement.
 
 All six candidates are terminally deferred for this workflow. There is no promotion-pending
 candidate and no residual source behavior change.

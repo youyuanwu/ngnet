@@ -116,10 +116,11 @@ The ordinary `tests/ngnet-bench/tests/ngtcp2_fixture.rs` regressions are active 
 ignored. They run 125 sequential exact echoes at both 16 KiB and 1 MiB in debug and release.
 With the additive `diagnostics` feature, the same fixture checks every attempt's
 `accepted <= staged <= min(offered, sampled payload)`, FIN suppression on a truncated prefix,
-accepted/release and packet-category reconciliation, linear staging under a fixed test bound,
-and zero-progress retries only after a recorded enabling event. The feature-enabled but
-unarmed allocation test additionally pins that diagnostic hooks allocate nothing and return
-the default snapshot.
+accepted/release and packet-category reconciliation, and real zero-progress retry/enabling
+event accounting. Fixed-limit scaling is deterministic retention coverage rather than a flaky
+live-loopback ratio gate. The feature-enabled but unarmed allocation test additionally pins
+that diagnostic hooks allocate nothing and return the default snapshot, and the representative
+drain test proves diagnostic-only staging work is not evaluated while unarmed.
 
 ## FFI — `crates/ngnet-quic/tests/versioned_ffi.rs`
 

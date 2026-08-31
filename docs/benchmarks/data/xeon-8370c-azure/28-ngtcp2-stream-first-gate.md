@@ -11,15 +11,16 @@
 The reviewed Phase 3 plan permits a stream-first packet-order experiment only when all of
 these conditions already hold:
 
-1. the Phase 2 origin is stable;
+1. the Phase 2 checkout has qualifying stability evidence;
 2. recurring ACK/control debt exists alongside stream data;
 3. standalone transport packets are attributable specifically to transport-first ordering;
 4. a target gap larger than matched drift is declared before measuring the candidate.
 
-Phase 2 established the stable origin and observed recurring transport-only packets. It did
-not establish conditions 2–4. In particular, the origin timing spans were 11.79% target and
-14.30% control at 16 KiB, and 38.29% target and 21.13% control at 1 MiB. No packet-count or
-latency target larger than those spans was declared before Phase 3.
+Run 27 historically treated Phase 2 as a stable origin and observed recurring transport-only
+packets. Final review later found its timing asymmetric/uncalibrated and reproduced diagnostic
+timeouts, so condition 1 is no longer claimed for the current checkout. Conditions 2–4 also
+remain unsatisfied. No packet-count or latency target larger than the historical spans was
+declared before Phase 3.
 
 ## What the current diagnostics prove
 

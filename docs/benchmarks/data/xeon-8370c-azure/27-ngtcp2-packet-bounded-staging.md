@@ -2,8 +2,9 @@
 
 **Machine:** historical [`xeon-8370c-azure`](README.md) label; CPU 3
 **Date:** 2026-08-30
-**Source:** `e4815f7` (complete Phase 2 implementation; documentation follows)
-**Purpose:** correctness/resource qualification and stable-origin characterization
+**Source:** unrecoverable uncommitted working tree based on `e4815f7`; `9010a5b` is the
+subsequent committed representation of the repair, not proof of measured-tree identity
+**Purpose:** historical correctness/resource qualification and report-only origin context
 **Exclusions:** no failed, slow, or signalled system-under-test attempt was excluded
 
 ## Repair
@@ -32,7 +33,7 @@ multi-slice, complete, blocked, empty-FIN, delayed-FIN, stable-address, acknowle
 release behavior are covered by retention, stream, diagnostic, allocation, and end-to-end
 tests.
 
-The release scaling test reported:
+The historical live-loopback release scaling test reported:
 
 | Run | Aggregate prepared backing |
 | --- | ---: |
@@ -40,12 +41,14 @@ The release scaling test reported:
 | Fixed 1024-byte limit, 64 KiB body | 322,691 B |
 | Fixed 1024-byte limit, 128 KiB body | 652,388 B |
 
-The fixed-limit doubling ratio is `652388 / 322691 = 2.021×`, below the `2.1×` bound. Every
-recorded attempt is asserted to satisfy
+The fixed-limit doubling ratio was `652388 / 322691 = 2.021×`. This is retained as recorded
+evidence only: the flaky live-loopback `2.1×` automated gate was removed in favor of
+deterministic controlled staging coverage. Every recorded attempt was asserted to satisfy
 `accepted <= staged <= min(offered, sampled_payload_limit)`. Each diagnostic batch also
 asserts aggregate staged bytes are no greater than accepted bytes plus one effective payload
 limit for each partial or zero-accept attempt. Accepted and HTTP/3 release-event bytes matched
-exactly for both roles.
+exactly for both roles. Those fields are transport stream bytes, including HTTP/3
+framing/control data; exact echoed application-body bytes were checked separately.
 
 ## Persistent exactness
 
@@ -88,11 +91,13 @@ taskset -c 3 ./target/release/examples/probe \
   ngnet-quic-h3 body 1048576 COUNT diagnostic
 ```
 
-The three 125-exchange runs and the 250/500 runs all completed exactly, reported zero inbound
-drops, zero zero-accept retries without a recorded enabling event, no counter overflow, and
-accepted bytes equal to release-event bytes.
+The three 125-exchange runs and the single 250/500 runs all completed exactly, reported zero
+inbound drops, no counter overflow, and accepted transport stream bytes equal to release-event
+bytes. The historical zero-accept retry result is not accepted as liveness proof: local
+transport-packet production and generic driver wakes were then misclassified as enabling
+events, allowing the diagnostic to satisfy itself.
 
-| Exchanges | Ready RSS | Maximum RSS | Final RSS | Maximum increase |
+| Exchanges | Ready RSS | Maximum sampled post-boundary `VmRSS` | Final RSS | Maximum increase |
 | ---: | ---: | ---: | ---: | ---: |
 | 125 (1) | 13,852 KiB | 18,392 KiB | 17,364 KiB | 4,540 KiB |
 | 125 (2) | 13,844 KiB | 22,460 KiB | 21,432 KiB | 8,616 KiB |
@@ -108,7 +113,7 @@ The first 125-run final snapshots reported client/server prepared backing of
 1.042×/1.060× accepted progress rather than Phase 1's 17.13×/7.58× three-exchange
 complete-offer amplification.
 
-## Stable-origin characterization
+## Historical origin characterization
 
 The predecessor is a correctness-failing reference, not a 1 MiB throughput baseline. The
 repaired checkout was therefore characterized as a new origin, interleaving three unarmed
@@ -125,8 +130,11 @@ taskset -c 3 ./target/release/examples/probe ARM body SIZE 125 timing
 | 1 MiB | 5,833,162,457; 5,107,401,231; 3,877,749,160 | 775,944,379; 666,550,713; 635,099,036 |
 
 Every target and control process completed 125 exchanges. Span was 11.79% target and 14.30%
-control at 16 KiB, and 38.29% target and 21.13% control at 1 MiB. These noisy-host values
-characterize the repaired origin but do not support a directional performance claim.
+control at 16 KiB, and 38.29% target and 21.13% control at 1 MiB. The target arm performed
+byte-exact comparison while the control arm only drained/counts bytes, and the probe had not
+passed its required 1 KiB Criterion calibration. These values are therefore historical,
+non-comparable observations only; they do not establish a calibrated performance origin or a
+directional performance claim.
 
 ## Verification and limitations
 
@@ -158,3 +166,10 @@ are not substituted for a same-session matched control.
 Packet ordering was not changed. Diagnostic snapshots show recurring transport-only packets,
 but current timing spread is too large and no transport-first-attributed target gap has been
 declared. Phase 3 therefore remains gated.
+
+The exact measured source tree cannot now be reconstructed. No dirty-tree diff, source
+archive, measured binary hash, or raw log was retained. Git proves that `e4815f7` has tree
+`ca5b4d189a8a6ad02021f743ebb8e06b2ce2e19a`, while the later Phase 2 commit `9010a5b` has
+tree `358699c20f97565e15cb119cb1116c3d764a7524`; those trees differ across the repair code and
+tests. `9010a5b` is the likely durable representation, but the stronger identity claim is not
+recoverable and is not guessed.

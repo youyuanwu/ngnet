@@ -115,16 +115,21 @@ ngtcp2's acknowledgement releases the transport-owned backing.
 
 ## Backpressure retries require new information
 
-The detached outbound queue is bounded at 64 datagrams. Before producing, the adapter
-atomically observes capacity or registers its waker while the queue remains full. The first
-full-to-available transition consumes that registration; later removals do not create
+The detached outbound queue is bounded at 64 datagrams in total. Normal production may occupy
+63 slots; the final slot is reserved because synchronous `QuicConnection::close` cannot
+return `Pending`. A close waits behind every already-produced datagram, so it neither exceeds
+the bound nor discards/reorders earlier output. Before normal production, the adapter
+atomically observes capacity or registers its waker while those 63 slots remain full. The
+first full-to-available transition consumes that registration; later removals do not create
 duplicate retries.
 
 A stream-write call that produces a transport-only datagram while accepting zero stream bytes
-ends the current drain. It does not immediately reoffer the same prefix against unchanged
-state: the connection waits for inbound work, a timer, restored queue capacity, or another
-recorded enabling event. This keeps liveness without spinning or repeatedly staging the same
-offer.
+ends the current drain, avoiding an immediate inner-loop reoffer. Diagnostics distinguish
+that local packet production and a generic driver wake from true inbound-datagram,
+timer-fire, or outbound-capacity events. The outer HTTP/3 driver can still poll the same
+prefix again without a proven external/sendability generation; diagnostics report that
+honestly as `zero_accept_retries_without_enable`. Changing production scheduling to enforce a
+generation gate is deferred until a reproduced defect justifies that broader redesign.
 
 ## Peer-opened unidirectional streams are not announced
 

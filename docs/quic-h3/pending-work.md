@@ -29,10 +29,12 @@ maximum-UDP-payload prefix per attempt rather than the caller's complete outstan
 The other copy — serialising nghttp3's bytes into the packet — is not obviously avoidable,
 since that is what constructing a datagram means.
 
-Run [`27`](../benchmarks/data/xeon-8370c-azure/27-ngtcp2-packet-bounded-staging.md) measures
-staged backing, accepted progress, exactness, and RSS: 125/250/500 × 1 MiB completes within
-the recorded envelope. It does not isolate copy CPU cost from packet protection, endpoint,
-adapter, or generic HTTP/3 work.
+Run [`27`](../benchmarks/data/xeon-8370c-azure/27-ngtcp2-packet-bounded-staging.md) records
+historical staged backing, accepted progress, exactness, and sampled RSS. Final-review
+[`run 30`](../benchmarks/data/xeon-8370c-azure/30-ngtcp2-final-review-resolution.md) records
+fresh diagnostic timeouts, so current persistent stability and the RSS envelope remain unmet.
+Neither record isolates copy CPU cost from packet protection, endpoint, adapter, or generic
+HTTP/3 work.
 
 **What would settle the remaining copy:** route ownership-taking HTTP/3 buffers through
 `Conn::write_stream_owned`, change release to acknowledgement, and change
@@ -95,12 +97,14 @@ Nothing acts on the count.
 
 The persistent diagnostic workload now exercises 125/250/500 sequential 1 MiB exchanges.
 Before the endpoint yielded after each receive batch, one 1 MiB run recorded 73 unexpected
-drops; after the fairness repair, all recorded qualification processes report zero. This
-settles the ordinary persistent case without changing the explicit overflow rule.
+drops. Later quiet-path processes reported zero drops, including the final-review attempts
+that timed out for a different reason. A deterministic induced-drop test now fills the
+64-datagram inbound queue, accounts for the expected discarded packets, and inventories the
+queued datagrams when the owner marks the connection terminal.
 
-**What would settle the broader limit:** a deliberately slow detached consumer and multiple
-connections sharing one socket, with drops and recovery treated as the expected result rather
-than a benchmark invalidation.
+**What would settle the broader network behavior:** a deliberately slow detached consumer and
+multiple connections sharing one socket, with loss recovery treated as the expected result
+rather than a benchmark invalidation.
 
 ## Packet ordering and residual optimizations are deferred
 

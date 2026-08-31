@@ -175,7 +175,11 @@ taskset -c 3 ./target/release/examples/probe ngnet-quic-h3 body 16384 125 timing
 Only `PROBE-METADATA`, `PROBE-READY`, `PROBE-TIMING`, and `PROBE-DONE` are emitted. Setup and
 warm-up precede readiness; the measured interval contains no progress, diagnostic,
 allocation-sampling, or RSS work. `PROBE-TIMING` reports two-direction application bytes and
-elapsed nanoseconds.
+elapsed nanoseconds for body workloads (concurrent workloads report rounds and streams
+instead). Every timing arm performs equivalent response draining and byte counting; byte-exact
+comparison is deliberately confined to diagnostic/correctness runs. A feature-enabled timing
+binary still takes only the arming checks: it does not traverse offered ranges, retained
+storage, attempts, or liveness state while unarmed.
 
 Diagnostic mode is a separate feature-enabled process built from the same checkout:
 
@@ -186,23 +190,45 @@ taskset -c 3 ./target/release/examples/probe ngnet-quic-h3 body 16384 125 diagno
 
 The non-default `diagnostics` feature is additive and remains unarmed until after
 `PROBE-READY`. Armed output is line-flushed only after a fully drained exact response. It
-contains one record per transport offer plus cumulative client/server snapshots: offered,
-prepared backing, accepted, retained, released, packet, timer, wake, retry, park, queue,
-drop, and overflow observations. A field the safe transport cannot currently distinguish,
-such as retransmission attribution, is printed as `unavailable`, never as a guessed zero.
+contains one record per transport offer plus exclusive per-exchange client/server intervals:
+offered, prepared backing, accepted, retained, released, packet, timer, wake, retry, park,
+queue, drop, terminal-discard, and overflow observations. Cumulative counters reset at each
+exclusive drain. Live retained/queue gauges keep their current values and their next
+high-water intervals start at those values. A field the safe transport cannot currently
+distinguish, such as retransmission attribution, is printed as `unavailable`, never as a
+guessed zero.
+
+`application_body_bytes` is the body drained by one endpoint for that exchange.
+`transport_stream_accepted` and `transport_stream_release_bytes` are QUIC stream bytes and
+include HTTP/3 HEADERS/DATA framing and control-stream bytes. Diagnostics assert that accepted
+transport stream bytes cover the application body and report the difference as
+`framing_overhead_bytes`; accepted/release equality remains a separate transport-copy
+reconciliation.
 The probe rejects an attempt unless prepared backing is no greater than
 `min(offered, sampled_payload_limit)`, rejects FIN on a truncated staged prefix, and checks
 aggregate staged bytes against accepted progress plus one sampled limit for every
 partial/zero-accept attempt.
-RSS is read from `/proc/self/status` after readiness, after complete exchanges, and after
-the final drain; non-Linux hosts print `rss_kib=unavailable`.
+RSS is read from `/proc/self/status` after readiness, immediately after each response drain
+and before diagnostic formatting, and after the final diagnostic drain; non-Linux hosts print
+`rss_kib=unavailable`. Failure paths make a best-effort RSS sample and exclusive diagnostic
+drain before panicking.
 
-The probe gives each exchange a body-scaled timeout (2 seconds plus 3 seconds per started
-MiB), reports the last completed exchange before timing out, and checks every response
-length. Run it under an outer supervisor as well, because a native signal cannot be caught
-reliably by Rust:
+Diagnostic mode gives each exchange a body- and build-scaled timeout: release builds allow
+5 seconds plus 10 seconds per started MiB; debug builds allow 15 seconds plus 30 seconds per
+started MiB. It reports the last completed exchange before timing out and checks every
+response byte. Timing mode intentionally has no in-process timeout because polling a timeout
+changes the measured scheduler path. **An outer supervisor is therefore required for timing
+runs** and remains required for diagnostics because a native signal cannot be caught reliably
+by Rust:
 
 ```sh
+# Timing has no in-process timeout.
+timeout --signal=TERM --kill-after=5s 900s \
+  taskset -c 3 ./target/release/examples/probe \
+  ngnet-quic-h3 body 1048576 125 timing
+printf 'timing_probe_exit=%s\n' "$?"
+
+# Diagnostic mode also keeps the outer boundary for native signals.
 # 125 x 1 MiB: 60 seconds setup allowance plus 125 x 5 seconds.
 timeout --signal=TERM --kill-after=5s 685s \
   taskset -c 3 ./target/release/examples/probe \
@@ -215,6 +241,24 @@ Record exit `0`, `124` (outer timeout), or `128 + signal`, the final
 `PROBE-PROGRESS`, and the final complete snapshot. Never exclude a stalled, signalled,
 wrong-length, or unexpectedly dropped run from correctness results.
 
+Before stability is claimed, predetermine and run five default-profile and five release-profile
+125 × 1 MiB exact repetitions. Each process is externally bounded and every status is kept:
+
+```sh
+for profile in debug release; do
+  for repetition in 1 2 3 4 5; do
+    if [ "$profile" = release ]; then release=--release; outer=900; else release=; outer=1800; fi
+    printf 'STABILITY profile=%s repetition=%s outer_timeout_s=%s\n' \
+      "$profile" "$repetition" "$outer"
+    timeout --signal=TERM --kill-after=5s "${outer}s" \
+      cargo test -p ngnet-bench --test ngtcp2_fixture $release \
+      ngtcp2_fixture_repeats_1_mib_exactly -- --exact --nocapture
+    printf 'STABILITY profile=%s repetition=%s exit=%s\n' \
+      "$profile" "$repetition" "$?"
+  done
+done
+```
+
 ### Calibrating 1 KiB timing
 
 Before treating fixed-count probe throughput as a phase guard, compare its 1 KiB
@@ -222,12 +266,22 @@ per-exchange time with Criterion in one pinned, otherwise idle session. Build on
 three interleaved pairs:
 
 ```sh
-cargo build -p ngnet-bench --bench quic_stack_body_throughput --example probe --release
+cargo build -p ngnet-bench \
+  --bench quic_stack_body_throughput --example probe \
+  --release --features diagnostics
 
-# Repeat this Criterion/probe pair three times without rebuilding.
-taskset -c 3 cargo bench -p ngnet-bench --bench quic_stack_body_throughput -- \
-  'quic_stack_body_throughput/ngnet-quic-h3/1024'
-taskset -c 3 ./target/release/examples/probe ngnet-quic-h3 body 1024 10000 timing
+for pass in 1 2 3; do
+  printf 'CALIBRATION pass=%s instrument=criterion\n' "$pass"
+  taskset -c 3 cargo bench -p ngnet-bench \
+    --bench quic_stack_body_throughput --features diagnostics -- \
+    'quic_stack_body_throughput/ngnet-quic-h3/1024'
+
+  printf 'CALIBRATION pass=%s instrument=probe\n' "$pass"
+  timeout --signal=TERM --kill-after=5s 300s \
+    taskset -c 3 ./target/release/examples/probe \
+    ngnet-quic-h3 body 1024 10000 timing
+  printf 'CALIBRATION pass=%s probe_exit=%s\n' "$pass" "$?"
+done
 ```
 
 Divide each probe's `elapsed_ns` by 10,000. The calibration passes only when the median
@@ -237,12 +291,26 @@ diagnostic instrument; its throughput must not gate a phase.
 
 ### Persistent memory envelope
 
-Use fresh diagnostic processes for three 125-exchange 1 MiB runs, then fresh 250- and
-500-exchange runs. For each process, take the post-warm-up `boundary=ready` sample and the
-largest completed-exchange/final sample. The 125-run envelope is the largest post-warm-up
-increase across the three fresh runs. Each longer run must remain within that envelope plus
+Use fresh diagnostic processes for three 125-exchange, three 250-exchange, and three
+500-exchange 1 MiB runs. For each process, take the post-warm-up `boundary=ready` sample and
+the largest completed-exchange/final sample. The 125-run envelope is the largest post-warm-up
+increase across the three fresh runs. Every longer run must remain within that envelope plus
 the larger of 5% or 2 MiB. Preserve every complete RSS line and report
-`rss_kib=unavailable` when the host cannot provide it.
+`rss_kib=unavailable` when the host cannot provide it. These are sampled `VmRSS` values, not
+kernel `VmHWM` process peaks. The exact five-process schedule is:
+
+```sh
+run=0
+for count in 125 125 125 250 250 250 500 500 500; do
+  run=$((run + 1))
+  limit=$((60 + 5 * count))
+  printf 'RSS run=%s count=%s outer_timeout_s=%s\n' "$run" "$count" "$limit"
+  timeout --signal=TERM --kill-after=5s "${limit}s" \
+    taskset -c 3 ./target/release/examples/probe \
+    ngnet-quic-h3 body 1048576 "$count" diagnostic
+  printf 'RSS run=%s count=%s probe_exit=%s\n' "$run" "$count" "$?"
+done
+```
 
 ### Validating the ngtcp2 HTTP/3 path
 

@@ -545,13 +545,18 @@ against. Observation and registration are one operation under the queue lock:
 `poll_outbound_capacity` either reports room or records the producer's waker while the queue
 is still full. Removing the first datagram from a full queue consumes that waker; later
 removals do not manufacture additional retries. This full-to-available wake is separate from
-the general inbound/work wake.
+the general inbound/work wake. The fixed total is 64 datagrams, with 63 available to normal
+production and one reserved for synchronous CONNECTION_CLOSE. The reserved close drains after
+existing output; it cannot overflow the queue or be lost when the owner marks the detached
+connection terminal.
 
 ### Eviction needs the owner to say when it is done
 
 The endpoint decides a managed connection is finished by asking whether it is draining. It
 cannot ask a detached one, because it does not hold it. So the owner marks it, and until then
-the routing entry stays. Guessing either way is a leak or a connection cut off mid-close.
+the routing entry stays. Marking terminal inventories and discards unread inbound datagrams,
+but preserves all outbound datagrams through socket drain before eviction. Guessing either
+way is a leak or a connection cut off mid-close.
 
 ### The clock travels with the connection
 

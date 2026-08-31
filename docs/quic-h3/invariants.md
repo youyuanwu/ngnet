@@ -36,7 +36,9 @@ keeps 125 × 16 KiB and 125 × 1 MiB exact regressions active in debug and relea
 
 Compiling diagnostics does not arm them. The feature-enabled unarmed allocation proof records
 representative packet, release, timer, wake, and park hooks and requires zero allocations plus
-the default snapshot.
+the default snapshot. A separate integrated drain proof leaves a one-byte diagnostic-only
+staging control set while unarmed, requires actual multi-byte progress, and still requires the
+default snapshot; this catches range/retention traversal or behavior leaking into timing.
 
 ## Module files are flat
 
