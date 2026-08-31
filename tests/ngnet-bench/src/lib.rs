@@ -1289,7 +1289,7 @@ where
         .build::<_, Bytes>(connection)
         .await
         .expect("an upstream H3 QMux server");
-    loop {
+    'requests: loop {
         let resolver = match connection.accept().await {
             Ok(Some(resolver)) => resolver,
             Ok(None) | Err(_) => return,
@@ -1303,7 +1303,7 @@ where
             match stream.recv_data().await {
                 Ok(Some(chunk)) => body.put(chunk),
                 Ok(None) => break,
-                Err(_) => continue,
+                Err(_) => continue 'requests,
             }
         }
         if stream
