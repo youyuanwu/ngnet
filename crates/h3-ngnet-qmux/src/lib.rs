@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Buf;
 use ngnet_qmux::io::{AsyncByteStream, Clock, Connection as QmuxConnection};
 
-pub use connection::{Connection, OpenStreams, Snapshot};
+pub use connection::{Connection, Observer, OpenStreams, Snapshot};
 pub use driver::Driver;
 pub use error::Error;
 pub use stream::{BidiStream, RecvStream, SendStream};

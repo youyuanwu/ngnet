@@ -36,35 +36,16 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> Connection<S, C, B> {
     #[doc(hidden)]
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
-        let core = self
-            .shared
-            .core
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
-        Snapshot {
-            streams: core.streams.len(),
-            pending_accepts: core
-                .streams
-                .values()
-                .filter(|state| state.pending_accept)
-                .count(),
-            receive_bytes: core
-                .streams
-                .values()
-                .flat_map(|state| state.recv.iter())
-                .map(|item| item.data.len())
-                .sum(),
-            receive_terminals: core
-                .streams
-                .values()
-                .filter(|state| state.recv_terminal.is_some())
-                .count(),
-            retained_send_bytes: slots.retained_bytes(),
-            retained_send_high_water: slots.high_water(),
-            lower_queued_output: core.lower.queued_output(),
-            #[cfg(debug_assertions)]
-            routed_events: core.routed_events,
+        snapshot(&self.shared, &self.slots)
+    }
+
+    /// Returns a cloneable read-only handle to the same bounded-state snapshot.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn observer(&self) -> Observer<S, C, B> {
+        Observer {
+            shared: self.shared.clone(),
+            slots: Arc::clone(&self.slots),
         }
     }
 
@@ -319,6 +300,62 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> Drop for OpenStreams<S, C, B> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove_opener(self.opener_id);
+    }
+}
+
+fn snapshot<S: AsyncByteStream, C: Clock, B: Buf>(
+    shared: &Shared<S, C>,
+    send_slots: &Arc<Mutex<SendSlots<B>>>,
+) -> Snapshot {
+    let core = shared.core.lock().unwrap_or_else(PoisonError::into_inner);
+    let slots = send_slots.lock().unwrap_or_else(PoisonError::into_inner);
+    Snapshot {
+        streams: core.streams.len(),
+        pending_accepts: core
+            .streams
+            .values()
+            .filter(|state| state.pending_accept)
+            .count(),
+        receive_bytes: core
+            .streams
+            .values()
+            .flat_map(|state| state.recv.iter())
+            .map(|item| item.data.len())
+            .sum(),
+        receive_terminals: core
+            .streams
+            .values()
+            .filter(|state| state.recv_terminal.is_some())
+            .count(),
+        retained_send_bytes: slots.retained_bytes(),
+        retained_send_high_water: slots.high_water(),
+        lower_queued_output: core.lower.queued_output(),
+        #[cfg(debug_assertions)]
+        routed_events: core.routed_events,
+    }
+}
+
+/// Cloneable read-only adapter state observer.
+#[doc(hidden)]
+pub struct Observer<S: AsyncByteStream, C: Clock, B: Buf> {
+    shared: Shared<S, C>,
+    slots: Arc<Mutex<SendSlots<B>>>,
+}
+
+impl<S: AsyncByteStream, C: Clock, B: Buf> Clone for Observer<S, C, B> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            slots: Arc::clone(&self.slots),
+        }
+    }
+}
+
+impl<S: AsyncByteStream, C: Clock, B: Buf> Observer<S, C, B> {
+    /// Returns the current bounded-state snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot {
+        snapshot(&self.shared, &self.slots)
     }
 }
 

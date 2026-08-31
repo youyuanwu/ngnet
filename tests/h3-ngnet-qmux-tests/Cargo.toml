@@ -9,7 +9,9 @@ repository.workspace = true
 
 [dependencies]
 bytes.workspace = true
-h3.workspace = true
+h3 = { workspace = true, features = [
+    "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+] }
 h3-ngnet-qmux.workspace = true
 http.workspace = true
 ngnet-qmux = { workspace = true, features = ["tokio"] }
