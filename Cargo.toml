@@ -17,6 +17,7 @@ members = [
     "crates/ngnet-util",
     "tests/ngnet-h2-tests",
     "tests/ngnet-h3-tests",
+    "tests/h3-ngnet-qmux-tests",
     "tests/ngnet-quic-tests",
     "tests/ngnet-quic-h3-tests",
     "tests/ngnet-qmux-h3-tests",
@@ -91,6 +92,7 @@ ngnet-h3-sys = { path = "crates/ngnet-h3-sys", version = "0.0.1" }
 # implementation instead of copying the former integration-test backend.
 ngnet-h3-quinn = { path = "crates/ngnet-h3-quinn" }
 h3-ngnet-qmux = { path = "crates/h3-ngnet-qmux" }
+h3-ngnet-qmux-tests = { path = "tests/h3-ngnet-qmux-tests" }
 ngnet-quic-sys = { path = "crates/ngnet-quic-sys", version = "0.0.1", default-features = false }
 ngnet-quic = { path = "crates/ngnet-quic", version = "0.0.1" }
 ngnet-quic-h3-tests = { path = "tests/ngnet-quic-h3-tests" }

@@ -1026,7 +1026,15 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
             return Poll::Ready(Ok(event));
         }
         match pumped {
-            Ok(()) => Poll::Pending,
+            Ok(true) => {
+                // A bounded read may end in the middle of a record. The lower source was
+                // ready, so it owes no later wake merely because bytes remain buffered.
+                // Schedule exactly one continuation for that positive read; the next bounded
+                // turn either completes an event, reads one more batch, or parks normally.
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Ok(false) => Poll::Pending,
             Err(error) => Poll::Ready(Err(error)),
         }
     }
@@ -1444,7 +1452,7 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
     }
 
     /// The adapter-oriented pump: the ordinary bounded output work and no more than one read.
-    fn pump_bounded(&mut self, cx: &mut Context<'_>, flush: Flush) -> Result<()> {
+    fn pump_bounded(&mut self, cx: &mut Context<'_>, flush: Flush) -> Result<bool> {
         #[cfg(debug_assertions)]
         {
             self.pump_calls += 1;
@@ -1454,11 +1462,11 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         }
 
         self.write_side(cx, flush)?;
-        let _ = self.read_once(cx)?;
+        let read = self.read_once(cx)?;
         if self.produce_pending {
             self.write_side(cx, flush)?;
         }
-        Ok(())
+        Ok(read)
     }
 
     /// Reports bytes consumed on a stream, so the peer may send that much more.

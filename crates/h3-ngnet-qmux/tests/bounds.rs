@@ -1,9 +1,13 @@
 mod common;
 
 use std::future::Future;
+#[cfg(debug_assertions)]
 use std::sync::Arc;
+#[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+#[cfg(debug_assertions)]
+use std::task::Wake;
+use std::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
 use h3::quic;
@@ -13,8 +17,10 @@ use ngnet_qmux::io::testing::{TestClock, stream_pair};
 use ngnet_qmux::io::{Config, OUTBOUND_CEILING};
 
 #[derive(Default)]
+#[cfg(debug_assertions)]
 struct Count(AtomicUsize);
 
+#[cfg(debug_assertions)]
 impl Wake for Count {
     fn wake(self: Arc<Self>) {
         self.0.fetch_add(1, Ordering::SeqCst);

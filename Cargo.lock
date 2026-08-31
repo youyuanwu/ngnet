@@ -820,6 +820,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "h3-ngnet-qmux-tests"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "h3",
+ "h3-ngnet-qmux",
+ "http",
+ "ngnet-qmux",
+ "tokio",
+]
+
+[[package]]
 name = "h3-quinn"
 version = "0.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
