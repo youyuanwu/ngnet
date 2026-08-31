@@ -1,11 +1,11 @@
 # 31 — Hyperium H3 and ngnet H3 over the same QMux transport
 
-**Machine:** [`xeon-8370c-azure`](README.md)  
-**Date:** 2026-08-31  
-**Commit:** `87a2cff67af74bb8ee130e9ff97eec4fff8f1901`  
-**Cases:** QMux duplex/socket serial latency and body throughput; focused adapter diagnostics  
+**Machine:** [`xeon-8370c-azure`](README.md)
+**Date:** 2026-08-31
+**Commit:** `87a2cff67af74bb8ee130e9ff97eec4fff8f1901`
+**Cases:** QMux duplex/socket serial latency and body throughput; focused adapter diagnostics
 **Repetitions:** three pinned, interleaved fixed-count timing rounds at 1 MiB; Criterion
-surveys used 20 serial samples or 10 body samples  
+surveys used 20 serial samples or 10 body samples
 **Exclusions:** no numerical sample was excluded. Criterion-reported outliers remain in its
 confidence intervals. The unpinned Criterion survey is context, not the controlled verdict.
 
