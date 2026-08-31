@@ -487,6 +487,14 @@ fn recording_guard() -> Option<RwLockReadGuard<'static, ()>> {
     armed().then_some(guard)
 }
 
+/// Evaluates diagnostic-only preparation while recording is armed.
+///
+/// The closure is deliberately lazy: feature-enabled timing paths use this helper to avoid
+/// retained-store traversal and other preparation, not merely to discard a prepared record.
+pub(crate) fn capture_when_armed<T>(capture: impl FnOnce() -> T) -> Option<T> {
+    armed().then(capture)
+}
+
 fn push_liveness(
     connection_id: u64,
     role: Role,
@@ -994,6 +1002,10 @@ mod tests {
     fn enabled_but_unarmed_hooks_change_nothing() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset();
+        assert_eq!(
+            capture_when_armed(|| panic!("unarmed diagnostics evaluated preparation")),
+            None
+        );
         record_packet(1, Role::Client, true);
         record_release(1, Role::Client, 7);
         assert_eq!(snapshot(), Snapshot::default());
