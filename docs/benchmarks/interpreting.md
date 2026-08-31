@@ -11,6 +11,12 @@ control active. They compare two complete implementations on one transport under
 local workload; they do not predict internet latency, loss recovery, multi-core scaling, or
 tail behaviour under load.
 
+The matched QMux H3 benches compare two complete H3 implementations and adapters over the same
+QMux transport. Duplex and socket results are separate observations: changing the substrate
+changes syscall and scheduler work, and a sign from one must not be carried to the other.
+Feature-gated `h3-ngnet-qmux` counters are asymmetric focused evidence only; the baseline
+adapter exposes no matching units, so those counts cannot attribute a timing delta.
+
 Read them as a measure of **protocol, wrapper and syscall CPU work**, and nothing else.
 
 - **The duplex removes the kernel.** No syscalls, no sockets, no network. Real-world

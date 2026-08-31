@@ -137,6 +137,12 @@ jobs:
       - name: Test (HTTP/3 over QMux, release)
         run: cargo test -p ngnet-qmux-h3 -p ngnet-qmux-h3-tests --release
 
+      - name: Test (hyperium HTTP/3 over QMux, release)
+        run: cargo test -p h3-ngnet-qmux -p h3-ngnet-qmux-tests --release
+
+      - name: Test (hyperium QMux adapter diagnostics)
+        run: cargo test -p h3-ngnet-qmux --features diagnostics
+
       # Sixteen configurations that differ only in a package and its features, so they are one
       # step iterating a list rather than ten near-identical steps. The list is the whole
       # point of the step: a configuration is added by adding a line, and the reason it
@@ -227,6 +233,8 @@ jobs:
           # makes it an ordinary library that `--all-targets` would otherwise lint only when
           # something else happened to build it.
           HTTP/3 over QMux                         | -p ngnet-qmux-h3 -p ngnet-qmux-h3-tests
+          hyperium HTTP/3 over QMux                | -p h3-ngnet-qmux -p h3-ngnet-qmux-tests
+          hyperium QMux adapter diagnostics        | -p h3-ngnet-qmux --features diagnostics
 
           # `ngnet-axum` has no feature matrix -- axum, tokio and the h2 transport are all
           # unconditional -- so unlike the crates above it needs exactly one invocation
@@ -313,6 +321,9 @@ jobs:
           QMux wrapper, all features               | -p ngnet-qmux --all-features
           HTTP/3 over QMux                         | -p ngnet-qmux-h3
           HTTP/3-over-QMux tests                   | -p ngnet-qmux-h3-tests
+          hyperium HTTP/3 over QMux                | -p h3-ngnet-qmux
+          hyperium QMux adapter diagnostics        | -p h3-ngnet-qmux --features diagnostics
+          hyperium QMux integration tests          | -p h3-ngnet-qmux-tests
 
           # One invocation each, for the same reason as their clippy entries: no features to
           # vary.

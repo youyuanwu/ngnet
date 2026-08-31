@@ -32,6 +32,9 @@ cargo test -p ngnet-quic --no-default-features
 cargo test -p ngnet-quic --no-default-features --features endpoint
 cargo test -p ngnet-quic --release
 cargo test -p ngnet-quic-h3 -p ngnet-quic-h3-tests --release
+cargo test -p ngnet-qmux-h3 -p ngnet-qmux-h3-tests --release
+cargo test -p h3-ngnet-qmux -p h3-ngnet-qmux-tests --release
+cargo test -p h3-ngnet-qmux --features diagnostics
 
 # Runs each benchmark once without timing it. Benchmarks are not part of `cargo test`, so
 # without this they rot silently as the API moves.
@@ -66,6 +69,9 @@ cargo clippy -p ngnet-quic --no-default-features --all-targets -- -D warnings
 cargo clippy -p ngnet-quic --features tokio   --all-targets -- -D warnings
 cargo clippy -p ngnet-quic --no-default-features --features endpoint --all-targets -- -D warnings
 cargo clippy -p ngnet-quic-h3                 --all-targets -- -D warnings
+cargo clippy -p ngnet-qmux-h3 -p ngnet-qmux-h3-tests --all-targets -- -D warnings
+cargo clippy -p h3-ngnet-qmux -p h3-ngnet-qmux-tests --all-targets -- -D warnings
+cargo clippy -p h3-ngnet-qmux --features diagnostics --all-targets -- -D warnings
 
 # One entry each, not a matrix: `ngnet-axum` and `ngnet-util` have no features. axum, tokio,
 # the h2 transport and the tower `Service` impl are all unconditional, so there is no second
@@ -106,6 +112,12 @@ cargo doc --no-deps -p ngnet-quic --all-features
 cargo doc --no-deps -p ngnet-quic-tests
 cargo doc --no-deps -p ngnet-quic-h3
 cargo doc --no-deps -p ngnet-quic-h3-tests
+cargo doc --no-deps -p ngnet-qmux
+cargo doc --no-deps -p ngnet-qmux-h3
+cargo doc --no-deps -p ngnet-qmux-h3-tests
+cargo doc --no-deps -p h3-ngnet-qmux
+cargo doc --no-deps -p h3-ngnet-qmux --features diagnostics
+cargo doc --no-deps -p h3-ngnet-qmux-tests
 
 cargo doc --no-deps -p ngnet-axum
 cargo doc --no-deps -p ngnet-util
