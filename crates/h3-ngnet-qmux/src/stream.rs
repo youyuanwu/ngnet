@@ -63,18 +63,27 @@ impl<B: Buf> SendSlots<B> {
         self.retained_bytes = self.retained_bytes.saturating_add(data.remaining());
         self.high_water = self.high_water.max(self.retained_bytes);
         self.writing.insert(stream_id, data);
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::diagnostics::send_chunk();
+            crate::diagnostics::send_gauge(self.retained_bytes);
+        }
         true
     }
 
     fn remove(&mut self, stream_id: StreamId) {
         if let Some(data) = self.writing.remove(&stream_id) {
             self.retained_bytes = self.retained_bytes.saturating_sub(data.remaining());
+            #[cfg(feature = "diagnostics")]
+            crate::diagnostics::send_gauge(self.retained_bytes);
         }
     }
 
     fn clear(&mut self) {
         self.writing.clear();
         self.retained_bytes = 0;
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::send_gauge(0);
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
@@ -91,6 +100,8 @@ pub(crate) fn apply_effects<B: Buf>(
     slots: &Arc<Mutex<SendSlots<B>>>,
     effects: Effects,
 ) {
+    #[cfg(feature = "diagnostics")]
+    crate::diagnostics::wakes(effects.wakes.len());
     if effects.discard_all || !effects.discard.is_empty() {
         let mut slots = slots.lock().unwrap_or_else(PoisonError::into_inner);
         if effects.discard_all {
@@ -113,6 +124,8 @@ pub(crate) fn drive<S: AsyncByteStream, C: Clock, B: Buf>(
     shared: &Shared<S, C>,
     slots: &Arc<Mutex<SendSlots<B>>>,
 ) {
+    #[cfg(feature = "diagnostics")]
+    crate::diagnostics::adapter_poll();
     let effects = shared.with_core(|core| core.drive_turn(&shared.lower_wake));
     apply_effects(&shared.lower_wake, slots, effects);
 }
@@ -519,6 +532,8 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> quic::RecvStream for RecvStream<S, C,
                     .streams
                     .get_mut(&self.stream_id)
                     .and_then(|state| state.recv.pop_front());
+                #[cfg(feature = "diagnostics")]
+                crate::diagnostics::receive_gauge(core.retained_receive_bytes());
                 if let Some(item) = item {
                     let bytes = item.data.len() as u64;
                     let credited = core
@@ -530,6 +545,13 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> quic::RecvStream for RecvStream<S, C,
                         effects.merge(core.fail(terminal.clone()));
                         Poll::Ready(Err(terminal.stream_error()))
                     } else {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            if bytes != 0 {
+                                crate::diagnostics::stream_credit();
+                                crate::diagnostics::connection_credit();
+                            }
+                        }
                         if item.fin
                             && let Some(state) = core.streams.get_mut(&self.stream_id)
                         {

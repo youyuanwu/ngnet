@@ -10,6 +10,7 @@ repository.workspace = true
 [features]
 default = []
 diagnostics = [
+    "h3-ngnet-qmux/diagnostics",
     "ngnet-quic/diagnostics",
     "ngnet-quic-h3/diagnostics",
     "ngnet-quic-h3-tests/diagnostics",

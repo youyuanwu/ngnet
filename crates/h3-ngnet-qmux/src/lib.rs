@@ -27,6 +27,8 @@
 #![deny(missing_docs, unsafe_code)]
 
 mod connection;
+#[cfg(feature = "diagnostics")]
+pub mod diagnostics;
 mod driver;
 mod error;
 mod state;
@@ -126,4 +128,23 @@ where
     let connection = Connection::new(shared.clone(), Arc::clone(&slots), 0);
     let driver = Driver::new(shared, slots);
     (connection, driver)
+}
+
+/// Adapts a QMux connection built over [`diagnostics::ObservedStream`].
+///
+/// The handle is accepted as construction evidence and is also used by the caller to arm,
+/// snapshot, and drain the combined lower-I/O and adapter interval.
+#[cfg(feature = "diagnostics")]
+#[must_use = "construction returns a driver which must be polled"]
+pub fn from_qmux_with_diagnostics<B, S, C>(
+    connection: QmuxConnection<S, C>,
+    _lower: diagnostics::LowerIoHandle,
+    config: AdapterConfig,
+) -> (Connection<S, C, B>, Driver<S, C, B>)
+where
+    B: Buf,
+    S: AsyncByteStream,
+    C: Clock,
+{
+    from_qmux_with_config(connection, config)
 }

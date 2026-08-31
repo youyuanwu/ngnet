@@ -3,6 +3,8 @@
 //!
 //! Usage: `probe <arm> <workload> <param> <iters> [timing|diagnostic]`
 //!   arm      = h2-duplex | h2-socket | qmux-duplex | qmux-socket |
+//!              ngnet-qmux-matched-duplex | ngnet-qmux-matched-socket |
+//!              h3-qmux-duplex | h3-qmux-socket |
 //!              ngnet-h3-quinn | ngnet-quic-h3 | h3-quinn
 //!   workload = body | concurrent
 //!   param    = body size in bytes, or stream count
@@ -16,8 +18,9 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use ngnet_bench::{
-    NgnetH2, NgnetH3Quinn, NgnetNgtcpH3, NgnetQmuxH3, NgnetQmuxH3Socket, TokioSocket,
-    UpstreamH3Quinn, body_of, current_thread_runtime,
+    NgnetH2, NgnetH3Quinn, NgnetNgtcpH3, NgnetQmuxH3, NgnetQmuxH3Matched, NgnetQmuxH3MatchedSocket,
+    NgnetQmuxH3Socket, TokioSocket, UpstreamH3Qmux, UpstreamH3QmuxSocket, UpstreamH3Quinn, body_of,
+    current_thread_runtime,
 };
 
 enum Arm {
@@ -25,6 +28,10 @@ enum Arm {
     H2Socket(TokioSocket),
     QmuxDuplex(NgnetQmuxH3),
     QmuxSocket(NgnetQmuxH3Socket),
+    NgnetQmuxMatchedDuplex(NgnetQmuxH3Matched),
+    NgnetQmuxMatchedSocket(NgnetQmuxH3MatchedSocket),
+    UpstreamQmuxDuplex(UpstreamH3Qmux),
+    UpstreamQmuxSocket(UpstreamH3QmuxSocket),
     NgnetH3Quinn(NgnetH3Quinn),
     NgnetNgtcpH3(NgnetNgtcpH3),
     UpstreamH3Quinn(UpstreamH3Quinn),
@@ -37,6 +44,10 @@ impl Arm {
             Arm::H2Socket(a) => a.round_trip(body).await,
             Arm::QmuxDuplex(a) => a.round_trip(body).await,
             Arm::QmuxSocket(a) => a.round_trip(body).await,
+            Arm::NgnetQmuxMatchedDuplex(a) => a.round_trip(body).await,
+            Arm::NgnetQmuxMatchedSocket(a) => a.round_trip(body).await,
+            Arm::UpstreamQmuxDuplex(a) => a.round_trip(body).await,
+            Arm::UpstreamQmuxSocket(a) => a.round_trip(body).await,
             Arm::NgnetH3Quinn(a) => a.round_trip(body).await,
             Arm::NgnetNgtcpH3(a) => a.round_trip(body).await,
             Arm::UpstreamH3Quinn(a) => a.round_trip(body).await,
@@ -46,7 +57,9 @@ impl Arm {
     async fn round_trip_checked(&self, body: bytes::Bytes) -> Result<(usize, bool), String> {
         match self {
             Arm::NgnetNgtcpH3(a) => a.try_round_trip_checked(body).await,
-            _ => unreachable!("request validation restricts diagnostic mode to ngnet-quic-h3"),
+            Arm::UpstreamQmuxDuplex(a) => a.try_round_trip_checked(body).await,
+            Arm::UpstreamQmuxSocket(a) => a.try_round_trip_checked(body).await,
+            _ => unreachable!("request validation restricts diagnostic mode to supported arms"),
         }
     }
 
@@ -56,7 +69,13 @@ impl Arm {
             Arm::H2Socket(a) => a.concurrent(n).await,
             Arm::QmuxDuplex(a) => a.concurrent(n).await,
             Arm::QmuxSocket(a) => a.concurrent(n).await,
-            Arm::NgnetH3Quinn(_) | Arm::NgnetNgtcpH3(_) | Arm::UpstreamH3Quinn(_) => {
+            Arm::NgnetQmuxMatchedDuplex(_)
+            | Arm::NgnetQmuxMatchedSocket(_)
+            | Arm::UpstreamQmuxDuplex(_)
+            | Arm::UpstreamQmuxSocket(_)
+            | Arm::NgnetH3Quinn(_)
+            | Arm::NgnetNgtcpH3(_)
+            | Arm::UpstreamH3Quinn(_) => {
                 unreachable!("QUIC arms reject concurrent before setup")
             }
         }
@@ -105,7 +124,57 @@ fn emit_rss(boundary: &str, exchange: usize, sample: Option<u64>) {
 }
 
 #[cfg(feature = "diagnostics")]
-fn emit_diagnostics(exchange: usize, scope: &str, application_body_bytes: Option<usize>) {
+fn emit_diagnostics(
+    arm_name: &str,
+    exchange: usize,
+    scope: &str,
+    application_body_bytes: Option<usize>,
+) {
+    if matches!(arm_name, "h3-qmux-duplex" | "h3-qmux-socket") {
+        let snapshot = h3_ngnet_qmux::diagnostics::drain();
+        eprintln!(
+            "PROBE-QMUX-DIAGNOSTIC exchange={exchange} scope={scope} \
+             lower_read_calls={} lower_read_bytes={} lower_write_calls={} \
+             lower_write_bytes={} lower_write_not_now={} lower_shutdown_calls={} \
+             lower_failures={} adapter_polls={} driver_polls={} pump_attempts={} \
+             productive_turns={} routed_events={} stream_events={} connection_events={} \
+             stream_credit_applications={} connection_credit_applications={} \
+             waiter_registrations={} waiter_replacements={} wake_deliveries={} \
+             logical_send_chunks={} retained_send_bytes={} retained_send_high_water={} \
+             retained_receive_bytes={} retained_receive_high_water={} cleanups={} \
+             terminal_fanouts={} application_body_bytes={} overflow={}",
+            snapshot.lower_read_calls,
+            snapshot.lower_read_bytes,
+            snapshot.lower_write_calls,
+            snapshot.lower_write_bytes,
+            snapshot.lower_write_not_now,
+            snapshot.lower_shutdown_calls,
+            snapshot.lower_failures,
+            snapshot.adapter_polls,
+            snapshot.driver_polls,
+            snapshot.pump_attempts,
+            snapshot.productive_turns,
+            snapshot.routed_events,
+            snapshot.stream_events,
+            snapshot.connection_events,
+            snapshot.stream_credit_applications,
+            snapshot.connection_credit_applications,
+            snapshot.waiter_registrations,
+            snapshot.waiter_replacements,
+            snapshot.wake_deliveries,
+            snapshot.logical_send_chunks,
+            snapshot.retained_send_bytes,
+            snapshot.retained_send_high_water,
+            snapshot.retained_receive_bytes,
+            snapshot.retained_receive_high_water,
+            snapshot.cleanups,
+            snapshot.terminal_fanouts,
+            application_body_bytes
+                .map_or_else(|| "unavailable".to_string(), |bytes| bytes.to_string()),
+            snapshot.overflowed,
+        );
+        return;
+    }
     let drained = ngnet_quic::diagnostics::drain();
     let attempts = drained.attempts;
     let mut staged = 0u64;
@@ -281,7 +350,12 @@ fn emit_diagnostics(exchange: usize, scope: &str, application_body_bytes: Option
 }
 
 #[cfg(not(feature = "diagnostics"))]
-fn emit_diagnostics(_exchange: usize, _scope: &str, _application_body_bytes: Option<usize>) {
+fn emit_diagnostics(
+    _arm_name: &str,
+    _exchange: usize,
+    _scope: &str,
+    _application_body_bytes: Option<usize>,
+) {
     unreachable!("diagnostic mode is rejected before setup")
 }
 
@@ -295,7 +369,17 @@ fn validate_request(
     if iters == 0 {
         return Err("iters must be non-zero".to_string());
     }
-    if matches!(arm_name, "ngnet-h3-quinn" | "ngnet-quic-h3" | "h3-quinn") && workload != "body" {
+    if matches!(
+        arm_name,
+        "ngnet-h3-quinn"
+            | "ngnet-quic-h3"
+            | "h3-quinn"
+            | "ngnet-qmux-matched-duplex"
+            | "ngnet-qmux-matched-socket"
+            | "h3-qmux-duplex"
+            | "h3-qmux-socket"
+    ) && workload != "body"
+    {
         return Err(format!(
             "the {arm_name} arm supports the body workload only"
         ));
@@ -305,8 +389,17 @@ fn validate_request(
             "ngnet-quic-h3 fixed-count probes support 0, 1024, 16384, or 1048576 bytes".to_string(),
         );
     }
-    if mode == Mode::Diagnostic && (arm_name != "ngnet-quic-h3" || workload != "body") {
-        return Err("diagnostic mode supports only `ngnet-quic-h3 body`".to_string());
+    if mode == Mode::Diagnostic
+        && (!matches!(
+            arm_name,
+            "ngnet-quic-h3" | "h3-qmux-duplex" | "h3-qmux-socket"
+        ) || workload != "body")
+    {
+        return Err(
+            "diagnostic mode supports only `ngnet-quic-h3`, `h3-qmux-duplex`, or \
+             `h3-qmux-socket` body"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -338,6 +431,14 @@ fn main() {
             "h2-socket" => Arm::H2Socket(TokioSocket::establish().await),
             "qmux-duplex" => Arm::QmuxDuplex(NgnetQmuxH3::establish().await),
             "qmux-socket" => Arm::QmuxSocket(NgnetQmuxH3Socket::establish().await),
+            "ngnet-qmux-matched-duplex" => {
+                Arm::NgnetQmuxMatchedDuplex(NgnetQmuxH3Matched::establish().await)
+            }
+            "ngnet-qmux-matched-socket" => {
+                Arm::NgnetQmuxMatchedSocket(NgnetQmuxH3MatchedSocket::establish().await)
+            }
+            "h3-qmux-duplex" => Arm::UpstreamQmuxDuplex(UpstreamH3Qmux::establish().await),
+            "h3-qmux-socket" => Arm::UpstreamQmuxSocket(UpstreamH3QmuxSocket::establish().await),
             "ngnet-h3-quinn" => Arm::NgnetH3Quinn(NgnetH3Quinn::establish().await),
             "ngnet-quic-h3" => Arm::NgnetNgtcpH3(
                 tokio::time::timeout(establishment_timeout(), NgnetNgtcpH3::establish())
@@ -384,7 +485,12 @@ fn main() {
         #[cfg(feature = "diagnostics")]
         {
             ngnet_quic::diagnostics::reset();
-            ngnet_quic::diagnostics::arm(mode == Mode::Diagnostic);
+            ngnet_quic::diagnostics::arm(mode == Mode::Diagnostic && arm_name == "ngnet-quic-h3");
+            h3_ngnet_qmux::diagnostics::reset();
+            h3_ngnet_qmux::diagnostics::arm(
+                mode == Mode::Diagnostic
+                    && matches!(arm_name.as_str(), "h3-qmux-duplex" | "h3-qmux-socket"),
+            );
         }
 
         if mode == Mode::Diagnostic {
@@ -416,7 +522,12 @@ fn main() {
                                     exchange - 1,
                                 );
                                 emit_rss("failure-request-or-body", exchange, failure_rss);
-                                emit_diagnostics(exchange, "failure-request-or-body", None);
+                                emit_diagnostics(
+                                    &arm_name,
+                                    exchange,
+                                    "failure-request-or-body",
+                                    None,
+                                );
                                 flush_stderr();
                                 panic!("exchange {exchange} failed before an exact response");
                             }
@@ -429,7 +540,7 @@ fn main() {
                                     exchange_timeout(param).as_millis()
                                 );
                                 emit_rss("failure-timeout", exchange, failure_rss);
-                                emit_diagnostics(exchange, "failure-timeout", None);
+                                emit_diagnostics(&arm_name, exchange, "failure-timeout", None);
                                 flush_stderr();
                                 panic!("exchange {exchange} exceeded its workload-scaled timeout");
                             }
@@ -451,7 +562,7 @@ fn main() {
                         );
                         if mode == Mode::Diagnostic {
                             emit_rss("failure-response-drained", exchange, post_drain_rss);
-                            emit_diagnostics(exchange, "failure-response-drained", None);
+                            emit_diagnostics(&arm_name, exchange, "failure-response-drained", None);
                         }
                         flush_stderr();
                         panic!("exchange {exchange} response was not exact");
@@ -459,7 +570,7 @@ fn main() {
                     black_box(received);
                     if mode == Mode::Diagnostic {
                         emit_rss("response-drained", exchange, post_drain_rss);
-                        emit_diagnostics(exchange, "both-endpoints", Some(param));
+                        emit_diagnostics(&arm_name, exchange, "both-endpoints", Some(param));
                         eprintln!(
                             "PROBE-PROGRESS exchange={exchange} completed={exchange} \
                              expected_bytes={param} received_bytes={received}"
@@ -496,7 +607,7 @@ fn main() {
                 );
             }
         } else {
-            emit_diagnostics(iters, "final", None);
+            emit_diagnostics(&arm_name, iters, "final", None);
             emit_rss("final", iters, rss_kib());
         }
         eprintln!("PROBE-DONE completed={iters}");
@@ -511,6 +622,8 @@ mod tests {
     #[test]
     fn diagnostic_mode_is_restricted_to_the_supported_target_body_arm() {
         assert!(validate_request("ngnet-quic-h3", "body", 1024, 1, Mode::Diagnostic).is_ok());
+        assert!(validate_request("h3-qmux-duplex", "body", 1024, 1, Mode::Diagnostic).is_ok());
+        assert!(validate_request("h3-qmux-socket", "body", 1024, 1, Mode::Diagnostic).is_ok());
         assert!(validate_request("ngnet-h3-quinn", "body", 1024, 1, Mode::Diagnostic).is_err());
         assert!(validate_request("ngnet-quic-h3", "concurrent", 1, 1, Mode::Diagnostic).is_err());
     }

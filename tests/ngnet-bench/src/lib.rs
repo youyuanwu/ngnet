@@ -1256,11 +1256,29 @@ impl NgnetQmuxH3Matched {
     }
 }
 
-type UpstreamMemoryOpener =
-    h3_ngnet_qmux::OpenStreams<TokioStream<tokio::io::DuplexStream>, TokioClock, Bytes>;
+#[cfg(feature = "diagnostics")]
+type UpstreamObserved<S> = h3_ngnet_qmux::diagnostics::ObservedStream<S>;
+#[cfg(not(feature = "diagnostics"))]
+type UpstreamObserved<S> = S;
+
+#[cfg(feature = "diagnostics")]
+fn upstream_observe<S>(stream: S) -> UpstreamObserved<S> {
+    h3_ngnet_qmux::diagnostics::observe(stream).0
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn upstream_observe<S>(stream: S) -> UpstreamObserved<S> {
+    stream
+}
+
+type UpstreamMemoryOpener = h3_ngnet_qmux::OpenStreams<
+    UpstreamObserved<TokioStream<tokio::io::DuplexStream>>,
+    TokioClock,
+    Bytes,
+>;
 type UpstreamMemorySender = h3::client::SendRequest<UpstreamMemoryOpener, Bytes>;
 type UpstreamSocketOpener =
-    h3_ngnet_qmux::OpenStreams<TokioStream<TokioTcpStream>, TokioClock, Bytes>;
+    h3_ngnet_qmux::OpenStreams<UpstreamObserved<TokioStream<TokioTcpStream>>, TokioClock, Bytes>;
 type UpstreamSocketSender = h3::client::SendRequest<UpstreamSocketOpener, Bytes>;
 
 /// Pending peer accepts reserved by the benchmark adapter.
@@ -1371,6 +1389,50 @@ where
     total
 }
 
+async fn upstream_qmux_round_trip_checked<O>(
+    sender: &h3::client::SendRequest<O, Bytes>,
+    body: Bytes,
+) -> Result<(usize, bool), String>
+where
+    O: h3::quic::OpenStreams<Bytes> + Clone,
+{
+    let expected = body.clone();
+    let mut sender = sender.clone();
+    let mut stream = sender
+        .send_request(upstream_qmux_request_head())
+        .await
+        .map_err(|error| format!("upstream QMux request failed: {error:?}"))?;
+    if !body.is_empty() {
+        stream
+            .send_data(body)
+            .await
+            .map_err(|error| format!("upstream QMux request data failed: {error:?}"))?;
+    }
+    stream
+        .finish()
+        .await
+        .map_err(|error| format!("upstream QMux request finish failed: {error:?}"))?;
+    let response = stream
+        .recv_response()
+        .await
+        .map_err(|error| format!("upstream QMux response failed: {error:?}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "upstream QMux response status was {}",
+            response.status()
+        ));
+    }
+    let mut received = BytesMut::new();
+    while let Some(chunk) = stream
+        .recv_data()
+        .await
+        .map_err(|error| format!("upstream QMux response data failed: {error:?}"))?
+    {
+        received.put(chunk);
+    }
+    Ok((received.len(), received.as_ref() == expected.as_ref()))
+}
+
 struct UpstreamQmuxTasks {
     server_adapter: JoinHandle<()>,
     server_h3: JoinHandle<()>,
@@ -1397,7 +1459,7 @@ impl Drop for UpstreamQmuxTasks {
 async fn upstream_memory_pair() -> (UpstreamMemorySender, UpstreamQmuxTasks) {
     let (client_io, server_io) = duplex(DUPLEX_CAPACITY);
     let server_lower = ngnet_qmux::io::Connection::server(
-        TokioStream::new(server_io),
+        upstream_observe(TokioStream::new(server_io)),
         TokioClock::new(),
         qmux_config(),
     )
@@ -1412,7 +1474,7 @@ async fn upstream_memory_pair() -> (UpstreamMemorySender, UpstreamQmuxTasks) {
     let server_h3 = tokio::spawn(upstream_h3_qmux_server(server_connection));
 
     let client_lower = ngnet_qmux::io::Connection::client(
-        TokioStream::new(client_io),
+        upstream_observe(TokioStream::new(client_io)),
         TokioClock::new(),
         qmux_config(),
     )
@@ -1463,6 +1525,11 @@ impl UpstreamH3Qmux {
     /// Sends one request body and drains its exact echo.
     pub async fn round_trip(&self, body: Bytes) -> usize {
         upstream_qmux_round_trip(&self.sender, body).await
+    }
+
+    /// Sends and drains one body while checking every echoed byte.
+    pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
+        upstream_qmux_round_trip_checked(&self.sender, body).await
     }
 
     /// Takes away both server-side drivers.
@@ -1993,7 +2060,7 @@ impl NgnetQmuxH3MatchedSocket {
 async fn upstream_socket_pair() -> (UpstreamSocketSender, UpstreamQmuxTasks) {
     let (client_io, server_io) = tokio_socket_pair().await;
     let server_lower = ngnet_qmux::io::Connection::server(
-        TokioStream::new(server_io),
+        upstream_observe(TokioStream::new(server_io)),
         TokioClock::new(),
         qmux_config(),
     )
@@ -2008,7 +2075,7 @@ async fn upstream_socket_pair() -> (UpstreamSocketSender, UpstreamQmuxTasks) {
     let server_h3 = tokio::spawn(upstream_h3_qmux_server(server_connection));
 
     let client_lower = ngnet_qmux::io::Connection::client(
-        TokioStream::new(client_io),
+        upstream_observe(TokioStream::new(client_io)),
         TokioClock::new(),
         qmux_config(),
     )
@@ -2059,6 +2126,11 @@ impl UpstreamH3QmuxSocket {
     /// Sends one body and drains its exact echo.
     pub async fn round_trip(&self, body: Bytes) -> usize {
         upstream_qmux_round_trip(&self.sender, body).await
+    }
+
+    /// Sends and drains one body while checking every echoed byte.
+    pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
+        upstream_qmux_round_trip_checked(&self.sender, body).await
     }
 
     /// Takes away both server-side socket drivers.
