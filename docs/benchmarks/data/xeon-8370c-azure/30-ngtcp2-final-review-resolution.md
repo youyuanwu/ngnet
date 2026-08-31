@@ -2,8 +2,9 @@
 
 **Machine:** historical [`xeon-8370c-azure`](README.md) label; CPU 3
 **Date:** 2026-08-30
-**Source:** `d8d9d90` (initial final-review source/test fixes) and `3c9c305` (complete
-feature-enabled/unarmed callback isolation)
+**Source:** `d8d9d90` (initial fixes), `3c9c305` (complete unarmed callback isolation),
+`8ae2a1c` (independent final-review reproduction), and `0b4f8e3` (extended-timeout/final
+quarantine source; measured from its identical pre-commit working tree)
 **Base:** `24874f3`
 **Purpose:** resolve final-review timing, liveness, failure-evidence, and memory findings
 **Exclusions:** no system-under-test failure was excluded or replaced
