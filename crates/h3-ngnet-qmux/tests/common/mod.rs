@@ -7,12 +7,12 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use bytes::{Buf, Bytes};
 use h3::quic;
-use h3_ngnet_qmux::{AdapterConfig, Connection, Driver, from_qmux_with_config};
+use h3_ngnet_qmux::{Connection, Driver, from_qmux};
 use ngnet_qmux::io::testing::{TestByteStream, TestClock, stream_pair};
 use ngnet_qmux::io::{Config, Connection as QmuxConnection};
 
-pub type TestConnection = Connection<TestByteStream, TestClock, Bytes>;
-pub type TestDriver = Driver<TestByteStream, TestClock, Bytes>;
+pub type TestConnection = Connection<TestByteStream, TestClock>;
+pub type TestDriver = Driver<TestByteStream, TestClock>;
 
 const MAX_PASSES: usize = 1_000_000;
 
@@ -38,19 +38,19 @@ impl Wake for Flag {
 }
 
 pub fn pair(lower: Config) -> (TestConnection, TestDriver, TestConnection, TestDriver) {
-    pair_with(lower, AdapterConfig::new(), AdapterConfig::new())
+    pair_with(lower, 128, 128)
 }
 
 pub fn pair_with(
     lower: Config,
-    client_adapter: AdapterConfig,
-    server_adapter: AdapterConfig,
+    client_pending_accepts: usize,
+    server_pending_accepts: usize,
 ) -> (TestConnection, TestDriver, TestConnection, TestDriver) {
     let (client_io, server_io) = stream_pair();
     let client = QmuxConnection::client(client_io, TestClock::new(), lower).expect("client QMux");
     let server = QmuxConnection::server(server_io, TestClock::new(), lower).expect("server QMux");
-    let (client, client_driver) = from_qmux_with_config::<Bytes, _, _>(client, client_adapter);
-    let (server, server_driver) = from_qmux_with_config::<Bytes, _, _>(server, server_adapter);
+    let (client, client_driver) = from_qmux(client, client_pending_accepts);
+    let (server, server_driver) = from_qmux(server, server_pending_accepts);
     (client, client_driver, server, server_driver)
 }
 
@@ -108,7 +108,7 @@ where
 
 pub async fn open_bidi(
     connection: &mut TestConnection,
-) -> h3_ngnet_qmux::BidiStream<TestByteStream, TestClock, Bytes> {
+) -> h3_ngnet_qmux::BidiStream<TestByteStream, TestClock> {
     poll_fn(|cx| quic::OpenStreams::poll_open_bidi(connection, cx))
         .await
         .expect("open bidi")
@@ -116,7 +116,7 @@ pub async fn open_bidi(
 
 pub async fn open_uni(
     connection: &mut TestConnection,
-) -> h3_ngnet_qmux::SendStream<TestByteStream, TestClock, Bytes> {
+) -> h3_ngnet_qmux::SendStream<TestByteStream, TestClock> {
     poll_fn(|cx| quic::OpenStreams::poll_open_send(connection, cx))
         .await
         .expect("open uni")
@@ -124,7 +124,7 @@ pub async fn open_uni(
 
 pub async fn accept_bidi(
     connection: &mut TestConnection,
-) -> h3_ngnet_qmux::BidiStream<TestByteStream, TestClock, Bytes> {
+) -> h3_ngnet_qmux::BidiStream<TestByteStream, TestClock> {
     poll_fn(|cx| quic::Connection::poll_accept_bidi(connection, cx))
         .await
         .expect("accept bidi")
@@ -132,7 +132,7 @@ pub async fn accept_bidi(
 
 pub async fn accept_uni(
     connection: &mut TestConnection,
-) -> h3_ngnet_qmux::RecvStream<TestByteStream, TestClock, Bytes> {
+) -> h3_ngnet_qmux::RecvStream<TestByteStream, TestClock> {
     poll_fn(|cx| quic::Connection::poll_accept_recv(connection, cx))
         .await
         .expect("accept uni")

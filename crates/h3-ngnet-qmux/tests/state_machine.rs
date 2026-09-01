@@ -36,7 +36,6 @@ fn peer_uni_and_bidi_streams_are_routed_to_exactly_one_accept_path() {
     );
     assert_eq!(uni, b"uni");
     assert_eq!(bidi, b"bidi");
-    assert_eq!(server.snapshot().pending_accepts, 0);
 }
 
 #[test]

@@ -3,59 +3,42 @@ use std::sync::Arc;
 use h3::quic::{ConnectionErrorIncoming, StreamErrorIncoming};
 use ngnet_qmux::{CloseKind, CloseReason};
 
-/// Stable classification returned by the caller-polled adapter driver.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ErrorKind {
+/// Stable error returned by the caller-polled adapter driver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Error {
     /// The peer closed the connection with an application code.
     ApplicationClose {
         /// Peer-supplied application code.
         error_code: u64,
     },
     /// The adapter detected local misuse or an invariant violation.
-    Internal,
+    Internal(Arc<str>),
     /// QMux, its byte stream, or another underlying component failed.
-    Undefined,
-}
-
-/// A stable adapter-driver failure.
-#[derive(Clone, Debug)]
-pub struct Error {
-    kind: ErrorKind,
-    message: Arc<str>,
+    Undefined(Arc<str>),
 }
 
 impl Error {
     pub(crate) fn application(error_code: u64) -> Self {
-        Self {
-            kind: ErrorKind::ApplicationClose { error_code },
-            message: format!("peer application close, code {error_code}").into(),
-        }
+        Self::ApplicationClose { error_code }
     }
 
     pub(crate) fn internal(message: impl Into<Arc<str>>) -> Self {
-        Self {
-            kind: ErrorKind::Internal,
-            message: message.into(),
-        }
+        Self::Internal(message.into())
     }
 
     pub(crate) fn undefined(message: impl Into<Arc<str>>) -> Self {
-        Self {
-            kind: ErrorKind::Undefined,
-            message: message.into(),
-        }
-    }
-
-    /// Stable failure classification.
-    #[must_use]
-    pub const fn kind(&self) -> ErrorKind {
-        self.kind
+        Self::Undefined(message.into())
     }
 }
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.message)
+        match self {
+            Self::ApplicationClose { error_code } => {
+                write!(f, "peer application close, code {error_code}")
+            }
+            Self::Internal(message) | Self::Undefined(message) => f.write_str(message),
+        }
     }
 }
 
@@ -122,20 +105,16 @@ mod tests {
     #[test]
     fn every_terminal_has_a_stable_public_driver_classification() {
         assert_eq!(
-            ConnectionTerminal::Application(17).driver_error().kind(),
-            ErrorKind::ApplicationClose { error_code: 17 }
+            ConnectionTerminal::Application(17).driver_error(),
+            Error::ApplicationClose { error_code: 17 }
         );
         assert_eq!(
-            ConnectionTerminal::Internal("invariant".into())
-                .driver_error()
-                .kind(),
-            ErrorKind::Internal
+            ConnectionTerminal::Internal("invariant".into()).driver_error(),
+            Error::Internal("invariant".into())
         );
         assert_eq!(
-            ConnectionTerminal::Undefined(Error::undefined("lower"))
-                .driver_error()
-                .kind(),
-            ErrorKind::Undefined
+            ConnectionTerminal::Undefined(Error::undefined("lower")).driver_error(),
+            Error::Undefined("lower".into())
         );
     }
 }

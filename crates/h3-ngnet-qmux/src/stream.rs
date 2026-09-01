@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 
@@ -39,79 +37,9 @@ impl<S: AsyncByteStream, C: Clock> Shared<S, C> {
     }
 }
 
-pub(crate) struct SendSlots<B: Buf> {
-    writing: BTreeMap<StreamId, WriteBuf<B>>,
-    retained_bytes: usize,
-    high_water: usize,
-}
-
-impl<B: Buf> Default for SendSlots<B> {
-    fn default() -> Self {
-        Self {
-            writing: BTreeMap::new(),
-            retained_bytes: 0,
-            high_water: 0,
-        }
-    }
-}
-
-impl<B: Buf> SendSlots<B> {
-    fn insert(&mut self, stream_id: StreamId, data: WriteBuf<B>) -> bool {
-        if self.writing.contains_key(&stream_id) {
-            return false;
-        }
-        self.retained_bytes = self.retained_bytes.saturating_add(data.remaining());
-        self.high_water = self.high_water.max(self.retained_bytes);
-        self.writing.insert(stream_id, data);
-        #[cfg(feature = "diagnostics")]
-        {
-            crate::diagnostics::send_chunk();
-            crate::diagnostics::send_gauge(self.retained_bytes);
-        }
-        true
-    }
-
-    fn remove(&mut self, stream_id: StreamId) {
-        if let Some(data) = self.writing.remove(&stream_id) {
-            self.retained_bytes = self.retained_bytes.saturating_sub(data.remaining());
-            #[cfg(feature = "diagnostics")]
-            crate::diagnostics::send_gauge(self.retained_bytes);
-        }
-    }
-
-    fn clear(&mut self) {
-        self.writing.clear();
-        self.retained_bytes = 0;
-        #[cfg(feature = "diagnostics")]
-        crate::diagnostics::send_gauge(0);
-    }
-
-    pub(crate) fn retained_bytes(&self) -> usize {
-        self.retained_bytes
-    }
-
-    pub(crate) fn high_water(&self) -> usize {
-        self.high_water
-    }
-}
-
-pub(crate) fn apply_effects<B: Buf>(
-    lower_wake: &Arc<LowerWake>,
-    slots: &Arc<Mutex<SendSlots<B>>>,
-    effects: Effects,
-) {
+pub(crate) fn apply_effects(lower_wake: &Arc<LowerWake>, effects: Effects) {
     #[cfg(feature = "diagnostics")]
     crate::diagnostics::wakes(effects.wakes.len());
-    if effects.discard_all || !effects.discard.is_empty() {
-        let mut slots = slots.lock().unwrap_or_else(PoisonError::into_inner);
-        if effects.discard_all {
-            slots.clear();
-        } else {
-            for stream_id in effects.discard {
-                slots.remove(stream_id);
-            }
-        }
-    }
     for waker in effects.wakes {
         waker.wake();
     }
@@ -120,14 +48,11 @@ pub(crate) fn apply_effects<B: Buf>(
     }
 }
 
-pub(crate) fn drive<S: AsyncByteStream, C: Clock, B: Buf>(
-    shared: &Shared<S, C>,
-    slots: &Arc<Mutex<SendSlots<B>>>,
-) {
+pub(crate) fn drive<S: AsyncByteStream, C: Clock>(shared: &Shared<S, C>) {
     #[cfg(feature = "diagnostics")]
     crate::diagnostics::adapter_poll();
     let effects = shared.with_core(|core| core.drive_turn(&shared.lower_wake));
-    apply_effects(&shared.lower_wake, slots, effects);
+    apply_effects(&shared.lower_wake, effects);
 }
 
 fn h3_id(stream_id: StreamId) -> quic::StreamId {
@@ -167,25 +92,14 @@ fn waiting_for_output<S: AsyncByteStream, C: Clock>(core: &Core<S, C>) -> bool {
 }
 
 /// A QMux-backed H3 sending stream.
-pub struct SendStream<S: AsyncByteStream, C: Clock, B: Buf> {
+pub struct SendStream<S: AsyncByteStream, C: Clock> {
     pub(crate) shared: Shared<S, C>,
-    pub(crate) slots: Arc<Mutex<SendSlots<B>>>,
     pub(crate) stream_id: StreamId,
-    _body: PhantomData<fn() -> B>,
 }
 
-impl<S: AsyncByteStream, C: Clock, B: Buf> SendStream<S, C, B> {
-    pub(crate) fn new(
-        shared: Shared<S, C>,
-        slots: Arc<Mutex<SendSlots<B>>>,
-        stream_id: StreamId,
-    ) -> Self {
-        Self {
-            shared,
-            slots,
-            stream_id,
-            _body: PhantomData,
-        }
+impl<S: AsyncByteStream, C: Clock> SendStream<S, C> {
+    pub(crate) fn new(shared: Shared<S, C>, stream_id: StreamId) -> Self {
+        Self { shared, stream_id }
     }
 
     fn terminal(&self) -> Option<StreamErrorIncoming> {
@@ -209,12 +123,14 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> SendStream<S, C, B> {
                 } else if let Some(terminal) = core.stream_error(self.stream_id, true) {
                     Step::Error(direction_error(terminal))
                 } else {
-                    let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
-                    let Some(data) = slots.writing.get_mut(&self.stream_id) else {
+                    let Some(mut data) = core
+                        .streams
+                        .get_mut(&self.stream_id)
+                        .and_then(|state| state.writing.take())
+                    else {
                         return Step::Done;
                     };
                     if data.remaining() == 0 {
-                        slots.remove(self.stream_id);
                         Step::Done
                     } else {
                         let chunk = data.chunk();
@@ -237,6 +153,10 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> SendStream<S, C, B> {
                                     )
                                 }
                                 Ok(StreamWrite::Accepted(0)) => {
+                                    core.streams
+                                        .get_mut(&self.stream_id)
+                                        .expect("live stream")
+                                        .writing = Some(data);
                                     core.park_send(
                                         self.stream_id,
                                         false,
@@ -249,14 +169,17 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> SendStream<S, C, B> {
                                 Ok(StreamWrite::Accepted(accepted)) => {
                                     data.advance(accepted);
                                     let complete = data.remaining() == 0;
-                                    slots.retained_bytes =
-                                        slots.retained_bytes.saturating_sub(accepted);
-                                    #[cfg(feature = "diagnostics")]
-                                    crate::diagnostics::send_gauge(slots.retained_bytes);
                                     if complete {
-                                        slots.remove(self.stream_id);
+                                        #[cfg(feature = "diagnostics")]
+                                        crate::diagnostics::send_gauge(core.retained_send_bytes());
                                         Step::Done
                                     } else if accepted < offered {
+                                        core.streams
+                                            .get_mut(&self.stream_id)
+                                            .expect("live stream")
+                                            .writing = Some(data);
+                                        #[cfg(feature = "diagnostics")]
+                                        crate::diagnostics::send_gauge(core.retained_send_bytes());
                                         core.park_send(
                                             self.stream_id,
                                             false,
@@ -266,10 +189,20 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> SendStream<S, C, B> {
                                         );
                                         Step::Pending
                                     } else {
+                                        core.streams
+                                            .get_mut(&self.stream_id)
+                                            .expect("live stream")
+                                            .writing = Some(data);
+                                        #[cfg(feature = "diagnostics")]
+                                        crate::diagnostics::send_gauge(core.retained_send_bytes());
                                         Step::Progress
                                     }
                                 }
                                 Ok(StreamWrite::Blocked) => {
+                                    core.streams
+                                        .get_mut(&self.stream_id)
+                                        .expect("live stream")
+                                        .writing = Some(data);
                                     core.park_send(
                                         self.stream_id,
                                         false,
@@ -294,7 +227,7 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> SendStream<S, C, B> {
                     }
                 }
             });
-            apply_effects(&self.shared.lower_wake, &self.slots, effects);
+            apply_effects(&self.shared.lower_wake, effects);
 
             match step {
                 Step::Done => return Poll::Ready(Ok(())),
@@ -323,17 +256,17 @@ enum Step {
     Error(StreamErrorIncoming),
 }
 
-impl<S: AsyncByteStream, C: Clock, B: Buf> quic::SendStream<B> for SendStream<S, C, B> {
+impl<S: AsyncByteStream, C: Clock> quic::SendStream<Bytes> for SendStream<S, C> {
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-        drive(&self.shared, &self.slots);
+        drive(&self.shared);
         if let Some(error) = self.terminal() {
             return Poll::Ready(Err(error));
         }
         self.poll_retained(cx)
     }
 
-    fn send_data<T: Into<WriteBuf<B>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
-        let core = self
+    fn send_data<T: Into<WriteBuf<Bytes>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
+        let mut core = self
             .shared
             .core
             .lock()
@@ -344,14 +277,20 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> quic::SendStream<B> for SendStream<S,
         if let Some(terminal) = core.stream_error(self.stream_id, true) {
             return Err(direction_error(terminal));
         }
-        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
-        if slots.insert(self.stream_id, data.into()) {
-            Ok(())
-        } else {
+        let state = core.streams.get_mut(&self.stream_id).expect("live stream");
+        if state.writing.is_some() {
             Err(ConnectionTerminal::Internal(
                 "send_data called before the previous logical send became ready".into(),
             )
             .stream_error())
+        } else {
+            state.writing = Some(data.into());
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::diagnostics::send_chunk();
+                crate::diagnostics::send_gauge(core.retained_send_bytes());
+            }
+            Ok(())
         }
     }
 
@@ -422,22 +361,21 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> quic::SendStream<B> for SendStream<S,
                 }
             }
         });
-        apply_effects(&self.shared.lower_wake, &self.slots, effects);
+        apply_effects(&self.shared.lower_wake, effects);
         result
     }
 
     fn reset(&mut self, reset_code: u64) {
         let mut effects = Effects::default();
         self.shared.with_core(|core| {
-            self.slots
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(self.stream_id);
+            if let Some(state) = core.streams.get_mut(&self.stream_id) {
+                state.writing = None;
+            }
             if let Err(terminal) = core.reset_send(self.stream_id, reset_code) {
                 effects.merge(core.fail(terminal));
             }
         });
-        apply_effects(&self.shared.lower_wake, &self.slots, effects);
+        apply_effects(&self.shared.lower_wake, effects);
         self.shared.lower_wake.request_driver();
     }
 
@@ -446,23 +384,21 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> quic::SendStream<B> for SendStream<S,
     }
 }
 
-impl<S: AsyncByteStream, C: Clock, B: Buf> quic::SendStreamUnframed<B> for SendStream<S, C, B> {
+impl<S: AsyncByteStream, C: Clock> quic::SendStreamUnframed<Bytes> for SendStream<S, C> {
     fn poll_send<D: Buf>(
         &mut self,
         cx: &mut Context<'_>,
         buf: &mut D,
     ) -> Poll<Result<usize, StreamErrorIncoming>> {
-        drive(&self.shared, &self.slots);
+        drive(&self.shared);
         if let Some(error) = self.terminal() {
             return Poll::Ready(Err(error));
         }
-        if self
-            .slots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .writing
-            .contains_key(&self.stream_id)
-        {
+        if self.shared.with_core(|core| {
+            core.streams
+                .get(&self.stream_id)
+                .is_some_and(|state| state.writing.is_some())
+        }) {
             return Poll::Ready(Err(ConnectionTerminal::Internal(
                 "unframed send attempted while framed data is retained".into(),
             )
@@ -516,19 +452,18 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> quic::SendStreamUnframed<B> for SendS
         if let Poll::Ready(Ok(accepted)) = &result {
             buf.advance(*accepted);
         }
-        apply_effects(&self.shared.lower_wake, &self.slots, effects);
+        apply_effects(&self.shared.lower_wake, effects);
         result
     }
 }
 
-impl<S: AsyncByteStream, C: Clock, B: Buf> Drop for SendStream<S, C, B> {
+impl<S: AsyncByteStream, C: Clock> Drop for SendStream<S, C> {
     fn drop(&mut self) {
         let mut effects = Effects::default();
         self.shared.with_core(|core| {
-            self.slots
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(self.stream_id);
+            if let Some(state) = core.streams.get_mut(&self.stream_id) {
+                state.writing = None;
+            }
             if core.stream_error(self.stream_id, true).is_none()
                 && let Err(terminal) = core.reset_send(self.stream_id, ABANDONED)
             {
@@ -536,40 +471,31 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> Drop for SendStream<S, C, B> {
             }
             core.drop_direction(self.stream_id, true);
         });
-        apply_effects(&self.shared.lower_wake, &self.slots, effects);
+        apply_effects(&self.shared.lower_wake, effects);
         self.shared.lower_wake.request_driver();
     }
 }
 
 /// A QMux-backed H3 receiving stream.
-pub struct RecvStream<S: AsyncByteStream, C: Clock, B: Buf> {
+pub struct RecvStream<S: AsyncByteStream, C: Clock> {
     pub(crate) shared: Shared<S, C>,
-    pub(crate) slots: Arc<Mutex<SendSlots<B>>>,
     pub(crate) stream_id: StreamId,
 }
 
-impl<S: AsyncByteStream, C: Clock, B: Buf> RecvStream<S, C, B> {
-    pub(crate) fn new(
-        shared: Shared<S, C>,
-        slots: Arc<Mutex<SendSlots<B>>>,
-        stream_id: StreamId,
-    ) -> Self {
-        Self {
-            shared,
-            slots,
-            stream_id,
-        }
+impl<S: AsyncByteStream, C: Clock> RecvStream<S, C> {
+    pub(crate) fn new(shared: Shared<S, C>, stream_id: StreamId) -> Self {
+        Self { shared, stream_id }
     }
 }
 
-impl<S: AsyncByteStream, C: Clock, B: Buf> quic::RecvStream for RecvStream<S, C, B> {
+impl<S: AsyncByteStream, C: Clock> quic::RecvStream for RecvStream<S, C> {
     type Buf = Bytes;
 
     fn poll_data(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
-        drive(&self.shared, &self.slots);
+        drive(&self.shared);
 
         let mut effects = Effects::default();
         let result = self.shared.with_core(|core| {
@@ -629,7 +555,7 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> quic::RecvStream for RecvStream<S, C,
                 }
             }
         });
-        apply_effects(&self.shared.lower_wake, &self.slots, effects);
+        apply_effects(&self.shared.lower_wake, effects);
         result
     }
 
@@ -641,7 +567,7 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> quic::RecvStream for RecvStream<S, C,
             }
         });
         effects.continuation = true;
-        apply_effects(&self.shared.lower_wake, &self.slots, effects);
+        apply_effects(&self.shared.lower_wake, effects);
     }
 
     fn recv_id(&self) -> quic::StreamId {
@@ -649,7 +575,7 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> quic::RecvStream for RecvStream<S, C,
     }
 }
 
-impl<S: AsyncByteStream, C: Clock, B: Buf> Drop for RecvStream<S, C, B> {
+impl<S: AsyncByteStream, C: Clock> Drop for RecvStream<S, C> {
     fn drop(&mut self) {
         let mut effects = Effects::default();
         self.shared.with_core(|core| {
@@ -659,31 +585,31 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> Drop for RecvStream<S, C, B> {
             core.drop_direction(self.stream_id, false);
         });
         effects.continuation = true;
-        apply_effects(&self.shared.lower_wake, &self.slots, effects);
+        apply_effects(&self.shared.lower_wake, effects);
     }
 }
 
 /// A QMux-backed H3 bidirectional stream.
-pub struct BidiStream<S: AsyncByteStream, C: Clock, B: Buf> {
-    pub(crate) send: SendStream<S, C, B>,
-    pub(crate) recv: RecvStream<S, C, B>,
+pub struct BidiStream<S: AsyncByteStream, C: Clock> {
+    pub(crate) send: SendStream<S, C>,
+    pub(crate) recv: RecvStream<S, C>,
 }
 
-impl<S: AsyncByteStream, C: Clock, B: Buf> quic::BidiStream<B> for BidiStream<S, C, B> {
-    type SendStream = SendStream<S, C, B>;
-    type RecvStream = RecvStream<S, C, B>;
+impl<S: AsyncByteStream, C: Clock> quic::BidiStream<Bytes> for BidiStream<S, C> {
+    type SendStream = SendStream<S, C>;
+    type RecvStream = RecvStream<S, C>;
 
     fn split(self) -> (Self::SendStream, Self::RecvStream) {
         (self.send, self.recv)
     }
 }
 
-impl<S: AsyncByteStream, C: Clock, B: Buf> quic::SendStream<B> for BidiStream<S, C, B> {
+impl<S: AsyncByteStream, C: Clock> quic::SendStream<Bytes> for BidiStream<S, C> {
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
         self.send.poll_ready(cx)
     }
 
-    fn send_data<T: Into<WriteBuf<B>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
+    fn send_data<T: Into<WriteBuf<Bytes>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
         self.send.send_data(data)
     }
 
@@ -700,7 +626,7 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> quic::SendStream<B> for BidiStream<S,
     }
 }
 
-impl<S: AsyncByteStream, C: Clock, B: Buf> quic::SendStreamUnframed<B> for BidiStream<S, C, B> {
+impl<S: AsyncByteStream, C: Clock> quic::SendStreamUnframed<Bytes> for BidiStream<S, C> {
     fn poll_send<D: Buf>(
         &mut self,
         cx: &mut Context<'_>,
@@ -710,7 +636,7 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> quic::SendStreamUnframed<B> for BidiS
     }
 }
 
-impl<S: AsyncByteStream, C: Clock, B: Buf> quic::RecvStream for BidiStream<S, C, B> {
+impl<S: AsyncByteStream, C: Clock> quic::RecvStream for BidiStream<S, C> {
     type Buf = Bytes;
 
     fn poll_data(

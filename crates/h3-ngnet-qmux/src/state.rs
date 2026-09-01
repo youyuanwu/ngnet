@@ -3,8 +3,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
 
+#[cfg(feature = "diagnostics")]
+use bytes::Buf;
 use bytes::Bytes;
 use h3::error::Code;
+use h3::quic::WriteBuf;
 use ngnet_qmux::io::{AsyncByteStream, Clock, Connection as QmuxConnection, Event, StreamOpen};
 use ngnet_qmux::{
     CloseReason, Directionality, Initiator, Role, Shutdown, StreamId, StreamLimitKind,
@@ -33,7 +36,7 @@ pub(crate) struct Received {
     pub(crate) fin: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct StreamState {
     pub(crate) pending_accept: bool,
     pub(crate) lower_closed: bool,
@@ -49,6 +52,7 @@ pub(crate) struct StreamState {
     pub(crate) finish_waiter: Option<Waker>,
     pub(crate) send_waiting_output: bool,
     pub(crate) finish_waiting_output: bool,
+    pub(crate) writing: Option<WriteBuf<Bytes>>,
 }
 
 #[derive(Debug, Default)]
@@ -60,16 +64,12 @@ struct OpenerWaiters {
 #[derive(Debug, Default)]
 pub(crate) struct Effects {
     pub(crate) wakes: Vec<Waker>,
-    pub(crate) discard: Vec<StreamId>,
-    pub(crate) discard_all: bool,
     pub(crate) continuation: bool,
 }
 
 impl Effects {
     pub(crate) fn merge(&mut self, mut other: Self) {
         self.wakes.append(&mut other.wakes);
-        self.discard.append(&mut other.discard);
-        self.discard_all |= other.discard_all;
         self.continuation |= other.continuation;
     }
 }
@@ -364,9 +364,11 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
                     state
                         .send_terminal
                         .get_or_insert(DirectionTerminal::Stopped(app_error_code));
-                    effects.discard.push(stream_id);
+                    state.writing = None;
                     take_waiter(&mut state.send_waiter, &mut effects);
                     take_waiter(&mut state.finish_waiter, &mut effects);
+                    #[cfg(feature = "diagnostics")]
+                    crate::diagnostics::send_gauge(self.retained_send_bytes());
                 }
             }
             Event::StreamDataCredit { stream_id, .. } => {
@@ -523,10 +525,7 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
         self.terminal = Some(terminal);
         #[cfg(feature = "diagnostics")]
         crate::diagnostics::terminal();
-        let mut effects = Effects {
-            discard_all: true,
-            ..Effects::default()
-        };
+        let mut effects = Effects::default();
         take_waiter(&mut self.accept_uni, &mut effects);
         take_waiter(&mut self.accept_bidi, &mut effects);
         for opener in self.openers.values_mut() {
@@ -534,6 +533,7 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
             take_waiter(&mut opener.bidi, &mut effects);
         }
         for stream in self.streams.values_mut() {
+            stream.writing = None;
             take_waiter(&mut stream.recv_waiter, &mut effects);
             take_waiter(&mut stream.send_waiter, &mut effects);
             take_waiter(&mut stream.finish_waiter, &mut effects);
@@ -737,6 +737,15 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
             .sum()
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn retained_send_bytes(&self) -> usize {
+        self.streams
+            .values()
+            .filter_map(|state| state.writing.as_ref())
+            .map(Buf::remaining)
+            .sum()
+    }
+
     fn local_initiator(&self) -> Initiator {
         match self.role {
             Role::Client => Initiator::Client,
@@ -841,13 +850,12 @@ mod tests {
     #[test]
     fn impossible_local_unidirectional_receive_is_connection_fatal() {
         let mut core = make_core(4);
-        let effects = core.route(Event::StreamData {
+        let _ = core.route(Event::StreamData {
             stream_id: stream(2),
             offset: 0,
             data: b"impossible".to_vec(),
             fin: false,
         });
-        assert!(effects.discard_all);
         assert!(matches!(
             core.terminal,
             Some(ConnectionTerminal::Internal(_))
@@ -892,7 +900,7 @@ mod tests {
             wake.wake();
         }
         assert_eq!(send_count.0.load(Ordering::SeqCst), 1);
-        assert_eq!(stop.discard, vec![id]);
+        assert!(core.streams.get(&id).expect("stream").writing.is_none());
 
         let _ = core.route(Event::StreamDataCredit {
             stream_id: id,
@@ -938,10 +946,9 @@ mod tests {
         let _ = core.route(Event::StreamOpened {
             stream_id: stream(1),
         });
-        let effects = core.route(Event::StreamOpened {
+        let _ = core.route(Event::StreamOpened {
             stream_id: stream(3),
         });
-        assert!(effects.discard_all);
         assert!(matches!(
             core.terminal,
             Some(ConnectionTerminal::Application(code))
@@ -949,11 +956,10 @@ mod tests {
         ));
 
         let mut core = make_core(1);
-        let first = core.unsupported_event();
+        let _first = core.unsupported_event();
         let second = core.unsupported_event();
-        assert!(first.discard_all);
         assert!(
-            !second.discard_all,
+            second.wakes.is_empty(),
             "the first terminal classification wins"
         );
         assert!(matches!(
@@ -1040,13 +1046,12 @@ mod tests {
         core.cleanup(id);
         assert!(core.streams.contains_key(&id));
 
-        let effects = core.route(Event::StreamData {
+        let _ = core.route(Event::StreamData {
             stream_id: id,
             offset: 0,
             data: b"late".to_vec(),
             fin: false,
         });
-        assert!(!effects.discard_all);
         assert!(core.terminal.is_none());
         assert!(core.streams.contains_key(&id));
 
@@ -1076,7 +1081,6 @@ mod tests {
         let mut effects = Effects::default();
         assert!(core.open(0, OpenKind::Uni, waker, &mut effects).is_err());
         assert!(core.terminal.is_some());
-        assert!(effects.discard_all);
         for wake in effects.wakes {
             wake.wake();
         }
@@ -1102,6 +1106,6 @@ mod tests {
         ));
         assert_eq!(core.stream_error(id, true), Some(DirectionTerminal::Closed));
         assert!(core.terminal.is_none());
-        assert!(!effects.discard_all);
+        assert!(effects.wakes.is_empty());
     }
 }

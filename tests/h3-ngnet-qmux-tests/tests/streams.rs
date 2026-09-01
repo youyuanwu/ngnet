@@ -55,8 +55,8 @@ async fn raw_uni_bidi_split_framed_and_unframed_traits_complete_independently() 
                 QmuxConnection::client(client_io, TestClock::new(), Config::new()).expect("client");
             let server_lower =
                 QmuxConnection::server(server_io, TestClock::new(), Config::new()).expect("server");
-            let (mut client, client_driver) = from_qmux::<Bytes, _, _>(client_lower);
-            let (mut server, server_driver) = from_qmux::<Bytes, _, _>(server_lower);
+            let (mut client, client_driver) = from_qmux(client_lower, 128);
+            let (mut server, server_driver) = from_qmux(server_lower, 128);
             tokio::task::spawn_local(async move {
                 let _ = client_driver.await;
             });

@@ -1499,13 +1499,11 @@ fn upstream_observe<S>(stream: S) -> UpstreamObserved<S> {
 type UpstreamMemoryOpener = h3_ngnet_qmux::OpenStreams<
     CountingStream<UpstreamObserved<TokioStream<tokio::io::DuplexStream>>>,
     TokioClock,
-    Bytes,
 >;
 type UpstreamMemorySender = h3::client::SendRequest<UpstreamMemoryOpener, Bytes>;
 type UpstreamSocketOpener = h3_ngnet_qmux::OpenStreams<
     CountingStream<UpstreamObserved<TokioStream<TokioTcpStream>>>,
     TokioClock,
-    Bytes,
 >;
 type UpstreamSocketSender = h3::client::SendRequest<UpstreamSocketOpener, Bytes>;
 
@@ -1691,10 +1689,8 @@ async fn upstream_memory_pair() -> (UpstreamMemorySender, UpstreamQmuxTasks, Ben
         qmux_config(),
     )
     .expect("an upstream server QMux connection");
-    let (server_connection, server_driver) = h3_ngnet_qmux::from_qmux_with_config::<Bytes, _, _>(
-        server_lower,
-        h3_ngnet_qmux::AdapterConfig::new().pending_accept_limit(UPSTREAM_QMUX_PENDING_ACCEPTS),
-    );
+    let (server_connection, server_driver) =
+        h3_ngnet_qmux::from_qmux(server_lower, UPSTREAM_QMUX_PENDING_ACCEPTS);
     let server = tokio::spawn(run_combined_endpoint(
         server_driver,
         upstream_h3_qmux_server(server_connection),
@@ -1710,10 +1706,8 @@ async fn upstream_memory_pair() -> (UpstreamMemorySender, UpstreamQmuxTasks, Ben
         qmux_config(),
     )
     .expect("an upstream client QMux connection");
-    let (client_connection, client_driver) = h3_ngnet_qmux::from_qmux_with_config::<Bytes, _, _>(
-        client_lower,
-        h3_ngnet_qmux::AdapterConfig::new().pending_accept_limit(UPSTREAM_QMUX_PENDING_ACCEPTS),
-    );
+    let (client_connection, client_driver) =
+        h3_ngnet_qmux::from_qmux(client_lower, UPSTREAM_QMUX_PENDING_ACCEPTS);
     let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
     let client_counters = counters.clone();
     let client = tokio::spawn(async move {
@@ -2361,10 +2355,8 @@ async fn upstream_socket_pair() -> (UpstreamSocketSender, UpstreamQmuxTasks, Ben
         qmux_config(),
     )
     .expect("an upstream socket server QMux connection");
-    let (server_connection, server_driver) = h3_ngnet_qmux::from_qmux_with_config::<Bytes, _, _>(
-        server_lower,
-        h3_ngnet_qmux::AdapterConfig::new().pending_accept_limit(UPSTREAM_QMUX_PENDING_ACCEPTS),
-    );
+    let (server_connection, server_driver) =
+        h3_ngnet_qmux::from_qmux(server_lower, UPSTREAM_QMUX_PENDING_ACCEPTS);
     let server = tokio::spawn(run_combined_endpoint(
         server_driver,
         upstream_h3_qmux_server(server_connection),
@@ -2380,10 +2372,8 @@ async fn upstream_socket_pair() -> (UpstreamSocketSender, UpstreamQmuxTasks, Ben
         qmux_config(),
     )
     .expect("an upstream socket client QMux connection");
-    let (client_connection, client_driver) = h3_ngnet_qmux::from_qmux_with_config::<Bytes, _, _>(
-        client_lower,
-        h3_ngnet_qmux::AdapterConfig::new().pending_accept_limit(UPSTREAM_QMUX_PENDING_ACCEPTS),
-    );
+    let (client_connection, client_driver) =
+        h3_ngnet_qmux::from_qmux(client_lower, UPSTREAM_QMUX_PENDING_ACCEPTS);
     let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
     let client_counters = counters.clone();
     let client = tokio::spawn(async move {

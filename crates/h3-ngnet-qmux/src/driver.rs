@@ -1,14 +1,13 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, PoisonError};
 use std::task::{Context, Poll, Waker};
 
-use bytes::Buf;
 use ngnet_qmux::io::{AsyncByteStream, Clock};
 
 use crate::error::Error;
 use crate::state::Effects;
-use crate::stream::{SendSlots, Shared, apply_effects};
+use crate::stream::{Shared, apply_effects};
 
 /// The single caller-polled owner of lower-I/O liveness and close completion.
 ///
@@ -19,20 +18,19 @@ use crate::stream::{SendSlots, Shared, apply_effects};
 ///
 /// A locally requested close resolves successfully once delivered. A peer application close,
 /// adapter invariant failure, or underlying QMux/byte-stream failure resolves with a stable
-/// [`crate::ErrorKind`] classification.
+/// [`crate::Error`] classification.
 #[must_use = "the QMux adapter makes no lower-I/O progress unless its driver is polled"]
-pub struct Driver<S: AsyncByteStream, C: Clock, B: Buf> {
+pub struct Driver<S: AsyncByteStream, C: Clock> {
     pub(crate) shared: Shared<S, C>,
-    pub(crate) slots: Arc<Mutex<SendSlots<B>>>,
 }
 
-impl<S: AsyncByteStream, C: Clock, B: Buf> Driver<S, C, B> {
-    pub(crate) fn new(shared: Shared<S, C>, slots: Arc<Mutex<SendSlots<B>>>) -> Self {
-        Self { shared, slots }
+impl<S: AsyncByteStream, C: Clock> Driver<S, C> {
+    pub(crate) fn new(shared: Shared<S, C>) -> Self {
+        Self { shared }
     }
 }
 
-impl<S: AsyncByteStream, C: Clock, B: Buf> Future for Driver<S, C, B> {
+impl<S: AsyncByteStream, C: Clock> Future for Driver<S, C> {
     type Output = Result<(), Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -87,9 +85,9 @@ impl<S: AsyncByteStream, C: Clock, B: Buf> Future for Driver<S, C, B> {
             }
         };
         this.shared.lower_wake.end_defer();
-        apply_effects(&this.shared.lower_wake, &this.slots, effects);
+        apply_effects(&this.shared.lower_wake, effects);
         result
     }
 }
 
-impl<S: AsyncByteStream, C: Clock, B: Buf> Unpin for Driver<S, C, B> {}
+impl<S: AsyncByteStream, C: Clock> Unpin for Driver<S, C> {}

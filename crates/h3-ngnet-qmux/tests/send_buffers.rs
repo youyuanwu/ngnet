@@ -48,7 +48,7 @@ impl Buf for MultiChunk {
     }
 }
 
-type MultiBidi = BidiStream<TestByteStream, TestClock, MultiChunk>;
+type TestBidi = BidiStream<TestByteStream, TestClock>;
 
 #[test]
 fn framed_send_walks_header_and_every_payload_chunk_exactly_once() {
@@ -58,20 +58,19 @@ fn framed_send_walks_header_and_every_payload_chunk_exactly_once() {
         QmuxConnection::client(client_io, TestClock::new(), lower).expect("client QMux");
     let server_lower =
         QmuxConnection::server(server_io, TestClock::new(), lower).expect("server QMux");
-    let (mut client, mut client_driver) = from_qmux::<MultiChunk, _, _>(client_lower);
-    let (mut server, mut server_driver) = from_qmux::<MultiChunk, _, _>(server_lower);
+    let (mut client, mut client_driver) = from_qmux(client_lower, 128);
+    let (mut server, mut server_driver) = from_qmux(server_lower, 128);
 
     let client_task = async {
-        let mut stream: MultiBidi =
-            poll_fn(|cx| quic::OpenStreams::poll_open_bidi(&mut client, cx))
-                .await
-                .expect("open bidi");
+        let mut stream: TestBidi = poll_fn(|cx| quic::OpenStreams::poll_open_bidi(&mut client, cx))
+            .await
+            .expect("open bidi");
         stream
-            .send_data(Frame::Data(MultiChunk::new(&[b"abc", b"defgh", b"ijkl"])))
+            .send_data(Frame::Data(Bytes::from_static(b"abcdefghijkl")))
             .expect("retain framed send");
         assert!(
             stream
-                .send_data(Frame::Data(MultiChunk::new(&[b"later"])))
+                .send_data(Frame::Data(Bytes::from_static(b"later")))
                 .is_err(),
             "a second logical send cannot overtake retained data"
         );
@@ -91,7 +90,7 @@ fn framed_send_walks_header_and_every_payload_chunk_exactly_once() {
             .expect("finish behind framed data");
     };
     let server_task = async {
-        let mut stream: MultiBidi =
+        let mut stream: TestBidi =
             poll_fn(|cx| quic::Connection::poll_accept_bidi(&mut server, cx))
                 .await
                 .expect("accept bidi");
@@ -116,8 +115,6 @@ fn framed_send_walks_header_and_every_payload_chunk_exactly_once() {
         [vec![0, 12], b"abcdefghijkl".to_vec()].concat(),
         "the H3 DATA header precedes every payload chunk with no duplication"
     );
-    assert_eq!(client.snapshot().retained_send_bytes, 0);
-    assert_eq!(client.snapshot().retained_send_high_water, 14);
 }
 
 #[test]

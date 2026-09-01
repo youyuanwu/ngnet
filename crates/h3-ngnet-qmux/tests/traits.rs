@@ -14,25 +14,14 @@ fn assert_connection_traits<S, C>()
 where
     S: AsyncByteStream,
     C: Clock,
-    Connection<S, C, Bytes>: quic::Connection<Bytes>
-        + quic::OpenStreams<
-            Bytes,
-            SendStream = SendStream<S, C, Bytes>,
-            BidiStream = BidiStream<S, C, Bytes>,
-        >,
-    OpenStreams<S, C, Bytes>: Clone
-        + quic::OpenStreams<
-            Bytes,
-            SendStream = SendStream<S, C, Bytes>,
-            BidiStream = BidiStream<S, C, Bytes>,
-        >,
-    SendStream<S, C, Bytes>: quic::SendStream<Bytes> + quic::SendStreamUnframed<Bytes>,
-    RecvStream<S, C, Bytes>: quic::RecvStream<Buf = Bytes>,
-    BidiStream<S, C, Bytes>: quic::BidiStream<
-            Bytes,
-            SendStream = SendStream<S, C, Bytes>,
-            RecvStream = RecvStream<S, C, Bytes>,
-        > + quic::SendStreamUnframed<Bytes>
+    Connection<S, C>: quic::Connection<Bytes>
+        + quic::OpenStreams<Bytes, SendStream = SendStream<S, C>, BidiStream = BidiStream<S, C>>,
+    OpenStreams<S, C>: Clone
+        + quic::OpenStreams<Bytes, SendStream = SendStream<S, C>, BidiStream = BidiStream<S, C>>,
+    SendStream<S, C>: quic::SendStream<Bytes> + quic::SendStreamUnframed<Bytes>,
+    RecvStream<S, C>: quic::RecvStream<Buf = Bytes>,
+    BidiStream<S, C>: quic::BidiStream<Bytes, SendStream = SendStream<S, C>, RecvStream = RecvStream<S, C>>
+        + quic::SendStreamUnframed<Bytes>
         + quic::RecvStream<Buf = Bytes>,
 {
 }
@@ -79,13 +68,13 @@ fn every_hyperium_trait_and_associated_type_is_implemented() {
 }
 
 #[test]
-fn sendable_lower_and_body_types_produce_sendable_handles() {
-    assert_send::<Connection<SendStreamIo, SendClock, Bytes>>();
-    assert_send::<OpenStreams<SendStreamIo, SendClock, Bytes>>();
-    assert_send::<SendStream<SendStreamIo, SendClock, Bytes>>();
-    assert_send::<RecvStream<SendStreamIo, SendClock, Bytes>>();
-    assert_send::<BidiStream<SendStreamIo, SendClock, Bytes>>();
-    assert_send::<Driver<SendStreamIo, SendClock, Bytes>>();
+fn sendable_lower_types_produce_sendable_handles() {
+    assert_send::<Connection<SendStreamIo, SendClock>>();
+    assert_send::<OpenStreams<SendStreamIo, SendClock>>();
+    assert_send::<SendStream<SendStreamIo, SendClock>>();
+    assert_send::<RecvStream<SendStreamIo, SendClock>>();
+    assert_send::<BidiStream<SendStreamIo, SendClock>>();
+    assert_send::<Driver<SendStreamIo, SendClock>>();
 }
 
 #[test]

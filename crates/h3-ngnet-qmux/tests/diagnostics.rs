@@ -10,7 +10,7 @@ use bytes::{Buf, Bytes};
 use h3::proto::frame::Frame;
 use h3::quic;
 use h3_ngnet_qmux::diagnostics::{self, observe};
-use h3_ngnet_qmux::{AdapterConfig, from_qmux_with_diagnostics};
+use h3_ngnet_qmux::from_qmux;
 use ngnet_qmux::io::testing::{Fault, TestClock, stream_pair};
 use ngnet_qmux::io::{AsyncByteStream, Config, Connection as QmuxConnection, Written};
 
@@ -198,16 +198,9 @@ fn observed_test_stream_pair_reconciles_lower_oracle_while_driving_the_adapter()
         QmuxConnection::client(client_io, TestClock::new(), Config::new()).expect("client");
     let server_lower =
         QmuxConnection::server(server_io, TestClock::new(), Config::new()).expect("server");
-    let (mut client, mut client_driver) = from_qmux_with_diagnostics::<Bytes, _, _>(
-        client_lower,
-        client_handle,
-        AdapterConfig::new(),
-    );
-    let (mut server, mut server_driver) = from_qmux_with_diagnostics::<Bytes, _, _>(
-        server_lower,
-        server_handle,
-        AdapterConfig::new(),
-    );
+    let (mut client, mut client_driver) = from_qmux(client_lower, 128);
+    let (mut server, mut server_driver) = from_qmux(server_lower, 128);
+    let _handles = (client_handle, server_handle);
     diagnostics::arm(true);
 
     let client_task = async {
@@ -345,8 +338,8 @@ fn lower_failure_counts_once_and_fans_out_one_terminal() {
     let fault = near.fault_control();
     let (observed, handle) = observe(near);
     let lower = QmuxConnection::client(observed, TestClock::new(), Config::new()).expect("client");
-    let (_connection, mut driver) =
-        from_qmux_with_diagnostics::<Bytes, _, _>(lower, handle, AdapterConfig::new());
+    let (_connection, mut driver) = from_qmux(lower, 128);
+    let _handle = handle;
     diagnostics::arm(true);
     fault.inject(Fault::Broken);
     let waker = Waker::noop();
