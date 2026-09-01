@@ -129,11 +129,13 @@ fn matched_qmux_fixtures_use_symmetric_per_instance_counters() {
     let body = body_of(100_003);
 
     let ngnet = runtime.block_on(NgnetQmuxH3Matched::establish());
+    assert_eq!(ngnet.counter_snapshot(), Default::default());
     ngnet.arm_counters();
     assert_eq!(runtime.block_on(ngnet.round_trip(body.clone())), body.len());
     let ngnet_memory = ngnet.counter_snapshot();
 
     let upstream = runtime.block_on(UpstreamH3Qmux::establish());
+    assert_eq!(upstream.counter_snapshot(), Default::default());
     upstream.arm_counters();
     assert_eq!(
         runtime.block_on(upstream.round_trip(body.clone())),
@@ -142,6 +144,7 @@ fn matched_qmux_fixtures_use_symmetric_per_instance_counters() {
     let upstream_memory = upstream.counter_snapshot();
 
     let ngnet_socket = runtime.block_on(NgnetQmuxH3MatchedSocket::establish());
+    assert_eq!(ngnet_socket.counter_snapshot(), Default::default());
     ngnet_socket.arm_counters();
     assert_eq!(
         runtime.block_on(ngnet_socket.round_trip(body.clone())),
@@ -150,6 +153,7 @@ fn matched_qmux_fixtures_use_symmetric_per_instance_counters() {
     let ngnet_socket = ngnet_socket.counter_snapshot();
 
     let upstream_socket = runtime.block_on(UpstreamH3QmuxSocket::establish());
+    assert_eq!(upstream_socket.counter_snapshot(), Default::default());
     upstream_socket.arm_counters();
     assert_eq!(runtime.block_on(upstream_socket.round_trip(body)), 100_003);
     let upstream_socket = upstream_socket.counter_snapshot();
@@ -157,9 +161,40 @@ fn matched_qmux_fixtures_use_symmetric_per_instance_counters() {
     for snapshot in [ngnet_memory, upstream_memory, ngnet_socket, upstream_socket] {
         assert!(snapshot.lower_read_calls > 0);
         assert!(snapshot.lower_write_calls > 0);
-        assert!(snapshot.lower_read_bytes >= 200_006);
+        assert!((200_006..=201_030).contains(&snapshot.lower_read_bytes));
+        assert!((200_006..=201_030).contains(&snapshot.lower_write_bytes));
         assert!(snapshot.lower_write_bytes >= snapshot.lower_read_bytes);
+        assert!(snapshot.lower_write_bytes - snapshot.lower_read_bytes <= 1024);
+        assert_eq!(snapshot.lower_write_not_now, 0);
         assert!(snapshot.endpoint_polls > 0);
         assert!(!snapshot.overflowed);
     }
+    assert_eq!(
+        (
+            ngnet_memory.lower_read_bytes,
+            ngnet_memory.lower_write_bytes
+        ),
+        (200_271, 200_271)
+    );
+    assert_eq!(
+        (
+            upstream_memory.lower_read_bytes,
+            upstream_memory.lower_write_bytes
+        ),
+        (200_384, 200_398)
+    );
+    assert_eq!(
+        (
+            ngnet_socket.lower_read_bytes,
+            ngnet_socket.lower_write_bytes
+        ),
+        (200_271, 200_271)
+    );
+    assert_eq!(
+        (
+            upstream_socket.lower_read_bytes,
+            upstream_socket.lower_write_bytes
+        ),
+        (200_384, 200_398)
+    );
 }

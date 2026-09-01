@@ -996,14 +996,11 @@ impl CompioSharedSocket {
 // second function is unavoidable; its body is one call to the shared `collect` and one to the
 // shared `response_for`, which is as close to no restatement as the type system allows.
 //
-// Both drivers are spawned with plain `tokio::spawn`, exactly as the HTTP/2 arms' are. Note
-// that this repository's own QMux HTTP/3 test harness uses a `LocalSet` and `spawn_local`
-// instead: that is forced by its `!Send` in-memory *test* byte stream, not by the join, which
-// imposes no `Send` bound anywhere and is `Send` whenever the caller's byte stream and clock
-// are. `TokioStream<S>` is `Send` when `S` is, and both `tokio::io::DuplexStream` and
-// `tokio::net::TcpStream` are — so `tokio::spawn` accepting these futures at all is the
-// check, made by the compiler rather than by a comment. The runtime arrangement is therefore
-// identical to the HTTP/2 arms' and is not a confound.
+// Each matched fixture spawns exactly one task per endpoint. The ngnet connection future
+// already combines transport and H3 progress, so its task is only counted. Hyperium exposes
+// separate adapter and H3 futures, so one bench-local future polls them together and retains
+// the adapter close tail after H3 exits. Both tasks use plain `tokio::spawn`; non-`Send`
+// portability remains covered by the adapter tests rather than changing benchmark topology.
 // ---------------------------------------------------------------------------------------
 
 #[derive(Default)]
@@ -1019,6 +1016,11 @@ struct CounterState {
 }
 
 /// Per-fixture symmetric lower-I/O and endpoint-poll counters.
+///
+/// One instance aggregates the client and server endpoints of exactly one fixture. It starts
+/// disarmed, and every `establish` method resets it after the explicit warm-up. Criterion never
+/// arms it; fixed diagnostic probes and fixture tests call [`BenchCounters::reset_and_arm`]
+/// immediately before their measured exchange.
 #[derive(Clone, Default)]
 pub struct BenchCounters {
     state: Arc<CounterState>,
@@ -1037,7 +1039,7 @@ pub struct BenchCounterSnapshot {
     pub lower_write_bytes: u64,
     /// Lower writes returning `NotNow`.
     pub lower_write_not_now: u64,
-    /// Polls of a combined endpoint task.
+    /// Polls of one endpoint task, summed across both endpoints of the fixture.
     pub endpoint_polls: u64,
     /// Whether any counter saturated.
     pub overflowed: bool,
@@ -1064,7 +1066,7 @@ impl BenchCounters {
         }
     }
 
-    /// Resets the interval and controls whether subsequent operations are counted.
+    /// Resets the aggregate client+server interval and controls subsequent counting.
     pub fn reset_and_arm(&self, armed: bool) {
         self.state.armed.store(false, Ordering::Release);
         for counter in [
@@ -1081,7 +1083,7 @@ impl BenchCounters {
         self.state.armed.store(armed, Ordering::Release);
     }
 
-    /// Returns the current per-fixture interval.
+    /// Returns the current aggregate client+server fixture interval.
     #[must_use]
     pub fn snapshot(&self) -> BenchCounterSnapshot {
         BenchCounterSnapshot {
@@ -1449,6 +1451,17 @@ impl NgnetQmuxH3Matched {
             .expect("a matched ngnet response head");
         assert!(response.status().is_success());
         drain(response.into_body()).await
+    }
+
+    /// Sends one request and validates every echoed byte for diagnostic probes.
+    pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
+        let expected = body.clone();
+        let response = self
+            .handle
+            .send_request(request_for(body))
+            .await
+            .map_err(|error| format!("matched ngnet response head failed: {error:?}"))?;
+        try_drain_checked(response.into_body(), &expected).await
     }
 
     /// Takes away the matched ngnet server for failure-path tests.
@@ -2306,6 +2319,17 @@ impl NgnetQmuxH3MatchedSocket {
             .expect("a matched ngnet socket response");
         assert!(response.status().is_success());
         drain(response.into_body()).await
+    }
+
+    /// Sends one request and validates every echoed byte for diagnostic probes.
+    pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
+        let expected = body.clone();
+        let response = self
+            .handle
+            .send_request(request_for(body))
+            .await
+            .map_err(|error| format!("matched ngnet socket response failed: {error:?}"))?;
+        try_drain_checked(response.into_body(), &expected).await
     }
 
     /// Takes away the matched ngnet socket server.

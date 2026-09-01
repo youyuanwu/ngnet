@@ -57,6 +57,8 @@ impl Arm {
     async fn round_trip_checked(&self, body: bytes::Bytes) -> Result<(usize, bool), String> {
         match self {
             Arm::NgnetNgtcpH3(a) => a.try_round_trip_checked(body).await,
+            Arm::NgnetQmuxMatchedDuplex(a) => a.try_round_trip_checked(body).await,
+            Arm::NgnetQmuxMatchedSocket(a) => a.try_round_trip_checked(body).await,
             Arm::UpstreamQmuxDuplex(a) => a.try_round_trip_checked(body).await,
             Arm::UpstreamQmuxSocket(a) => a.try_round_trip_checked(body).await,
             _ => unreachable!("request validation restricts diagnostic mode to supported arms"),
@@ -79,6 +81,38 @@ impl Arm {
                 unreachable!("QUIC arms reject concurrent before setup")
             }
         }
+    }
+
+    fn arm_symmetric_counters(&self) {
+        match self {
+            Arm::NgnetQmuxMatchedDuplex(a) => a.arm_counters(),
+            Arm::NgnetQmuxMatchedSocket(a) => a.arm_counters(),
+            Arm::UpstreamQmuxDuplex(a) => a.arm_counters(),
+            Arm::UpstreamQmuxSocket(a) => a.arm_counters(),
+            _ => {}
+        }
+    }
+
+    fn emit_symmetric_counters(&self, exchange: usize, scope: &str) {
+        let snapshot = match self {
+            Arm::NgnetQmuxMatchedDuplex(a) => a.counter_snapshot(),
+            Arm::NgnetQmuxMatchedSocket(a) => a.counter_snapshot(),
+            Arm::UpstreamQmuxDuplex(a) => a.counter_snapshot(),
+            Arm::UpstreamQmuxSocket(a) => a.counter_snapshot(),
+            _ => return,
+        };
+        eprintln!(
+            "PROBE-SYMMETRIC-QMUX exchange={exchange} scope={scope} \
+             lower_read_calls={} lower_read_bytes={} lower_write_calls={} \
+             lower_write_bytes={} lower_write_not_now={} endpoint_polls={} overflow={}",
+            snapshot.lower_read_calls,
+            snapshot.lower_read_bytes,
+            snapshot.lower_write_calls,
+            snapshot.lower_write_bytes,
+            snapshot.lower_write_not_now,
+            snapshot.endpoint_polls,
+            snapshot.overflowed,
+        );
     }
 }
 
@@ -130,6 +164,12 @@ fn emit_diagnostics(
     scope: &str,
     application_body_bytes: Option<usize>,
 ) {
+    if matches!(
+        arm_name,
+        "ngnet-qmux-matched-duplex" | "ngnet-qmux-matched-socket"
+    ) {
+        return;
+    }
     if matches!(arm_name, "h3-qmux-duplex" | "h3-qmux-socket") {
         let snapshot = h3_ngnet_qmux::diagnostics::drain();
         eprintln!(
@@ -393,12 +433,15 @@ fn validate_request(
     if mode == Mode::Diagnostic
         && (!matches!(
             arm_name,
-            "ngnet-quic-h3" | "h3-qmux-duplex" | "h3-qmux-socket"
+            "ngnet-quic-h3"
+                | "ngnet-qmux-matched-duplex"
+                | "ngnet-qmux-matched-socket"
+                | "h3-qmux-duplex"
+                | "h3-qmux-socket"
         ) || workload != "body")
     {
         return Err(
-            "diagnostic mode supports only `ngnet-quic-h3`, `h3-qmux-duplex`, or \
-             `h3-qmux-socket` body"
+            "diagnostic mode supports only `ngnet-quic-h3` or the four matched QMux body arms"
                 .to_string(),
         );
     }
@@ -495,6 +538,7 @@ fn main() {
         }
 
         if mode == Mode::Diagnostic {
+            arm.arm_symmetric_counters();
             emit_rss("ready", 0, rss_kib());
             flush_stderr();
         }
@@ -529,6 +573,7 @@ fn main() {
                                     "failure-request-or-body",
                                     None,
                                 );
+                                arm.emit_symmetric_counters(exchange, "failure-request-or-body");
                                 flush_stderr();
                                 panic!("exchange {exchange} failed before an exact response");
                             }
@@ -542,6 +587,7 @@ fn main() {
                                 );
                                 emit_rss("failure-timeout", exchange, failure_rss);
                                 emit_diagnostics(&arm_name, exchange, "failure-timeout", None);
+                                arm.emit_symmetric_counters(exchange, "failure-timeout");
                                 flush_stderr();
                                 panic!("exchange {exchange} exceeded its workload-scaled timeout");
                             }
@@ -564,6 +610,7 @@ fn main() {
                         if mode == Mode::Diagnostic {
                             emit_rss("failure-response-drained", exchange, post_drain_rss);
                             emit_diagnostics(&arm_name, exchange, "failure-response-drained", None);
+                            arm.emit_symmetric_counters(exchange, "failure-response-drained");
                         }
                         flush_stderr();
                         panic!("exchange {exchange} response was not exact");
@@ -572,6 +619,7 @@ fn main() {
                     if mode == Mode::Diagnostic {
                         emit_rss("response-drained", exchange, post_drain_rss);
                         emit_diagnostics(&arm_name, exchange, "both-endpoints", Some(param));
+                        arm.emit_symmetric_counters(exchange, "both-endpoints");
                         eprintln!(
                             "PROBE-PROGRESS exchange={exchange} completed={exchange} \
                              expected_bytes={param} received_bytes={received}"
@@ -609,6 +657,7 @@ fn main() {
             }
         } else {
             emit_diagnostics(&arm_name, iters, "final", None);
+            arm.emit_symmetric_counters(iters, "final");
             emit_rss("final", iters, rss_kib());
         }
         eprintln!("PROBE-DONE completed={iters}");
@@ -625,6 +674,26 @@ mod tests {
         assert!(validate_request("ngnet-quic-h3", "body", 1024, 1, Mode::Diagnostic).is_ok());
         assert!(validate_request("h3-qmux-duplex", "body", 1024, 1, Mode::Diagnostic).is_ok());
         assert!(validate_request("h3-qmux-socket", "body", 1024, 1, Mode::Diagnostic).is_ok());
+        assert!(
+            validate_request(
+                "ngnet-qmux-matched-duplex",
+                "body",
+                1024,
+                1,
+                Mode::Diagnostic
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_request(
+                "ngnet-qmux-matched-socket",
+                "body",
+                1024,
+                1,
+                Mode::Diagnostic
+            )
+            .is_ok()
+        );
         assert!(validate_request("ngnet-h3-quinn", "body", 1024, 1, Mode::Diagnostic).is_err());
         assert!(validate_request("ngnet-quic-h3", "concurrent", 1, 1, Mode::Diagnostic).is_err());
     }
