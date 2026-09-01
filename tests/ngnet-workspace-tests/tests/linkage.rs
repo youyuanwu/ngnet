@@ -196,7 +196,6 @@ fn qmux_links_no_tls_in_any_configuration() {
         "ngnet-qmux",
         "ngnet-qmux-h3",
         "h3-ngnet-qmux",
-        "h3-ngnet-qmux-tests",
     ] {
         for binary in test_executables(&["-p", package]) {
             let linked: Vec<String> = needed_libraries(&binary)

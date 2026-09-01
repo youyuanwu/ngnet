@@ -96,8 +96,6 @@ QMux connection without owning an endpoint, TLS, runtime, or task.
   bounded lower progress, routing, credit, lifecycle, close, and measurement.
 - [`h3-ngnet-qmux/invariants.md`](h3-ngnet-qmux/invariants.md) — the deterministic and end-to-end
   evidence for each contract.
-- [`h3-ngnet-qmux/pending-work.md`](h3-ngnet-qmux/pending-work.md) — interoperability,
-  cumulative limits, deferred coalescing, and measurement limits.
 
 ## HTTP/3 over QUIC
 

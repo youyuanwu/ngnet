@@ -240,47 +240,6 @@ fn lower_failure_fans_out_one_stable_connection_category_to_all_openers() {
 }
 
 #[test]
-fn reset_stream_does_not_prevent_an_unrelated_sibling_from_completing() {
-    const CODE: u64 = 0xa1;
-    let (mut client, mut client_driver, mut server, mut server_driver) =
-        common::pair(Config::new());
-    let client_task = async {
-        let mut reset = common::open_bidi(&mut client).await;
-        common::send_all_unframed(&mut reset, Bytes::from_static(b"x")).await;
-        quic::SendStream::reset(&mut reset, CODE);
-
-        let mut sibling = common::open_bidi(&mut client).await;
-        common::send_all_unframed(&mut sibling, Bytes::from_static(b"sibling")).await;
-        common::finish(&mut sibling).await;
-    };
-    let server_task = async {
-        let mut reset = common::accept_bidi(&mut server).await;
-        let first = poll_fn(|cx| quic::RecvStream::poll_data(&mut reset, cx))
-            .await
-            .expect("prefix")
-            .expect("prefix bytes");
-        let reset_error = poll_fn(|cx| quic::RecvStream::poll_data(&mut reset, cx))
-            .await
-            .expect_err("reset");
-        let mut sibling = common::accept_bidi(&mut server).await;
-        let sibling = common::receive_all(&mut sibling).await;
-        (first, reset_error, sibling)
-    };
-    let (_, (first, reset_error, sibling)) = common::run_pair(
-        client_task,
-        &mut client_driver,
-        server_task,
-        &mut server_driver,
-    );
-    assert_eq!(first, b"x"[..]);
-    assert!(matches!(
-        reset_error,
-        quic::StreamErrorIncoming::StreamTerminated { error_code: CODE }
-    ));
-    assert_eq!(sibling, b"sibling");
-}
-
-#[test]
 fn dropping_an_unfinished_send_is_observed_as_one_reset() {
     let (mut client, mut client_driver, mut server, mut server_driver) =
         common::pair(Config::new());

@@ -816,16 +816,6 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "h3",
- "ngnet-qmux",
-]
-
-[[package]]
-name = "h3-ngnet-qmux-tests"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "h3",
- "h3-ngnet-qmux",
  "http",
  "ngnet-qmux",
  "tokio",

@@ -114,28 +114,12 @@ pub async fn open_bidi(
         .expect("open bidi")
 }
 
-pub async fn open_uni(
-    connection: &mut TestConnection,
-) -> h3_ngnet_qmux::SendStream<TestByteStream, TestClock> {
-    poll_fn(|cx| quic::OpenStreams::poll_open_send(connection, cx))
-        .await
-        .expect("open uni")
-}
-
 pub async fn accept_bidi(
     connection: &mut TestConnection,
 ) -> h3_ngnet_qmux::BidiStream<TestByteStream, TestClock> {
     poll_fn(|cx| quic::Connection::poll_accept_bidi(connection, cx))
         .await
         .expect("accept bidi")
-}
-
-pub async fn accept_uni(
-    connection: &mut TestConnection,
-) -> h3_ngnet_qmux::RecvStream<TestByteStream, TestClock> {
-    poll_fn(|cx| quic::Connection::poll_accept_recv(connection, cx))
-        .await
-        .expect("accept uni")
 }
 
 pub async fn send_all_unframed<S>(stream: &mut S, mut data: Bytes)

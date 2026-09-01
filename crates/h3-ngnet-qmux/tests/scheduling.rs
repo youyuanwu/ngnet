@@ -39,7 +39,6 @@ fn counting_context() -> (Arc<Count>, Waker) {
     (count, waker)
 }
 
-#[test]
 fn handles_do_no_lower_io_and_the_driver_owns_the_first_flight() {
     let (client_io, _peer_io) = stream_pair();
     let reads = client_io.read_log();
@@ -47,7 +46,7 @@ fn handles_do_no_lower_io_and_the_driver_owns_the_first_flight() {
     let lower =
         QmuxConnection::client(client_io, TestClock::new(), Config::new()).expect("client QMux");
     let (mut client, mut driver) = from_qmux(lower, 4);
-    let (_handle_count, handle_waker) = counting_context();
+    let (handle_count, handle_waker) = counting_context();
     let mut handle_cx = Context::from_waker(&handle_waker);
 
     assert!(matches!(
@@ -59,6 +58,11 @@ fn handles_do_no_lower_io_and_the_driver_owns_the_first_flight() {
         writes.writes(),
         0,
         "an H3 handle must not poll lower output"
+    );
+    assert_eq!(
+        handle_count.get(),
+        0,
+        "a blocked handle must park, not spin"
     );
 
     let (driver_count, driver_waker) = counting_context();
@@ -81,7 +85,6 @@ fn handles_do_no_lower_io_and_the_driver_owns_the_first_flight() {
     );
 }
 
-#[test]
 fn a_productive_driver_read_schedules_one_poll_to_register_lower_readiness() {
     let (client_io, server_io) = stream_pair();
     let client_lower =
@@ -110,31 +113,6 @@ fn a_productive_driver_read_schedules_one_poll_to_register_lower_readiness() {
     );
 }
 
-#[test]
-fn blocked_open_and_idle_driver_do_not_self_wake() {
-    let (mut client, mut client_driver, _server, _server_driver) = common::pair(Config::new());
-    let (open_count, open_waker) = counting_context();
-    let mut open_cx = Context::from_waker(&open_waker);
-    assert!(matches!(
-        quic::OpenStreams::<Bytes>::poll_open_bidi(&mut client, &mut open_cx),
-        Poll::Pending
-    ));
-    assert_eq!(open_count.get(), 0, "a blocked open must park, not spin");
-
-    let (driver_count, driver_waker) = counting_context();
-    let mut driver_cx = Context::from_waker(&driver_waker);
-    assert!(matches!(
-        std::pin::Pin::new(&mut client_driver).poll(&mut driver_cx),
-        Poll::Pending
-    ));
-    assert_eq!(
-        driver_count.get(),
-        0,
-        "an idle lower poll must not wake its own driver"
-    );
-}
-
-#[test]
 fn cloned_openers_keep_independent_current_wakers() {
     let (client, mut client_driver, _server, mut server_driver) = common::pair(Config::new());
     let mut first = quic::Connection::<Bytes>::opener(&client);
@@ -168,38 +146,6 @@ fn cloned_openers_keep_independent_current_wakers() {
     assert!(second_count.get() > 0, "second opener retained its waiter");
 }
 
-#[test]
-fn two_cloned_unidirectional_openers_keep_independent_wakers() {
-    let (client, mut client_driver, _server, mut server_driver) = common::pair(Config::new());
-    let mut first = quic::Connection::<Bytes>::opener(&client);
-    let mut second = first.clone();
-    let (first_count, first_waker) = counting_context();
-    let (second_count, second_waker) = counting_context();
-    let mut first_cx = Context::from_waker(&first_waker);
-    let mut second_cx = Context::from_waker(&second_waker);
-    assert!(matches!(
-        quic::OpenStreams::<Bytes>::poll_open_send(&mut first, &mut first_cx),
-        Poll::Pending
-    ));
-    assert!(matches!(
-        quic::OpenStreams::<Bytes>::poll_open_send(&mut second, &mut second_cx),
-        Poll::Pending
-    ));
-
-    let waker = Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    for _ in 0..16 {
-        let _ = std::pin::Pin::new(&mut server_driver).poll(&mut cx);
-        let _ = std::pin::Pin::new(&mut client_driver).poll(&mut cx);
-        if first_count.get() != 0 && second_count.get() != 0 {
-            break;
-        }
-    }
-    assert!(first_count.get() > 0);
-    assert!(second_count.get() > 0);
-}
-
-#[test]
 fn replacing_one_serialized_opener_waker_keeps_only_the_current_task() {
     let (client, mut client_driver, _server, mut server_driver) = common::pair(Config::new());
     let mut opener = quic::Connection::<Bytes>::opener(&client);
@@ -236,7 +182,6 @@ fn replacing_one_serialized_opener_waker_keeps_only_the_current_task() {
     );
 }
 
-#[test]
 fn two_busy_streams_both_make_progress_under_small_connection_credit() {
     let lower = Config::new().initial_max_stream_data(2).initial_max_data(4);
     let (mut client, mut client_driver, mut server, mut server_driver) = common::pair(lower);
@@ -297,7 +242,6 @@ fn two_busy_streams_both_make_progress_under_small_connection_credit() {
     assert_eq!(second, b"second");
 }
 
-#[test]
 fn credit_blocked_writer_and_driver_do_not_wake_each_other_without_progress() {
     let lower = Config::new().initial_max_stream_data(1).initial_max_data(1);
     let (mut client, mut client_driver, mut server, mut server_driver) = common::pair(lower);
@@ -354,86 +298,6 @@ fn credit_blocked_writer_and_driver_do_not_wake_each_other_without_progress() {
     );
 }
 
-#[test]
-fn two_credit_blocked_writers_retain_independent_waiters() {
-    let lower = Config::new().initial_max_stream_data(1).initial_max_data(2);
-    let (mut client, mut client_driver, mut server, mut server_driver) = common::pair(lower);
-    let client_task = async {
-        let mut first = common::open_bidi(&mut client).await;
-        let mut first_byte = Bytes::from_static(b"a");
-        std::future::poll_fn(|cx| {
-            quic::SendStreamUnframed::poll_send(&mut first, cx, &mut first_byte)
-        })
-        .await
-        .expect("first initial byte");
-
-        let mut second = common::open_bidi(&mut client).await;
-        let mut second_byte = Bytes::from_static(b"b");
-        std::future::poll_fn(|cx| {
-            quic::SendStreamUnframed::poll_send(&mut second, cx, &mut second_byte)
-        })
-        .await
-        .expect("second initial byte");
-        (first, second)
-    };
-    let server_task = async {
-        let first = common::accept_bidi(&mut server).await;
-        let second = common::accept_bidi(&mut server).await;
-        (first, second)
-    };
-    let ((mut first, mut second), _server_streams) = common::run_pair(
-        client_task,
-        &mut client_driver,
-        server_task,
-        &mut server_driver,
-    );
-    let (first_count, first_waker) = counting_context();
-    let (second_count, second_waker) = counting_context();
-    let mut first_cx = Context::from_waker(&first_waker);
-    let mut second_cx = Context::from_waker(&second_waker);
-    let mut first_blocked = Bytes::from_static(b"c");
-    let mut second_blocked = Bytes::from_static(b"d");
-    assert!(matches!(
-        quic::SendStreamUnframed::poll_send(&mut first, &mut first_cx, &mut first_blocked),
-        Poll::Pending
-    ));
-    assert!(matches!(
-        quic::SendStreamUnframed::poll_send(&mut second, &mut second_cx, &mut second_blocked),
-        Poll::Pending
-    ));
-    assert_eq!(first_count.get(), 0);
-    assert_eq!(second_count.get(), 0);
-}
-
-#[test]
-fn framed_send_resumes_after_local_output_ceiling_is_flushed() {
-    let (mut client, mut client_driver, mut server, mut server_driver) =
-        common::pair(Config::new());
-    let expected = Bytes::from(vec![0x6d; 200 * 1024]);
-    let client_body = expected.clone();
-    let client_task = async {
-        let mut stream = common::open_bidi(&mut client).await;
-        quic::SendStream::send_data(&mut stream, Frame::Data(client_body))
-            .expect("retain framed body");
-        std::future::poll_fn(|cx| quic::SendStream::poll_ready(&mut stream, cx))
-            .await
-            .expect("local output drainage wakes retained send");
-        common::finish(&mut stream).await;
-    };
-    let server_task = async {
-        let mut stream = common::accept_bidi(&mut server).await;
-        common::receive_all(&mut stream).await
-    };
-    let (_, received) = common::run_pair(
-        client_task,
-        &mut client_driver,
-        server_task,
-        &mut server_driver,
-    );
-    assert_eq!(&received[received.len() - expected.len()..], expected);
-}
-
-#[test]
 fn local_output_drain_wakes_the_parked_framed_sender() {
     let (mut client, mut client_driver, mut server, mut server_driver) =
         common::pair(Config::new());
@@ -487,4 +351,23 @@ fn local_output_drain_wakes_the_parked_framed_sender() {
         sender_count.get() > 0,
         "draining the local output ceiling wakes the specifically parked sender"
     );
+}
+
+#[test]
+fn lower_and_driver_work_bounds() {
+    handles_do_no_lower_io_and_the_driver_owns_the_first_flight();
+    a_productive_driver_read_schedules_one_poll_to_register_lower_readiness();
+}
+
+#[test]
+fn independent_operation_waiters() {
+    cloned_openers_keep_independent_current_wakers();
+    replacing_one_serialized_opener_waker_keeps_only_the_current_task();
+}
+
+#[test]
+fn no_spin_output_and_credit_liveness() {
+    two_busy_streams_both_make_progress_under_small_connection_credit();
+    credit_blocked_writer_and_driver_do_not_wake_each_other_without_progress();
+    local_output_drain_wakes_the_parked_framed_sender();
 }

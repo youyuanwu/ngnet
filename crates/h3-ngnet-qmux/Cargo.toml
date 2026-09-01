@@ -17,3 +17,6 @@ ngnet-qmux = { workspace = true }
 h3 = { workspace = true, features = [
     "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
 ] }
+http.workspace = true
+ngnet-qmux = { workspace = true, features = ["tokio"] }
+tokio.workspace = true
