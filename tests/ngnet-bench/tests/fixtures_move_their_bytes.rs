@@ -122,3 +122,44 @@ fn the_sweep_builds_independent_bodies() {
     );
     assert_eq!(body_of(0), Bytes::new(), "and the control point is empty");
 }
+
+#[test]
+fn matched_qmux_fixtures_use_symmetric_per_instance_counters() {
+    let runtime = current_thread_runtime();
+    let body = body_of(100_003);
+
+    let ngnet = runtime.block_on(NgnetQmuxH3Matched::establish());
+    ngnet.arm_counters();
+    assert_eq!(runtime.block_on(ngnet.round_trip(body.clone())), body.len());
+    let ngnet_memory = ngnet.counter_snapshot();
+
+    let upstream = runtime.block_on(UpstreamH3Qmux::establish());
+    upstream.arm_counters();
+    assert_eq!(
+        runtime.block_on(upstream.round_trip(body.clone())),
+        body.len()
+    );
+    let upstream_memory = upstream.counter_snapshot();
+
+    let ngnet_socket = runtime.block_on(NgnetQmuxH3MatchedSocket::establish());
+    ngnet_socket.arm_counters();
+    assert_eq!(
+        runtime.block_on(ngnet_socket.round_trip(body.clone())),
+        body.len()
+    );
+    let ngnet_socket = ngnet_socket.counter_snapshot();
+
+    let upstream_socket = runtime.block_on(UpstreamH3QmuxSocket::establish());
+    upstream_socket.arm_counters();
+    assert_eq!(runtime.block_on(upstream_socket.round_trip(body)), 100_003);
+    let upstream_socket = upstream_socket.counter_snapshot();
+
+    for snapshot in [ngnet_memory, upstream_memory, ngnet_socket, upstream_socket] {
+        assert!(snapshot.lower_read_calls > 0);
+        assert!(snapshot.lower_write_calls > 0);
+        assert!(snapshot.lower_read_bytes >= 200_006);
+        assert!(snapshot.lower_write_bytes >= snapshot.lower_read_bytes);
+        assert!(snapshot.endpoint_polls > 0);
+        assert!(!snapshot.overflowed);
+    }
+}
