@@ -93,11 +93,11 @@ motivation, and this crate is the only place the two families meet.
 QMux connection without owning an endpoint, TLS, runtime, or task.
 
 - [`h3-ngnet-qmux/design.md`](h3-ngnet-qmux/design.md) — shared ownership, the central driver,
-  bounded lower progress, routing, credit, lifecycle, close, and diagnostics.
+  bounded lower progress, routing, credit, lifecycle, close, and measurement.
 - [`h3-ngnet-qmux/invariants.md`](h3-ngnet-qmux/invariants.md) — the deterministic and end-to-end
   evidence for each contract.
 - [`h3-ngnet-qmux/pending-work.md`](h3-ngnet-qmux/pending-work.md) — interoperability,
-  cumulative limits, deferred coalescing, diagnostic scope, and measurement limits.
+  cumulative limits, deferred coalescing, and measurement limits.
 
 ## HTTP/3 over QUIC
 

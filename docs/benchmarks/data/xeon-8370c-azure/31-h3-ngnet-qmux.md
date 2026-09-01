@@ -1,9 +1,14 @@
 # 31 — Hyperium H3 and ngnet H3 over the same QMux transport
 
+> **Historical evidence.** This run predates the equal one-task-per-endpoint topology and used
+> production, process-global `h3-ngnet-qmux` diagnostics that have since been removed. Preserve
+> these observations as a record of that tree; do not use them as current API documentation or
+> as evidence for the revised adapter.
+
 **Machine:** [`xeon-8370c-azure`](README.md)
 **Date:** 2026-08-31
 **Commit:** `acb7574` (diagnostic reconciliation review fix included)
-**Cases:** QMux duplex/socket serial latency and body throughput; focused adapter diagnostics
+**Cases:** QMux duplex/socket serial latency and body throughput; historical focused diagnostics
 **Repetitions:** three pinned, interleaved fixed-count timing rounds at 1 MiB; Criterion
 surveys used 20 serial samples or 10 body samples
 **Exclusions:** no numerical sample was excluded. Criterion-reported outliers remain in its
@@ -62,9 +67,8 @@ taskset -c 0 target/release/examples/probe h3-qmux-duplex body 1048576 100 timin
 taskset -c 0 target/release/examples/probe ngnet-qmux-matched-socket body 1048576 100 timing
 taskset -c 0 target/release/examples/probe h3-qmux-socket body 1048576 100 timing
 
-cargo build -p ngnet-bench --example probe --release --features diagnostics
-taskset -c 0 target/release/examples/probe h3-qmux-duplex body 1048576 1 diagnostic
-taskset -c 0 target/release/examples/probe h3-qmux-socket body 1048576 1 diagnostic
+# The historical diagnostic commands used a removed adapter feature and are intentionally
+# omitted. Current QMux probes use symmetric bench-local counters without adapter instrumentation.
 ```
 
 ## Criterion survey
@@ -103,10 +107,11 @@ The median hyperium delta is −6.05% on duplex and +20.92% on sockets. Those de
 clear the within-arm ranges on this shared VM (11.2–40.2% relative to each arm's minimum), so
 the controlled result remains **inconclusive/noisy**, not a stable winner.
 
-## Focused adapter diagnostics
+## Historical focused adapter diagnostics
 
-Diagnostics were compiled and armed only after `PROBE-READY`; default timing probes were rebuilt
-without the feature. Both substrates produced the same one-exchange 1 MiB structural counts:
+The now-removed process-global diagnostics were compiled and armed only after `PROBE-READY`;
+default timing probes were rebuilt without them. Both substrates produced the same one-exchange
+1 MiB structural counts:
 
 | Counter | duplex | socket |
 | --- | ---: | ---: |
@@ -122,20 +127,21 @@ without the feature. Both substrates produced the same one-exchange 1 MiB struct
 | final retained send / receive | 0 / 0 | 0 / 0 |
 | overflow / lower failures | false / 0 | false / 0 |
 
-These process-global counters aggregate both observed endpoints in this one isolated probe and
-describe only `h3-ngnet-qmux`; the baseline exposes no matched internal counters. They therefore
-support adapter invariants and candidate generation, not a numerical attribution against
-`ngnet-qmux-h3`. The retained-send high-water is the caller-owned 1 MiB body plus H3 framing,
-not a second body-sized copy. The receive high-water remains within the configured connection
+These historical process-global counters aggregated both observed endpoints in one isolated probe
+and described only `h3-ngnet-qmux`; the baseline exposed no matched internal counters. They
+supported adapter invariants and candidate generation, not numerical attribution against
+`ngnet-qmux-h3`. The retained-send high-water was the caller-owned 1 MiB body plus H3 framing,
+not a second body-sized copy. The receive high-water remained within the configured connection
 window.
 
 ## What this establishes
 
-- All eight matched combinations execute complete request/echo/drain work.
-- The result's sign differs between duplex and sockets.
-- The controlled 1 MiB repetitions are too noisy to name a stable whole-stack winner.
-- Armed adapter counters reconcile credit applications, wake delivery, final gauges, and exact
-  application completion without overflow.
+- On the historical tree, all eight matched combinations executed complete request/echo/drain
+  work.
+- The historical result's sign differed between duplex and sockets.
+- The controlled 1 MiB repetitions were too noisy to name a stable whole-stack winner.
+- The removed counters reconciled credit applications, wake delivery, final gauges, and exact
+  application completion without overflow on that tree.
 
 ## What this does not establish
 

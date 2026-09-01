@@ -24,7 +24,7 @@ including that close.
 
 ## Streams and flow control
 
-- Framed sends retain at most one generic `WriteBuf<B>` and walk every
+- Framed sends use `Bytes`, retaining at most one `WriteBuf<Bytes>` and walking every
   `Buf::chunk()` without copying the body into another body-sized buffer.
 - Unframed sends never retain the borrowed buffer and advance only the exact
   accepted prefix.
@@ -35,28 +35,25 @@ including that close.
 - Finish, reset, stop, split-half drop, and repeated terminal polls are
   idempotent. A split half cannot invalidate its sibling.
 
-Pending peer streams are bounded by `AdapterConfig::pending_accept_limit`
-(default 128). Exceeding it is connection-fatal with `H3_EXCESSIVE_LOAD`;
-hyperium exposes no per-stream rejection result. QMux stream allowances are
-cumulative lifetime budgets and are not recycled when streams close.
+The `pending_accept_limit` constructor argument bounds pending peer streams.
+Exceeding it is connection-fatal with `H3_EXCESSIVE_LOAD`; hyperium exposes no
+per-stream rejection result. QMux stream allowances are cumulative lifetime
+budgets and are not recycled when streams close.
 
 Connection errors preserve application-close codes. Peer resets and
 `STOP_SENDING` preserve stream codes. Byte-stream, protocol, truncation, and
 other QMux failures map to hyperium's undefined underlying failure; the adapter
 does not invent timeouts.
 
-## Runtime neutrality and diagnostics
+## Runtime neutrality and measurement
 
-The stream, clock, and body buffer have no imposed `Send` bound. Sendability
-follows those supplied types, so `Rc`-based thread-per-core streams and
-sendable Tokio streams are both supported.
+The stream and clock have no imposed `Send` bound. Sendability follows those
+supplied types, so `Rc`-based thread-per-core streams and sendable Tokio streams
+are both supported.
 
-The off-by-default `diagnostics` feature adds an `ObservedStream<S>`, explicitly
-armed counters, snapshots, and interval drains. Default builds contain none of
-that path. A feature-enabled but unarmed build still pays arming checks and
-receive-gauge calculation sites; use it for diagnostics, not timing.
-Counters are process-global and aggregate every observed endpoint in the
-process; run one isolated diagnostic workload at a time.
+The production adapter exposes no diagnostic counters or observed-stream
+wrapper. Benchmark fixtures apply the same per-instance `CountingStream` and
+combined endpoint poll counter to both compared stacks.
 
 See [`docs/h3-ngnet-qmux/`](../../docs/h3-ngnet-qmux/) for design, invariants,
 and known limits.

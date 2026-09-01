@@ -10,9 +10,9 @@
 - **Header and payload chunks are submitted sequentially.** Coalescing them
   would require copying or additional lower support. Run 31 found no controlled
   causal timing evidence that justifies that change.
-- **Diagnostics are process-global and asymmetric.** They are suitable for one
-  isolated probe, not simultaneous independently attributed connections, and
-  the baseline adapter has no equivalent internal counters.
+- **Production diagnostics are intentionally absent.** Benchmark-only lower-I/O
+  and endpoint-poll counters are per fixture and wrap both compared adapters
+  symmetrically; they do not attribute work inside either H3 implementation.
 - **Timeouts remain caller policy.** QMux provides a clock reading but no timer,
   so the adapter does not manufacture timeout errors.
 - **The benchmark verdict is noisy.** Duplex and socket signs differ and pinned

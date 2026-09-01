@@ -74,12 +74,12 @@ cargo bench -p ngnet-bench --bench qmux_h3_body_throughput
 cargo bench -p ngnet-bench --bench qmux_h3_socket_serial_latency
 cargo bench -p ngnet-bench --bench qmux_h3_socket_body_throughput
 
-# The default timing probe contains no h3-ngnet-qmux diagnostic path.
+# Timing leaves the bench-local QMux counters disarmed.
 cargo build -p ngnet-bench --example probe --release
 taskset -c 3 target/release/examples/probe h3-qmux-duplex body 1048576 100 timing
 
-# Focused adapter evidence is a separate feature-enabled, explicitly armed process.
-cargo build -p ngnet-bench --example probe --release --features diagnostics
+# QMux diagnostic mode arms the same per-instance wrapper on both compared adapters.
+cargo build -p ngnet-bench --example probe --release
 taskset -c 3 target/release/examples/probe h3-qmux-duplex body 1048576 1 diagnostic
 
 # The opt-in no-copy path against the push path: duplex, then real sockets.

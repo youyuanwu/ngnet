@@ -7,11 +7,10 @@ TLS, authentication, and runtime policy, remains the caller's responsibility.
 
 ## Shared core and driver
 
-The root connection, cloneable openers, stream halves, observers, and one
-caller-polled driver share `Arc<Mutex<Core<S, C>>>`. Generic framed sends live
-in a separate `SendSlots<B>` registry so a routed peer stop or connection error
-can immediately discard a non-`'static`, potentially non-`Send` `WriteBuf<B>`
-without unsafe type erasure or a body copy.
+The root connection, cloneable openers, stream halves, and one caller-polled
+driver share `Arc<Mutex<Core<S, C>>>`. Each active send may retain one
+`WriteBuf<Bytes>` directly in its stream state, so resets and terminal fan-out
+discard it under the same authoritative lock without a second registry.
 
 The driver is the stable lower-I/O wake target and shutdown-completion owner.
 Trait polls may borrow bounded progress, but the crate never spawns and creates
@@ -46,7 +45,7 @@ moment H3 takes owned bytes. Stop or final receive drop queues one read
 shutdown, discards retained data, and extends only connection credit. Future
 data on the retired receive side follows the same discard rule.
 
-Framed readiness advances exactly what QMux accepted across every generic
+Framed readiness advances exactly what QMux accepted across every `Bytes`
 buffer chunk. Finish drains retained data before one empty FIN. Reset discards
 unaccepted framed data before one write shutdown. Directional drop performs
 abandonment only for a still-live direction.
@@ -55,14 +54,11 @@ Synchronous H3 close records the first reason. The driver subsequently drains
 stream/control output, writes QMux close, flushes it, and shuts down the lower
 write side. Without another driver poll, delivery is not promised.
 
-## Diagnostics and measurement
+## Measurement
 
-The `diagnostics` feature wraps lower I/O and counts adapter polls, bounded
-pumps, routed events, credit, waiters, wakes, retained gauges, cleanup, and
-terminal fan-out. Counters saturate with one overflow flag. Snapshot is
-non-destructive; drain resets interval counters, preserves current gauges, and
-re-seeds high-water marks from them.
-
-Diagnostics are asymmetric focused evidence: `ngnet-qmux-h3` exposes no matched
-internal counters. Timings therefore remain whole-stack comparisons. Run 31 in
-the benchmark data records both the controls and the inconclusive/noisy result.
+The production adapter contains no observation feature or counters. The
+benchmark crate wraps both compared adapters with the same per-instance lower-I/O
+counter and polls each adapter/H3 pair through one combined endpoint future.
+Timings remain whole-stack comparisons. Run 31 is historical evidence from the
+superseded asymmetric topology and instrumentation; current conclusions require
+the post-revision matched runs.
