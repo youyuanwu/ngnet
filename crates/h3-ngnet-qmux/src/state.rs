@@ -787,8 +787,10 @@ mod tests {
 
     use h3::proto::frame::Frame;
     use ngnet_qmux::TransportParams;
+    #[cfg(debug_assertions)]
+    use ngnet_qmux::io::StreamWrite;
     use ngnet_qmux::io::testing::{TestByteStream, TestClock, stream_pair};
-    use ngnet_qmux::io::{Config, OUTBOUND_CEILING, StreamWrite};
+    use ngnet_qmux::io::{Config, OUTBOUND_CEILING};
 
     fn make_core(limit: usize) -> Core<TestByteStream, TestClock> {
         let (near, _far) = stream_pair();
@@ -1118,6 +1120,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn one_core_turn_routes_sixty_four_events_from_one_lower_read_batch() {
         let (client_io, server_io) = stream_pair();
         server_io.set_read_cap(Some(16 * 1024));
@@ -1195,11 +1198,20 @@ mod tests {
         );
         assert_eq!(core.retained_receive_bytes(), 7);
         assert_eq!(core.retained_send_bytes(), 1027);
+        let _ = poll_once(|cx| core.lower.poll_pump_buffered(cx));
+        assert!(core.lower.queued_output() > 0);
         assert!(core.lower.queued_output() <= OUTBOUND_CEILING);
     }
 
     #[test]
     fn unread_reset_data_is_discarded_before_terminal_retirement() {
+        #[cfg(feature = "diagnostics")]
+        let _serial = crate::diagnostics::lock_for_test();
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::diagnostics::reset();
+            crate::diagnostics::arm(true);
+        }
         let mut core = make_core(4);
         let id = stream(1);
         core.streams.insert(
@@ -1217,6 +1229,12 @@ mod tests {
         );
         core.discard_receive(id, ABANDONED).expect("discard");
         assert_eq!(core.retained_receive_bytes(), 0);
+        #[cfg(feature = "diagnostics")]
+        {
+            let snapshot = crate::diagnostics::snapshot();
+            assert_eq!(snapshot.connection_credit_applications, 1);
+            assert_eq!(snapshot.stream_credit_applications, 0);
+        }
         core.drop_direction(id, false);
         assert!(!core.streams.contains_key(&id));
     }

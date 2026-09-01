@@ -345,10 +345,11 @@ impl<S: AsyncByteStream, C: Clock> quic::SendStream<Bytes> for SendStream<S, C> 
                             Poll::Pending
                         }
                         Ok(StreamWrite::Accepted(_)) => {
-                            Poll::Ready(Err(ConnectionTerminal::Internal(
+                            let terminal = ConnectionTerminal::Internal(
                                 "QMux returned an invalid result for an empty FIN".into(),
-                            )
-                            .stream_error()))
+                            );
+                            effects.merge(core.fail(terminal.clone()));
+                            Poll::Ready(Err(terminal.stream_error()))
                         }
                         Ok(StreamWrite::Closed) => Poll::Ready(Err(closed_stream_error(
                             core,
@@ -422,10 +423,11 @@ impl<S: AsyncByteStream, C: Clock> quic::SendStreamUnframed<Bytes> for SendStrea
         let result = self.shared.with_core(|core| {
             match core.lower.try_write_stream(self.stream_id, chunk, false) {
                 Ok(StreamWrite::Accepted(accepted)) if accepted > offered => {
-                    Poll::Ready(Err(ConnectionTerminal::Internal(
+                    let terminal = ConnectionTerminal::Internal(
                         "QMux accepted more bytes than were offered".into(),
-                    )
-                    .stream_error()))
+                    );
+                    effects.merge(core.fail(terminal.clone()));
+                    Poll::Ready(Err(terminal.stream_error()))
                 }
                 Ok(StreamWrite::Accepted(0)) | Ok(StreamWrite::Blocked) => {
                     core.park_send(
