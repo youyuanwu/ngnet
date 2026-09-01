@@ -38,8 +38,8 @@ use io_harness::{
     connection_with_peer_stream, counting_waker, exchange, flush, next_event, open_bidi,
     peer_writes, poll_once, run_pair, write_all,
 };
-use ngnet_qmux::io::testing::Fault;
-use ngnet_qmux::io::{Config, Event, StreamOpen, StreamWrite};
+use ngnet_qmux::io::testing::{Fault, TestClock, stream_pair};
+use ngnet_qmux::io::{Config, Connection, Event, StreamOpen, StreamWrite};
 use ngnet_qmux::{Directionality, Role, StreamId};
 
 const REQUEST: &[u8] = b"the request that had to wait for stream capacity";
@@ -101,21 +101,22 @@ fn an_open_blocked_by_the_peers_limit_completes_once_the_limit_is_raised() {
     );
 }
 
-/// A blocked open parks; it does not wake itself (Spec SC-012, and the reason for it).
+/// A blocked immediate open does no polling and cannot wake (Spec SC-012).
 ///
 /// The connection is given a peer announcement permitting no bidirectional streams and nothing
-/// else, so its open can only wait. If the wait were a self-wake -- pending plus an immediate
-/// wake, which looks identical to a caller -- the count below would rise by one per poll, and
-/// the executor above would spin for as long as the peer took to raise the limit.
+/// else. The outer scheduler owns any waiter; this operation only reports the current state.
 #[test]
 fn an_immediate_blocked_open_does_not_wake_or_poll() {
-    let (mut conn, mut far) = connection_with_peer_stream(Role::Client);
+    let (near, mut far) = stream_pair();
+    let reads = near.read_log();
+    let writes = near.write_log();
+    let mut conn =
+        Connection::client(near, TestClock::new(), Config::new()).expect("client connection");
     peer_writes(
         &mut far,
         &announcement_record_configured(Role::Server, Config::new().max_streams_bidi(0)),
     );
-
-    let (_waker, wakes) = counting_waker();
+    let before = (reads.reads(), writes.writes());
 
     for _ in 0..16 {
         assert!(
@@ -124,10 +125,9 @@ fn an_immediate_blocked_open_does_not_wake_or_poll() {
         );
     }
     assert_eq!(
-        wakes.count(),
-        0,
-        "the blocked open asked to be polled again rather than parking on the limit: that is a \
-         busy loop, and it costs a core for every connection waiting on a slow peer"
+        (reads.reads(), writes.writes()),
+        before,
+        "an immediate blocked open must leave lower I/O entirely to its outer scheduler"
     );
 }
 

@@ -191,7 +191,7 @@ fn send_fixed_payload(
 }
 
 #[test]
-fn buffered_event_and_open_calls_owe_one_forced_flush() {
+fn buffered_event_and_immediate_open_calls_owe_one_forced_flush() {
     let (mut conn, mut far, log) = client_with_peer(|_| {});
     peer_writes(&mut far, &announcement_record(Role::Server));
     let stream = run(async {

@@ -20,15 +20,41 @@ each of three passes, duplex and loopback-socket empty/body probes ran for the
 ngnet control and hyperium candidate:
 
 ```sh
-cargo build -p ngnet-bench --example probe --release
-taskset -c 0 target/release/examples/probe <arm> body 0 1000 timing
-taskset -c 0 target/release/examples/probe <arm> body 1048576 100 timing
+for pass in 1 2 3; do
+  git checkout --detach 8d0479b
+  cargo build -p ngnet-bench --example probe --release
+  for arm in ngnet-qmux-matched-duplex h3-qmux-duplex \
+             ngnet-qmux-matched-socket h3-qmux-socket; do
+    taskset -c 0 target/release/examples/probe "$arm" body 0 1000 timing
+    taskset -c 0 target/release/examples/probe "$arm" body 1048576 100 timing
+  done
+
+  git checkout feature/h3-ngnet-qmux
+  cargo build -p ngnet-bench --example probe --release
+  for arm in ngnet-qmux-matched-duplex h3-qmux-duplex \
+             ngnet-qmux-matched-socket h3-qmux-socket; do
+    taskset -c 0 target/release/examples/probe "$arm" body 0 1000 timing
+    taskset -c 0 target/release/examples/probe "$arm" body 1048576 100 timing
+  done
+done
 ```
 
 ## Timing results
 
 Values are the median elapsed milliseconds across three runs. Delta is
 driver-only relative to opportunistic; negative is faster.
+
+| Baseline pass | ngnet duplex empty / 1 MiB | hyperium duplex empty / 1 MiB | ngnet socket empty / 1 MiB | hyperium socket empty / 1 MiB |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 20.202 / 82.398 | 26.474 / 160.074 | 32.835 / 140.822 | 36.425 / 315.454 |
+| 2 | 19.383 / 66.669 | 24.046 / 151.022 | 34.321 / 131.697 | 31.583 / 334.251 |
+| 3 | 19.121 / 66.409 | 19.604 / 143.861 | 33.487 / 147.389 | 30.204 / 321.352 |
+
+| Driver-only pass | ngnet duplex empty / 1 MiB | hyperium duplex empty / 1 MiB | ngnet socket empty / 1 MiB | hyperium socket empty / 1 MiB |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 19.469 / 69.246 | 23.004 / 61.732 | 35.525 / 132.011 | 27.959 / 134.291 |
+| 2 | 22.602 / 67.217 | 16.704 / 59.749 | 33.413 / 142.508 | 32.514 / 126.896 |
+| 3 | 19.127 / 76.132 | 19.880 / 59.878 | 37.324 / 143.409 | 38.668 / 126.045 |
 
 | Substrate / workload | Stack | Opportunistic | Driver-only | Delta |
 | --- | --- | ---: | ---: | ---: |

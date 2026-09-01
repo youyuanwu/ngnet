@@ -182,9 +182,12 @@ drift bar, survey the arms, and re-settle one verdict the legacy host could not.
 together**; a claim carried over from the legacy host is a claim awaiting re-measurement, and
 [`data/README.md`](data/README.md) says how to file the run that settles it.
 
-The hyperium-H3-over-QMux comparison is recorded in
-[`31-h3-ngnet-qmux`](data/xeon-8370c-azure/31-h3-ngnet-qmux.md). Its pinned repetitions are
-noisy and the sign differs between duplex and sockets, so it establishes no stable winner.
+The current equal-topology hyperium-H3-over-QMux comparison is recorded in
+[`33-h3-qmux-post-revision`](data/xeon-8370c-azure/33-h3-qmux-post-revision.md).
+All Criterion point estimates favor hyperium, but every pinned within-arm range overlaps, so
+it establishes no stable winner. Run
+[`32`](data/xeon-8370c-azure/32-h3-qmux-driver-ownership.md) records the driver-ownership A/B;
+Run [`31`](data/xeon-8370c-azure/31-h3-ngnet-qmux.md) is historical first-revision evidence.
 
 QMux/H3 is now measured against HTTP/2 in runs
 [`08`](data/xeon-8370c-azure/08-qmux-against-h2.md),

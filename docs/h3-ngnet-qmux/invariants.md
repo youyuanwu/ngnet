@@ -4,7 +4,7 @@
 | --- | --- |
 | One lower read batch and at most 64 routed events per adapter turn | `ngnet-qmux/tests/io_bounded.rs`; private `state` unit tests |
 | Only the stable proxy waker reaches QMux; user wakes occur after unlock | `h3-ngnet-qmux/tests/scheduling.rs`; `state` unit tests |
-| Independent bidi/uni opener, writer, receive, and finish waiters are not displaced | `tests/scheduling.rs` |
+| Independent opener, writer, receive, and finish waiters are not displaced | `tests/scheduling.rs`; private `state` unit tests |
 | Idle and credit-blocked operations do not form a self-wake loop | `tests/scheduling.rs` |
 | Explicit and data-first peer streams are accepted exactly once | private `state` unit tests; `tests/e2e.rs` |
 | Every current event variant has a stable route; unknown variants fail closed | `state` unit tests |

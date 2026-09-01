@@ -31,7 +31,7 @@ an idle or credit-blocked turn does not self-wake.
 Every current QMux event has an explicit route. `StreamData` can discover a
 peer uni or bidi stream before `StreamOpened`; stream-ID initiator and direction
 bits classify it. Unknown future event variants fail the connection rather than
-disappearing. Completed entries remain retired until the ordered lower
+disappearing. Completed entries remain retained until the ordered lower
 `StreamClosed`, so data already decoded beyond one routing budget is discarded
 and credited rather than rediscovering a stream.
 

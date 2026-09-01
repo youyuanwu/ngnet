@@ -3,7 +3,7 @@
 **Status: historical Azure-VM label; current captures use the migrated CPU described below.**
 Runs have been collected in this directory since 2026-08-16.
 
-**First run:** 2026-08-16 · **Last run:** 2026-08-31
+**First run:** 2026-08-16 · **Last run:** 2026-09-01
 
 ## Hardware and system
 

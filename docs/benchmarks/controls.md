@@ -56,9 +56,9 @@ adapter-only attribution.
 
 Remaining asymmetries are explicit. Hyperium clones its request handle inside a round trip;
 ngnet does not. Hyperium GREASE can be disabled while ngnet exposes no toggle. Hyperium's
-stateless QPACK has no capacity control, so the matched ngnet fixture uses zero. Diagnostics
-exist only for `h3-ngnet-qmux`; their counts are focused evidence and are never compared as if
-the baseline exposed the same units. Duplex and socket signs must be reported separately.
+stateless QPACK has no capacity control, so the matched ngnet fixture uses zero. Production
+adapters expose no diagnostic instrumentation; both arms use the same bench-local lower-I/O
+and endpoint-poll counters. Duplex and socket signs must be reported separately.
 
 ## Confounds of the cross-protocol pair
 
