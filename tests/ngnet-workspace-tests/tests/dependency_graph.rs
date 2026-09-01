@@ -274,6 +274,7 @@ fn the_http3_wrapper_reaches_no_quic_implementation() {
         "ngnet-qmux",
         "ngnet-qmux-sys",
         "ngnet-qmux-h3",
+        "h3-ngnet-qmux",
         "quinn",
     ] {
         assert!(
@@ -406,6 +407,51 @@ fn the_qmux_adapter_depends_on_both_families() {
              byte stream the caller supplies.\n\n{tree}",
         );
     }
+}
+
+/// The hyperium adapter joins only hyperium H3 and QMux, without choosing a runtime or TLS.
+#[test]
+fn the_hyperium_qmux_adapter_has_the_exact_direct_dependencies() {
+    let tree = cargo_tree(&["-p", "h3-ngnet-qmux", "-e", "normal"]);
+    let mut direct: Vec<String> = tree
+        .lines()
+        .skip(1)
+        .filter(|line| line.starts_with('\u{251c}') || line.starts_with('\u{2514}'))
+        .map(dependency_name)
+        .collect();
+    direct.sort();
+    assert_eq!(
+        direct,
+        ["bytes", "h3", "ngnet-qmux"],
+        "h3-ngnet-qmux must directly join bytes, hyperium h3, and ngnet-qmux only.\n{tree}"
+    );
+
+    for forbidden in [
+        "ngnet-h3",
+        "ngnet-quic",
+        "ngnet-quic-sys",
+        "quinn",
+        "rustls",
+        "openssl",
+        "openssl-sys",
+        "compio",
+    ] {
+        assert!(
+            !contains_at_word_boundary(&tree, forbidden),
+            "{forbidden} reached h3-ngnet-qmux.\n{tree}"
+        );
+    }
+    assert!(
+        !tree
+            .lines()
+            .skip(1)
+            .any(
+                |line| (line.starts_with('\u{251c}') || line.starts_with('\u{2514}'))
+                    && dependency_name(line) == "tokio"
+            ),
+        "tokio may occur transitively through hyperium h3 synchronization, but must not be a \
+         direct adapter dependency.\n{tree}"
+    );
 }
 
 /// The QMux core depends only on its bindings.
@@ -553,6 +599,7 @@ fn no_other_protocol_stack_or_tls_reaches_qmux() {
             "ngnet-quic-sys",
             "ngnet-quic-h3",
             "ngnet-qmux-h3",
+            "h3-ngnet-qmux",
             "ngnet-h2",
             "ngnet-h2-sys",
             "ngnet-h3",
@@ -581,13 +628,13 @@ fn no_other_protocol_stack_or_tls_reaches_qmux() {
 /// rest of the workspace from growing into QMux. Both crates are unpublished and expected to
 /// churn with the draft, so anything depending on them inherits that churn.
 ///
-/// `ngnet-qmux-h3` is deliberately absent from the list, and its absence is the whole point of
+/// The two QMux/H3 adapters are deliberately absent from the list, and that absence is the whole point of
 /// the list being spelled out crate by crate rather than derived from workspace membership.
 /// The join is new, unpublished and expected to churn alongside QMux itself, so it is allowed
 /// to take the dependency; every crate that predates QMux is not. Adding a member here is the
 /// deliberate act that decides which side of that line a new crate falls on, and
-/// `the_qmux_adapter_depends_on_both_families` above asserts the exception is a real crate
-/// joining two real families rather than a hole in the check.
+/// the two positive adapter checks above assert each exception is a real join rather than a
+/// hole in the check.
 #[test]
 fn no_existing_crate_reaches_qmux() {
     for crate_name in [
@@ -600,7 +647,12 @@ fn no_existing_crate_reaches_qmux() {
     ] {
         let tree = cargo_tree(&["-p", crate_name, "-e", "normal"]);
 
-        for forbidden in ["ngnet-qmux", "ngnet-qmux-sys", "ngnet-qmux-h3"] {
+        for forbidden in [
+            "ngnet-qmux",
+            "ngnet-qmux-sys",
+            "ngnet-qmux-h3",
+            "h3-ngnet-qmux",
+        ] {
             assert!(
                 !contains_at_word_boundary(&tree, forbidden),
                 "{forbidden} reached {crate_name}'s normal dependency graph.\n\

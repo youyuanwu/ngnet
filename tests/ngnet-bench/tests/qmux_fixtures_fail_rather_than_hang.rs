@@ -27,7 +27,9 @@ use bytes::Bytes;
 use tokio::time::{Duration, timeout};
 
 use ngnet_bench::{
-    MAX_CONCURRENT_STREAMS, NgnetQmuxH3, NgnetQmuxH3Socket, body_of, current_thread_runtime,
+    MAX_CONCURRENT_STREAMS, NgnetQmuxH3, NgnetQmuxH3Socket, UPSTREAM_QMUX_PENDING_ACCEPTS,
+    UpstreamH3Qmux, UpstreamH3QmuxSocket, body_of, current_thread_runtime,
+    validate_upstream_qmux_concurrency,
 };
 
 /// How long a fixture may take before a test treats it as hung.
@@ -156,4 +158,42 @@ fn one_connection_outlives_the_default_stream_allowance() {
         .await
         .expect("1,500 exchanges on one connection must complete, not stop part-way")
     });
+}
+
+#[test]
+#[should_panic(expected = "an upstream QMux response")]
+fn a_failed_upstream_duplex_exchange_panics() {
+    let runtime = current_thread_runtime();
+    let fixture = runtime.block_on(UpstreamH3Qmux::establish());
+    fixture.abandon_server();
+    runtime.block_on(async {
+        timeout(LIMIT, fixture.round_trip(body_of(1024)))
+            .await
+            .expect("the upstream duplex exchange must fail rather than hang")
+    });
+}
+
+#[test]
+#[should_panic(expected = "an upstream QMux response")]
+fn a_failed_upstream_socket_exchange_panics() {
+    let runtime = current_thread_runtime();
+    let fixture = runtime.block_on(UpstreamH3QmuxSocket::establish());
+    fixture.abandon_server();
+    runtime.block_on(async {
+        timeout(LIMIT, fixture.round_trip(body_of(1024)))
+            .await
+            .expect("the upstream socket exchange must fail rather than hang")
+    });
+}
+
+#[test]
+#[should_panic(expected = "exceeds the 128 pending accepts")]
+fn upstream_invalid_concurrency_is_rejected_before_the_wire() {
+    validate_upstream_qmux_concurrency(UPSTREAM_QMUX_PENDING_ACCEPTS + 1);
+}
+
+#[test]
+fn upstream_pending_accept_capacity_covers_the_declared_workload() {
+    assert!(UPSTREAM_QMUX_PENDING_ACCEPTS >= MAX_CONCURRENT_STREAMS as usize);
+    validate_upstream_qmux_concurrency(MAX_CONCURRENT_STREAMS as usize);
 }

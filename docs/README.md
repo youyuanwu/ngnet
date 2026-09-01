@@ -87,6 +87,16 @@ motivation, and this crate is the only place the two families meet.
 - [`qmux-h3/invariants.md`](qmux-h3/invariants.md) — what its suites pin, and what nothing
   currently enforces.
 
+## Hyperium H3 over QMux — [`h3-ngnet-qmux/`](h3-ngnet-qmux/)
+
+`h3-ngnet-qmux` implements hyperium H3's per-stream transport traits over the same established
+QMux connection without owning an endpoint, TLS, runtime, or task.
+
+- [`h3-ngnet-qmux/design.md`](h3-ngnet-qmux/design.md) — shared ownership, the central driver,
+  bounded lower progress, routing, credit, lifecycle, close, and measurement.
+- [`h3-ngnet-qmux/invariants.md`](h3-ngnet-qmux/invariants.md) — the deterministic and end-to-end
+  evidence for each contract.
+
 ## HTTP/3 over QUIC
 
 `ngnet-quic-h3` joins the two families: HTTP/3 running on this workspace's own QUIC stack. It

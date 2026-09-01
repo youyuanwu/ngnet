@@ -47,7 +47,7 @@ not tidiness.
 `poll_event` has one refinement to that rule. If a release or translated event is already queued,
 it performs the pump explicitly before returning the queued work, preserving the rule that a newly
 discovered ending is latched behind it. If neither is queued, `fill` performs the initial pump
-through `poll_next_event_buffered`; pumping explicitly first would ask the same connection twice
+through `poll_next_event`; pumping explicitly first would ask the same connection twice
 before inspecting the lower event queue. Lower events with no HTTP/3 translation may still make
 `fill` advance and pump again, so the invariant is one initial pump source per active branch
 decision, not one pump across an arbitrarily long filtering loop.

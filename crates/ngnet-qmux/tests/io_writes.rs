@@ -42,7 +42,8 @@ use io_harness::{
 };
 use ngnet_qmux::io::testing::{TestByteStream, TestClock, WriteLog, stream_pair};
 use ngnet_qmux::io::{
-    AsyncByteStream, Config, Connection, OUTBOUND_CARRY, OUTBOUND_CEILING, StreamWrite, Written,
+    AsyncByteStream, Config, Connection, OUTBOUND_CARRY, OUTBOUND_CEILING, StreamOpen, StreamWrite,
+    Written,
 };
 use ngnet_qmux::{DEFAULT_MAX_RECORD_SIZE, Role};
 
@@ -190,7 +191,7 @@ fn send_fixed_payload(
 }
 
 #[test]
-fn buffered_event_and_open_calls_owe_one_forced_flush() {
+fn buffered_event_and_immediate_open_calls_owe_one_forced_flush() {
     let (mut conn, mut far, log) = client_with_peer(|_| {});
     peer_writes(&mut far, &announcement_record(Role::Server));
     let stream = run(async {
@@ -208,11 +209,11 @@ fn buffered_event_and_open_calls_owe_one_forced_flush() {
     let waker = std::task::Waker::noop();
     let mut cx = Context::from_waker(waker);
 
-    if let Poll::Ready(Err(error)) = conn.poll_next_event_buffered(&mut cx) {
+    if let Poll::Ready(Err(error)) = conn.poll_next_event(&mut cx) {
         panic!("buffered event poll failed: {error}");
     }
     assert!(
-        conn.poll_open_bidi_buffered(&mut cx).is_ready(),
+        matches!(conn.try_open_bidi(), Ok(StreamOpen::Opened(_))),
         "the peer's stream allowance should permit another open"
     );
     assert_eq!(

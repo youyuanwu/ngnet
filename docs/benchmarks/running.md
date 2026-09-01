@@ -68,6 +68,20 @@ cargo bench -p ngnet-bench --bench serial_latency
 cargo bench -p ngnet-bench --bench concurrent_throughput
 cargo bench -p ngnet-bench --bench body_throughput
 
+# Matched ngnet-H3/hyperium-H3 comparison over QMux: duplex then loopback TCP.
+cargo bench -p ngnet-bench --bench qmux_h3_serial_latency
+cargo bench -p ngnet-bench --bench qmux_h3_body_throughput
+cargo bench -p ngnet-bench --bench qmux_h3_socket_serial_latency
+cargo bench -p ngnet-bench --bench qmux_h3_socket_body_throughput
+
+# Timing leaves the bench-local QMux counters disarmed.
+cargo build -p ngnet-bench --example probe --release
+taskset -c 3 target/release/examples/probe h3-qmux-duplex body 1048576 100 timing
+
+# QMux diagnostic mode arms the same per-instance wrapper on both compared adapters.
+cargo build -p ngnet-bench --example probe --release
+taskset -c 3 target/release/examples/probe h3-qmux-duplex body 1048576 1 diagnostic
+
 # The opt-in no-copy path against the push path: duplex, then real sockets.
 cargo bench -p ngnet-bench --bench shared_body
 taskset -c 3 cargo bench -p ngnet-bench --bench transport_shared_body

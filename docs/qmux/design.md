@@ -299,14 +299,13 @@ a real transport — per 16382-byte record, and a driver turn that produces sixt
 sixty of them where one would have carried the same bytes. What replaced it is: produce while
 the buffer has room for another whole record, write what has accumulated, then read.
 
-There are forced and buffered forms of the operations that drive this order. The ordinary
-public event/open/pump methods are forced: a standalone caller may stop after any one of them,
-so they do not return ready with live output waiting for an unspecified future call. Their
-buffered counterparts are for a caller that owns a larger scheduling turn and can prove it will
-either continue driving or execute a forced operation before suspending. They write only for
-capacity and carry an explicit documented flush obligation. HTTP/3 over QMux is that caller; its
-driver discharges the obligation at every actual task suspension rather than at every internal
-protocol pass.
+`try_next_event` drains already decoded events without lower I/O. `poll_next_event` then admits
+at most one lower read batch and leaves sub-ceiling output buffered; `poll_pump_buffered` is the
+corresponding productive progress operation. A caller that is about to suspend must use
+`poll_pump`, which forces accumulated output but performs no lower read. Opens are separate
+immediate operations: `try_open_bidi` and `try_open_uni` return `StreamOpen::Blocked` without
+polling or parking, leaving an outer scheduler to own each open waiter. Both HTTP/3 adapters are
+such schedulers and discharge the forced-output obligation only at an actual suspension.
 
 The old rule was defended by three arguments, and the replacement has to answer all three.
 
@@ -526,17 +525,18 @@ every layer above.
 
 ### Waiting, and reading no further ahead than the caller
 
-Three things here cannot proceed on demand: an open the peer's stream limit forbids, a write
-with no credit, and a read the caller has made no room for. Each parks against the event that
-ends it. The alternative — waking one's own waker and returning `Pending` — compiles, passes a
-functional suite, and burns a core; it is a busy loop wearing waiting's clothes, and the tests
-that keep it out count wakeups rather than checking eventual answers.
+Two polling operations here cannot proceed on demand: a write with no credit and a read the
+caller has made no room for. Each parks against the event that ends it. An immediate open
+instead returns `StreamOpen::Blocked`; the outer adapter parks its direction-specific opener.
+The alternative — waking one's own waker and returning `Pending` — compiles, passes a functional
+suite, and burns a core; it is a busy loop wearing waiting's clothes.
 
 The connection-level window is the awkward one, because dwnx has no MAX_DATA callback: it
 applies the frame to the send window and tells nobody. So the connection samples
-`max_data_left` across each `Conn::read` and wakes a parked writer when it moves. Waking on any
-inbound bytes would have been simpler and would have spun a blocked writer once per arriving
-record for as long as the peer kept talking.
+`max_data_left` across each `Conn::read`, wakes its directly parked writer, and emits the
+ordered `ConnectionDataCredit` event used by outer schedulers. Waking on any inbound bytes
+would have been simpler and would have spun a blocked writer once per arriving record for as
+long as the peer kept talking.
 
 Read-ahead is bounded by bytes **delivered to the caller and not yet credited back**, not by
 queue depth. Depth is the natural meter and the wrong one: a caller that drains events into a

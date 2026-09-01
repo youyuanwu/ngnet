@@ -127,6 +127,7 @@ fn a_suspension_flush_parks_on_backpressure_and_finishes_after_its_wake() {
             "the write-blocked pump must still reach and register its pending read"
         );
     }
+
     assert!(
         connection.poll_flush(&mut cx).is_pending(),
         "a one-byte substrate cannot take the whole announcement"
@@ -153,6 +154,29 @@ fn a_suspension_flush_parks_on_backpressure_and_finishes_after_its_wake() {
         }
     }
     panic!("the short-accepting substrate never drained the buffered output");
+}
+
+#[test]
+fn an_internal_only_lower_batch_schedules_event_poll_continuation() {
+    let mut pair = Pair::new();
+    let (waker, flag) = pair.context();
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(pair.server.poll_event(&mut cx).is_pending());
+    assert!(
+        pair.server.poll_flush(&mut cx).is_ready(),
+        "the peer transport parameters must reach the client"
+    );
+    flag.take();
+
+    assert!(
+        pair.client.poll_event(&mut cx).is_pending(),
+        "transport parameters are consumed by the adapter rather than exposed to H3"
+    );
+    assert!(
+        flag.take(),
+        "a Ready lower read containing only adapter events owes a continuation before H3 parks"
+    );
 }
 
 /// One initial pump serves the empty event branch and leaves a real read wake behind.
@@ -235,8 +259,8 @@ impl Pair {
 
     /// Collects everything one end has to report, moving bytes as it goes.
     ///
-    /// `poll_event` pumps before it looks, so this is also what carries records between the
-    /// two ends: there is no separate delivery step to forget.
+    /// `poll_event` performs productive bounded progress, and the explicit suspension flush
+    /// publishes records before this manual executor parks either end.
     fn drain(&mut self, of: Side) {
         let (waker, flag) = self.context();
         let mut cx = Context::from_waker(&waker);

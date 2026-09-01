@@ -46,10 +46,12 @@
 
 use std::convert::Infallible;
 use std::fmt::Debug;
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use http_body::Body;
@@ -74,7 +76,7 @@ use ngnet_h3::http::{
     serve as h3_serve,
 };
 use ngnet_h3_quinn::QuinnBackend;
-use ngnet_qmux::io::{TokioClock, TokioStream};
+use ngnet_qmux::io::{AsyncByteStream, TokioClock, TokioStream, Written};
 use ngnet_qmux_h3::{HttpConfig, TransportConfig, connect_with, serve_with as qmux_serve_with};
 use ngnet_quic::OsslSession;
 use ngnet_quic::endpoint::Endpoint as NgtcpEndpoint;
@@ -245,6 +247,17 @@ pub fn qmux_h3_config() -> HttpConfig {
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
         .max_field_section_size(MAX_HEADER_LIST_SIZE as u64)
         .qpack_max_dtable_capacity(HEADER_TABLE_SIZE as usize)
+}
+
+/// Comparison-only ngnet H3 configuration matched to hyperium H3's fixed QPACK setting.
+///
+/// Hyperium H3 0.0.8 exposes no dynamic-table-capacity control, so the matched QMux pair
+/// disables the ngnet side's dynamic table rather than silently comparing unlike state.
+pub fn qmux_h3_matched_config() -> HttpConfig {
+    HttpConfig::default()
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .max_field_section_size(MAX_HEADER_LIST_SIZE as u64)
+        .qpack_max_dtable_capacity(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -983,15 +996,202 @@ impl CompioSharedSocket {
 // second function is unavoidable; its body is one call to the shared `collect` and one to the
 // shared `response_for`, which is as close to no restatement as the type system allows.
 //
-// Both drivers are spawned with plain `tokio::spawn`, exactly as the HTTP/2 arms' are. Note
-// that this repository's own QMux HTTP/3 test harness uses a `LocalSet` and `spawn_local`
-// instead: that is forced by its `!Send` in-memory *test* byte stream, not by the join, which
-// imposes no `Send` bound anywhere and is `Send` whenever the caller's byte stream and clock
-// are. `TokioStream<S>` is `Send` when `S` is, and both `tokio::io::DuplexStream` and
-// `tokio::net::TcpStream` are — so `tokio::spawn` accepting these futures at all is the
-// check, made by the compiler rather than by a comment. The runtime arrangement is therefore
-// identical to the HTTP/2 arms' and is not a confound.
+// Each matched fixture spawns exactly one task per endpoint. The ngnet connection future
+// already combines transport and H3 progress, so its task is only counted. Hyperium exposes
+// separate adapter and H3 futures, so one bench-local future polls them together and retains
+// the adapter close tail after H3 exits. Both tasks use plain `tokio::spawn`; non-`Send`
+// portability remains covered by the adapter tests rather than changing benchmark topology.
 // ---------------------------------------------------------------------------------------
+
+#[derive(Default)]
+struct CounterState {
+    armed: AtomicBool,
+    lower_read_calls: AtomicU64,
+    lower_read_bytes: AtomicU64,
+    lower_write_calls: AtomicU64,
+    lower_write_bytes: AtomicU64,
+    lower_write_not_now: AtomicU64,
+    endpoint_polls: AtomicU64,
+    overflowed: AtomicBool,
+}
+
+/// Per-fixture symmetric lower-I/O and endpoint-poll counters.
+///
+/// One instance aggregates the client and server endpoints of exactly one fixture. It starts
+/// disarmed, and every `establish` method resets it after the explicit warm-up. Criterion never
+/// arms it; fixed diagnostic probes and fixture tests call [`BenchCounters::reset_and_arm`]
+/// immediately before their measured exchange.
+#[derive(Clone, Default)]
+pub struct BenchCounters {
+    state: Arc<CounterState>,
+}
+
+/// One counter interval.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BenchCounterSnapshot {
+    /// Lower read polls.
+    pub lower_read_calls: u64,
+    /// Bytes returned by lower reads.
+    pub lower_read_bytes: u64,
+    /// Lower write polls.
+    pub lower_write_calls: u64,
+    /// Bytes accepted by lower writes.
+    pub lower_write_bytes: u64,
+    /// Lower writes returning `NotNow`.
+    pub lower_write_not_now: u64,
+    /// Polls of one endpoint task, summed across both endpoints of the fixture.
+    pub endpoint_polls: u64,
+    /// Whether any counter saturated.
+    pub overflowed: bool,
+}
+
+impl BenchCounters {
+    fn add(&self, counter: &AtomicU64, value: u64) {
+        if !self.state.armed.load(Ordering::Relaxed) || value == 0 {
+            return;
+        }
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(value);
+            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    if next == u64::MAX && current != u64::MAX {
+                        self.state.overflowed.store(true, Ordering::Relaxed);
+                    }
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Resets the aggregate client+server interval and controls subsequent counting.
+    pub fn reset_and_arm(&self, armed: bool) {
+        self.state.armed.store(false, Ordering::Release);
+        for counter in [
+            &self.state.lower_read_calls,
+            &self.state.lower_read_bytes,
+            &self.state.lower_write_calls,
+            &self.state.lower_write_bytes,
+            &self.state.lower_write_not_now,
+            &self.state.endpoint_polls,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+        self.state.overflowed.store(false, Ordering::Relaxed);
+        self.state.armed.store(armed, Ordering::Release);
+    }
+
+    /// Returns the current aggregate client+server fixture interval.
+    #[must_use]
+    pub fn snapshot(&self) -> BenchCounterSnapshot {
+        BenchCounterSnapshot {
+            lower_read_calls: self.state.lower_read_calls.load(Ordering::Relaxed),
+            lower_read_bytes: self.state.lower_read_bytes.load(Ordering::Relaxed),
+            lower_write_calls: self.state.lower_write_calls.load(Ordering::Relaxed),
+            lower_write_bytes: self.state.lower_write_bytes.load(Ordering::Relaxed),
+            lower_write_not_now: self.state.lower_write_not_now.load(Ordering::Relaxed),
+            endpoint_polls: self.state.endpoint_polls.load(Ordering::Relaxed),
+            overflowed: self.state.overflowed.load(Ordering::Relaxed),
+        }
+    }
+
+    fn endpoint_poll(&self) {
+        self.add(&self.state.endpoint_polls, 1);
+    }
+}
+
+/// Byte-stream wrapper used identically around both measured QMux adapters.
+pub struct CountingStream<S> {
+    inner: S,
+    counters: BenchCounters,
+}
+
+impl<S> CountingStream<S> {
+    fn new(inner: S, counters: BenchCounters) -> Self {
+        Self { inner, counters }
+    }
+}
+
+impl<S: AsyncByteStream> AsyncByteStream for CountingStream<S> {
+    type Error = S::Error;
+
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        buffer: &mut [u8],
+    ) -> Poll<Result<usize, Self::Error>> {
+        self.counters.add(&self.counters.state.lower_read_calls, 1);
+        let result = self.inner.poll_read(cx, buffer);
+        if let Poll::Ready(Ok(bytes)) = &result {
+            self.counters
+                .add(&self.counters.state.lower_read_bytes, *bytes as u64);
+        }
+        result
+    }
+
+    fn poll_write(
+        &mut self,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<Written, Self::Error>> {
+        self.counters.add(&self.counters.state.lower_write_calls, 1);
+        let result = self.inner.poll_write(cx, buffer);
+        match &result {
+            Poll::Ready(Ok(Written::Accepted(bytes))) => self
+                .counters
+                .add(&self.counters.state.lower_write_bytes, *bytes as u64),
+            Poll::Ready(Ok(Written::NotNow)) => self
+                .counters
+                .add(&self.counters.state.lower_write_not_now, 1),
+            Poll::Pending | Poll::Ready(Err(_)) => {}
+        }
+        result
+    }
+
+    fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_shutdown(cx)
+    }
+}
+
+async fn run_counted_endpoint<F>(future: F, counters: BenchCounters)
+where
+    F: Future<Output = ()>,
+{
+    let mut future = Box::pin(future);
+    poll_fn(|cx| {
+        counters.endpoint_poll();
+        future.as_mut().poll(cx)
+    })
+    .await;
+}
+
+async fn run_combined_endpoint<D, H, E>(driver: D, h3: H, counters: BenchCounters)
+where
+    D: Future<Output = Result<(), E>>,
+    H: Future<Output = ()>,
+{
+    let mut driver = Box::pin(driver);
+    let mut h3 = Box::pin(h3);
+    let mut driver_done = false;
+    let mut h3_done = false;
+    poll_fn(|cx| {
+        counters.endpoint_poll();
+        if !h3_done && h3.as_mut().poll(cx).is_ready() {
+            h3_done = true;
+        }
+        if !driver_done && driver.as_mut().poll(cx).is_ready() {
+            driver_done = true;
+        }
+        if h3_done && driver_done {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+}
 
 /// The HTTP/3 server handler: drain the request body, echo it back.
 ///
@@ -1188,13 +1388,381 @@ impl NgnetQmuxH3 {
     }
 
     /// Takes the server away without telling the client, so the next exchange fails.
-    ///
-    /// No benchmark calls this, and none should: an arm that could lose its peer mid-run
-    /// would be measuring something other than what it claims. It exists so the harness's own
-    /// test suite can show that a failed exchange ends the run rather than being quietly
-    /// recorded as a fast iteration — a property that can only be demonstrated by causing it.
     pub fn abandon_server(&self) {
         self.server.abort();
+    }
+}
+
+/// The ngnet H3-over-QMux duplex fixture with QPACK disabled to match hyperium H3.
+pub struct NgnetQmuxH3Matched {
+    handle: H3SendRequest<BenchBody>,
+    server: JoinHandle<()>,
+    counters: BenchCounters,
+}
+
+impl NgnetQmuxH3Matched {
+    /// Establishes and warms the matched ngnet fixture.
+    pub async fn establish() -> Self {
+        let (client_io, server_io) = duplex(DUPLEX_CAPACITY);
+        let counters = BenchCounters::default();
+        let server = qmux_serve_with(
+            CountingStream::new(TokioStream::new(server_io), counters.clone()),
+            TokioClock::new(),
+            qmux_h3_echo,
+            qmux_config(),
+            qmux_h3_matched_config(),
+        )
+        .expect("a matched ngnet server");
+        let server_counters = counters.clone();
+        let server = tokio::spawn(run_counted_endpoint(
+            async move {
+                let _ = server.await;
+            },
+            server_counters,
+        ));
+        let (handle, connection) = connect_with::<_, _, BenchBody>(
+            CountingStream::new(TokioStream::new(client_io), counters.clone()),
+            TokioClock::new(),
+            qmux_config(),
+            qmux_h3_matched_config(),
+        )
+        .expect("a matched ngnet client");
+        tokio::spawn(run_counted_endpoint(
+            async move {
+                let _ = connection.await;
+            },
+            counters.clone(),
+        ));
+        qmux_warm_up(&handle).await;
+        tokio::task::yield_now().await;
+        counters.reset_and_arm(false);
+        Self {
+            handle,
+            server,
+            counters,
+        }
+    }
+
+    /// Sends one request body and drains its exact echo.
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        let response = self
+            .handle
+            .send_request(request_for(body))
+            .await
+            .expect("a matched ngnet response head");
+        assert!(response.status().is_success());
+        drain(response.into_body()).await
+    }
+
+    /// Sends one request and validates every echoed byte for diagnostic probes.
+    pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
+        let expected = body.clone();
+        let response = self
+            .handle
+            .send_request(request_for(body))
+            .await
+            .map_err(|error| format!("matched ngnet response head failed: {error:?}"))?;
+        try_drain_checked(response.into_body(), &expected).await
+    }
+
+    /// Takes away the matched ngnet server for failure-path tests.
+    pub fn abandon_server(&self) {
+        self.server.abort();
+    }
+
+    /// Enables a fresh symmetric counter interval.
+    pub fn arm_counters(&self) {
+        self.counters.reset_and_arm(true);
+    }
+
+    /// Current symmetric fixture counters.
+    #[must_use]
+    pub fn counter_snapshot(&self) -> BenchCounterSnapshot {
+        self.counters.snapshot()
+    }
+}
+
+type UpstreamMemoryOpener =
+    h3_ngnet_qmux::OpenStreams<CountingStream<TokioStream<tokio::io::DuplexStream>>, TokioClock>;
+type UpstreamMemorySender = h3::client::SendRequest<UpstreamMemoryOpener, Bytes>;
+type UpstreamSocketOpener =
+    h3_ngnet_qmux::OpenStreams<CountingStream<TokioStream<TokioTcpStream>>, TokioClock>;
+type UpstreamSocketSender = h3::client::SendRequest<UpstreamSocketOpener, Bytes>;
+
+/// Pending peer accepts reserved by the benchmark adapter.
+pub const UPSTREAM_QMUX_PENDING_ACCEPTS: usize = MAX_CONCURRENT_STREAMS as usize;
+
+/// Rejects a workload that exceeds the adapter's pending-accept resource policy.
+///
+/// Benchmark targets call only serial round trips today. This guard is public so any future
+/// concurrent target and the fixture tests share one pre-wire admission rule.
+pub fn validate_upstream_qmux_concurrency(n: usize) {
+    assert!(
+        n <= UPSTREAM_QMUX_PENDING_ACCEPTS,
+        "a concurrency of {n} exceeds the {UPSTREAM_QMUX_PENDING_ACCEPTS} pending accepts \
+         reserved by the hyperium QMux fixture"
+    );
+}
+
+async fn upstream_h3_qmux_server<C>(connection: C)
+where
+    C: h3::quic::Connection<Bytes>,
+{
+    let mut builder = h3::server::builder();
+    builder.send_grease(false);
+    builder.max_field_section_size(MAX_HEADER_LIST_SIZE as u64);
+    let mut connection = builder
+        .build::<_, Bytes>(connection)
+        .await
+        .expect("an upstream H3 QMux server");
+    'requests: loop {
+        let resolver = match connection.accept().await {
+            Ok(Some(resolver)) => resolver,
+            Ok(None) | Err(_) => return,
+        };
+        let (_request, mut stream) = match resolver.resolve_request().await {
+            Ok(request) => request,
+            Err(_) => continue,
+        };
+        let mut body = BytesMut::new();
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(chunk)) => body.put(chunk),
+                Ok(None) => break,
+                Err(_) => continue 'requests,
+            }
+        }
+        if stream
+            .send_response(
+                http::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(())
+                    .expect("an upstream H3 QMux response"),
+            )
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        if !body.is_empty() && stream.send_data(body.freeze()).await.is_err() {
+            continue;
+        }
+        let _ = stream.finish().await;
+    }
+}
+
+fn upstream_qmux_request_head() -> http::Request<()> {
+    http::Request::builder()
+        .method(http::Method::POST)
+        .uri(WORKLOAD_URI)
+        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+        .header("x-bench", "1")
+        .body(())
+        .expect("an upstream QMux request")
+}
+
+async fn upstream_qmux_round_trip<O>(
+    sender: &h3::client::SendRequest<O, Bytes>,
+    body: Bytes,
+) -> usize
+where
+    O: h3::quic::OpenStreams<Bytes> + Clone,
+{
+    let mut sender = sender.clone();
+    let mut stream = sender
+        .send_request(upstream_qmux_request_head())
+        .await
+        .expect("an upstream QMux request stream");
+    if !body.is_empty() {
+        stream
+            .send_data(body)
+            .await
+            .expect("upstream QMux request data");
+    }
+    stream.finish().await.expect("finish upstream QMux request");
+    let response = stream
+        .recv_response()
+        .await
+        .expect("an upstream QMux response head");
+    assert!(response.status().is_success());
+    let mut total = 0;
+    while let Some(chunk) = stream
+        .recv_data()
+        .await
+        .expect("upstream QMux response data")
+    {
+        total += chunk.remaining();
+    }
+    total
+}
+
+async fn upstream_qmux_round_trip_checked<O>(
+    sender: &h3::client::SendRequest<O, Bytes>,
+    body: Bytes,
+) -> Result<(usize, bool), String>
+where
+    O: h3::quic::OpenStreams<Bytes> + Clone,
+{
+    let expected = body.clone();
+    let mut sender = sender.clone();
+    let mut stream = sender
+        .send_request(upstream_qmux_request_head())
+        .await
+        .map_err(|error| format!("upstream QMux request failed: {error:?}"))?;
+    if !body.is_empty() {
+        stream
+            .send_data(body)
+            .await
+            .map_err(|error| format!("upstream QMux request data failed: {error:?}"))?;
+    }
+    stream
+        .finish()
+        .await
+        .map_err(|error| format!("upstream QMux request finish failed: {error:?}"))?;
+    let response = stream
+        .recv_response()
+        .await
+        .map_err(|error| format!("upstream QMux response failed: {error:?}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "upstream QMux response status was {}",
+            response.status()
+        ));
+    }
+    let mut received = BytesMut::new();
+    while let Some(chunk) = stream
+        .recv_data()
+        .await
+        .map_err(|error| format!("upstream QMux response data failed: {error:?}"))?
+    {
+        received.put(chunk);
+    }
+    Ok((received.len(), received.as_ref() == expected.as_ref()))
+}
+
+struct UpstreamQmuxTasks {
+    server: JoinHandle<()>,
+    client: JoinHandle<()>,
+}
+
+impl UpstreamQmuxTasks {
+    fn abandon_server(&self) {
+        self.server.abort();
+    }
+}
+
+impl Drop for UpstreamQmuxTasks {
+    fn drop(&mut self) {
+        self.server.abort();
+        self.client.abort();
+    }
+}
+
+async fn upstream_memory_pair() -> (UpstreamMemorySender, UpstreamQmuxTasks, BenchCounters) {
+    let (client_io, server_io) = duplex(DUPLEX_CAPACITY);
+    let counters = BenchCounters::default();
+    let server_lower = ngnet_qmux::io::Connection::server(
+        CountingStream::new(TokioStream::new(server_io), counters.clone()),
+        TokioClock::new(),
+        qmux_config(),
+    )
+    .expect("an upstream server QMux connection");
+    let (server_connection, server_driver) =
+        h3_ngnet_qmux::from_qmux(server_lower, UPSTREAM_QMUX_PENDING_ACCEPTS);
+    let server = tokio::spawn(run_combined_endpoint(
+        server_driver,
+        upstream_h3_qmux_server(server_connection),
+        counters.clone(),
+    ));
+
+    let client_lower = ngnet_qmux::io::Connection::client(
+        CountingStream::new(TokioStream::new(client_io), counters.clone()),
+        TokioClock::new(),
+        qmux_config(),
+    )
+    .expect("an upstream client QMux connection");
+    let (client_connection, client_driver) =
+        h3_ngnet_qmux::from_qmux(client_lower, UPSTREAM_QMUX_PENDING_ACCEPTS);
+    let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
+    let client_counters = counters.clone();
+    let client = tokio::spawn(async move {
+        let mut adapter = Box::pin(client_driver);
+        let mut builder = h3::client::builder();
+        builder.send_grease(false);
+        builder.max_field_section_size(MAX_HEADER_LIST_SIZE as u64);
+        let building = builder.build(client_connection);
+        tokio::pin!(building);
+        let (mut h3, sender) = poll_fn(|cx| {
+            client_counters.endpoint_poll();
+            if let Poll::Ready(built) = building.as_mut().poll(cx) {
+                return Poll::Ready(built);
+            }
+            let _ = adapter.as_mut().poll(cx);
+            Poll::Pending
+        })
+        .await
+        .expect("an upstream H3 QMux client");
+        sender_tx.send(sender).ok();
+        run_combined_endpoint(
+            adapter,
+            async move {
+                let _ = poll_fn(|context| h3.poll_close(context)).await;
+            },
+            client_counters,
+        )
+        .await;
+    });
+    let sender = sender_rx.await.expect("upstream H3 client sender");
+    (sender, UpstreamQmuxTasks { server, client }, counters)
+}
+
+/// A persistent hyperium H3-over-QMux duplex fixture.
+pub struct UpstreamH3Qmux {
+    sender: UpstreamMemorySender,
+    tasks: UpstreamQmuxTasks,
+    counters: BenchCounters,
+}
+
+impl UpstreamH3Qmux {
+    /// Establishes and warms the hyperium fixture outside the measured closure.
+    pub async fn establish() -> Self {
+        let (sender, tasks, counters) = upstream_memory_pair().await;
+        let fixture = Self {
+            sender,
+            tasks,
+            counters,
+        };
+        assert_eq!(fixture.round_trip(Bytes::new()).await, 0);
+        tokio::task::yield_now().await;
+        fixture.counters.reset_and_arm(false);
+        fixture
+    }
+
+    /// Sends one request body and drains its exact echo.
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        upstream_qmux_round_trip(&self.sender, body).await
+    }
+
+    /// Sends and drains one body while checking every echoed byte.
+    pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
+        upstream_qmux_round_trip_checked(&self.sender, body).await
+    }
+
+    /// Takes away both server-side drivers.
+    pub fn abandon_server(&self) {
+        self.tasks.abandon_server();
+    }
+
+    /// Enables a fresh symmetric counter interval.
+    pub fn arm_counters(&self) {
+        self.counters.reset_and_arm(true);
+    }
+
+    /// Current symmetric fixture counters.
+    #[must_use]
+    pub fn counter_snapshot(&self) -> BenchCounterSnapshot {
+        self.counters.snapshot()
     }
 }
 
@@ -1662,5 +2230,200 @@ impl NgnetQmuxH3Socket {
     /// Takes the server away without telling the client. See [`NgnetQmuxH3::abandon_server`].
     pub fn abandon_server(&self) {
         self.server.abort();
+    }
+}
+
+/// The ngnet H3-over-QMux socket fixture with QPACK disabled to match hyperium H3.
+pub struct NgnetQmuxH3MatchedSocket {
+    handle: H3SendRequest<BenchBody>,
+    server: JoinHandle<()>,
+    counters: BenchCounters,
+}
+
+impl NgnetQmuxH3MatchedSocket {
+    /// Establishes and warms the matched ngnet socket fixture.
+    pub async fn establish() -> Self {
+        let (client_io, server_io) = tokio_socket_pair().await;
+        let counters = BenchCounters::default();
+        let server = qmux_serve_with(
+            CountingStream::new(TokioStream::new(server_io), counters.clone()),
+            TokioClock::new(),
+            qmux_h3_echo,
+            qmux_config(),
+            qmux_h3_matched_config(),
+        )
+        .expect("a matched ngnet socket server");
+        let server = tokio::spawn(run_counted_endpoint(
+            async move {
+                let _ = server.await;
+            },
+            counters.clone(),
+        ));
+        let (handle, connection) = connect_with::<_, _, BenchBody>(
+            CountingStream::new(TokioStream::new(client_io), counters.clone()),
+            TokioClock::new(),
+            qmux_config(),
+            qmux_h3_matched_config(),
+        )
+        .expect("a matched ngnet socket client");
+        tokio::spawn(run_counted_endpoint(
+            async move {
+                let _ = connection.await;
+            },
+            counters.clone(),
+        ));
+        qmux_warm_up(&handle).await;
+        tokio::task::yield_now().await;
+        counters.reset_and_arm(false);
+        Self {
+            handle,
+            server,
+            counters,
+        }
+    }
+
+    /// Sends one body and drains its exact echo.
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        let response = self
+            .handle
+            .send_request(request_for(body))
+            .await
+            .expect("a matched ngnet socket response");
+        assert!(response.status().is_success());
+        drain(response.into_body()).await
+    }
+
+    /// Sends one request and validates every echoed byte for diagnostic probes.
+    pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
+        let expected = body.clone();
+        let response = self
+            .handle
+            .send_request(request_for(body))
+            .await
+            .map_err(|error| format!("matched ngnet socket response failed: {error:?}"))?;
+        try_drain_checked(response.into_body(), &expected).await
+    }
+
+    /// Takes away the matched ngnet socket server.
+    pub fn abandon_server(&self) {
+        self.server.abort();
+    }
+
+    /// Enables a fresh symmetric counter interval.
+    pub fn arm_counters(&self) {
+        self.counters.reset_and_arm(true);
+    }
+
+    /// Current symmetric fixture counters.
+    #[must_use]
+    pub fn counter_snapshot(&self) -> BenchCounterSnapshot {
+        self.counters.snapshot()
+    }
+}
+
+async fn upstream_socket_pair() -> (UpstreamSocketSender, UpstreamQmuxTasks, BenchCounters) {
+    let (client_io, server_io) = tokio_socket_pair().await;
+    let counters = BenchCounters::default();
+    let server_lower = ngnet_qmux::io::Connection::server(
+        CountingStream::new(TokioStream::new(server_io), counters.clone()),
+        TokioClock::new(),
+        qmux_config(),
+    )
+    .expect("an upstream socket server QMux connection");
+    let (server_connection, server_driver) =
+        h3_ngnet_qmux::from_qmux(server_lower, UPSTREAM_QMUX_PENDING_ACCEPTS);
+    let server = tokio::spawn(run_combined_endpoint(
+        server_driver,
+        upstream_h3_qmux_server(server_connection),
+        counters.clone(),
+    ));
+
+    let client_lower = ngnet_qmux::io::Connection::client(
+        CountingStream::new(TokioStream::new(client_io), counters.clone()),
+        TokioClock::new(),
+        qmux_config(),
+    )
+    .expect("an upstream socket client QMux connection");
+    let (client_connection, client_driver) =
+        h3_ngnet_qmux::from_qmux(client_lower, UPSTREAM_QMUX_PENDING_ACCEPTS);
+    let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
+    let client_counters = counters.clone();
+    let client = tokio::spawn(async move {
+        let mut adapter = Box::pin(client_driver);
+        let mut builder = h3::client::builder();
+        builder.send_grease(false);
+        builder.max_field_section_size(MAX_HEADER_LIST_SIZE as u64);
+        let building = builder.build(client_connection);
+        tokio::pin!(building);
+        let (mut h3, sender) = poll_fn(|cx| {
+            client_counters.endpoint_poll();
+            if let Poll::Ready(built) = building.as_mut().poll(cx) {
+                return Poll::Ready(built);
+            }
+            let _ = adapter.as_mut().poll(cx);
+            Poll::Pending
+        })
+        .await
+        .expect("an upstream H3 socket client");
+        sender_tx.send(sender).ok();
+        run_combined_endpoint(
+            adapter,
+            async move {
+                let _ = poll_fn(|context| h3.poll_close(context)).await;
+            },
+            client_counters,
+        )
+        .await;
+    });
+    let sender = sender_rx.await.expect("upstream H3 socket sender");
+    (sender, UpstreamQmuxTasks { server, client }, counters)
+}
+
+/// A persistent hyperium H3-over-QMux loopback TCP fixture.
+pub struct UpstreamH3QmuxSocket {
+    sender: UpstreamSocketSender,
+    tasks: UpstreamQmuxTasks,
+    counters: BenchCounters,
+}
+
+impl UpstreamH3QmuxSocket {
+    /// Establishes and warms the hyperium socket fixture.
+    pub async fn establish() -> Self {
+        let (sender, tasks, counters) = upstream_socket_pair().await;
+        let fixture = Self {
+            sender,
+            tasks,
+            counters,
+        };
+        assert_eq!(fixture.round_trip(Bytes::new()).await, 0);
+        tokio::task::yield_now().await;
+        fixture.counters.reset_and_arm(false);
+        fixture
+    }
+
+    /// Sends one body and drains its exact echo.
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        upstream_qmux_round_trip(&self.sender, body).await
+    }
+
+    /// Sends and drains one body while checking every echoed byte.
+    pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
+        upstream_qmux_round_trip_checked(&self.sender, body).await
+    }
+
+    /// Takes away both server-side socket drivers.
+    pub fn abandon_server(&self) {
+        self.tasks.abandon_server();
+    }
+
+    /// Enables a fresh symmetric counter interval.
+    pub fn arm_counters(&self) {
+        self.counters.reset_and_arm(true);
+    }
+
+    /// Current symmetric fixture counters.
+    #[must_use]
+    pub fn counter_snapshot(&self) -> BenchCounterSnapshot {
+        self.counters.snapshot()
     }
 }

@@ -38,8 +38,8 @@ use io_harness::{
     connection_with_peer_stream, counting_waker, exchange, flush, next_event, open_bidi,
     peer_writes, poll_once, run_pair, write_all,
 };
-use ngnet_qmux::io::testing::Fault;
-use ngnet_qmux::io::{Config, Event, StreamWrite};
+use ngnet_qmux::io::testing::{Fault, TestClock, stream_pair};
+use ngnet_qmux::io::{Config, Connection, Event, StreamOpen, StreamWrite};
 use ngnet_qmux::{Directionality, Role, StreamId};
 
 const REQUEST: &[u8] = b"the request that had to wait for stream capacity";
@@ -59,21 +59,14 @@ fn an_open_blocked_by_the_peers_limit_completes_once_the_limit_is_raised() {
         connected_pair_with(Config::new(), Config::new().max_streams_bidi(0), |_| {});
 
     let client_side = async {
-        let mut parked = 0usize;
-        let stream = std::future::poll_fn(|cx| {
-            let polled = client.poll_open_bidi(cx);
-            if polled.is_pending() {
-                parked += 1;
-            }
-            polled
-        })
-        .await
-        .expect("the open reported an error rather than waiting");
+        let stream = io_harness::open_bidi(&mut client)
+            .await
+            .expect("the open reported an error rather than waiting");
         write_all(&mut client, stream, REQUEST, true)
             .await
             .expect("writing the request");
         flush(&mut client).await.expect("flushing");
-        parked
+        stream
     };
 
     let server_side = async {
@@ -95,13 +88,8 @@ fn an_open_blocked_by_the_peers_limit_completes_once_the_limit_is_raised() {
             .expect("accepting the stream the client finally opened")
     };
 
-    let (parked, (stream, received)) = run_pair(client_side, server_side);
-
-    assert!(
-        parked > 0,
-        "the open never waited, so the limit was raised before it was ever blocked and this \
-         test proved nothing"
-    );
+    let (opened, (stream, received)) = run_pair(client_side, server_side);
+    assert_eq!(opened, stream);
     assert_eq!(
         received, REQUEST,
         "the stream opened after the wait carried its payload intact"
@@ -113,34 +101,39 @@ fn an_open_blocked_by_the_peers_limit_completes_once_the_limit_is_raised() {
     );
 }
 
-/// A blocked open parks; it does not wake itself (Spec SC-012, and the reason for it).
+/// A blocked immediate open does no polling and cannot wake (Spec SC-012).
 ///
 /// The connection is given a peer announcement permitting no bidirectional streams and nothing
-/// else, so its open can only wait. If the wait were a self-wake -- pending plus an immediate
-/// wake, which looks identical to a caller -- the count below would rise by one per poll, and
-/// the executor above would spin for as long as the peer took to raise the limit.
+/// else. The outer scheduler owns any waiter; this operation only reports the current state.
 #[test]
-fn a_blocked_open_parks_rather_than_waking_itself() {
-    let (mut conn, mut far) = connection_with_peer_stream(Role::Client);
+fn an_immediate_blocked_open_does_not_wake_or_poll() {
+    let (near, mut far) = stream_pair();
+    let reads = near.read_log();
+    let writes = near.write_log();
+    let mut conn =
+        Connection::client(near, TestClock::new(), Config::new()).expect("client connection");
     peer_writes(
         &mut far,
         &announcement_record_configured(Role::Server, Config::new().max_streams_bidi(0)),
     );
-
-    let (waker, wakes) = counting_waker();
-    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(
+        poll_once(|cx| conn.poll_next_event(cx)),
+        Poll::Ready(Ok(Event::PeerTransportParams(_)))
+    ));
+    reads.clear();
+    writes.clear();
+    let before = (reads.reads(), writes.writes());
 
     for _ in 0..16 {
         assert!(
-            conn.poll_open_bidi(&mut cx).is_pending(),
+            matches!(conn.try_open_bidi(), Ok(StreamOpen::Blocked)),
             "the peer permits no bidirectional streams, so the open cannot complete"
         );
     }
     assert_eq!(
-        wakes.count(),
-        0,
-        "the blocked open asked to be polled again rather than parking on the limit: that is a \
-         busy loop, and it costs a core for every connection waiting on a slow peer"
+        (reads.reads(), writes.writes()),
+        before,
+        "an immediate blocked open must leave lower I/O entirely to its outer scheduler"
     );
 }
 
@@ -218,10 +211,13 @@ fn a_credit_exhausted_write_parks_and_is_woken_by_the_extension() {
     let mut stream: Option<StreamId> = None;
     let mut sent = 0usize;
     for _ in 0..64 {
+        let _ = poll_once(|cx| client.poll_next_event(cx));
+        let _ = poll_once(|cx| server.poll_next_event(cx));
+        let _ = poll_once(|cx| client.poll_pump(cx));
         let _ = poll_once(|cx| server.poll_pump(cx));
         match stream {
             None => {
-                if let Poll::Ready(Ok(id)) = poll_once(|cx| client.poll_open_bidi(cx)) {
+                if let StreamOpen::Opened(id) = client.try_open_bidi().expect("open outcome") {
                     stream = Some(id);
                 }
             }
@@ -265,6 +261,23 @@ fn a_credit_exhausted_write_parks_and_is_woken_by_the_extension() {
         .extend_connection_credit(WINDOW)
         .expect("extending the connection window");
     let _ = poll_once(|cx| server.poll_pump(cx));
+    let mut connection_credit = None;
+    for _ in 0..4 {
+        match client.poll_next_event(&mut cx) {
+            Poll::Ready(Ok(Event::ConnectionDataCredit { available })) => {
+                connection_credit = Some(available);
+            }
+            Poll::Ready(Ok(_)) => {}
+            Poll::Ready(Err(error)) => {
+                panic!("the connection ended while receiving credit: {error}")
+            }
+            Poll::Pending => break,
+        }
+    }
+    assert!(
+        connection_credit.is_some_and(|available| available >= WINDOW),
+        "MAX_DATA growth must be reported as ordered connection credit: {connection_credit:?}"
+    );
 
     assert!(
         matches!(
@@ -435,10 +448,11 @@ fn flood(budget: u64) -> Flooded {
             }
         }
         high_water = high_water.max(server.read_ahead());
+        let _ = poll_once(|cx| client.poll_next_event(cx));
 
         match stream {
             None => {
-                if let Poll::Ready(Ok(id)) = poll_once(|cx| client.poll_open_bidi(cx)) {
+                if let StreamOpen::Opened(id) = client.try_open_bidi().expect("open outcome") {
                     stream = Some(id);
                 }
             }
@@ -456,6 +470,7 @@ fn flood(budget: u64) -> Flooded {
             Some(_) => {}
         }
         let _ = poll_once(|cx| client.poll_pump(cx));
+        let _ = poll_once(|cx| server.poll_pump(cx));
 
         if pass == PASSES / 2 {
             delivered_halfway = delivered;

@@ -45,7 +45,19 @@ async fn a_close_through_the_http3_layer_reaches_the_peer() {
             // to the connection that receives it.
             let watching = async {
                 loop {
-                    match poll_fn(|cx| peer.poll_next_event(cx)).await {
+                    match poll_fn(|cx| match peer.poll_next_event(cx) {
+                        core::task::Poll::Pending => match peer.poll_pump(cx) {
+                            core::task::Poll::Ready(Err(error)) => {
+                                core::task::Poll::Ready(Err(error))
+                            }
+                            core::task::Poll::Ready(Ok(())) | core::task::Poll::Pending => {
+                                core::task::Poll::Pending
+                            }
+                        },
+                        ready => ready,
+                    })
+                    .await
+                    {
                         Ok(_event) => {}
                         Err(error) => return error,
                     }
@@ -140,6 +152,9 @@ async fn a_served_connection_also_closes_when_it_is_done() {
             timeout(LIMIT, handshake)
                 .await
                 .expect("the handshake must not hang");
+            poll_fn(|cx| peer.poll_pump(cx))
+                .await
+                .expect("the peer transport parameters must be published");
 
             // A server closes when its peer does, so the peer has to go first. Its close is
             // the ordinary end of an HTTP/3 connection.

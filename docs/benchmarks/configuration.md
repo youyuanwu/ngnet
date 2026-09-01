@@ -26,6 +26,18 @@ settings: upstream `h3` uses stateless QPACK while `ngnet-h3` delegates QPACK to
 differences are part of the implementations under comparison, not transport knobs the harness
 can match without changing one stack's normal behavior.
 
+## The matched QMux HTTP/3 comparison
+
+The four `qmux_h3_*` targets hold QMux itself fixed while comparing `ngnet-h3` with hyperium
+H3. Both ends use 65,535-byte stream and connection windows, 65,535-byte read-ahead, `2^40`
+bidi and 16 uni lifetime allowances, a 128 pending/concurrent policy, the same request and
+echo, separate current-thread Tokio runtimes, and one untimed warm-up.
+
+Both field-section bounds are 64 KiB. Hyperium GREASE is disabled; ngnet exposes no matching
+toggle. Hyperium 0.0.8 exposes no QPACK dynamic-table-capacity setting, so only the comparison
+fixtures set ngnet's capacity to zero. The established `NgnetQmuxH3` fixtures retain their
+existing 4 KiB configuration and behavior.
+
 ## The three-stack QUIC comparison
 
 `quic_stack_serial_latency` and `quic_stack_body_throughput` retain both Quinn arms above and

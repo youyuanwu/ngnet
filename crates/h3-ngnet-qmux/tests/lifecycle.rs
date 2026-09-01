@@ -1,0 +1,338 @@
+mod common;
+
+use std::future::{Future, poll_fn};
+use std::task::{Context, Poll, Waker};
+
+use bytes::Bytes;
+use h3::error::Code;
+use h3::proto::frame::Frame;
+use h3::quic::{self, SendStream as _};
+use h3_ngnet_qmux::{Error, from_qmux};
+use ngnet_qmux::io::testing::{Fault, TestClock, stream_pair};
+use ngnet_qmux::io::{Config, Connection as QmuxConnection, StreamOpen, StreamWrite};
+
+#[test]
+fn peer_stop_terminates_send_and_discards_retained_framed_data() {
+    const CODE: u64 = 0x55;
+    let lower = Config::new().initial_max_stream_data(3).initial_max_data(3);
+    let (mut client, mut client_driver, mut server, mut server_driver) = common::pair(lower);
+    let client_task = async {
+        let mut stream = common::open_bidi(&mut client).await;
+        stream
+            .send_data(Frame::Data(Bytes::from_static(b"retained body")))
+            .expect("retain body");
+        poll_fn(|cx| stream.poll_ready(cx))
+            .await
+            .expect_err("peer stop terminates the send")
+    };
+    let server_task = async {
+        let mut stream = common::accept_bidi(&mut server).await;
+        quic::RecvStream::stop_sending(&mut stream, CODE);
+    };
+    let (error, _) = common::run_pair(
+        client_task,
+        &mut client_driver,
+        server_task,
+        &mut server_driver,
+    );
+    assert!(matches!(
+        error,
+        quic::StreamErrorIncoming::StreamTerminated { error_code: CODE }
+    ));
+}
+
+#[test]
+fn peer_reset_is_ordered_after_already_delivered_data_and_is_stable() {
+    const CODE: u64 = 0x77;
+    let (mut client, mut client_driver, mut server, mut server_driver) =
+        common::pair(Config::new());
+    let client_task = async {
+        let mut stream = common::open_bidi(&mut client).await;
+        common::send_all_unframed(&mut stream, Bytes::from_static(b"prefix")).await;
+        quic::SendStream::reset(&mut stream, CODE);
+    };
+    let server_task = async {
+        let mut stream = common::accept_bidi(&mut server).await;
+        let first = poll_fn(|cx| quic::RecvStream::poll_data(&mut stream, cx))
+            .await
+            .expect("queued data")
+            .expect("data before reset");
+        let first_error = poll_fn(|cx| quic::RecvStream::poll_data(&mut stream, cx))
+            .await
+            .expect_err("reset after data");
+        let second_error = poll_fn(|cx| quic::RecvStream::poll_data(&mut stream, cx))
+            .await
+            .expect_err("stable reset");
+        (first, first_error, second_error)
+    };
+    let (_, (first, first_error, second_error)) = common::run_pair(
+        client_task,
+        &mut client_driver,
+        server_task,
+        &mut server_driver,
+    );
+    assert_eq!(first, b"prefix"[..]);
+    for error in [first_error, second_error] {
+        assert!(matches!(
+            error,
+            quic::StreamErrorIncoming::StreamTerminated { error_code: CODE }
+        ));
+    }
+}
+
+#[test]
+fn dropping_one_split_half_does_not_invalidate_the_other() {
+    let (mut client, mut client_driver, mut server, mut server_driver) =
+        common::pair(Config::new());
+    let client_task = async {
+        let stream = common::open_bidi(&mut client).await;
+        let (send, mut recv) = quic::BidiStream::split(stream);
+        drop(send);
+        common::receive_all(&mut recv).await
+    };
+    let server_task = async {
+        let mut stream = common::accept_bidi(&mut server).await;
+        common::send_all_unframed(&mut stream, Bytes::from_static(b"still alive")).await;
+        common::finish(&mut stream).await;
+    };
+    let (received, _) = common::run_pair(
+        client_task,
+        &mut client_driver,
+        server_task,
+        &mut server_driver,
+    );
+    assert_eq!(received, b"still alive");
+}
+
+#[test]
+fn finish_is_idempotent_and_emits_one_fin() {
+    let (mut client, mut client_driver, mut server, mut server_driver) =
+        common::pair(Config::new());
+    let client_task = async {
+        let mut stream = common::open_bidi(&mut client).await;
+        common::finish(&mut stream).await;
+        common::finish(&mut stream).await;
+    };
+    let server_task = async {
+        let mut stream = common::accept_bidi(&mut server).await;
+        let first = poll_fn(|cx| quic::RecvStream::poll_data(&mut stream, cx))
+            .await
+            .expect("fin");
+        let second = poll_fn(|cx| quic::RecvStream::poll_data(&mut stream, cx))
+            .await
+            .expect("stable fin");
+        (first, second)
+    };
+    let (_, (first, second)) = common::run_pair(
+        client_task,
+        &mut client_driver,
+        server_task,
+        &mut server_driver,
+    );
+    assert!(first.is_none());
+    assert!(second.is_none());
+}
+
+#[test]
+fn synchronous_close_preserves_first_reason_and_driver_completes_delivery() {
+    let (mut client, mut client_driver, mut server, mut server_driver) =
+        common::pair(Config::new());
+    quic::OpenStreams::<Bytes>::close(&mut client, Code::H3_NO_ERROR, b"first");
+    quic::OpenStreams::<Bytes>::close(&mut client, Code::H3_INTERNAL_ERROR, b"second");
+
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let immediate = quic::OpenStreams::<Bytes>::poll_open_bidi(&mut client, &mut cx);
+    assert!(matches!(
+        immediate,
+        Poll::Ready(Err(
+            quic::StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: quic::ConnectionErrorIncoming::ApplicationClose {
+                    error_code
+                }
+            }
+        )) if error_code == Code::H3_NO_ERROR.value()
+    ));
+    assert!(
+        matches!(
+            quic::Connection::<Bytes>::poll_accept_bidi(&mut server, &mut cx),
+            Poll::Pending
+        ),
+        "synchronous close must not claim delivery before the driver is polled"
+    );
+
+    let mut local_complete = false;
+    let mut peer_code = None;
+    let mut peer_driver_done = false;
+    for _ in 0..128 {
+        if !local_complete
+            && let Poll::Ready(result) = std::pin::Pin::new(&mut client_driver).poll(&mut cx)
+        {
+            result.expect("local close driver");
+            local_complete = true;
+        }
+        if !peer_driver_done
+            && let Poll::Ready(result) = std::pin::Pin::new(&mut server_driver).poll(&mut cx)
+        {
+            let error = result.expect_err("peer driver reports the incoming close");
+            assert_eq!(
+                error,
+                Error::ApplicationClose {
+                    error_code: Code::H3_NO_ERROR.value()
+                }
+            );
+            peer_driver_done = true;
+        }
+        if peer_code.is_none()
+            && let Poll::Ready(Err(quic::ConnectionErrorIncoming::ApplicationClose { error_code })) =
+                quic::Connection::<Bytes>::poll_accept_bidi(&mut server, &mut cx)
+        {
+            peer_code = Some(error_code);
+        }
+        if local_complete && peer_code.is_some() && peer_driver_done {
+            break;
+        }
+    }
+    assert!(local_complete);
+    assert!(peer_driver_done);
+    assert_eq!(peer_code, Some(Code::H3_NO_ERROR.value()));
+}
+
+#[test]
+fn pending_accept_overload_flushes_h3_excessive_load_before_driver_error() {
+    let (client_io, server_io) = stream_pair();
+    server_io.set_capacity(Some(1));
+    let mut client =
+        QmuxConnection::client(client_io, TestClock::new(), Config::new()).expect("client");
+    let server =
+        QmuxConnection::server(server_io, TestClock::new(), Config::new()).expect("server");
+    let (_server, mut driver) = from_qmux(server, 0);
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+
+    for _ in 0..128 {
+        assert!(std::pin::Pin::new(&mut driver).poll(&mut cx).is_pending());
+        let _ = client.poll_next_event(&mut cx);
+        let _ = client.poll_pump(&mut cx);
+        if client.peer_transport_params().is_some() {
+            break;
+        }
+    }
+    let stream = match client.try_open_bidi().expect("open outcome") {
+        StreamOpen::Opened(stream) => stream,
+        StreamOpen::Blocked => panic!("server transport parameters did not arrive"),
+    };
+    assert!(matches!(
+        client.try_write_stream(stream, b"x", true),
+        Ok(StreamWrite::Accepted(1))
+    ));
+    let _ = client.poll_pump(&mut cx);
+
+    let mut driver_error = None;
+    let mut peer_code = None;
+    for _ in 0..256 {
+        if driver_error.is_none()
+            && let Poll::Ready(result) = std::pin::Pin::new(&mut driver).poll(&mut cx)
+        {
+            driver_error = Some(result.expect_err("overload is driver-fatal"));
+        }
+        match client.poll_next_event(&mut cx) {
+            Poll::Ready(Ok(_)) | Poll::Pending => {}
+            Poll::Ready(Err(error)) => {
+                peer_code = error
+                    .close_reason()
+                    .map(ngnet_qmux::CloseReason::error_code);
+            }
+        }
+        let _ = client.poll_pump(&mut cx);
+        if driver_error.is_some() && peer_code.is_some() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        driver_error,
+        Some(Error::ApplicationClose {
+            error_code: Code::H3_EXCESSIVE_LOAD.value(),
+        })
+    );
+    assert_eq!(
+        peer_code,
+        Some(Code::H3_EXCESSIVE_LOAD.value()),
+        "the peer must receive the overload close despite one-byte lower capacity"
+    );
+}
+
+#[test]
+fn lower_failure_fans_out_one_stable_connection_category_to_all_openers() {
+    let (client_io, server_io) = stream_pair();
+    let failure = client_io.fault_control();
+    let client_lower =
+        QmuxConnection::client(client_io, TestClock::new(), Config::new()).expect("client");
+    let _server_lower =
+        QmuxConnection::server(server_io, TestClock::new(), Config::new()).expect("server");
+    let (client, mut driver) = from_qmux(client_lower, 128);
+    let mut first = quic::Connection::<Bytes>::opener(&client);
+    let mut second = first.clone();
+    failure.inject(Fault::Broken);
+
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let first_driver_error = match std::pin::Pin::new(&mut driver).poll(&mut cx) {
+        Poll::Ready(Err(error)) => error,
+        _ => panic!("lower failure must complete the driver"),
+    };
+    assert!(matches!(&first_driver_error, Error::Undefined(_)));
+    let stable_driver_error = match std::pin::Pin::new(&mut driver).poll(&mut cx) {
+        Poll::Ready(Err(error)) => error,
+        _ => panic!("driver failure must remain stable"),
+    };
+    assert_eq!(
+        std::mem::discriminant(&stable_driver_error),
+        std::mem::discriminant(&first_driver_error)
+    );
+    for result in [
+        quic::OpenStreams::<Bytes>::poll_open_bidi(&mut first, &mut cx),
+        quic::OpenStreams::<Bytes>::poll_open_bidi(&mut second, &mut cx),
+    ] {
+        assert!(matches!(
+            result,
+            Poll::Ready(Err(quic::StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: quic::ConnectionErrorIncoming::Undefined(_)
+            }))
+        ));
+    }
+}
+
+#[test]
+fn dropping_an_unfinished_send_is_observed_as_one_reset() {
+    let (mut client, mut client_driver, mut server, mut server_driver) =
+        common::pair(Config::new());
+    let client_task = async {
+        let mut stream = common::open_bidi(&mut client).await;
+        common::send_all_unframed(&mut stream, Bytes::from_static(b"partial")).await;
+        drop(stream);
+    };
+    let server_task = async {
+        let mut stream = common::accept_bidi(&mut server).await;
+        let data = poll_fn(|cx| quic::RecvStream::poll_data(&mut stream, cx))
+            .await
+            .expect("data")
+            .expect("partial data");
+        let reset = poll_fn(|cx| quic::RecvStream::poll_data(&mut stream, cx))
+            .await
+            .expect_err("abandonment reset");
+        (data, reset)
+    };
+    let (_, (data, reset)) = common::run_pair(
+        client_task,
+        &mut client_driver,
+        server_task,
+        &mut server_driver,
+    );
+    assert_eq!(data, b"partial"[..]);
+    assert!(matches!(
+        reset,
+        quic::StreamErrorIncoming::StreamTerminated { error_code: 0x10c }
+    ));
+}

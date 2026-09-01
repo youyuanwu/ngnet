@@ -1,0 +1,22 @@
+[package]
+name = "h3-ngnet-qmux"
+version = "0.1.0"
+description = "Hyperium H3 transport traits over an established ngnet QMux connection"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+bytes = { workspace = true }
+h3 = { workspace = true }
+ngnet-qmux = { workspace = true }
+
+[dev-dependencies]
+h3 = { workspace = true, features = [
+    "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+] }
+http.workspace = true
+ngnet-qmux = { workspace = true, features = ["tokio"] }
+tokio.workspace = true

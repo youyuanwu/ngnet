@@ -3,7 +3,7 @@
 **Status: historical Azure-VM label; current captures use the migrated CPU described below.**
 Runs have been collected in this directory since 2026-08-16.
 
-**First run:** 2026-08-16 · **Last run:** 2026-08-30
+**First run:** 2026-08-16 · **Last run:** 2026-09-01
 
 ## Hardware and system
 
@@ -56,7 +56,7 @@ in every run.
 
 ## Arms this machine can run
 
-All twelve bench targets. `cargo bench -p ngnet-bench -- --test` completes with `Success` for
+All benchmark targets, including the four matched QMux-H3 targets. `cargo bench -p ngnet-bench -- --test` completes with `Success` for
 every arm, including `compio-push` and `compio-shared`, which abort unless they obtain
 `DriverType::IoUring` — so io_uring is genuinely available here and not silently falling back
 to a polling driver.
@@ -107,6 +107,9 @@ compiler, CMake, and libclang are common prerequisites.
 | [28-ngtcp2-stream-first-gate](28-ngtcp2-stream-first-gate.md) | 2026-08-30 | `383082f` | Stream-first packet production — **not attributable with current diagnostics; deferred unchanged** |
 | [29-ngtcp2-residual-eligibility](29-ngtcp2-residual-eligibility.md) | 2026-08-30 | `6a7af57` | Residual partition — **all six candidates deferred; no stable attributed gap beyond drift** |
 | [30-ngtcp2-final-review-resolution](30-ngtcp2-final-review-resolution.md) | 2026-08-30 | `d8d9d90` through `8964a97` | Final-review evidence — **final calibration passes; release repetition remains flaky at 15 s and 60 s; 3 diagnostic timeouts preserved; RSS/stability gate unmet** |
+| [31-h3-ngnet-qmux](31-h3-ngnet-qmux.md) | 2026-08-31 | `acb7574` | Matched ngnet/hyperium H3 over QMux — **duplex/socket signs differ and pinned repetitions remain inconclusive under drift** |
+| [32-h3-qmux-driver-ownership](32-h3-qmux-driver-ownership.md) | 2026-09-01 | `bed0402` against `8d0479b` | Driver-only lower I/O A/B — **retained; 1 MiB median improves about 60% on duplex and socket while controls drift by at most 3.9% and 1.2% for the body cases** |
+| [33-h3-qmux-post-revision](33-h3-qmux-post-revision.md) | 2026-09-01 | `d8f0bec` | Equal-topology post-revision matrix — **all Criterion points favor hyperium, but all pinned ranges overlap; no stable winner** |
 
 Still outstanding, in the order they are worth doing:
 

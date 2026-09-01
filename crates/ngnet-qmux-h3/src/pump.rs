@@ -25,11 +25,11 @@ use ngnet_qmux::io::{AsyncByteStream, Clock};
 
 use crate::connection::Inner;
 
-/// Drives the connection one pass, writing out everything it produced.
+/// Forces all buffered connection output before the caller suspends.
 ///
-/// The pass is the QMux layer's own: produce whatever the state machine owes, write it, then
-/// read whatever has arrived. `cx` is registered on both halves of the byte stream, so the
-/// caller is polled again when either becomes ready.
+/// This form does not read the byte stream. Productive progress already performed the bounded
+/// lower read; the suspension hook only discharges its obligation to publish accumulated
+/// output. `cx` is registered on the write half when it cannot currently accept everything.
 ///
 /// `true` means everything queued has reached the byte stream. `false` means either the
 /// connection has ended — the ending is latched on `inner`, not returned, because every

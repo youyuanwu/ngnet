@@ -42,7 +42,7 @@ fn a_failing_byte_stream_ends_the_connection() {
     let mut conn =
         Connection::client(near, TestClock::new(), Config::new()).expect("constructing a client");
 
-    let error = match poll_once(|cx| conn.poll_next_event_buffered(cx)) {
+    let error = match poll_once(|cx| conn.poll_next_event(cx)) {
         Poll::Ready(Err(error)) => error,
         other => panic!("the injected byte-stream failure was not reported: {other:?}"),
     };
@@ -121,7 +121,12 @@ fn a_byte_stream_that_ends_mid_record_reports_a_truncated_record() {
     let mut conn =
         Connection::client(near, TestClock::new(), Config::new()).expect("constructing a client");
 
-    let error = match poll_once(|cx| conn.poll_next_event_buffered(cx)) {
+    let first = poll_once(|cx| conn.poll_next_event(cx));
+    assert!(
+        matches!(first, Poll::Pending),
+        "the bounded poll consumes the partial record before observing EOF"
+    );
+    let error = match poll_once(|cx| conn.poll_next_event(cx)) {
         Poll::Ready(Err(error)) => error,
         other => panic!("the truncated record was not reported: {other:?}"),
     };
@@ -715,7 +720,7 @@ fn an_orderly_inbound_end_does_not_strand_retained_output() {
         Poll::Ready(Ok(()))
     ));
 
-    let ending = match poll_once(|cx| conn.poll_next_event_buffered(cx)) {
+    let ending = match poll_once(|cx| conn.poll_next_event(cx)) {
         Poll::Ready(Err(error)) => error,
         other => panic!("the peer's orderly end was not reported: {other:?}"),
     };

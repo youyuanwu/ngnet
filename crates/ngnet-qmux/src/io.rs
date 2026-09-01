@@ -55,13 +55,11 @@
 //!
 //! # Waiting, and the cost of getting it wrong
 //!
-//! Three things here have to wait for the peer: an open the peer's stream limit forbids, a
-//! write whose flow-control credit is spent, and a connection with nothing to do. Each parks a
-//! waker and is woken by the event that actually unblocks it -- a raised limit, an extended
-//! window, or bytes arriving on the byte stream. The alternative, waking one's own waker and
-//! returning [`Pending`](core::task::Poll::Pending), compiles and passes a functional test
-//! suite while burning a core; `conn`'s documentation names the events, and
-//! `tests/io_scheduling.rs` counts wakeups to prove none of them is a spin.
+//! A write whose flow-control credit is spent and a connection with nothing to do park wakers
+//! until an extended window or lower readiness unblocks them. Opens are immediate and return
+//! [`StreamOpen::Blocked`] for an outer scheduler to wait on. The alternative, waking one's own
+//! waker and returning [`Pending`](core::task::Poll::Pending), compiles and passes a functional
+//! suite while burning a core; `tests/io_scheduling.rs` checks that these paths do not spin.
 //!
 //! The same reasoning runs the other way for reading. This layer stops pulling from the byte
 //! stream once it is far enough ahead of a caller who is not consuming, where "far enough" is
@@ -133,7 +131,7 @@ pub use clock::Clock;
 pub use close::{decode_close_frame, encode_close_record};
 pub use conn::{
     Config, Connection, DEFAULT_CONNECTION_DATA, DEFAULT_MAX_STREAMS, DEFAULT_READ_AHEAD,
-    DEFAULT_STREAM_DATA, OUTBOUND_CARRY, OUTBOUND_CEILING, StreamWrite,
+    DEFAULT_STREAM_DATA, OUTBOUND_CARRY, OUTBOUND_CEILING, StreamOpen, StreamWrite,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use event::Event;

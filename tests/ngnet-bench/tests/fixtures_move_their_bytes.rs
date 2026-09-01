@@ -12,7 +12,8 @@ use bytes::Bytes;
 
 use ngnet_bench::{
     CompioSharedSocket, CompioSocket, Hyper, NgnetH2, NgnetH2Shared, NgnetQmuxH3,
-    NgnetQmuxH3Socket, TokioSharedSocket, TokioSocket, body_of, compio_runtime,
+    NgnetQmuxH3Matched, NgnetQmuxH3MatchedSocket, NgnetQmuxH3Socket, TokioSharedSocket,
+    TokioSocket, UpstreamH3Qmux, UpstreamH3QmuxSocket, body_of, compio_runtime,
     current_thread_runtime,
 };
 
@@ -86,6 +87,26 @@ echoes_whole!(
     NgnetQmuxH3Socket,
     current_thread_runtime()
 );
+echoes_whole!(
+    matched_ngnet_qmux_h3_duplex_echoes_whole,
+    NgnetQmuxH3Matched,
+    current_thread_runtime()
+);
+echoes_whole!(
+    matched_ngnet_qmux_h3_socket_echoes_whole,
+    NgnetQmuxH3MatchedSocket,
+    current_thread_runtime()
+);
+echoes_whole!(
+    upstream_h3_qmux_duplex_echoes_whole,
+    UpstreamH3Qmux,
+    current_thread_runtime()
+);
+echoes_whole!(
+    upstream_h3_qmux_socket_echoes_whole,
+    UpstreamH3QmuxSocket,
+    current_thread_runtime()
+);
 
 /// The bodies really are distinct objects, so `body_of` is not handing every arm the same
 /// shared allocation and letting one arm's work be attributed to another.
@@ -100,4 +121,110 @@ fn the_sweep_builds_independent_bodies() {
         "but distinct allocations, so no arm can be measuring a body another arm warmed"
     );
     assert_eq!(body_of(0), Bytes::new(), "and the control point is empty");
+}
+
+#[test]
+fn matched_qmux_fixtures_use_symmetric_per_instance_counters() {
+    let runtime = current_thread_runtime();
+    let body = body_of(100_003);
+
+    let ngnet = runtime.block_on(NgnetQmuxH3Matched::establish());
+    assert_eq!(ngnet.counter_snapshot(), Default::default());
+    ngnet.arm_counters();
+    runtime.block_on(tokio::task::yield_now());
+    assert_eq!(ngnet.counter_snapshot(), Default::default());
+    assert_eq!(
+        runtime.block_on(async {
+            let received = ngnet.round_trip(body.clone()).await;
+            tokio::task::yield_now().await;
+            received
+        }),
+        body.len()
+    );
+    let ngnet_memory = ngnet.counter_snapshot();
+
+    let upstream = runtime.block_on(UpstreamH3Qmux::establish());
+    assert_eq!(upstream.counter_snapshot(), Default::default());
+    upstream.arm_counters();
+    runtime.block_on(tokio::task::yield_now());
+    assert_eq!(upstream.counter_snapshot(), Default::default());
+    assert_eq!(
+        runtime.block_on(async {
+            let received = upstream.round_trip(body.clone()).await;
+            tokio::task::yield_now().await;
+            received
+        }),
+        body.len()
+    );
+    let upstream_memory = upstream.counter_snapshot();
+
+    let ngnet_socket = runtime.block_on(NgnetQmuxH3MatchedSocket::establish());
+    assert_eq!(ngnet_socket.counter_snapshot(), Default::default());
+    ngnet_socket.arm_counters();
+    runtime.block_on(tokio::task::yield_now());
+    assert_eq!(ngnet_socket.counter_snapshot(), Default::default());
+    assert_eq!(
+        runtime.block_on(async {
+            let received = ngnet_socket.round_trip(body.clone()).await;
+            tokio::task::yield_now().await;
+            received
+        }),
+        body.len()
+    );
+    let ngnet_socket = ngnet_socket.counter_snapshot();
+
+    let upstream_socket = runtime.block_on(UpstreamH3QmuxSocket::establish());
+    assert_eq!(upstream_socket.counter_snapshot(), Default::default());
+    upstream_socket.arm_counters();
+    runtime.block_on(tokio::task::yield_now());
+    assert_eq!(upstream_socket.counter_snapshot(), Default::default());
+    assert_eq!(
+        runtime.block_on(async {
+            let received = upstream_socket.round_trip(body).await;
+            tokio::task::yield_now().await;
+            received
+        }),
+        100_003
+    );
+    let upstream_socket = upstream_socket.counter_snapshot();
+
+    for snapshot in [ngnet_memory, upstream_memory, ngnet_socket, upstream_socket] {
+        assert!(snapshot.lower_read_calls > 0);
+        assert!(snapshot.lower_write_calls > 0);
+        assert!((200_006..=201_030).contains(&snapshot.lower_read_bytes));
+        assert!((200_006..=201_030).contains(&snapshot.lower_write_bytes));
+        assert!(snapshot.lower_write_bytes >= snapshot.lower_read_bytes);
+        assert!(snapshot.lower_write_bytes - snapshot.lower_read_bytes <= 1024);
+        assert_eq!(snapshot.lower_write_not_now, 0);
+        assert!(snapshot.endpoint_polls > 0);
+        assert!(!snapshot.overflowed);
+    }
+    assert_eq!(
+        (
+            ngnet_memory.lower_read_bytes,
+            ngnet_memory.lower_write_bytes
+        ),
+        (200_278, 200_278)
+    );
+    assert_eq!(
+        (
+            upstream_memory.lower_read_bytes,
+            upstream_memory.lower_write_bytes
+        ),
+        (200_357, 200_357)
+    );
+    assert_eq!(
+        (
+            ngnet_socket.lower_read_bytes,
+            ngnet_socket.lower_write_bytes
+        ),
+        (200_271, 200_278)
+    );
+    assert_eq!(
+        (
+            upstream_socket.lower_read_bytes,
+            upstream_socket.lower_write_bytes
+        ),
+        (200_350, 200_357)
+    );
 }

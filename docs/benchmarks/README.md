@@ -1,6 +1,6 @@
 # Benchmarks
 
-`tests/ngnet-bench` holds four [Criterion](https://bheisler.github.io/criterion.rs/)
+`tests/ngnet-bench` holds five [Criterion](https://bheisler.github.io/criterion.rs/)
 benchmark families, which answer different questions and must not be read as one:
 
 - **The duplex family** — this stack against [hyper](https://hyper.rs) and against
@@ -15,6 +15,9 @@ benchmark families, which answer different questions and must not be read as one
 - **The QUIC-stack HTTP/3 family** — three arms over loopback UDP: the two Quinn stacks above
   plus `ngnet-h3` + `ngnet-quic-h3` + ngtcp2/OpenSSL. This is an end-to-end transport-stack
   comparison, not an adapter-only attribution.
+- **The matched QMux H3 family** — `ngnet-h3 + ngnet-qmux-h3` against hyperium
+  `h3 + h3-ngnet-qmux`, over the same QMux configuration and either Tokio duplex or loopback
+  TCP. Four targets cover serial/body × duplex/socket; results are whole-stack only.
 
 Between them they fill in the whole matrix of stack against I/O model:
 
@@ -22,9 +25,10 @@ Between them they fill in the whole matrix of stack against I/O model:
 | --- | --- | --- | --- |
 | **`ngnet-h2`** (HTTP/2) | `ngnet-h2` | `ngnet-h2-tokio` | `ngnet-h2-compio` |
 | **`ngnet-qmux-h3`** (HTTP/3 over QMux) | `ngnet-qmux-h3` | `ngnet-qmux-h3-tokio` | n/a — no completion byte stream for QMux |
+| **hyperium `h3` over QMux** | `h3-ngnet-qmux` | `h3-ngnet-qmux` | n/a — no completion byte stream for QMux |
 | **hyper** (HTTP/2) | `hyper` | `hyper-tokio` | n/a — hyper has no completion transport |
 
-Neither empty cell is an omission. hyper's connection types are built on tokio's
+The empty cells are not omissions. hyper's connection types are built on tokio's
 readiness-based `AsyncRead`/`AsyncWrite`, so there is no hyper-on-io_uring arm to run.
 `ngnet-qmux` ships a byte-stream adapter for tokio and none for a completion runtime, and
 supplying one would be a piece of transport engineering rather than benchmark infrastructure —
@@ -148,6 +152,10 @@ HTTP/2 arm and an HTTP/3-over-QMux arm.
 | [`quinn_body_throughput`](cases/quinn-body-throughput.md) | Quinn loopback | HTTP/3 implementation × body ∈ {16 KiB, 1 MiB} | MB/s |
 | [`quic_stack_serial_latency`](cases/quic-stack-serial-latency.md) | QUIC loopback | HTTP/3 × QUIC × TLS stack | latency of one empty-body exchange |
 | [`quic_stack_body_throughput`](cases/quic-stack-body-throughput.md) | QUIC loopback | HTTP/3 × QUIC × TLS stack at 1 KiB | MB/s |
+| [`qmux_h3_serial_latency`](cases/qmux-h3-comparison.md) | QMux duplex | HTTP/3 implementation | latency of one empty exchange |
+| [`qmux_h3_body_throughput`](cases/qmux-h3-comparison.md) | QMux duplex | HTTP/3 implementation × body ∈ {0, 1 KiB, 64 KiB, 1 MiB, 8 MiB} | MB/s |
+| [`qmux_h3_socket_serial_latency`](cases/qmux-h3-comparison.md) | QMux loopback TCP | HTTP/3 implementation | latency of one empty exchange |
+| [`qmux_h3_socket_body_throughput`](cases/qmux-h3-comparison.md) | QMux loopback TCP | HTTP/3 implementation × body ∈ {0, 1 KiB, 64 KiB, 1 MiB, 8 MiB} | MB/s |
 
 ## The findings so far
 
@@ -173,6 +181,13 @@ drift bar, survey the arms, and re-settle one verdict the legacy host could not.
 **Absolute numbers from the two hosts are not comparable and must never be tabulated
 together**; a claim carried over from the legacy host is a claim awaiting re-measurement, and
 [`data/README.md`](data/README.md) says how to file the run that settles it.
+
+The current equal-topology hyperium-H3-over-QMux comparison is recorded in
+[`33-h3-qmux-post-revision`](data/xeon-8370c-azure/33-h3-qmux-post-revision.md).
+All Criterion point estimates favor hyperium, but every pinned within-arm range overlaps, so
+it establishes no stable winner. Run
+[`32`](data/xeon-8370c-azure/32-h3-qmux-driver-ownership.md) records the driver-ownership A/B;
+Run [`31`](data/xeon-8370c-azure/31-h3-ngnet-qmux.md) is historical first-revision evidence.
 
 QMux/H3 is now measured against HTTP/2 in runs
 [`08`](data/xeon-8370c-azure/08-qmux-against-h2.md),
