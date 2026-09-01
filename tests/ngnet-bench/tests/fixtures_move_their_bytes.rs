@@ -131,6 +131,8 @@ fn matched_qmux_fixtures_use_symmetric_per_instance_counters() {
     let ngnet = runtime.block_on(NgnetQmuxH3Matched::establish());
     assert_eq!(ngnet.counter_snapshot(), Default::default());
     ngnet.arm_counters();
+    runtime.block_on(tokio::task::yield_now());
+    assert_eq!(ngnet.counter_snapshot(), Default::default());
     assert_eq!(
         runtime.block_on(async {
             let received = ngnet.round_trip(body.clone()).await;
@@ -144,6 +146,8 @@ fn matched_qmux_fixtures_use_symmetric_per_instance_counters() {
     let upstream = runtime.block_on(UpstreamH3Qmux::establish());
     assert_eq!(upstream.counter_snapshot(), Default::default());
     upstream.arm_counters();
+    runtime.block_on(tokio::task::yield_now());
+    assert_eq!(upstream.counter_snapshot(), Default::default());
     assert_eq!(
         runtime.block_on(async {
             let received = upstream.round_trip(body.clone()).await;
@@ -157,6 +161,8 @@ fn matched_qmux_fixtures_use_symmetric_per_instance_counters() {
     let ngnet_socket = runtime.block_on(NgnetQmuxH3MatchedSocket::establish());
     assert_eq!(ngnet_socket.counter_snapshot(), Default::default());
     ngnet_socket.arm_counters();
+    runtime.block_on(tokio::task::yield_now());
+    assert_eq!(ngnet_socket.counter_snapshot(), Default::default());
     assert_eq!(
         runtime.block_on(async {
             let received = ngnet_socket.round_trip(body.clone()).await;
@@ -170,6 +176,8 @@ fn matched_qmux_fixtures_use_symmetric_per_instance_counters() {
     let upstream_socket = runtime.block_on(UpstreamH3QmuxSocket::establish());
     assert_eq!(upstream_socket.counter_snapshot(), Default::default());
     upstream_socket.arm_counters();
+    runtime.block_on(tokio::task::yield_now());
+    assert_eq!(upstream_socket.counter_snapshot(), Default::default());
     assert_eq!(
         runtime.block_on(async {
             let received = upstream_socket.round_trip(body).await;

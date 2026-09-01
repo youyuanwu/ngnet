@@ -1434,6 +1434,7 @@ impl NgnetQmuxH3Matched {
             counters.clone(),
         ));
         qmux_warm_up(&handle).await;
+        tokio::task::yield_now().await;
         counters.reset_and_arm(false);
         Self {
             handle,
@@ -1733,6 +1734,7 @@ impl UpstreamH3Qmux {
             counters,
         };
         assert_eq!(fixture.round_trip(Bytes::new()).await, 0);
+        tokio::task::yield_now().await;
         fixture.counters.reset_and_arm(false);
         fixture
     }
@@ -2271,6 +2273,7 @@ impl NgnetQmuxH3MatchedSocket {
             counters.clone(),
         ));
         qmux_warm_up(&handle).await;
+        tokio::task::yield_now().await;
         counters.reset_and_arm(false);
         Self {
             handle,
@@ -2393,6 +2396,7 @@ impl UpstreamH3QmuxSocket {
             counters,
         };
         assert_eq!(fixture.round_trip(Bytes::new()).await, 0);
+        tokio::task::yield_now().await;
         fixture.counters.reset_and_arm(false);
         fixture
     }
