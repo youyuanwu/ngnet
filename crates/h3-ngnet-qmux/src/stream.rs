@@ -135,22 +135,20 @@ impl<S: AsyncByteStream, C: Clock> SendStream<S, C> {
                     } else {
                         let chunk = data.chunk();
                         if chunk.is_empty() {
-                            Step::Error(
-                                ConnectionTerminal::Internal(
-                                    "Buf returned an empty chunk with bytes remaining".into(),
-                                )
-                                .stream_error(),
-                            )
+                            let terminal = ConnectionTerminal::Internal(
+                                "Buf returned an empty chunk with bytes remaining".into(),
+                            );
+                            effects.merge(core.fail(terminal.clone()));
+                            Step::Error(terminal.stream_error())
                         } else {
                             let offered = chunk.len();
                             match core.lower.try_write_stream(self.stream_id, chunk, false) {
                                 Ok(StreamWrite::Accepted(accepted)) if accepted > offered => {
-                                    Step::Error(
-                                        ConnectionTerminal::Internal(
-                                            "QMux accepted more bytes than were offered".into(),
-                                        )
-                                        .stream_error(),
-                                    )
+                                    let terminal = ConnectionTerminal::Internal(
+                                        "QMux accepted more bytes than were offered".into(),
+                                    );
+                                    effects.merge(core.fail(terminal.clone()));
+                                    Step::Error(terminal.stream_error())
                                 }
                                 Ok(StreamWrite::Accepted(0)) => {
                                     core.streams
@@ -277,7 +275,12 @@ impl<S: AsyncByteStream, C: Clock> quic::SendStream<Bytes> for SendStream<S, C> 
         if let Some(terminal) = core.stream_error(self.stream_id, true) {
             return Err(direction_error(terminal));
         }
-        let state = core.streams.get_mut(&self.stream_id).expect("live stream");
+        let Some(state) = core.streams.get_mut(&self.stream_id) else {
+            return Err(ConnectionTerminal::Internal(
+                "send_data called after stream state was retired".into(),
+            )
+            .stream_error());
+        };
         if state.writing.is_some() {
             Err(ConnectionTerminal::Internal(
                 "send_data called before the previous logical send became ready".into(),

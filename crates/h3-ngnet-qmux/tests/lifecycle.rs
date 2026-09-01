@@ -240,28 +240,6 @@ fn lower_failure_fans_out_one_stable_connection_category_to_all_openers() {
 }
 
 #[test]
-fn dropping_unread_data_after_reset_returns_connection_credit_and_reclaims_state() {
-    const CODE: u64 = 0x91;
-    let lower = Config::new().initial_max_stream_data(6).initial_max_data(6);
-    let (mut client, mut client_driver, mut server, mut server_driver) = common::pair(lower);
-    let client_task = async {
-        let mut stream = common::open_bidi(&mut client).await;
-        common::send_all_unframed(&mut stream, Bytes::from_static(b"queued")).await;
-        quic::SendStream::reset(&mut stream, CODE);
-    };
-    let server_task = async {
-        let stream = common::accept_bidi(&mut server).await;
-        drop(stream);
-    };
-    common::run_pair(
-        client_task,
-        &mut client_driver,
-        server_task,
-        &mut server_driver,
-    );
-}
-
-#[test]
 fn reset_stream_does_not_prevent_an_unrelated_sibling_from_completing() {
     const CODE: u64 = 0xa1;
     let (mut client, mut client_driver, mut server, mut server_driver) =

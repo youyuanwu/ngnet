@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
 
-#[cfg(feature = "diagnostics")]
+#[cfg(any(feature = "diagnostics", test))]
 use bytes::Buf;
 use bytes::Bytes;
 use h3::error::Code;
@@ -728,7 +728,7 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
         }
     }
 
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", test))]
     pub(crate) fn retained_receive_bytes(&self) -> usize {
         self.streams
             .values()
@@ -737,7 +737,7 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
             .sum()
     }
 
-    #[cfg(feature = "diagnostics")]
+    #[cfg(any(feature = "diagnostics", test))]
     pub(crate) fn retained_send_bytes(&self) -> usize {
         self.streams
             .values()
@@ -785,9 +785,10 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use h3::proto::frame::Frame;
     use ngnet_qmux::TransportParams;
-    use ngnet_qmux::io::Config;
     use ngnet_qmux::io::testing::{TestByteStream, TestClock, stream_pair};
+    use ngnet_qmux::io::{Config, OUTBOUND_CEILING, StreamWrite};
 
     fn make_core(limit: usize) -> Core<TestByteStream, TestClock> {
         let (near, _far) = stream_pair();
@@ -798,6 +799,12 @@ mod tests {
 
     fn stream(id: i64) -> StreamId {
         StreamId::new(id).expect("valid stream id")
+    }
+
+    fn poll_once<T>(poll: impl FnOnce(&mut Context<'_>) -> Poll<T>) -> Poll<T> {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        poll(&mut cx)
     }
 
     #[derive(Default)]
@@ -871,6 +878,7 @@ mod tests {
             StreamState {
                 send_handle: true,
                 recv_handle: true,
+                writing: Some(Frame::Data(Bytes::from_static(b"retained")).into()),
                 ..StreamState::default()
             },
         );
@@ -1107,5 +1115,109 @@ mod tests {
         assert_eq!(core.stream_error(id, true), Some(DirectionTerminal::Closed));
         assert!(core.terminal.is_none());
         assert!(effects.wakes.is_empty());
+    }
+
+    #[test]
+    fn one_core_turn_routes_sixty_four_events_from_one_lower_read_batch() {
+        let (client_io, server_io) = stream_pair();
+        server_io.set_read_cap(Some(16 * 1024));
+        let reads = server_io.read_log();
+        let mut client =
+            QmuxConnection::client(client_io, TestClock::new(), Config::new()).expect("client");
+        let server =
+            QmuxConnection::server(server_io, TestClock::new(), Config::new()).expect("server");
+        let mut core = Core::new(server, 128);
+        let lower_wake = Arc::new(LowerWake::default());
+        let mut client_params = false;
+        let mut server_params = false;
+        for _ in 0..32 {
+            if let Poll::Ready(Ok(Event::PeerTransportParams(_))) =
+                poll_once(|cx| client.poll_next_event_bounded(cx))
+            {
+                client_params = true;
+            }
+            let effects = core.drive_turn(&lower_wake);
+            if core.lower.peer_transport_params().is_some() {
+                server_params = true;
+            }
+            for wake in effects.wakes {
+                wake.wake();
+            }
+            if client_params && server_params {
+                break;
+            }
+        }
+        while client.try_next_event().is_some() {}
+        while core.lower.try_next_event().is_some() {}
+
+        for value in 0..100_u8 {
+            let stream_id = match client.try_open_bidi().expect("open") {
+                StreamOpen::Opened(stream_id) => stream_id,
+                StreamOpen::Blocked => panic!("default allowance"),
+            };
+            assert!(matches!(
+                client.try_write_stream(stream_id, &[value], true),
+                Ok(StreamWrite::Accepted(1))
+            ));
+        }
+        assert!(matches!(
+            poll_once(|cx| client.poll_pump(cx)),
+            Poll::Ready(Ok(()))
+        ));
+        reads.clear();
+        let before = core.routed_events;
+        let effects = core.drive_turn(&lower_wake);
+        assert_eq!(reads.reads(), 1);
+        assert_eq!(core.routed_events - before, ROUTE_BUDGET as u64);
+        assert!(effects.continuation);
+    }
+
+    #[test]
+    fn retained_state_accounting_is_exact_and_lower_output_stays_bounded() {
+        let mut core = make_core(4);
+        let id = stream(0);
+        core.streams.insert(
+            id,
+            StreamState {
+                writing: Some(Frame::Data(Bytes::from(vec![7; 1024])).into()),
+                recv: VecDeque::from([
+                    Received {
+                        data: Bytes::from_static(b"abc"),
+                        fin: false,
+                    },
+                    Received {
+                        data: Bytes::from_static(b"defg"),
+                        fin: true,
+                    },
+                ]),
+                ..StreamState::default()
+            },
+        );
+        assert_eq!(core.retained_receive_bytes(), 7);
+        assert_eq!(core.retained_send_bytes(), 1027);
+        assert!(core.lower.queued_output() <= OUTBOUND_CEILING);
+    }
+
+    #[test]
+    fn unread_reset_data_is_discarded_before_terminal_retirement() {
+        let mut core = make_core(4);
+        let id = stream(1);
+        core.streams.insert(
+            id,
+            StreamState {
+                lower_closed: true,
+                recv_handle: true,
+                recv_terminal: Some(DirectionTerminal::Reset(19)),
+                recv: VecDeque::from([Received {
+                    data: Bytes::from_static(b"discard me"),
+                    fin: false,
+                }]),
+                ..StreamState::default()
+            },
+        );
+        core.discard_receive(id, ABANDONED).expect("discard");
+        assert_eq!(core.retained_receive_bytes(), 0);
+        core.drop_direction(id, false);
+        assert!(!core.streams.contains_key(&id));
     }
 }
