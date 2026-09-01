@@ -80,16 +80,23 @@ fn distinctive_http() -> HttpConfig {
 /// Runs a bare QMux end until the subject opposite it announces its transport parameters.
 ///
 /// The observer is an ordinary connection with ordinary defaults; it is a peer, not an
-/// instrument. `poll_next_event` pumps before it does anything else, which is what gets the
-/// subject's announcement read in the first place.
+/// instrument. Its manual executor forces buffered output before suspending.
 async fn parameters_announced_to(
     mut observer: LayerConnection<TestByteStream, TestClock>,
 ) -> TransportParams {
     timeout(LIMIT, async move {
         loop {
-            let event = poll_fn(|cx| observer.poll_next_event(cx))
-                .await
-                .expect("the observer's connection must not fail");
+            let event = poll_fn(|cx| match observer.poll_next_event(cx) {
+                core::task::Poll::Pending => match observer.poll_pump(cx) {
+                    core::task::Poll::Ready(Err(error)) => core::task::Poll::Ready(Err(error)),
+                    core::task::Poll::Ready(Ok(())) | core::task::Poll::Pending => {
+                        core::task::Poll::Pending
+                    }
+                },
+                ready => ready,
+            })
+            .await
+            .expect("the observer's connection must not fail");
             if let Event::PeerTransportParams(params) = event {
                 return params;
             }
@@ -159,9 +166,17 @@ async fn settings_announced_to(
     timeout(LIMIT, async move {
         let mut streams: HashMap<i64, Vec<u8>> = HashMap::new();
         loop {
-            let event = poll_fn(|cx| observer.poll_next_event(cx))
-                .await
-                .expect("the observer's connection must not fail");
+            let event = poll_fn(|cx| match observer.poll_next_event(cx) {
+                core::task::Poll::Pending => match observer.poll_pump(cx) {
+                    core::task::Poll::Ready(Err(error)) => core::task::Poll::Ready(Err(error)),
+                    core::task::Poll::Ready(Ok(())) | core::task::Poll::Pending => {
+                        core::task::Poll::Pending
+                    }
+                },
+                ready => ready,
+            })
+            .await
+            .expect("the observer's connection must not fail");
             if let Event::StreamData {
                 stream_id, data, ..
             } = event

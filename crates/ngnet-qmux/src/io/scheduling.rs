@@ -14,9 +14,6 @@
 //!
 //! So every wait in this layer is parked against the event that ends it:
 //!
-//! - An open the peer's stream limit forbids waits on [`Signals::park_open`], and the
-//!   `extend_max_streams` handler wakes it. That callback is dwnx telling this side the peer
-//!   raised the limit, which is the only thing that can make the open succeed.
 //! - A write with no flow-control credit waits on [`Signals::park_credit`], and the
 //!   `extend_max_stream_data` handler wakes it. The connection-level window has **no
 //!   callback** -- dwnx updates `tx.max_offset` from a MAX_DATA frame and tells nobody
@@ -66,14 +63,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 /// Which wait a waker belongs to.
 ///
-/// Separate slots rather than one, because the conditions are separate: a peer that extends a
-/// stream window has not raised the stream limit, and a caller that credits back consumed
-/// bytes has done neither. One shared slot would wake every waiter for every event, which is
-/// correct but is the spin this module exists to avoid.
+/// Separate slots rather than one, because the conditions are separate: peer send credit and
+/// caller-returned read-ahead capacity unblock different operations. One shared slot would wake
+/// every waiter for every event, which is correct but is the spin this module exists to avoid.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Slot {
-    /// Waiting for the peer to raise a stream-count limit.
-    Open,
     /// Waiting for flow-control credit, on a stream or across the connection.
     Credit,
     /// Waiting for the caller to credit back bytes it has been delivered.
@@ -92,7 +86,6 @@ pub(crate) struct Signals {
 
 #[derive(Debug, Default)]
 struct Parked {
-    open: Option<Waker>,
     credit: Option<Waker>,
     read_ahead: Option<Waker>,
 }
@@ -100,7 +93,6 @@ struct Parked {
 impl Parked {
     fn slot(&mut self, slot: Slot) -> &mut Option<Waker> {
         match slot {
-            Slot::Open => &mut self.open,
             Slot::Credit => &mut self.credit,
             Slot::ReadAhead => &mut self.read_ahead,
         }
@@ -111,16 +103,6 @@ impl Signals {
     /// No one waiting for anything.
     pub(crate) fn new() -> Self {
         Self::default()
-    }
-
-    /// Waits for the peer to raise a stream-count limit.
-    pub(crate) fn park_open(&self, cx: &Context<'_>) {
-        self.park(Slot::Open, cx);
-    }
-
-    /// The peer raised a stream-count limit.
-    pub(crate) fn wake_open(&self) {
-        self.wake(Slot::Open);
     }
 
     /// Waits for flow-control credit.
@@ -262,7 +244,6 @@ mod tests {
     fn parking_alone_wakes_nobody() {
         let signals = Signals::new();
         let (waker, counter) = counting_waker();
-        signals.park_open(&Context::from_waker(&waker));
         signals.park_credit(&Context::from_waker(&waker));
         signals.park_read_ahead(&Context::from_waker(&waker));
         assert_eq!(
@@ -277,18 +258,18 @@ mod tests {
         let signals = Signals::new();
         let (waker, counter) = counting_waker();
 
-        signals.park_open(&Context::from_waker(&waker));
+        signals.park_read_ahead(&Context::from_waker(&waker));
         signals.wake_credit();
         assert_eq!(
             counter.count(),
             0,
-            "a credit extension woke a waiter for stream capacity"
+            "a credit extension woke a waiter for read-ahead capacity"
         );
-        signals.wake_open();
+        signals.wake_read_ahead();
         assert_eq!(
             counter.count(),
             1,
-            "the limit was raised and nobody noticed"
+            "read-ahead capacity returned and nobody noticed"
         );
     }
 

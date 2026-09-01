@@ -207,7 +207,6 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
             return effects;
         }
 
-        let credit_before = self.lower.send_credit();
         let queued_before = self.lower.queued_output();
         let mut routed = 0usize;
         while routed < ROUTE_BUDGET {
@@ -226,7 +225,7 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
         if routed < ROUTE_BUDGET {
             let waker = Waker::from(Arc::clone(lower_wake));
             let mut cx = Context::from_waker(&waker);
-            match self.lower.poll_next_event_bounded(&mut cx) {
+            match self.lower.poll_next_event(&mut cx) {
                 Poll::Ready(Ok(event)) => {
                     routed += 1;
                     effects.merge(self.route(event));
@@ -246,9 +245,6 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
             }
         }
 
-        if self.terminal.is_none() && self.lower.send_credit() > credit_before {
-            self.wake_all_senders(&mut effects);
-        }
         if self.terminal.is_none() && self.lower.queued_output() < queued_before {
             self.wake_output_senders(&mut effects);
         }
@@ -264,7 +260,9 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
         #[cfg(feature = "diagnostics")]
         crate::diagnostics::route(!matches!(
             &event,
-            Event::StreamLimit { .. } | Event::PeerTransportParams(_)
+            Event::StreamLimit { .. }
+                | Event::ConnectionDataCredit { .. }
+                | Event::PeerTransportParams(_)
         ));
         #[cfg(debug_assertions)]
         {
@@ -380,6 +378,9 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
                     take_waiter(&mut state.send_waiter, &mut effects);
                     take_waiter(&mut state.finish_waiter, &mut effects);
                 }
+            }
+            Event::ConnectionDataCredit { .. } => {
+                self.wake_all_senders(&mut effects);
             }
             Event::StreamLimit { kind, .. } => match kind {
                 StreamLimitKind::LocalBidi => self.wake_openers(OpenKind::Bidi, &mut effects),
@@ -1143,11 +1144,13 @@ mod tests {
         let mut server_params = false;
         for _ in 0..32 {
             if let Poll::Ready(Ok(Event::PeerTransportParams(_))) =
-                poll_once(|cx| client.poll_next_event_bounded(cx))
+                poll_once(|cx| client.poll_next_event(cx))
             {
                 client_params = true;
             }
             let effects = core.drive_turn(&lower_wake);
+            let _ = poll_once(|cx| client.poll_pump(cx));
+            let _ = poll_once(|cx| core.lower.poll_pump(cx));
             if core.lower.peer_transport_params().is_some() {
                 server_params = true;
             }

@@ -80,7 +80,19 @@ impl<S: AsyncByteStream, C: Clock> Future for Driver<S, C> {
                     core.driver_complete = true;
                     Poll::Ready(Err(error))
                 } else {
-                    Poll::Pending
+                    let lower_waker = Waker::from(Arc::clone(&this.shared.lower_wake));
+                    let mut lower_cx = Context::from_waker(&lower_waker);
+                    match core.lower.poll_pump(&mut lower_cx) {
+                        Poll::Ready(Err(error)) => {
+                            let terminal = crate::error::ConnectionTerminal::from_lower(&error);
+                            effects.merge(core.fail(terminal.clone()));
+                            let error = terminal.driver_error();
+                            core.driver_error = Some(error.clone());
+                            core.driver_complete = true;
+                            Poll::Ready(Err(error))
+                        }
+                        Poll::Ready(Ok(())) | Poll::Pending => Poll::Pending,
+                    }
                 }
             }
         };

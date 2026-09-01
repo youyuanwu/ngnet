@@ -41,14 +41,13 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use ngnet_qmux::StreamId;
 use ngnet_qmux::io::testing::{TestByteStream, TestClock, stream_pair};
-use ngnet_qmux::io::{Config, Connection, Event};
+use ngnet_qmux::io::{Config, Connection, Event, StreamOpen};
 
 // Counting is per-thread rather than global. libtest runs test functions on parallel threads,
 // and a global counter would charge a sibling's allocations to this test's window -- the false
@@ -169,17 +168,6 @@ const SMALL: usize = 64 * 1024;
 /// windows and a fixed overhead common to both cancels out of the subtraction.
 const LARGE: usize = 256 * 1024;
 
-/// Polls `future` until it is ready.
-fn now_or_never<F: Future>(mut future: core::pin::Pin<&mut F>, waker: &Waker) -> F::Output {
-    let mut cx = Context::from_waker(waker);
-    for _ in 0..MAX_POLLS {
-        if let Poll::Ready(out) = future.as_mut().poll(&mut cx) {
-            return out;
-        }
-    }
-    panic!("a future that should have completed immediately did not");
-}
-
 /// A pair of connections that have exchanged transport parameters.
 fn connected(
     waker: &Waker,
@@ -194,10 +182,11 @@ fn connected(
     let mut server = Connection::server(server_io, clock, config()).expect("a server connection");
     let mut cx = Context::from_waker(waker);
 
-    // The announcement each end writes on its first pump is what carries the transport
-    // parameters, so both ends have to be pumped twice: once to write, once to read what the
-    // other wrote.
+    // Event polling consumes at most one lower read, while the forced pump publishes buffered
+    // output before this manual executor suspends either side.
     for _ in 0..MAX_POLLS {
+        let _ = client.poll_next_event(&mut cx);
+        let _ = server.poll_next_event(&mut cx);
         let _ = client.poll_pump(&mut cx);
         let _ = server.poll_pump(&mut cx);
         if client.peer_transport_params().is_some() && server.peer_transport_params().is_some() {
@@ -276,9 +265,9 @@ fn receive(payload: usize) -> (Drained, Cost) {
     let waker = Waker::from(Arc::new(Flag::default()));
     let (mut client, mut server) = connected(&waker);
 
-    let stream = {
-        let mut opening = core::pin::pin!(core::future::poll_fn(|cx| client.poll_open_bidi(cx)));
-        now_or_never(opening.as_mut(), &waker).expect("a stream")
+    let stream = match client.try_open_bidi().expect("opening a stream") {
+        StreamOpen::Opened(stream) => stream,
+        StreamOpen::Blocked => panic!("the connected peer grants stream capacity"),
     };
 
     // Not a constant pattern: a payload of one repeated byte would let a receive path that

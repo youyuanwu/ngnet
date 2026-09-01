@@ -37,7 +37,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use ngnet_qmux::io::testing::{TestByteStream, TestClock, stream_pair};
-use ngnet_qmux::io::{AsyncByteStream, Clock, Config, Connection, Error, Event, Result, Written};
+use ngnet_qmux::io::{
+    AsyncByteStream, Clock, Config, Connection, Error, Event, Result, StreamOpen, Written,
+};
 use ngnet_qmux::{CloseReason, Role, StreamId};
 
 /// How many round-robin passes before an exchange is declared broken.
@@ -306,21 +308,60 @@ pub fn announcement_record_configured(role: Role, config: Config) -> Vec<u8> {
 pub async fn next_event<S: AsyncByteStream, C: Clock>(
     conn: &mut Connection<S, C>,
 ) -> Result<Event> {
-    poll_fn(|cx| conn.poll_next_event(cx)).await
+    poll_fn(|cx| match conn.poll_next_event(cx) {
+        Poll::Pending => match conn.poll_pump(cx) {
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) | Poll::Pending => Poll::Pending,
+        },
+        ready => ready,
+    })
+    .await
 }
 
 /// Opens a bidirectional stream, waiting for capacity if the peer has not granted it yet.
 pub async fn open_bidi<S: AsyncByteStream, C: Clock>(
     conn: &mut Connection<S, C>,
 ) -> Result<StreamId> {
-    poll_fn(|cx| conn.poll_open_bidi(cx)).await
+    poll_open(conn, cx_open_bidi).await
 }
 
 /// Opens a unidirectional stream.
 pub async fn open_uni<S: AsyncByteStream, C: Clock>(
     conn: &mut Connection<S, C>,
 ) -> Result<StreamId> {
-    poll_fn(|cx| conn.poll_open_uni(cx)).await
+    poll_open(conn, cx_open_uni).await
+}
+
+fn cx_open_bidi<S: AsyncByteStream, C: Clock>(conn: &mut Connection<S, C>) -> Result<StreamOpen> {
+    conn.try_open_bidi()
+}
+
+fn cx_open_uni<S: AsyncByteStream, C: Clock>(conn: &mut Connection<S, C>) -> Result<StreamOpen> {
+    conn.try_open_uni()
+}
+
+async fn poll_open<S: AsyncByteStream, C: Clock>(
+    conn: &mut Connection<S, C>,
+    attempt: fn(&mut Connection<S, C>) -> Result<StreamOpen>,
+) -> Result<StreamId> {
+    poll_fn(|cx| {
+        loop {
+            match attempt(conn)? {
+                StreamOpen::Opened(stream_id) => return Poll::Ready(Ok(stream_id)),
+                StreamOpen::Blocked => match conn.poll_next_event(cx) {
+                    Poll::Ready(Ok(_)) => continue,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => {
+                        return match conn.poll_pump(cx) {
+                            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                            Poll::Ready(Ok(())) | Poll::Pending => Poll::Pending,
+                        };
+                    }
+                },
+            }
+        }
+    })
+    .await
 }
 
 /// Writes every byte of `data`, however many records and windows that takes.

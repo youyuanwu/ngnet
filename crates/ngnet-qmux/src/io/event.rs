@@ -126,6 +126,15 @@ pub enum Event {
         max_data: u64,
     },
 
+    /// The peer raised the connection-wide stream-data send window.
+    ///
+    /// Unlike [`Event::StreamDataCredit`], this is not associated with one stream. An adapter
+    /// uses it to wake operations blocked specifically on the connection window.
+    ConnectionDataCredit {
+        /// Connection-wide send credit currently available after applying the update.
+        available: u64,
+    },
+
     /// The peer raised one of the four stream-count limits.
     ///
     /// The event a blocked open is waiting for.

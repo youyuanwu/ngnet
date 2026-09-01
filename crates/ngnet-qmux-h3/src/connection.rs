@@ -2,22 +2,24 @@
 
 use core::future::Future;
 use core::pin::Pin;
-use core::task::{Context, Poll};
+use core::task::{Context, Poll, Waker};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use http_body::Body;
 use ngnet_h3::http::{
-    Config as H3Config, Connection as H3Connection, IncomingBody, QuicConnection, QuicEvent,
-    Result as H3Result, SendRequest, StreamSource,
+    Config as H3Config, Connection as H3Connection, Error as H3Error, IncomingBody, QuicConnection,
+    QuicEvent, Result as H3Result, SendRequest, StreamSource,
 };
 use ngnet_h3::{ErrorCode, StreamId as H3StreamId, Timestamp as H3Timestamp};
 use ngnet_qmux::io::{
     AsyncByteStream, Clock, Config, Connection as LayerConnection, Error as LayerError,
-    ErrorKind as LayerErrorKind,
+    ErrorKind as LayerErrorKind, Event as LayerEvent, StreamOpen,
 };
-use ngnet_qmux::{CloseKind, CloseReason, Initiator, Role, Shutdown, StreamId as LayerStreamId};
+use ngnet_qmux::{
+    CloseKind, CloseReason, Initiator, Role, Shutdown, StreamId as LayerStreamId, StreamLimitKind,
+};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::event::{ends_a_stream, qmux_stream, stream_id, translate};
@@ -174,6 +176,9 @@ pub(crate) struct Inner<S: AsyncByteStream, C: Clock> {
     /// per delivery. It is also the extension that wakes the read-ahead pump, so this is the
     /// count of wakeups the batching removes.
     connection_credit_applications: u64,
+    open_uni_waiter: Option<Waker>,
+    open_bidi_waiter: Option<Waker>,
+    deferred_wakes: Vec<Waker>,
 }
 
 impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
@@ -195,6 +200,9 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
             credit: PendingCredit::default(),
             credit_applications: 0,
             connection_credit_applications: 0,
+            open_uni_waiter: None,
+            open_bidi_waiter: None,
+            deferred_wakes: Vec::new(),
         }
     }
 
@@ -293,16 +301,63 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
         )
     }
 
+    fn wake_open(&mut self, bidi: bool) {
+        let waiter = if bidi {
+            self.open_bidi_waiter.take()
+        } else {
+            self.open_uni_waiter.take()
+        };
+        if let Some(waiter) = waiter {
+            self.deferred_wakes.push(waiter);
+        }
+    }
+
+    fn route_adapter_event(&mut self, event: LayerEvent) -> Option<LayerEvent> {
+        match event {
+            LayerEvent::StreamLimit { kind, .. } => {
+                match kind {
+                    StreamLimitKind::LocalBidi => self.wake_open(true),
+                    StreamLimitKind::LocalUni => self.wake_open(false),
+                    StreamLimitKind::RemoteBidi | StreamLimitKind::RemoteUni => {}
+                }
+                None
+            }
+            LayerEvent::PeerTransportParams(_) => {
+                self.wake_open(true);
+                self.wake_open(false);
+                None
+            }
+            LayerEvent::ConnectionDataCredit { .. } | LayerEvent::StreamDataCredit { .. } => None,
+            event => Some(event),
+        }
+    }
+
     /// Pulls from the layer until there is an event to hand over, or nothing left to pull.
     fn fill(&mut self, cx: &mut Context<'_>) {
+        let mut polled_lower = false;
         while self.next.is_none() {
-            match self.conn.poll_next_event_buffered(cx) {
-                Poll::Ready(Ok(event)) => self.next = translate(event, self.local),
-                Poll::Ready(Err(error)) => {
+            let event = if let Some(event) = self.conn.try_next_event() {
+                Some(Ok(event))
+            } else if polled_lower {
+                None
+            } else {
+                polled_lower = true;
+                match self.conn.poll_next_event(cx) {
+                    Poll::Ready(event) => Some(event),
+                    Poll::Pending => None,
+                }
+            };
+            match event {
+                Some(Ok(event)) => {
+                    if let Some(event) = self.route_adapter_event(event) {
+                        self.next = translate(event, self.local);
+                    }
+                }
+                Some(Err(error)) => {
                     self.end(&error);
                     break;
                 }
-                Poll::Pending => break,
+                None => break,
             }
         }
     }
@@ -316,7 +371,7 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
 
         // Queued work still pumps first so a terminal discovered here remains latched
         // behind that work. With no queued work, `fill` performs the one required pump
-        // through `poll_next_event_buffered`; pumping here as well would read the transport
+        // through `poll_next_event`; pumping here as well would read the transport
         // twice before checking the same lower event queue.
         if !self.releases.is_empty() || self.next.is_some() {
             pump::pump_buffered(self, cx);
@@ -382,24 +437,37 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
             return Poll::Ready(Err(self.ended()));
         }
         let opened = if bidi {
-            self.conn.poll_open_bidi_buffered(cx)
+            self.conn.try_open_bidi()
         } else {
-            self.conn.poll_open_uni_buffered(cx)
+            self.conn.try_open_uni()
         };
         match opened {
             // The open itself is only a record. Keep it with the request or control bytes the
             // driver is about to offer; `poll_flush` writes it before any operation can park.
-            Poll::Ready(Ok(id)) => {
+            Ok(StreamOpen::Opened(id)) => {
                 pump::pump_buffered(self, cx);
                 Poll::Ready(Ok(stream_id(id)))
             }
-            Poll::Ready(Err(error)) => {
+            Err(error) => {
                 self.end(&error);
                 Poll::Ready(Err(self.ended()))
             }
             // The peer's stream limit, not a failure. The layer waits, and the wake the
             // layer below registered is what releases it.
-            Poll::Pending => Poll::Pending,
+            Ok(StreamOpen::Blocked) => {
+                let waiter = if bidi {
+                    &mut self.open_bidi_waiter
+                } else {
+                    &mut self.open_uni_waiter
+                };
+                if !waiter
+                    .as_ref()
+                    .is_some_and(|current| current.will_wake(cx.waker()))
+                {
+                    *waiter = Some(cx.waker().clone());
+                }
+                Poll::Pending
+            }
         }
     }
 
@@ -636,7 +704,15 @@ impl<S: AsyncByteStream, C: Clock> QmuxConnection<S, C> {
         // Poisoning is not a failure mode worth propagating here: the only way to poison
         // this lock is to panic inside the HTTP/3 driver, and the state it guards is
         // consistent at every point one of these closures can unwind from.
-        act(&mut self.shared.lock().unwrap_or_else(PoisonError::into_inner))
+        let (result, wakes) = {
+            let mut inner = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+            let result = act(&mut inner);
+            (result, core::mem::take(&mut inner.deferred_wakes))
+        };
+        for wake in wakes {
+            wake.wake();
+        }
+        result
     }
 }
 
@@ -812,6 +888,12 @@ pub struct Connection<S: AsyncByteStream, C: Clock, D> {
     tail: QmuxConnection<S, C>,
 }
 
+fn orderly_backend_ending(error: &H3Error) -> bool {
+    std::error::Error::source(error)
+        .and_then(|source| source.downcast_ref::<Error>())
+        .is_some_and(|source| matches!(source.kind(), ErrorKind::EndOfStream | ErrorKind::Closed))
+}
+
 impl<S: AsyncByteStream, C: Clock, D> Connection<S, C, D> {
     fn new(driving: D, tail: QmuxConnection<S, C>) -> Self {
         Self {
@@ -839,7 +921,10 @@ where
             match Pin::new(driving).poll(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(outcome) => {
-                    this.outcome = Some(outcome);
+                    this.outcome = Some(match outcome {
+                        Err(error) if orderly_backend_ending(&error) => Ok(()),
+                        outcome => outcome,
+                    });
                     this.driving = None;
                 }
             }

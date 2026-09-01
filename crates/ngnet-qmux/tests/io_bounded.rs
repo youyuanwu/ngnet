@@ -29,15 +29,17 @@ fn established_pair() -> (
     let mut server_params = false;
     for _ in 0..64 {
         if let Poll::Ready(Ok(Event::PeerTransportParams(_))) =
-            poll_once(|cx| client.poll_next_event_bounded(cx))
+            poll_once(|cx| client.poll_next_event(cx))
         {
             client_params = true;
         }
         if let Poll::Ready(Ok(Event::PeerTransportParams(_))) =
-            poll_once(|cx| server.poll_next_event_bounded(cx))
+            poll_once(|cx| server.poll_next_event(cx))
         {
             server_params = true;
         }
+        let _ = poll_once(|cx| client.poll_pump(cx));
+        let _ = poll_once(|cx| server.poll_pump(cx));
         if client_params && server_params {
             while client.try_next_event().is_some() {}
             while server.try_next_event().is_some() {}
@@ -73,7 +75,7 @@ fn bounded_event_poll_drains_before_reading_and_reads_at_most_one_batch() {
     let before = reads.reads();
 
     assert!(matches!(
-        poll_once(|cx| server.poll_next_event_bounded(cx)),
+        poll_once(|cx| server.poll_next_event(cx)),
         Poll::Ready(Ok(_))
     ));
     assert_eq!(
@@ -83,7 +85,7 @@ fn bounded_event_poll_drains_before_reading_and_reads_at_most_one_batch() {
     );
 
     assert!(matches!(
-        poll_once(|cx| server.poll_next_event_bounded(cx)),
+        poll_once(|cx| server.poll_next_event(cx)),
         Poll::Ready(Ok(_))
     ));
     assert_eq!(
@@ -99,26 +101,11 @@ fn bounded_event_poll_drains_before_reading_and_reads_at_most_one_batch() {
         "draining decoded events performs no lower I/O"
     );
 
-    let _ = poll_once(|cx| server.poll_next_event_bounded(cx));
+    let _ = poll_once(|cx| server.poll_next_event(cx));
     assert_eq!(
         reads.reads(),
         before + 2,
         "the next bounded turn admitted one further read batch"
-    );
-}
-
-#[test]
-fn legacy_event_poll_retains_its_ready_source_draining_behavior() {
-    let (mut client, mut server, reads) = established_pair();
-    queue_many_events(&mut client);
-    let before = reads.reads();
-    assert!(matches!(
-        poll_once(|cx| server.poll_next_event(cx)),
-        Poll::Ready(Ok(_))
-    ));
-    assert!(
-        reads.reads() > before + 1,
-        "the existing unbounded API must continue draining an always-ready source"
     );
 }
 
@@ -157,8 +144,10 @@ fn bounded_peer_read_preserves_the_blocked_lower_writer_wake() {
         Connection::server(server_io, TestClock::new(), Config::new()).expect("server");
 
     for _ in 0..64 {
-        let _ = poll_once(|cx| client.poll_next_event_bounded(cx));
-        let _ = poll_once(|cx| server.poll_next_event_bounded(cx));
+        let _ = poll_once(|cx| client.poll_next_event(cx));
+        let _ = poll_once(|cx| server.poll_next_event(cx));
+        let _ = poll_once(|cx| client.poll_pump(cx));
+        let _ = poll_once(|cx| server.poll_pump(cx));
         if client
             .try_open_bidi()
             .is_ok_and(|open| matches!(open, StreamOpen::Opened(_)))
@@ -183,7 +172,7 @@ fn bounded_peer_read_preserves_the_blocked_lower_writer_wake() {
     let mut cx = Context::from_waker(&waker);
     assert!(matches!(client.poll_pump(&mut cx), Poll::Pending));
     assert_eq!(count.0.load(Ordering::SeqCst), 0);
-    let _ = poll_once(|cx| server.poll_next_event_bounded(cx));
+    let _ = poll_once(|cx| server.poll_next_event(cx));
     assert!(
         count.0.load(Ordering::SeqCst) > 0,
         "draining one bounded peer batch wakes the lower writer whose capacity returned"
