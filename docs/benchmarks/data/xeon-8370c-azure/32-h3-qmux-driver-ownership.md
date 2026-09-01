@@ -29,7 +29,7 @@ for pass in 1 2 3; do
     taskset -c 0 target/release/examples/probe "$arm" body 1048576 100 timing
   done
 
-  git checkout feature/h3-ngnet-qmux
+  git checkout --detach bed0402
   cargo build -p ngnet-bench --example probe --release
   for arm in ngnet-qmux-matched-duplex h3-qmux-duplex \
              ngnet-qmux-matched-socket h3-qmux-socket; do

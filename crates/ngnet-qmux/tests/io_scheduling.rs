@@ -116,6 +116,12 @@ fn an_immediate_blocked_open_does_not_wake_or_poll() {
         &mut far,
         &announcement_record_configured(Role::Server, Config::new().max_streams_bidi(0)),
     );
+    assert!(matches!(
+        poll_once(|cx| conn.poll_next_event(cx)),
+        Poll::Ready(Ok(Event::PeerTransportParams(_)))
+    ));
+    reads.clear();
+    writes.clear();
     let before = (reads.reads(), writes.writes());
 
     for _ in 0..16 {

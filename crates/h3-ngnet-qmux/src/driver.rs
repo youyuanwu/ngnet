@@ -16,9 +16,10 @@ use crate::stream::{Shared, apply_effects};
 /// synchronous `close` records intent only; this future is what flushes the QMux close and
 /// shuts down the established byte stream.
 ///
-/// A locally requested close resolves successfully once delivered. A peer application close,
-/// adapter invariant failure, or underlying QMux/byte-stream failure resolves with a stable
-/// [`crate::Error`] classification.
+/// A caller-requested close resolves successfully once delivered. An adapter-generated
+/// resource-overload close is delivered first and then resolves with its application error.
+/// A peer application close, adapter invariant failure, or underlying QMux/byte-stream failure
+/// resolves with a stable [`crate::Error`] classification.
 #[must_use = "the QMux adapter makes no lower-I/O progress unless its driver is polled"]
 pub struct Driver<S: AsyncByteStream, C: Clock> {
     pub(crate) shared: Shared<S, C>,

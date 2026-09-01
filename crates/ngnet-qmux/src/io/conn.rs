@@ -56,11 +56,12 @@
 //! An *opportunistic* one offers it only when it can no longer take another record -- to make
 //! room, not to empty it.
 //!
-//! Public entry points force unless their name ends in `_buffered`. The buffered forms exist
-//! for a caller which can distinguish productive work from a task suspension: they retain
-//! output within the same ceiling and owe [`poll_pump`](Connection::poll_pump) before the task
-//! parks. The HTTP/3 join has that scheduling proof. A standalone caller does not and should
-//! use the forced forms.
+//! [`poll_next_event`](Connection::poll_next_event) and
+//! [`poll_pump_buffered`](Connection::poll_pump_buffered) are productive buffered operations:
+//! they retain output within the same ceiling and owe
+//! [`poll_pump`](Connection::poll_pump) before the outer task parks. That forced operation
+//! writes only and admits no second read batch. Immediate state operations such as
+//! [`try_open_bidi`](Connection::try_open_bidi) perform no lower I/O.
 //!
 //! # What a partial accept leaves behind, and why nothing reclaims it
 //!
@@ -176,13 +177,12 @@
 //!
 //! # Waiting, and never spinning
 //!
-//! Three things here cannot proceed on demand: an open the peer's stream limit forbids, a
-//! write with no flow-control credit, and a read the caller has not made room for. Each parks
-//! against the event that ends it -- a raised limit, an extended window, credit reported back
-//! -- through [`Signals`], and none of them wakes itself. See that module for what a self-wake
-//! costs and which callback fires which slot.
+//! A polling write with no flow-control credit and a read the caller has not made room for park
+//! through [`Signals`] until an extended window or returned credit unblocks them. Immediate
+//! opens never park inside QMux: they return [`StreamOpen::Blocked`] for an outer scheduler to
+//! wait on, and none of these paths wakes itself.
 //!
-//! [`try_write_stream`](Connection::try_write_stream) is the deliberate exception: it reports
+//! [`try_write_stream`](Connection::try_write_stream) likewise reports
 //! [`StreamWrite::Blocked`] and returns, because the caller it exists for has no [`Context`]
 //! to park with.
 //!
@@ -2208,11 +2208,11 @@ fn pack_vectored(
 /// stream or clock. A handler cannot reach the connection by design, so each one records and
 /// returns; the pump acts once the entry point that provoked it has returned.
 ///
-/// Two of them do one thing more: they fire a waker. That is not the connection being reached
-/// into -- a waker is a scheduling primitive, not a connection handle, and the operation it
-/// wakes still runs from a poll like any other. It is how a blocked open and a blocked write
-/// learn that the frame they were waiting for has arrived, rather than by asking again on
-/// every pass.
+/// The stream-credit handler also fires the directly parked write waker. That is not the
+/// connection being reached into -- a waker is a scheduling primitive, not a connection
+/// handle, and the operation it wakes still runs from a poll like any other. MAX_DATA growth
+/// is detected around the read, where it both wakes that slot and queues
+/// `ConnectionDataCredit`; stream-limit handlers queue events for adapter-owned open waiters.
 fn handlers(events: &EventQueue, signals: &Signals) -> Handlers<'static> {
     let data = events.clone();
     let opened = events.clone();
