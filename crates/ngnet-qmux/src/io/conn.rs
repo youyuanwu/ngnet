@@ -833,10 +833,14 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
 
     /// Forces produced output to the byte stream before an outer task suspends.
     ///
-    /// Every other entry point does this first, so a caller never has to. It is public because
-    /// This is the suspension boundary paired with buffered event and productive pump calls.
-    /// It performs no lower read, so forcing output cannot exceed an outer turn's one-read
-    /// allowance.
+    /// This is the suspension boundary paired with the buffered event and productive pump
+    /// calls: it performs no lower read, so forcing output cannot exceed an outer turn's
+    /// one-read allowance.
+    ///
+    /// It reports the connection's ending ahead of events decoded before it, because it has
+    /// no way to hand those events over. A caller holding a backlog drains it with
+    /// [`Connection::try_next_event`] first; see [`Connection::poll_next_event`] for the
+    /// ordered delivery guarantee.
     ///
     /// [`Poll::Ready`] means everything produced has reached the byte stream. [`Poll::Pending`]
     /// means bytes are still queued and the byte stream cannot take them yet; the waker fires
