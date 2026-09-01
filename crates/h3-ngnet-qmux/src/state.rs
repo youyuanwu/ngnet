@@ -155,6 +155,8 @@ pub(crate) struct Core<S: AsyncByteStream, C: Clock> {
     next_opener: u64,
     pub(crate) terminal: Option<ConnectionTerminal>,
     pub(crate) close: Option<CloseReason>,
+    /// Whether the locally generated close must complete the driver with the terminal error.
+    pub(crate) close_is_failure: bool,
     pub(crate) driver_complete: bool,
     pub(crate) driver_error: Option<AdapterError>,
     #[cfg(debug_assertions)]
@@ -181,6 +183,7 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
             next_opener: 1,
             terminal: None,
             close: None,
+            close_is_failure: false,
             driver_complete: false,
             driver_error: None,
             #[cfg(debug_assertions)]
@@ -403,6 +406,7 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
             let code = Code::H3_EXCESSIVE_LOAD.value();
             self.close
                 .get_or_insert_with(|| close_reason(code, b"pending accept limit exceeded"));
+            self.close_is_failure = true;
             effects.merge(self.fail(ConnectionTerminal::Application(code)));
             return Err(());
         }

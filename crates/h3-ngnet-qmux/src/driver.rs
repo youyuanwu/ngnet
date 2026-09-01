@@ -57,7 +57,17 @@ impl<S: AsyncByteStream, C: Clock> Future for Driver<S, C> {
                 match core.lower.poll_close(&mut lower_cx, &reason) {
                     Poll::Ready(Ok(())) => {
                         core.driver_complete = true;
-                        Poll::Ready(Ok(()))
+                        if core.close_is_failure {
+                            let error = core
+                                .terminal
+                                .as_ref()
+                                .expect("failure close has a terminal")
+                                .driver_error();
+                            core.driver_error = Some(error.clone());
+                            Poll::Ready(Err(error))
+                        } else {
+                            Poll::Ready(Ok(()))
+                        }
                     }
                     Poll::Ready(Err(error)) => {
                         let error = Error::undefined(error.to_string());
@@ -70,16 +80,21 @@ impl<S: AsyncByteStream, C: Clock> Future for Driver<S, C> {
             } else {
                 effects = core.drive_turn(&this.shared.lower_wake);
                 if let Some(terminal) = core.terminal.clone() {
-                    let error = terminal.driver_error();
-                    core.driver_error = Some(error.clone());
-                    core.driver_complete = true;
-                    Poll::Ready(Err(error))
+                    if core.close.is_some() && core.close_is_failure {
+                        effects.continuation = true;
+                        Poll::Pending
+                    } else {
+                        let error = terminal.driver_error();
+                        core.driver_error = Some(error.clone());
+                        core.driver_complete = true;
+                        Poll::Ready(Err(error))
+                    }
                 } else if effects.continuation {
-                    // The routing budget was exhausted while decoded lower events remain.
-                    // `apply_effects` schedules the next turn, so this is an internal
-                    // self-woken boundary rather than a suspension. Do not ask the forced
-                    // pump for its terminal yet: QMux deliberately reports a latched ending
-                    // there even while pre-ending events remain queued.
+                    // A productive lower read needs one follow-up poll to register readiness;
+                    // exhausting the routing budget also leaves decoded events for that poll.
+                    // `apply_effects` schedules this internal self-woken boundary. Do not ask
+                    // the forced pump for its terminal yet: QMux deliberately reports a
+                    // latched ending there even while pre-ending events remain queued.
                     Poll::Pending
                 } else {
                     let lower_waker = Waker::from(Arc::clone(&this.shared.lower_wake));

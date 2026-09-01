@@ -9,7 +9,7 @@ use h3::proto::frame::Frame;
 use h3::quic::{self, SendStream as _};
 use h3_ngnet_qmux::{Error, from_qmux};
 use ngnet_qmux::io::testing::{Fault, TestClock, stream_pair};
-use ngnet_qmux::io::{Config, Connection as QmuxConnection};
+use ngnet_qmux::io::{Config, Connection as QmuxConnection, StreamOpen, StreamWrite};
 
 #[test]
 fn peer_stop_terminates_send_and_discards_retained_framed_data() {
@@ -196,6 +196,71 @@ fn synchronous_close_preserves_first_reason_and_driver_completes_delivery() {
     assert!(local_complete);
     assert!(peer_driver_done);
     assert_eq!(peer_code, Some(Code::H3_NO_ERROR.value()));
+}
+
+#[test]
+fn pending_accept_overload_flushes_h3_excessive_load_before_driver_error() {
+    let (client_io, server_io) = stream_pair();
+    server_io.set_capacity(Some(1));
+    let mut client =
+        QmuxConnection::client(client_io, TestClock::new(), Config::new()).expect("client");
+    let server =
+        QmuxConnection::server(server_io, TestClock::new(), Config::new()).expect("server");
+    let (_server, mut driver) = from_qmux(server, 0);
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+
+    for _ in 0..128 {
+        assert!(std::pin::Pin::new(&mut driver).poll(&mut cx).is_pending());
+        let _ = client.poll_next_event(&mut cx);
+        let _ = client.poll_pump(&mut cx);
+        if client.peer_transport_params().is_some() {
+            break;
+        }
+    }
+    let stream = match client.try_open_bidi().expect("open outcome") {
+        StreamOpen::Opened(stream) => stream,
+        StreamOpen::Blocked => panic!("server transport parameters did not arrive"),
+    };
+    assert!(matches!(
+        client.try_write_stream(stream, b"x", true),
+        Ok(StreamWrite::Accepted(1))
+    ));
+    let _ = client.poll_pump(&mut cx);
+
+    let mut driver_error = None;
+    let mut peer_code = None;
+    for _ in 0..256 {
+        if driver_error.is_none()
+            && let Poll::Ready(result) = std::pin::Pin::new(&mut driver).poll(&mut cx)
+        {
+            driver_error = Some(result.expect_err("overload is driver-fatal"));
+        }
+        match client.poll_next_event(&mut cx) {
+            Poll::Ready(Ok(_)) | Poll::Pending => {}
+            Poll::Ready(Err(error)) => {
+                peer_code = error
+                    .close_reason()
+                    .map(ngnet_qmux::CloseReason::error_code);
+            }
+        }
+        let _ = client.poll_pump(&mut cx);
+        if driver_error.is_some() && peer_code.is_some() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        driver_error,
+        Some(Error::ApplicationClose {
+            error_code: Code::H3_EXCESSIVE_LOAD.value(),
+        })
+    );
+    assert_eq!(
+        peer_code,
+        Some(Code::H3_EXCESSIVE_LOAD.value()),
+        "the peer must receive the overload close despite one-byte lower capacity"
+    );
 }
 
 #[test]
