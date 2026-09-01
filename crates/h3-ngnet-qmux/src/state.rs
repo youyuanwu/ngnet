@@ -157,6 +157,8 @@ pub(crate) struct Core<S: AsyncByteStream, C: Clock> {
     pub(crate) driver_error: Option<AdapterError>,
     #[cfg(debug_assertions)]
     pub(crate) routed_events: u64,
+    #[cfg(test)]
+    discarded_connection_credit_applications: u64,
 }
 
 impl<S: AsyncByteStream, C: Clock> Core<S, C> {
@@ -181,6 +183,8 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
             driver_error: None,
             #[cfg(debug_assertions)]
             routed_events: 0,
+            #[cfg(test)]
+            discarded_connection_credit_applications: 0,
         }
     }
 
@@ -675,6 +679,10 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
             self.lower
                 .extend_connection_credit(bytes)
                 .map_err(|error| ConnectionTerminal::from_lower(&error))?;
+            #[cfg(test)]
+            {
+                self.discarded_connection_credit_applications += 1;
+            }
             #[cfg(feature = "diagnostics")]
             crate::diagnostics::connection_credit();
         }
@@ -1205,13 +1213,6 @@ mod tests {
 
     #[test]
     fn unread_reset_data_is_discarded_before_terminal_retirement() {
-        #[cfg(feature = "diagnostics")]
-        let _serial = crate::diagnostics::lock_for_test();
-        #[cfg(feature = "diagnostics")]
-        {
-            crate::diagnostics::reset();
-            crate::diagnostics::arm(true);
-        }
         let mut core = make_core(4);
         let id = stream(1);
         core.streams.insert(
@@ -1229,12 +1230,7 @@ mod tests {
         );
         core.discard_receive(id, ABANDONED).expect("discard");
         assert_eq!(core.retained_receive_bytes(), 0);
-        #[cfg(feature = "diagnostics")]
-        {
-            let snapshot = crate::diagnostics::snapshot();
-            assert_eq!(snapshot.connection_credit_applications, 1);
-            assert_eq!(snapshot.stream_credit_applications, 0);
-        }
+        assert_eq!(core.discarded_connection_credit_applications, 1);
         core.drop_direction(id, false);
         assert!(!core.streams.contains_key(&id));
     }
