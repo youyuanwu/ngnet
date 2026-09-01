@@ -203,7 +203,7 @@ fn matched_qmux_fixtures_use_symmetric_per_instance_counters() {
             upstream_memory.lower_read_bytes,
             upstream_memory.lower_write_bytes
         ),
-        (200_398, 200_398)
+        (200_357, 200_357)
     );
     assert_eq!(
         (
@@ -217,6 +217,6 @@ fn matched_qmux_fixtures_use_symmetric_per_instance_counters() {
             upstream_socket.lower_read_bytes,
             upstream_socket.lower_write_bytes
         ),
-        (200_384, 200_398)
+        (200_350, 200_357)
     );
 }

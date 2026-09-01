@@ -35,10 +35,7 @@ impl<S: AsyncByteStream, C: Clock> Future for Driver<S, C> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let displaced = this.shared.lower_wake.register_driver(cx.waker());
-        if let Some(displaced) = displaced {
-            displaced.wake();
-        }
+        this.shared.lower_wake.register_driver(cx.waker());
         let _ = this.shared.lower_wake.take_ready();
         let mut effects = Effects::default();
 
@@ -87,7 +84,12 @@ impl<S: AsyncByteStream, C: Clock> Future for Driver<S, C> {
                 } else {
                     let lower_waker = Waker::from(Arc::clone(&this.shared.lower_wake));
                     let mut lower_cx = Context::from_waker(&lower_waker);
-                    match core.lower.poll_pump(&mut lower_cx) {
+                    let queued_before = core.lower.queued_output();
+                    let pumped = core.lower.poll_pump(&mut lower_cx);
+                    if core.lower.queued_output() < queued_before {
+                        core.wake_output_senders(&mut effects);
+                    }
+                    match pumped {
                         Poll::Ready(Err(error)) => {
                             let terminal = crate::error::ConnectionTerminal::from_lower(&error);
                             effects.merge(core.fail(terminal.clone()));

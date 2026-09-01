@@ -91,7 +91,6 @@ pub(crate) enum DirectionTerminal {
     Finished,
     Stopped(u64),
     Reset(u64),
-    Closed,
 }
 
 pub(crate) fn close_reason(code: u64, reason: &[u8]) -> CloseReason {

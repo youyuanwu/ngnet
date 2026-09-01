@@ -83,11 +83,13 @@ pub(crate) struct LowerWake {
 }
 
 impl LowerWake {
-    pub(crate) fn register_driver(&self, waker: &Waker) -> Option<Waker> {
+    pub(crate) fn register_driver(&self, waker: &Waker) {
         let mut held = self.driver.lock().unwrap_or_else(PoisonError::into_inner);
-        match held.as_ref() {
-            Some(current) if current.will_wake(waker) => None,
-            _ => held.replace(waker.clone()),
+        if !held
+            .as_ref()
+            .is_some_and(|current| current.will_wake(waker))
+        {
+            *held = Some(waker.clone());
         }
     }
 
@@ -207,6 +209,7 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
 
         let queued_before = self.lower.queued_output();
         let mut routed = 0usize;
+        let mut lower_event_ready = false;
         while routed < ROUTE_BUDGET {
             let Some(event) = self.lower.try_next_event() else {
                 break;
@@ -223,6 +226,7 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
             let mut cx = Context::from_waker(&waker);
             match self.lower.poll_next_event(&mut cx) {
                 Poll::Ready(Ok(event)) => {
+                    lower_event_ready = true;
                     routed += 1;
                     effects.merge(self.route(event));
                 }
@@ -244,7 +248,7 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
         if self.terminal.is_none() && self.lower.queued_output() < queued_before {
             self.wake_output_senders(&mut effects);
         }
-        if routed == ROUTE_BUDGET {
+        if routed == ROUTE_BUDGET || lower_event_ready {
             effects.continuation = true;
         }
         effects
@@ -446,7 +450,9 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
             }
             return Ok(Some(stream_id));
         }
-        replace_waiter(waiter, waker, effects);
+        if replace_waiter(waiter, waker) {
+            effects.continuation = true;
+        }
         Ok(None)
     }
 
@@ -488,7 +494,9 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
                     OpenKind::Uni => &mut slots.uni,
                     OpenKind::Bidi => &mut slots.bidi,
                 };
-                replace_waiter(waiter, waker, effects);
+                if replace_waiter(waiter, waker) {
+                    effects.continuation = true;
+                }
                 Ok(None)
             }
         }
@@ -569,38 +577,6 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
         })
     }
 
-    pub(crate) fn reconcile_closed_send(
-        &mut self,
-        stream_id: StreamId,
-        effects: &mut Effects,
-    ) -> Result<DirectionTerminal, ConnectionTerminal> {
-        for routed in 0..ROUTE_BUDGET {
-            if let Some(terminal) = &self.terminal {
-                return Err(terminal.clone());
-            }
-            if let Some(terminal) = self.stream_error(stream_id, true) {
-                return Ok(terminal);
-            }
-            let Some(event) = self.lower.try_next_event() else {
-                break;
-            };
-            effects.merge(self.route(event));
-            if routed + 1 == ROUTE_BUDGET {
-                effects.continuation = true;
-            }
-        }
-        if let Some(terminal) = &self.terminal {
-            return Err(terminal.clone());
-        }
-        if let Some(terminal) = self.stream_error(stream_id, true) {
-            return Ok(terminal);
-        }
-        if let Some(state) = self.streams.get_mut(&stream_id) {
-            state.send_terminal = Some(DirectionTerminal::Closed);
-        }
-        Ok(DirectionTerminal::Closed)
-    }
-
     pub(crate) fn park_send(
         &mut self,
         stream_id: StreamId,
@@ -617,13 +593,17 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
                 state.send_waiting_output = waiting_output;
                 &mut state.send_waiter
             };
-            replace_waiter(slot, waker, effects);
+            if replace_waiter(slot, waker) {
+                effects.continuation = true;
+            }
         }
     }
 
     pub(crate) fn park_recv(&mut self, stream_id: StreamId, waker: &Waker, effects: &mut Effects) {
-        if let Some(state) = self.streams.get_mut(&stream_id) {
-            replace_waiter(&mut state.recv_waiter, waker, effects);
+        if let Some(state) = self.streams.get_mut(&stream_id)
+            && replace_waiter(&mut state.recv_waiter, waker)
+        {
+            effects.continuation = true;
         }
     }
 
@@ -739,15 +719,15 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
     }
 }
 
-fn replace_waiter(slot: &mut Option<Waker>, waker: &Waker, effects: &mut Effects) {
-    match slot.as_ref() {
-        Some(current) if current.will_wake(waker) => {}
-        _ => {
-            let displaced = slot.replace(waker.clone());
-            if let Some(displaced) = displaced {
-                effects.wakes.push(displaced);
-            }
-        }
+fn replace_waiter(slot: &mut Option<Waker>, waker: &Waker) -> bool {
+    if !slot
+        .as_ref()
+        .is_some_and(|current| current.will_wake(waker))
+    {
+        *slot = Some(waker.clone());
+        true
+    } else {
+        false
     }
 }
 
@@ -968,7 +948,7 @@ mod tests {
         let lower = Arc::new(LowerWake::default());
         let count = Arc::new(Count::default());
         let driver = Waker::from(Arc::clone(&count));
-        assert!(lower.register_driver(&driver).is_none());
+        lower.register_driver(&driver);
         lower.begin_defer();
         Waker::from(Arc::clone(&lower)).wake_by_ref();
         assert_eq!(count.0.load(Ordering::SeqCst), 0);
@@ -1081,27 +1061,6 @@ mod tests {
         }
         assert_eq!(accept.0.load(Ordering::SeqCst), 1);
         assert_eq!(opener.0.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn closed_send_reconciliation_is_stream_scoped_without_an_event() {
-        let mut core = make_core(4);
-        let id = stream(0);
-        core.streams.insert(
-            id,
-            StreamState {
-                send_handle: true,
-                ..StreamState::default()
-            },
-        );
-        let mut effects = Effects::default();
-        assert!(matches!(
-            core.reconcile_closed_send(id, &mut effects),
-            Ok(DirectionTerminal::Closed)
-        ));
-        assert_eq!(core.stream_error(id, true), Some(DirectionTerminal::Closed));
-        assert!(core.terminal.is_none());
-        assert!(effects.wakes.is_empty());
     }
 
     #[test]

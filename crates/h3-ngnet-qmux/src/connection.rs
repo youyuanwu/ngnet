@@ -7,7 +7,7 @@ use h3::quic::{self, ConnectionErrorIncoming, StreamErrorIncoming};
 use ngnet_qmux::io::{AsyncByteStream, Clock};
 
 use crate::state::{AcceptKind, Effects, OpenKind};
-use crate::stream::{BidiStream, RecvStream, SendStream, Shared, apply_effects, drive};
+use crate::stream::{BidiStream, RecvStream, SendStream, Shared, apply_effects};
 
 /// Hyperium's connection handle over one shared QMux core.
 pub struct Connection<S: AsyncByteStream, C: Clock> {
@@ -26,7 +26,6 @@ impl<S: AsyncByteStream, C: Clock> Connection<S, C> {
         kind: OpenKind,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Opened<S, C>, StreamErrorIncoming>> {
-        drive(shared);
         let mut effects = Effects::default();
         let opened = shared.with_core(|core| core.open(opener_id, kind, cx.waker(), &mut effects));
         apply_effects(&shared.lower_wake, effects);
@@ -74,7 +73,6 @@ impl<S: AsyncByteStream, C: Clock> quic::Connection<Bytes> for Connection<S, C> 
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::RecvStream, ConnectionErrorIncoming>> {
-        drive(&self.shared);
         let mut effects = Effects::default();
         let accepted = {
             let mut core = self
@@ -96,7 +94,6 @@ impl<S: AsyncByteStream, C: Clock> quic::Connection<Bytes> for Connection<S, C> 
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
-        drive(&self.shared);
         let mut effects = Effects::default();
         let accepted = {
             let mut core = self

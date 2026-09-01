@@ -8,7 +8,9 @@ use std::task::{Context, Poll, Wake, Waker};
 use bytes::{Buf, Bytes};
 use h3::proto::frame::Frame;
 use h3::quic;
-use ngnet_qmux::io::Config;
+use h3_ngnet_qmux::from_qmux;
+use ngnet_qmux::io::testing::{TestClock, stream_pair};
+use ngnet_qmux::io::{Config, Connection as QmuxConnection};
 
 #[derive(Default)]
 struct Count {
@@ -35,6 +37,77 @@ fn counting_context() -> (Arc<Count>, Waker) {
     let count = Arc::new(Count::default());
     let waker = Waker::from(Arc::clone(&count));
     (count, waker)
+}
+
+#[test]
+fn handles_do_no_lower_io_and_the_driver_owns_the_first_flight() {
+    let (client_io, _peer_io) = stream_pair();
+    let reads = client_io.read_log();
+    let writes = client_io.write_log();
+    let lower =
+        QmuxConnection::client(client_io, TestClock::new(), Config::new()).expect("client QMux");
+    let (mut client, mut driver) = from_qmux(lower, 4);
+    let (_handle_count, handle_waker) = counting_context();
+    let mut handle_cx = Context::from_waker(&handle_waker);
+
+    assert!(matches!(
+        quic::OpenStreams::<Bytes>::poll_open_bidi(&mut client, &mut handle_cx),
+        Poll::Pending
+    ));
+    assert_eq!(reads.reads(), 0, "an H3 handle must not poll lower input");
+    assert_eq!(
+        writes.writes(),
+        0,
+        "an H3 handle must not poll lower output"
+    );
+
+    let (driver_count, driver_waker) = counting_context();
+    let mut driver_cx = Context::from_waker(&driver_waker);
+    assert!(
+        std::pin::Pin::new(&mut driver)
+            .poll(&mut driver_cx)
+            .is_pending()
+    );
+    assert_eq!(reads.reads(), 1, "the central driver owns lower input");
+    assert_eq!(
+        writes.writes(),
+        1,
+        "the central driver publishes first-flight output"
+    );
+    assert_eq!(
+        driver_count.get(),
+        0,
+        "a pending lower source does not make the driver spin"
+    );
+}
+
+#[test]
+fn a_productive_driver_read_schedules_one_poll_to_register_lower_readiness() {
+    let (client_io, server_io) = stream_pair();
+    let client_lower =
+        QmuxConnection::client(client_io, TestClock::new(), Config::new()).expect("client QMux");
+    let mut server_lower =
+        QmuxConnection::server(server_io, TestClock::new(), Config::new()).expect("server QMux");
+    let (_client, mut driver) = from_qmux(client_lower, 4);
+    let noop = Waker::noop();
+    let mut lower_cx = Context::from_waker(noop);
+    assert!(server_lower.poll_pump(&mut lower_cx).is_ready());
+
+    let (count, waker) = counting_context();
+    let mut cx = Context::from_waker(&waker);
+    assert!(std::pin::Pin::new(&mut driver).poll(&mut cx).is_pending());
+    assert_eq!(
+        count.get(),
+        1,
+        "a Ready internal-only lower batch needs one driver continuation"
+    );
+
+    assert!(std::pin::Pin::new(&mut driver).poll(&mut cx).is_pending());
+    assert_eq!(
+        count.get(),
+        1,
+        "the continuation registers lower readiness without scheduling an idle spin"
+    );
 }
 
 #[test]
@@ -127,7 +200,7 @@ fn two_cloned_unidirectional_openers_keep_independent_wakers() {
 }
 
 #[test]
-fn replacing_one_opener_waker_wakes_the_displaced_task_without_losing_the_new_one() {
+fn replacing_one_serialized_opener_waker_keeps_only_the_current_task() {
     let (client, mut client_driver, _server, mut server_driver) = common::pair(Config::new());
     let mut opener = quic::Connection::<Bytes>::opener(&client);
     let (old_count, old_waker) = counting_context();
@@ -142,7 +215,11 @@ fn replacing_one_opener_waker_wakes_the_displaced_task_without_losing_the_new_on
         quic::OpenStreams::<Bytes>::poll_open_send(&mut opener, &mut new_cx),
         Poll::Pending
     ));
-    assert_eq!(old_count.get(), 1, "the stale waiter was not silently lost");
+    assert_eq!(
+        old_count.get(),
+        0,
+        "serialized ownership replaces a stale waiter without a courtesy wake"
+    );
 
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);

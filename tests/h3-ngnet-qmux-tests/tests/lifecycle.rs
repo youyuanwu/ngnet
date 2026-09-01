@@ -151,8 +151,27 @@ async fn lower_io_failure_fans_out_as_a_stable_connection_error() {
             let _ = exchange(&sender, Bytes::new()).await;
             client_fault.inject(Fault::Broken);
 
+            // Handles are deliberately lower-I/O-free: the first immediate operation may be
+            // accepted into Core before the central driver observes the injected substrate
+            // failure. It exists to wake that driver; every operation after the driver turn
+            // must see the same terminal category.
+            let mut trigger = sender.clone();
+            if let Ok(stream) = trigger
+                .send_request(
+                    Request::builder()
+                        .method("GET")
+                        .uri("https://qmux.test/failure-trigger")
+                        .body(())
+                        .expect("request"),
+                )
+                .await
+            {
+                drop(stream);
+            }
+            tokio::task::yield_now().await;
+
             let mut category = None;
-            for _ in 0..2 {
+            for attempt in 0..2 {
                 let mut next = sender.clone();
                 let result = timeout(
                     LIMIT,
@@ -168,7 +187,7 @@ async fn lower_io_failure_fans_out_as_a_stable_connection_error() {
                 .expect("failure observation");
                 let error = match result {
                     Err(error) => error,
-                    Ok(_) => panic!("lower failure is terminal"),
+                    Ok(_) => panic!("lower failure is terminal on observation {attempt}"),
                 };
                 let current = std::mem::discriminant(&error);
                 if let Some(category) = category {

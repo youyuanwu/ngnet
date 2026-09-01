@@ -46,11 +46,6 @@ pub(crate) fn apply_effects(lower_wake: &Arc<LowerWake>, effects: Effects) {
     }
 }
 
-pub(crate) fn drive<S: AsyncByteStream, C: Clock>(shared: &Shared<S, C>) {
-    let effects = shared.with_core(|core| core.drive_turn(&shared.lower_wake));
-    apply_effects(&shared.lower_wake, effects);
-}
-
 fn h3_id(stream_id: StreamId) -> quic::StreamId {
     (stream_id.get() as u64)
         .try_into()
@@ -66,20 +61,6 @@ fn direction_error(terminal: DirectionTerminal) -> StreamErrorIncoming {
             "operation attempted after the stream direction finished".into(),
         )
         .stream_error(),
-        DirectionTerminal::Closed => StreamErrorIncoming::Unknown(Box::new(
-            crate::Error::undefined("QMux closed the stream direction"),
-        )),
-    }
-}
-
-fn closed_stream_error<S: AsyncByteStream, C: Clock>(
-    core: &mut Core<S, C>,
-    stream_id: StreamId,
-    effects: &mut Effects,
-) -> StreamErrorIncoming {
-    match core.reconcile_closed_send(stream_id, effects) {
-        Ok(terminal) => direction_error(terminal),
-        Err(terminal) => terminal.stream_error(),
     }
 }
 
@@ -162,6 +143,7 @@ impl<S: AsyncByteStream, C: Clock> SendStream<S, C> {
                                 }
                                 Ok(StreamWrite::Accepted(accepted)) => {
                                     data.advance(accepted);
+                                    effects.continuation = true;
                                     let complete = data.remaining() == 0;
                                     if complete {
                                         Step::Done
@@ -200,11 +182,20 @@ impl<S: AsyncByteStream, C: Clock> SendStream<S, C> {
                                     );
                                     Step::Pending
                                 }
-                                Ok(StreamWrite::Closed) => Step::Error(closed_stream_error(
-                                    core,
-                                    self.stream_id,
-                                    &mut effects,
-                                )),
+                                Ok(StreamWrite::Closed) => {
+                                    core.streams
+                                        .get_mut(&self.stream_id)
+                                        .expect("live stream")
+                                        .writing = Some(data);
+                                    core.park_send(
+                                        self.stream_id,
+                                        false,
+                                        false,
+                                        cx.waker(),
+                                        &mut effects,
+                                    );
+                                    Step::Pending
+                                }
                                 Err(error) => {
                                     let terminal = ConnectionTerminal::from_lower(&error);
                                     effects.merge(core.fail(terminal.clone()));
@@ -219,12 +210,8 @@ impl<S: AsyncByteStream, C: Clock> SendStream<S, C> {
 
             match step {
                 Step::Done => return Poll::Ready(Ok(())),
-                Step::Pending => {
-                    self.shared.lower_wake.request_driver();
-                    return Poll::Pending;
-                }
+                Step::Pending => return Poll::Pending,
                 Step::Progress => {
-                    self.shared.lower_wake.request_driver();
                     if turn + 1 == SEND_PROGRESS_BUDGET {
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
@@ -246,7 +233,6 @@ enum Step {
 
 impl<S: AsyncByteStream, C: Clock> quic::SendStream<Bytes> for SendStream<S, C> {
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-        drive(&self.shared);
         if let Some(error) = self.terminal() {
             return Poll::Ready(Err(error));
         }
@@ -254,32 +240,37 @@ impl<S: AsyncByteStream, C: Clock> quic::SendStream<Bytes> for SendStream<S, C> 
     }
 
     fn send_data<T: Into<WriteBuf<Bytes>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
-        let mut core = self
-            .shared
-            .core
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(terminal) = &core.terminal {
-            return Err(terminal.stream_error());
-        }
-        if let Some(terminal) = core.stream_error(self.stream_id, true) {
-            return Err(direction_error(terminal));
-        }
-        let Some(state) = core.streams.get_mut(&self.stream_id) else {
-            return Err(ConnectionTerminal::Internal(
-                "send_data called after stream state was retired".into(),
-            )
-            .stream_error());
+        let result = {
+            let mut core = self
+                .shared
+                .core
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(terminal) = &core.terminal {
+                Err(terminal.stream_error())
+            } else if let Some(terminal) = core.stream_error(self.stream_id, true) {
+                Err(direction_error(terminal))
+            } else if let Some(state) = core.streams.get_mut(&self.stream_id) {
+                if state.writing.is_some() {
+                    Err(ConnectionTerminal::Internal(
+                        "send_data called before the previous logical send became ready".into(),
+                    )
+                    .stream_error())
+                } else {
+                    state.writing = Some(data.into());
+                    Ok(())
+                }
+            } else {
+                Err(ConnectionTerminal::Internal(
+                    "send_data called after stream state was retired".into(),
+                )
+                .stream_error())
+            }
         };
-        if state.writing.is_some() {
-            Err(ConnectionTerminal::Internal(
-                "send_data called before the previous logical send became ready".into(),
-            )
-            .stream_error())
-        } else {
-            state.writing = Some(data.into());
-            Ok(())
+        if result.is_ok() {
+            self.shared.lower_wake.request_driver();
         }
+        result
     }
 
     fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
@@ -326,7 +317,6 @@ impl<S: AsyncByteStream, C: Clock> quic::SendStream<Bytes> for SendStream<S, C> 
                                 cx.waker(),
                                 &mut effects,
                             );
-                            effects.continuation = true;
                             Poll::Pending
                         }
                         Ok(StreamWrite::Accepted(_)) => {
@@ -336,11 +326,10 @@ impl<S: AsyncByteStream, C: Clock> quic::SendStream<Bytes> for SendStream<S, C> 
                             effects.merge(core.fail(terminal.clone()));
                             Poll::Ready(Err(terminal.stream_error()))
                         }
-                        Ok(StreamWrite::Closed) => Poll::Ready(Err(closed_stream_error(
-                            core,
-                            self.stream_id,
-                            &mut effects,
-                        ))),
+                        Ok(StreamWrite::Closed) => {
+                            core.park_send(self.stream_id, true, false, cx.waker(), &mut effects);
+                            Poll::Pending
+                        }
                         Err(error) => {
                             let terminal = ConnectionTerminal::from_lower(&error);
                             effects.merge(core.fail(terminal.clone()));
@@ -379,7 +368,6 @@ impl<S: AsyncByteStream, C: Clock> quic::SendStreamUnframed<Bytes> for SendStrea
         cx: &mut Context<'_>,
         buf: &mut D,
     ) -> Poll<Result<usize, StreamErrorIncoming>> {
-        drive(&self.shared);
         if let Some(error) = self.terminal() {
             return Poll::Ready(Err(error));
         }
@@ -422,7 +410,6 @@ impl<S: AsyncByteStream, C: Clock> quic::SendStreamUnframed<Bytes> for SendStrea
                         cx.waker(),
                         &mut effects,
                     );
-                    effects.continuation = true;
                     Poll::Pending
                 }
                 Ok(StreamWrite::Accepted(accepted)) => {
@@ -430,7 +417,8 @@ impl<S: AsyncByteStream, C: Clock> quic::SendStreamUnframed<Bytes> for SendStrea
                     Poll::Ready(Ok(accepted))
                 }
                 Ok(StreamWrite::Closed) => {
-                    Poll::Ready(Err(closed_stream_error(core, self.stream_id, &mut effects)))
+                    core.park_send(self.stream_id, false, false, cx.waker(), &mut effects);
+                    Poll::Pending
                 }
                 Err(error) => {
                     let terminal = ConnectionTerminal::from_lower(&error);
@@ -485,8 +473,6 @@ impl<S: AsyncByteStream, C: Clock> quic::RecvStream for RecvStream<S, C> {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
-        drive(&self.shared);
-
         let mut effects = Effects::default();
         let result = self.shared.with_core(|core| {
             if let Some(terminal) = &core.terminal {
@@ -524,9 +510,6 @@ impl<S: AsyncByteStream, C: Clock> quic::RecvStream for RecvStream<S, C> {
                             Poll::Ready(Err(StreamErrorIncoming::StreamTerminated {
                                 error_code: code,
                             }))
-                        }
-                        Some(DirectionTerminal::Closed) => {
-                            Poll::Ready(Err(direction_error(DirectionTerminal::Closed)))
                         }
                         None => {
                             core.park_recv(self.stream_id, cx.waker(), &mut effects);
