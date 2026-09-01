@@ -11,8 +11,10 @@ Four Criterion targets compare two complete H3 stacks over one shared QMux confi
 
 Each target places `ngnet-h3 + ngnet-qmux-h3` immediately beside
 `hyperium h3 + h3-ngnet-qmux`. Each arm gets a separate current-thread Tokio runtime, a
-persistent connection, and one explicit empty warm-up outside Criterion's measured closure.
-Body throughput declares request plus echoed response bytes.
+persistent connection, exactly one spawned task per endpoint, and one explicit empty warm-up
+outside Criterion's measured closure. Body throughput declares request plus echoed response
+bytes. Diagnostic probes use the same per-instance lower-I/O and endpoint-poll counters around
+both arms; production adapters expose no benchmark instrumentation.
 
 QMux windows, read-ahead, cumulative stream allowances, request headers, response, body
 generator, echo, and complete drain are identical. Hyperium GREASE is disabled and its field
@@ -22,5 +24,7 @@ the ngnet handle API does not require it; that small measured difference is disc
 
 Read duplex and socket results separately. The pair changes the H3 implementation and adapter,
 not QMux. It supports a whole-stack statement on this workload and no attribution to one layer.
-Run [`31`](../data/xeon-8370c-azure/31-h3-ngnet-qmux.md) records the current noisy,
-inconclusive evidence and asymmetric adapter diagnostics.
+Run [`31`](../data/xeon-8370c-azure/31-h3-ngnet-qmux.md) is historical evidence from unequal
+topology and removed diagnostics. Run
+[`33`](../data/xeon-8370c-azure/33-h3-qmux-post-revision.md) records the current symmetric,
+still-inconclusive comparison.
