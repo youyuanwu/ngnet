@@ -793,6 +793,8 @@ mod tests {
     use super::*;
 
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(debug_assertions)]
+    use std::{future::Future, pin::Pin, sync::Mutex};
 
     use h3::proto::frame::Frame;
     use ngnet_qmux::TransportParams;
@@ -800,6 +802,11 @@ mod tests {
     use ngnet_qmux::io::StreamWrite;
     use ngnet_qmux::io::testing::{TestByteStream, TestClock, stream_pair};
     use ngnet_qmux::io::{Config, OUTBOUND_CEILING};
+
+    #[cfg(debug_assertions)]
+    use crate::driver::Driver;
+    #[cfg(debug_assertions)]
+    use crate::stream::Shared;
 
     fn make_core(limit: usize) -> Core<TestByteStream, TestClock> {
         let (near, _far) = stream_pair();
@@ -1175,15 +1182,49 @@ mod tests {
             ));
         }
         assert!(matches!(
-            poll_once(|cx| client.poll_pump(cx)),
+            poll_once(|cx| client.poll_close(cx, &CloseReason::application(0x100, b"done"))),
             Poll::Ready(Ok(()))
         ));
         reads.clear();
         let before = core.routed_events;
-        let effects = core.drive_turn(&lower_wake);
-        assert_eq!(reads.reads(), 1);
-        assert_eq!(core.routed_events - before, ROUTE_BUDGET as u64);
-        assert!(effects.continuation);
+        #[allow(
+            clippy::arc_with_non_send_sync,
+            reason = "the test deliberately exercises the adapter's supported local-only lower I/O"
+        )]
+        let shared_core = Arc::new(Mutex::new(core));
+        let shared = Shared {
+            core: shared_core,
+            lower_wake,
+        };
+        let mut driver = Driver::new(shared.clone());
+        assert!(poll_once(|cx| Pin::new(&mut driver).poll(cx)).is_pending());
+        {
+            let core = shared.core.lock().expect("core");
+            assert_eq!(reads.reads(), 1);
+            assert_eq!(core.routed_events - before, ROUTE_BUDGET as u64);
+            assert!(
+                core.terminal.is_none(),
+                "a forced pump must not overtake decoded events at a self-woken budget boundary"
+            );
+        }
+
+        let mut ending = None;
+        for _ in 0..16 {
+            if let Poll::Ready(result) = poll_once(|cx| Pin::new(&mut driver).poll(cx)) {
+                ending = Some(result);
+                break;
+            }
+        }
+        assert!(
+            matches!(ending, Some(Err(_))),
+            "the peer close is eventually reported"
+        );
+        let core = shared.core.lock().expect("core");
+        assert_eq!(
+            core.routed_events - before,
+            200,
+            "all stream-open and final-data events precede the connection ending"
+        );
     }
 
     #[test]

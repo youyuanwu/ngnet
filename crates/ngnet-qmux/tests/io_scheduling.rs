@@ -255,7 +255,23 @@ fn a_credit_exhausted_write_parks_and_is_woken_by_the_extension() {
         .extend_connection_credit(WINDOW)
         .expect("extending the connection window");
     let _ = poll_once(|cx| server.poll_pump(cx));
-    let _ = poll_once(|cx| client.poll_next_event(cx));
+    let mut connection_credit = None;
+    for _ in 0..4 {
+        match client.poll_next_event(&mut cx) {
+            Poll::Ready(Ok(Event::ConnectionDataCredit { available })) => {
+                connection_credit = Some(available);
+            }
+            Poll::Ready(Ok(_)) => {}
+            Poll::Ready(Err(error)) => {
+                panic!("the connection ended while receiving credit: {error}")
+            }
+            Poll::Pending => break,
+        }
+    }
+    assert!(
+        connection_credit.is_some_and(|available| available >= WINDOW),
+        "MAX_DATA growth must be reported as ordered connection credit: {connection_credit:?}"
+    );
 
     assert!(
         matches!(

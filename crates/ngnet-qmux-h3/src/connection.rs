@@ -335,6 +335,7 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
     /// Pulls from the layer until there is an event to hand over, or nothing left to pull.
     fn fill(&mut self, cx: &mut Context<'_>) {
         let mut polled_lower = false;
+        let mut lower_made_progress = false;
         while self.next.is_none() {
             let event = if let Some(event) = self.conn.try_next_event() {
                 Some(Ok(event))
@@ -343,7 +344,11 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
             } else {
                 polled_lower = true;
                 match self.conn.poll_next_event(cx) {
-                    Poll::Ready(event) => Some(event),
+                    Poll::Ready(Ok(event)) => {
+                        lower_made_progress = true;
+                        Some(Ok(event))
+                    }
+                    Poll::Ready(Err(error)) => Some(Err(error)),
                     Poll::Pending => None,
                 }
             };
@@ -359,6 +364,12 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
                 }
                 None => break,
             }
+        }
+        if lower_made_progress && self.next.is_none() && self.ending.is_none() {
+            // A Ready lower read owes no wake. If its whole decoded batch consisted of
+            // adapter-only control events, schedule one continuation so the H3 event task
+            // cannot park before registering on the next lower read.
+            cx.waker().wake_by_ref();
         }
     }
 
@@ -455,6 +466,9 @@ impl<S: AsyncByteStream, C: Clock> Inner<S, C> {
             // The peer's stream limit, not a failure. The layer waits, and the wake the
             // layer below registered is what releases it.
             Ok(StreamOpen::Blocked) => {
+                // QMux opens are immediate and keep no parked-open slot. The next H3 driver
+                // pass polls events, where StreamLimit/PeerTransportParams routing wakes this
+                // operation's direction-specific waiter.
                 let waiter = if bidi {
                     &mut self.open_bidi_waiter
                 } else {
@@ -888,6 +902,14 @@ pub struct Connection<S: AsyncByteStream, C: Clock, D> {
     tail: QmuxConnection<S, C>,
 }
 
+/// Recognizes an orderly QMux ending surfaced through an H3 operation during startup.
+///
+/// Buffered event polling can decode transport parameters and a following peer close in one
+/// lower batch while H3 is still opening its control streams. In that narrow timing window the
+/// H3 driver reports the backend ending as an operation error instead of observing the ordered
+/// `Closed` event. The public connection future still treats QMux's explicitly orderly endings
+/// as successful connection completion; protocol, truncation, and lower-I/O failures remain
+/// errors.
 fn orderly_backend_ending(error: &H3Error) -> bool {
     std::error::Error::source(error)
         .and_then(|source| source.downcast_ref::<Error>())

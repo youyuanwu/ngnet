@@ -79,6 +79,13 @@ impl<S: AsyncByteStream, C: Clock> Future for Driver<S, C> {
                     core.driver_error = Some(error.clone());
                     core.driver_complete = true;
                     Poll::Ready(Err(error))
+                } else if effects.continuation {
+                    // The routing budget was exhausted while decoded lower events remain.
+                    // `apply_effects` schedules the next turn, so this is an internal
+                    // self-woken boundary rather than a suspension. Do not ask the forced
+                    // pump for its terminal yet: QMux deliberately reports a latched ending
+                    // there even while pre-ending events remain queued.
+                    Poll::Pending
                 } else {
                     let lower_waker = Waker::from(Arc::clone(&this.shared.lower_wake));
                     let mut lower_cx = Context::from_waker(&lower_waker);
