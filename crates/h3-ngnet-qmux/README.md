@@ -14,8 +14,9 @@ executor, or timer.
 
 All handles share one `Arc<Mutex<Core<S, C>>>`. A stable proxy waker is the only
 waker passed to QMux; accept, open, receive, send, finish, and driver operations
-keep independent current waiters above it. Each poll performs bounded
-opportunistic work: at most one lower read batch and 64 routed events.
+keep independent current waiters above it. Handle polls perform immediate state
+operations only. The central driver owns every lower read/write poll, admits at
+most one lower read batch per turn, and routes at most 64 events.
 
 Hyperium's synchronous `close` records the first application reason and wakes
 the driver. Delivery is complete only when the driver finishes. Dropping all

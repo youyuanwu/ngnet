@@ -7,12 +7,12 @@
 //! # Progress and close invariant
 //!
 //! The driver must be polled concurrently for the entire lifetime of the H3 connection and
-//! its stream handles. H3 operations may borrow one bounded progress turn, but the driver is
-//! the stable lower-I/O wake target and the only owner of shutdown completion. In particular,
-//! hyperium's `OpenStreams::close` is synchronous: it records the first close reason and wakes
-//! the driver, but it cannot claim that the close reached the peer. If the driver and all
-//! capable handles are dropped before another driver poll, buffered stream data and the close
-//! are not guaranteed to be delivered.
+//! its stream handles. H3 operations perform immediate shared-state work and register their
+//! current waiter; only the driver polls lower I/O, owns its stable wake target, and completes
+//! shutdown. In particular, hyperium's `OpenStreams::close` is synchronous: it records the
+//! first close reason and wakes the driver, but it cannot claim that the close reached the
+//! peer. If the driver and all capable handles are dropped before another driver poll,
+//! buffered stream data and the close are not guaranteed to be delivered.
 //!
 //! # Bounds and portability
 //!
@@ -27,7 +27,6 @@
 #![deny(missing_docs, unsafe_code)]
 
 mod connection;
-
 mod driver;
 mod error;
 mod state;

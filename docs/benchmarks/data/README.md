@@ -57,6 +57,7 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [29-ngtcp2-residual-eligibility](xeon-8370c-azure/29-ngtcp2-residual-eligibility.md) | xeon-8370c-azure | 2026-08-30 | Residual partition — **all candidates deferred; no promotion pending** | — |
 | [30-ngtcp2-final-review-resolution](xeon-8370c-azure/30-ngtcp2-final-review-resolution.md) | xeon-8370c-azure | 2026-08-30 | Final-review resolution — **final calibration passes; unarmed and diagnostic stalls retained; RSS/stability criterion unmet** | — |
 | [31-h3-ngnet-qmux](xeon-8370c-azure/31-h3-ngnet-qmux.md) | xeon-8370c-azure | 2026-08-31 | Matched ngnet/hyperium H3 over QMux — **substrate-dependent and inconclusive under drift** | — |
+| [32-h3-qmux-driver-ownership](xeon-8370c-azure/32-h3-qmux-driver-ownership.md) | xeon-8370c-azure | 2026-09-01 | Driver-only lower I/O A/B — **retained; body improvement clears controls on both substrates** | — |
 
 Runs [`08`](xeon-8370c-azure/08-qmux-against-h2.md) and
 [`09`](xeon-8370c-azure/09-qmux-h2-mechanisms.md) are the first cross-protocol comparison and its

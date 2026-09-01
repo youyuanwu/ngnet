@@ -13,10 +13,12 @@ driver share `Arc<Mutex<Core<S, C>>>`. Each active send may retain one
 discard it under the same authoritative lock without a second registry.
 
 The driver is the stable lower-I/O wake target and shutdown-completion owner.
-Trait polls may borrow bounded progress, but the crate never spawns and creates
-no per-stream task. QMux receives one proxy waker. It records lower readiness
-while the core is locked and delivers user wakes only after unlock, preventing
-inline-waker reentrancy from deadlocking the mutex.
+Trait polls perform only immediate Core operations, register their direction's
+current waiter when blocked, and notify the driver when they create work. The
+crate never spawns and creates no per-stream task. QMux receives one proxy
+waker. It records lower readiness while the core is locked and delivers user
+wakes only after unlock, preventing inline-waker reentrancy from deadlocking
+the mutex.
 
 ## Bounded lower seam and routing
 
@@ -61,4 +63,5 @@ benchmark crate wraps both compared adapters with the same per-instance lower-I/
 counter and polls each adapter/H3 pair through one combined endpoint future.
 Timings remain whole-stack comparisons. Run 31 is historical evidence from the
 superseded asymmetric topology and instrumentation; current conclusions require
-the post-revision matched runs.
+the post-revision matched runs. Run 32 records the controlled progress-ownership
+A/B that retained driver-only lower I/O.
