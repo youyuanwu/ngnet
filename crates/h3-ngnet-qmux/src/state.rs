@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
 
-#[cfg(any(feature = "diagnostics", test))]
+#[cfg(test)]
 use bytes::Buf;
 use bytes::Bytes;
 use h3::error::Code;
@@ -202,8 +202,6 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
     pub(crate) fn drive_turn(&mut self, lower_wake: &Arc<LowerWake>) -> Effects {
         let mut effects = Effects::default();
         if self.terminal.is_some() {
-            #[cfg(feature = "diagnostics")]
-            crate::diagnostics::pump(false);
             return effects;
         }
 
@@ -216,8 +214,6 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
             routed += 1;
             effects.merge(self.route(event));
             if self.terminal.is_some() {
-                #[cfg(feature = "diagnostics")]
-                crate::diagnostics::pump(true);
                 return effects;
             }
         }
@@ -251,19 +247,10 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
         if routed == ROUTE_BUDGET {
             effects.continuation = true;
         }
-        #[cfg(feature = "diagnostics")]
-        crate::diagnostics::pump(routed != 0);
         effects
     }
 
     fn route(&mut self, event: Event) -> Effects {
-        #[cfg(feature = "diagnostics")]
-        crate::diagnostics::route(!matches!(
-            &event,
-            Event::StreamLimit { .. }
-                | Event::ConnectionDataCredit { .. }
-                | Event::PeerTransportParams(_)
-        ));
         #[cfg(debug_assertions)]
         {
             self.routed_events = self.routed_events.saturating_add(1);
@@ -293,10 +280,6 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
                     {
                         return self.fail(ConnectionTerminal::from_lower(&error));
                     }
-                    #[cfg(feature = "diagnostics")]
-                    if !data.is_empty() {
-                        crate::diagnostics::connection_credit();
-                    }
                     return effects;
                 }
                 if !data.is_empty() {
@@ -310,8 +293,6 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
                     return effects;
                 }
                 take_waiter(&mut state.recv_waiter, &mut effects);
-                #[cfg(feature = "diagnostics")]
-                crate::diagnostics::receive_gauge(self.retained_receive_bytes());
             }
             Event::StreamOpened { stream_id } => {
                 if stream_id.initiator() == self.local_initiator() {
@@ -369,8 +350,6 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
                     state.writing = None;
                     take_waiter(&mut state.send_waiter, &mut effects);
                     take_waiter(&mut state.finish_waiter, &mut effects);
-                    #[cfg(feature = "diagnostics")]
-                    crate::diagnostics::send_gauge(self.retained_send_bytes());
                 }
             }
             Event::StreamDataCredit { stream_id, .. } => {
@@ -528,8 +507,6 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
             return Effects::default();
         }
         self.terminal = Some(terminal);
-        #[cfg(feature = "diagnostics")]
-        crate::diagnostics::terminal();
         let mut effects = Effects::default();
         take_waiter(&mut self.accept_uni, &mut effects);
         take_waiter(&mut self.accept_bidi, &mut effects);
@@ -674,8 +651,6 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
                 .map(|item| item.data.len() as u64)
                 .sum::<u64>()
         };
-        #[cfg(feature = "diagnostics")]
-        crate::diagnostics::receive_gauge(self.retained_receive_bytes());
         if bytes != 0 {
             self.lower
                 .extend_connection_credit(bytes)
@@ -684,8 +659,6 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
             {
                 self.discarded_connection_credit_applications += 1;
             }
-            #[cfg(feature = "diagnostics")]
-            crate::diagnostics::connection_credit();
         }
         Ok(())
     }
@@ -732,12 +705,10 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
         });
         if remove {
             self.streams.remove(&stream_id);
-            #[cfg(feature = "diagnostics")]
-            crate::diagnostics::cleanup();
         }
     }
 
-    #[cfg(any(feature = "diagnostics", test))]
+    #[cfg(test)]
     pub(crate) fn retained_receive_bytes(&self) -> usize {
         self.streams
             .values()
@@ -746,7 +717,7 @@ impl<S: AsyncByteStream, C: Clock> Core<S, C> {
             .sum()
     }
 
-    #[cfg(any(feature = "diagnostics", test))]
+    #[cfg(test)]
     pub(crate) fn retained_send_bytes(&self) -> usize {
         self.streams
             .values()
@@ -773,8 +744,6 @@ fn replace_waiter(slot: &mut Option<Waker>, waker: &Waker, effects: &mut Effects
         Some(current) if current.will_wake(waker) => {}
         _ => {
             let displaced = slot.replace(waker.clone());
-            #[cfg(feature = "diagnostics")]
-            crate::diagnostics::waiter(displaced.is_some());
             if let Some(displaced) = displaced {
                 effects.wakes.push(displaced);
             }

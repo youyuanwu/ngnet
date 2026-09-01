@@ -8,10 +8,6 @@ license.workspace = true
 repository.workspace = true
 readme = "README.md"
 
-[features]
-default = []
-diagnostics = []
-
 [dependencies]
 bytes = { workspace = true }
 h3 = { workspace = true }

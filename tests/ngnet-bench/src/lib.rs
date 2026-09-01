@@ -1481,30 +1481,11 @@ impl NgnetQmuxH3Matched {
     }
 }
 
-#[cfg(feature = "diagnostics")]
-type UpstreamObserved<S> = h3_ngnet_qmux::diagnostics::ObservedStream<S>;
-#[cfg(not(feature = "diagnostics"))]
-type UpstreamObserved<S> = S;
-
-#[cfg(feature = "diagnostics")]
-fn upstream_observe<S>(stream: S) -> UpstreamObserved<S> {
-    h3_ngnet_qmux::diagnostics::observe(stream).0
-}
-
-#[cfg(not(feature = "diagnostics"))]
-fn upstream_observe<S>(stream: S) -> UpstreamObserved<S> {
-    stream
-}
-
-type UpstreamMemoryOpener = h3_ngnet_qmux::OpenStreams<
-    CountingStream<UpstreamObserved<TokioStream<tokio::io::DuplexStream>>>,
-    TokioClock,
->;
+type UpstreamMemoryOpener =
+    h3_ngnet_qmux::OpenStreams<CountingStream<TokioStream<tokio::io::DuplexStream>>, TokioClock>;
 type UpstreamMemorySender = h3::client::SendRequest<UpstreamMemoryOpener, Bytes>;
-type UpstreamSocketOpener = h3_ngnet_qmux::OpenStreams<
-    CountingStream<UpstreamObserved<TokioStream<TokioTcpStream>>>,
-    TokioClock,
->;
+type UpstreamSocketOpener =
+    h3_ngnet_qmux::OpenStreams<CountingStream<TokioStream<TokioTcpStream>>, TokioClock>;
 type UpstreamSocketSender = h3::client::SendRequest<UpstreamSocketOpener, Bytes>;
 
 /// Pending peer accepts reserved by the benchmark adapter.
@@ -1681,10 +1662,7 @@ async fn upstream_memory_pair() -> (UpstreamMemorySender, UpstreamQmuxTasks, Ben
     let (client_io, server_io) = duplex(DUPLEX_CAPACITY);
     let counters = BenchCounters::default();
     let server_lower = ngnet_qmux::io::Connection::server(
-        CountingStream::new(
-            upstream_observe(TokioStream::new(server_io)),
-            counters.clone(),
-        ),
+        CountingStream::new(TokioStream::new(server_io), counters.clone()),
         TokioClock::new(),
         qmux_config(),
     )
@@ -1698,10 +1676,7 @@ async fn upstream_memory_pair() -> (UpstreamMemorySender, UpstreamQmuxTasks, Ben
     ));
 
     let client_lower = ngnet_qmux::io::Connection::client(
-        CountingStream::new(
-            upstream_observe(TokioStream::new(client_io)),
-            counters.clone(),
-        ),
+        CountingStream::new(TokioStream::new(client_io), counters.clone()),
         TokioClock::new(),
         qmux_config(),
     )
@@ -2347,10 +2322,7 @@ async fn upstream_socket_pair() -> (UpstreamSocketSender, UpstreamQmuxTasks, Ben
     let (client_io, server_io) = tokio_socket_pair().await;
     let counters = BenchCounters::default();
     let server_lower = ngnet_qmux::io::Connection::server(
-        CountingStream::new(
-            upstream_observe(TokioStream::new(server_io)),
-            counters.clone(),
-        ),
+        CountingStream::new(TokioStream::new(server_io), counters.clone()),
         TokioClock::new(),
         qmux_config(),
     )
@@ -2364,10 +2336,7 @@ async fn upstream_socket_pair() -> (UpstreamSocketSender, UpstreamQmuxTasks, Ben
     ));
 
     let client_lower = ngnet_qmux::io::Connection::client(
-        CountingStream::new(
-            upstream_observe(TokioStream::new(client_io)),
-            counters.clone(),
-        ),
+        CountingStream::new(TokioStream::new(client_io), counters.clone()),
         TokioClock::new(),
         qmux_config(),
     )

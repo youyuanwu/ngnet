@@ -9,9 +9,9 @@
 //!   workload = body | concurrent
 //!   param    = body size in bytes, or stream count
 //!
-//! The QUIC arms support `body` only. Diagnostic mode is supported by `ngnet-quic-h3 body`,
-//! `h3-qmux-duplex body`, and `h3-qmux-socket body`, and additionally requires
-//! `--features diagnostics`; timing mode is always unarmed.
+//! The QUIC arms support `body` only. Diagnostic mode uses bench-local symmetric counters for
+//! the four QMux arms. `ngnet-quic-h3 body` additionally requires `--features diagnostics`;
+//! timing mode is always unarmed.
 
 use std::hint::black_box;
 use std::io::Write;
@@ -166,54 +166,11 @@ fn emit_diagnostics(
 ) {
     if matches!(
         arm_name,
-        "ngnet-qmux-matched-duplex" | "ngnet-qmux-matched-socket"
+        "ngnet-qmux-matched-duplex"
+            | "ngnet-qmux-matched-socket"
+            | "h3-qmux-duplex"
+            | "h3-qmux-socket"
     ) {
-        return;
-    }
-    if matches!(arm_name, "h3-qmux-duplex" | "h3-qmux-socket") {
-        let snapshot = h3_ngnet_qmux::diagnostics::drain();
-        eprintln!(
-            "PROBE-QMUX-DIAGNOSTIC exchange={exchange} scope={scope} \
-             lower_read_calls={} lower_read_bytes={} lower_write_calls={} \
-             lower_write_bytes={} lower_write_not_now={} lower_shutdown_calls={} \
-             lower_failures={} adapter_polls={} driver_polls={} no_progress_polls={} pump_attempts={} \
-             productive_turns={} routed_events={} stream_events={} connection_events={} \
-             stream_credit_applications={} connection_credit_applications={} \
-             waiter_registrations={} waiter_replacements={} wake_deliveries={} \
-             logical_send_chunks={} retained_send_bytes={} retained_send_high_water={} \
-             retained_receive_bytes={} retained_receive_high_water={} cleanups={} \
-             terminal_fanouts={} application_body_bytes={} overflow={}",
-            snapshot.lower_read_calls,
-            snapshot.lower_read_bytes,
-            snapshot.lower_write_calls,
-            snapshot.lower_write_bytes,
-            snapshot.lower_write_not_now,
-            snapshot.lower_shutdown_calls,
-            snapshot.lower_failures,
-            snapshot.adapter_polls,
-            snapshot.driver_polls,
-            snapshot.no_progress_polls,
-            snapshot.pump_attempts,
-            snapshot.productive_turns,
-            snapshot.routed_events,
-            snapshot.stream_events,
-            snapshot.connection_events,
-            snapshot.stream_credit_applications,
-            snapshot.connection_credit_applications,
-            snapshot.waiter_registrations,
-            snapshot.waiter_replacements,
-            snapshot.wake_deliveries,
-            snapshot.logical_send_chunks,
-            snapshot.retained_send_bytes,
-            snapshot.retained_send_high_water,
-            snapshot.retained_receive_bytes,
-            snapshot.retained_receive_high_water,
-            snapshot.cleanups,
-            snapshot.terminal_fanouts,
-            application_body_bytes
-                .map_or_else(|| "unavailable".to_string(), |bytes| bytes.to_string()),
-            snapshot.overflowed,
-        );
         return;
     }
     let drained = ngnet_quic::diagnostics::drain();
@@ -392,12 +349,21 @@ fn emit_diagnostics(
 
 #[cfg(not(feature = "diagnostics"))]
 fn emit_diagnostics(
-    _arm_name: &str,
+    arm_name: &str,
     _exchange: usize,
     _scope: &str,
     _application_body_bytes: Option<usize>,
 ) {
-    unreachable!("diagnostic mode is rejected before setup")
+    assert!(
+        matches!(
+            arm_name,
+            "ngnet-qmux-matched-duplex"
+                | "ngnet-qmux-matched-socket"
+                | "h3-qmux-duplex"
+                | "h3-qmux-socket"
+        ),
+        "ngnet-quic-h3 diagnostic mode requires --features diagnostics"
+    );
 }
 
 fn validate_request(
@@ -463,9 +429,9 @@ fn main() {
         .unwrap_or_else(|message| panic!("{message}"));
     #[cfg(not(feature = "diagnostics"))]
     assert!(
-        mode == Mode::Timing,
-        "diagnostic mode requires `cargo build -p ngnet-bench --example probe --release \
-         --features diagnostics`"
+        mode == Mode::Timing || arm_name != "ngnet-quic-h3",
+        "ngnet-quic-h3 diagnostic mode requires `cargo build -p ngnet-bench --example probe \
+         --release --features diagnostics`"
     );
 
     let rt = current_thread_runtime();
@@ -530,11 +496,6 @@ fn main() {
         {
             ngnet_quic::diagnostics::reset();
             ngnet_quic::diagnostics::arm(mode == Mode::Diagnostic && arm_name == "ngnet-quic-h3");
-            h3_ngnet_qmux::diagnostics::reset();
-            h3_ngnet_qmux::diagnostics::arm(
-                mode == Mode::Diagnostic
-                    && matches!(arm_name.as_str(), "h3-qmux-duplex" | "h3-qmux-socket"),
-            );
         }
 
         if mode == Mode::Diagnostic {
@@ -617,6 +578,9 @@ fn main() {
                     }
                     black_box(received);
                     if mode == Mode::Diagnostic {
+                        // Let the counted endpoint consume its already-scheduled credit/flush
+                        // continuation before this per-exchange interval is observed.
+                        tokio::task::yield_now().await;
                         emit_rss("response-drained", exchange, post_drain_rss);
                         emit_diagnostics(&arm_name, exchange, "both-endpoints", Some(param));
                         arm.emit_symmetric_counters(exchange, "both-endpoints");

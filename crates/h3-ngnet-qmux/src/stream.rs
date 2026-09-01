@@ -38,8 +38,6 @@ impl<S: AsyncByteStream, C: Clock> Shared<S, C> {
 }
 
 pub(crate) fn apply_effects(lower_wake: &Arc<LowerWake>, effects: Effects) {
-    #[cfg(feature = "diagnostics")]
-    crate::diagnostics::wakes(effects.wakes.len());
     for waker in effects.wakes {
         waker.wake();
     }
@@ -49,8 +47,6 @@ pub(crate) fn apply_effects(lower_wake: &Arc<LowerWake>, effects: Effects) {
 }
 
 pub(crate) fn drive<S: AsyncByteStream, C: Clock>(shared: &Shared<S, C>) {
-    #[cfg(feature = "diagnostics")]
-    crate::diagnostics::adapter_poll();
     let effects = shared.with_core(|core| core.drive_turn(&shared.lower_wake));
     apply_effects(&shared.lower_wake, effects);
 }
@@ -168,16 +164,12 @@ impl<S: AsyncByteStream, C: Clock> SendStream<S, C> {
                                     data.advance(accepted);
                                     let complete = data.remaining() == 0;
                                     if complete {
-                                        #[cfg(feature = "diagnostics")]
-                                        crate::diagnostics::send_gauge(core.retained_send_bytes());
                                         Step::Done
                                     } else if accepted < offered {
                                         core.streams
                                             .get_mut(&self.stream_id)
                                             .expect("live stream")
                                             .writing = Some(data);
-                                        #[cfg(feature = "diagnostics")]
-                                        crate::diagnostics::send_gauge(core.retained_send_bytes());
                                         core.park_send(
                                             self.stream_id,
                                             false,
@@ -191,8 +183,6 @@ impl<S: AsyncByteStream, C: Clock> SendStream<S, C> {
                                             .get_mut(&self.stream_id)
                                             .expect("live stream")
                                             .writing = Some(data);
-                                        #[cfg(feature = "diagnostics")]
-                                        crate::diagnostics::send_gauge(core.retained_send_bytes());
                                         Step::Progress
                                     }
                                 }
@@ -288,11 +278,6 @@ impl<S: AsyncByteStream, C: Clock> quic::SendStream<Bytes> for SendStream<S, C> 
             .stream_error())
         } else {
             state.writing = Some(data.into());
-            #[cfg(feature = "diagnostics")]
-            {
-                crate::diagnostics::send_chunk();
-                crate::diagnostics::send_gauge(core.retained_send_bytes());
-            }
             Ok(())
         }
     }
@@ -511,8 +496,6 @@ impl<S: AsyncByteStream, C: Clock> quic::RecvStream for RecvStream<S, C> {
                     .streams
                     .get_mut(&self.stream_id)
                     .and_then(|state| state.recv.pop_front());
-                #[cfg(feature = "diagnostics")]
-                crate::diagnostics::receive_gauge(core.retained_receive_bytes());
                 if let Some(item) = item {
                     let bytes = item.data.len() as u64;
                     let credited = core
@@ -524,13 +507,6 @@ impl<S: AsyncByteStream, C: Clock> quic::RecvStream for RecvStream<S, C> {
                         effects.merge(core.fail(terminal.clone()));
                         Poll::Ready(Err(terminal.stream_error()))
                     } else {
-                        #[cfg(feature = "diagnostics")]
-                        {
-                            if bytes != 0 {
-                                crate::diagnostics::stream_credit();
-                                crate::diagnostics::connection_credit();
-                            }
-                        }
                         if item.fin
                             && let Some(state) = core.streams.get_mut(&self.stream_id)
                         {

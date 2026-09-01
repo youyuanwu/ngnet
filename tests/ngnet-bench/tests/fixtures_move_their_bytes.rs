@@ -131,14 +131,25 @@ fn matched_qmux_fixtures_use_symmetric_per_instance_counters() {
     let ngnet = runtime.block_on(NgnetQmuxH3Matched::establish());
     assert_eq!(ngnet.counter_snapshot(), Default::default());
     ngnet.arm_counters();
-    assert_eq!(runtime.block_on(ngnet.round_trip(body.clone())), body.len());
+    assert_eq!(
+        runtime.block_on(async {
+            let received = ngnet.round_trip(body.clone()).await;
+            tokio::task::yield_now().await;
+            received
+        }),
+        body.len()
+    );
     let ngnet_memory = ngnet.counter_snapshot();
 
     let upstream = runtime.block_on(UpstreamH3Qmux::establish());
     assert_eq!(upstream.counter_snapshot(), Default::default());
     upstream.arm_counters();
     assert_eq!(
-        runtime.block_on(upstream.round_trip(body.clone())),
+        runtime.block_on(async {
+            let received = upstream.round_trip(body.clone()).await;
+            tokio::task::yield_now().await;
+            received
+        }),
         body.len()
     );
     let upstream_memory = upstream.counter_snapshot();
@@ -147,7 +158,11 @@ fn matched_qmux_fixtures_use_symmetric_per_instance_counters() {
     assert_eq!(ngnet_socket.counter_snapshot(), Default::default());
     ngnet_socket.arm_counters();
     assert_eq!(
-        runtime.block_on(ngnet_socket.round_trip(body.clone())),
+        runtime.block_on(async {
+            let received = ngnet_socket.round_trip(body.clone()).await;
+            tokio::task::yield_now().await;
+            received
+        }),
         body.len()
     );
     let ngnet_socket = ngnet_socket.counter_snapshot();
@@ -155,7 +170,14 @@ fn matched_qmux_fixtures_use_symmetric_per_instance_counters() {
     let upstream_socket = runtime.block_on(UpstreamH3QmuxSocket::establish());
     assert_eq!(upstream_socket.counter_snapshot(), Default::default());
     upstream_socket.arm_counters();
-    assert_eq!(runtime.block_on(upstream_socket.round_trip(body)), 100_003);
+    assert_eq!(
+        runtime.block_on(async {
+            let received = upstream_socket.round_trip(body).await;
+            tokio::task::yield_now().await;
+            received
+        }),
+        100_003
+    );
     let upstream_socket = upstream_socket.counter_snapshot();
 
     for snapshot in [ngnet_memory, upstream_memory, ngnet_socket, upstream_socket] {
@@ -174,21 +196,21 @@ fn matched_qmux_fixtures_use_symmetric_per_instance_counters() {
             ngnet_memory.lower_read_bytes,
             ngnet_memory.lower_write_bytes
         ),
-        (200_271, 200_271)
+        (200_278, 200_278)
     );
     assert_eq!(
         (
             upstream_memory.lower_read_bytes,
             upstream_memory.lower_write_bytes
         ),
-        (200_384, 200_398)
+        (200_398, 200_398)
     );
     assert_eq!(
         (
             ngnet_socket.lower_read_bytes,
             ngnet_socket.lower_write_bytes
         ),
-        (200_271, 200_271)
+        (200_271, 200_278)
     );
     assert_eq!(
         (

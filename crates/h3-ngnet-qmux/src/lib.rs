@@ -27,8 +27,7 @@
 #![deny(missing_docs, unsafe_code)]
 
 mod connection;
-#[cfg(feature = "diagnostics")]
-pub mod diagnostics;
+
 mod driver;
 mod error;
 mod state;

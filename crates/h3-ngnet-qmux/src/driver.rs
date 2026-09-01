@@ -34,8 +34,6 @@ impl<S: AsyncByteStream, C: Clock> Future for Driver<S, C> {
     type Output = Result<(), Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        #[cfg(feature = "diagnostics")]
-        crate::diagnostics::driver_poll();
         let this = self.get_mut();
         let displaced = this.shared.lower_wake.register_driver(cx.waker());
         if let Some(displaced) = displaced {
