@@ -10,7 +10,7 @@ what the run does and does not establish.
 | Machine | Status | Runs |
 | --- | --- | --- |
 | [`legacy-dev-host`](legacy-dev-host/) | **Retired, unavailable.** Every measurement taken before 2026-08-16. Noisy: unchanged control arms drifted 5–15% within a session. | 4 |
-| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current VM; historical machine label and recorded spec are Intel Xeon Platinum 8370C. Runs 12–23 report 8573C, while runs 24, 29, and 30 report 8370C again; Azure migration timing is unknown, so absolute figures across runs are not controlled. | 30 |
+| [`xeon-8370c-azure`](xeon-8370c-azure/) | Current VM; historical machine label and recorded spec are Intel Xeon Platinum 8370C. Runs 12–23 report 8573C, while runs 24, 29, and 30 report 8370C again; Azure migration timing is unknown, so absolute figures across runs are not controlled. | 33 |
 
 **Absolute figures from different machines must never be tabulated together.** Nothing here
 is normalised for CPU model, kernel or io_uring implementation, and those are exactly the
