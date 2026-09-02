@@ -50,6 +50,13 @@ Release build, pinned with `taskset -c 0`, both arms over the same `ngnet-quic` 
 the same fixtures and the same workload. The host was **not** quiesced for these runs and did
 not need to be: a completion count is not a timing.
 
+The measurements were taken in two rounds, because a review of the first round changed the
+native arm and it would have been dishonest to keep reporting numbers describing code that no
+longer exists. Both rounds are given, with the code each describes.
+
+**Round 1** — the FIN distinction, with `ngnet-quic-h3` ending its drain pass on a packet that
+carried no STREAM frame:
+
 | Workload | Arm | Runs | Failures |
 | --- | --- | ---: | ---: |
 | 200 x 1 KiB | `h3-ngnet-quic` | 25 | 0 |
@@ -59,36 +66,56 @@ not need to be: a completion count is not a timing.
 | 30 x 1 MiB | `h3-ngnet-quic` | 10 | 0 |
 | 30 x 1 MiB | `ngnet-quic-h3` (matched) | 10 | 0 |
 
-For comparison, from run 01 on the same host before the fix, same 1 KiB workload:
-`h3-ngnet-quic` 6 failures in 10, `ngnet-quic-h3` 0 in 10.
+**Round 2** — after review, with `ngnet-quic-h3` re-offering the displaced stream inside the
+same pass instead of ending it. `Offers::write_next` unblocks and re-offers a stream only when
+it is asked again, and the packet that displaced it may be a bare acknowledgement, which is not
+ack-eliciting and so prompts nothing to come back:
 
-The crate's own suite, with every previously `#[ignore]`d live-loopback test enabled, passed 35
-tests in each of 3 consecutive pinned release runs.
+| Workload | Arm | Runs | Failures |
+| --- | --- | ---: | ---: |
+| 200 x 1 KiB | `h3-ngnet-quic` | 20 | 0 |
+| 200 x 1 KiB | `ngnet-quic-h3` (matched) | 20 | 0 |
+| 200 x 16 KiB | `h3-ngnet-quic` | 20 | 0 |
+| 200 x 16 KiB | `ngnet-quic-h3` (matched) | 50 | 0 |
+| 30 x 1 MiB | `h3-ngnet-quic` | 10 | 0 |
+| 30 x 1 MiB | `ngnet-quic-h3` (matched) | 10 | 0 |
+| Full `h3-ngnet-quic` suite, release, pinned | `h3-ngnet-quic` | 15 | 0 |
 
-## The 16 KiB row, and who owns it
+For comparison, from run 01 on the same host before any of this, same 1 KiB workload:
+`h3-ngnet-quic` 6 failures in 10 as first measured, and 11 failures in 25 after the two waker
+and timer fixes that run 01 also records. The second figure is the one this change is actually
+measured against, because it describes the code immediately before it; the first is quoted only
+because it is the one the defect was found with.
 
-The two failures are the *native* arm's, and they are the known S9 large-body defect rather than
-anything new. Both failed with `ErrorKind::Closed` — "the connection has ended" — reported by
-the ngtcp2 HTTP/3 server driver, not with a timeout.
+The 1 MiB rows are not evidence that 1 MiB is safe on either arm — see *What it does not*
+below. They are recorded because run 01 listed those probes as planned and not run.
 
-The attribution rule is the one run 01 fixed before measuring, applied unchanged and this time
-pointing the other way: the transport, the fixtures, the payload and the exchange count were
-identical across the two arms, so a failure on one and not the other belongs to the layer that
-differs. In run 01 that reasoning assigned the 1 KiB failures to `h3-ngnet-quic`. Here it
-assigns the 16 KiB failures to `ngnet-quic-h3`.
+### The 16 KiB rows, and what the second round does and does not show
 
-The FIN fix also removed a latent FIN-loss path in `ngnet-quic-h3` — its `transmit::drain` now
-reports a stream-less packet as `Blocked`, which reaches the arm in `ngnet-h3`'s driver written
-for exactly that case (`crates/ngnet-h3/src/http/driver.rs:293-298`). It did not resolve S9,
-which was checked rather than assumed.
+Round 1's two failures are the native arm's, with `ErrorKind::Closed` — "the connection has
+ended" — reported by the ngtcp2 HTTP/3 server driver, not a timeout. That is the known S9
+large-body defect, and run 01's attribution rule, fixed before measuring and used then to
+assign the 1 KiB failures to `h3-ngnet-quic`, assigns these to `ngnet-quic-h3`: the transport,
+payload, fixtures and exchange count were identical across the arms, so a failure on one and
+not the other belongs to the layer that differs.
+
+Round 2 saw none in 50 runs. **That is not a claim that S9 is fixed.** Going from 2-in-20 to
+0-in-50 is consistent with a real improvement — if the rate were still 10%, fifty clean runs
+would happen about half a percent of the time — but it bounds the rate loosely rather than
+showing it is zero: a residual rate of 2% would still produce fifty clean runs more than a third
+of the time. The change that separates the rounds is a plausible mechanism for *part* of S9,
+not a diagnosis of it, and S9's original evidence is a different workload on a different host.
+It stays recorded as open in
+[`../../../quic-h3/pending-work.md`](../../../quic-h3/pending-work.md).
 
 ## What this establishes
 
 - The liveness defect run 01 found is root-caused, fixed, and covered by a deterministic
   regression test that fails against the previous behaviour
   (`crates/ngnet-quic/tests/fin_delivery.rs`).
-- `h3-ngnet-quic` completed 55 supervised runs across three payload sizes without a failure,
-  including the exact workload that failed 6 times in 10 before.
+- `h3-ngnet-quic` completed 105 supervised probe runs across three payload sizes, over both
+  rounds, without a failure — including the exact workload that failed 6 times in 10 before —
+  plus 15 pinned release runs of its whole test suite and 30 of its repetition suite.
 - Its whole test suite is enabled and passes; nothing in it is `#[ignore]`d.
 - 16 KiB and 1 MiB probes, recorded as *not run* in run 01 because the adapter's defect made
   them meaningless, have now been run on both arms.
@@ -98,10 +125,11 @@ which was checked rather than assumed.
 - **It establishes nothing about performance.** No timing from these runs is reported,
   compared, or used. This host still cannot measure a difference of the size in question, and
   run 01's "no difference is claimed" is unchanged.
-- It does not put a rate on any residual timing failure in `h3-ngnet-quic`. Zero failures in 55
-  runs bounds it loosely; it does not prove it is zero.
-- It does not resolve S9, and does not locate it. The native arm's 16 KiB failure is recorded,
-  not explained.
+- It does not put a rate on any residual timing failure in `h3-ngnet-quic`. Zero failures
+  bounds it loosely; it does not prove it is zero.
+- **It does not resolve S9, and does not locate it.** Round 2's fifty clean native-arm runs are
+  reported as what was observed, not as a fix. See the section above for why that distinction
+  is kept.
 - It does not establish that 1 MiB is safe on either arm: 10 runs of 30 exchanges each is a
   small sample, and the 16 KiB failures show this class of fault is intermittent enough to hide
   in one.

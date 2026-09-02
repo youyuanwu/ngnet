@@ -71,18 +71,30 @@ through `cargo test -p h3-ngnet-quic --release`.
 
 ### Measured after the fix
 
-On `epyc-7763-azure`, release build, pinned to one core with `taskset -c 0`:
+On `epyc-7763-azure`, release build, pinned to one core with `taskset -c 0`. Taken in two
+rounds, because a review of the first changed the native arm; the full tables, and what each
+round's code was, are in
+[`../benchmarks/data/epyc-7763-azure/02-h3-ngnet-quic-fin-fix.md`](../benchmarks/data/epyc-7763-azure/02-h3-ngnet-quic-fin-fix.md).
 
 | Workload | Arm | Runs | Failures |
-| --- | --- | --- | --- |
-| 200 x 1 KiB exchanges | `h3-ngnet-quic` | 25 | 0 |
-| 200 x 1 KiB exchanges | `ngnet-quic-h3` (native, matched) | 25 | 0 |
-| 200 x 16 KiB exchanges | `h3-ngnet-quic` | 20 | 0 |
-| 200 x 16 KiB exchanges | `ngnet-quic-h3` (native, matched) | 20 | 2 |
-| Full crate suite, all tests enabled | `h3-ngnet-quic` | 3 | 0 |
+| --- | --- | ---: | ---: |
+| 200 x 1 KiB exchanges | `h3-ngnet-quic` | 45 | 0 |
+| 200 x 1 KiB exchanges | `ngnet-quic-h3` (native, matched) | 45 | 0 |
+| 200 x 16 KiB exchanges | `h3-ngnet-quic` | 40 | 0 |
+| 200 x 16 KiB exchanges | `ngnet-quic-h3` (native, matched) | 70 | 2 (both in round 1) |
+| 30 x 1 MiB exchanges | `h3-ngnet-quic` | 20 | 0 |
+| 30 x 1 MiB exchanges | `ngnet-quic-h3` (native, matched) | 20 | 0 |
+| `tests/repeated.rs`, release, pinned | `h3-ngnet-quic` | 30 | 0 |
+| Full crate suite, all tests enabled | `h3-ngnet-quic` | 18 | 0 |
 
-Before the fix the same 1 KiB workload failed 6 runs in 10 on this adapter and 0 in 10 on the
-native arm. The 16 KiB row is the inherited defect below, and it is the other way round.
+Before the fix the same 1 KiB workload failed 6 runs in 10 on this adapter as first measured,
+and 11 in 25 after the two waker and timer fixes below — that second figure is the code this
+change replaced. The native arm failed 0 in 10.
+
+The two 16 KiB failures are the native arm's and are the inherited defect below; both fell in
+the first round, and the second round saw none in fifty. That is not a claim the inherited
+defect is gone — see the run record for why fifty clean runs bound its rate loosely rather than
+showing it is zero. The 1 MiB rows establish that those probes now run, not that 1 MiB is safe.
 
 ### Two earlier fixes, which were real but were not this
 
@@ -104,24 +116,31 @@ and 1 MiB exchanges — review finding S9. The evidence is in
 and the root-cause area recorded there is the outer HTTP/3 sendability-generation scheduling
 interacting with `ngnet-quic`'s packet-bounded staging and its zero-acceptance re-offers.
 
-**The FIN fix above did not resolve it**, and that was checked rather than assumed. The
-transport-level change removed a latent FIN-loss path in `ngnet-quic-h3` too — its
-`transmit::drain` now reports a stream-less packet as `Blocked`, which reaches the arm in
-`ngnet-h3`'s driver that was written for exactly that case — but the 16 KiB failure survives it,
-so it is a different fault.
+**It is not claimed resolved, and the evidence is mixed rather than tidy.** The FIN change
+touched this stack twice: `transmit::drain` reports a stream-less packet as `Blocked`, which
+reaches the arm in `ngnet-h3`'s driver written for exactly that case, and — after review — it
+no longer ends the drain pass on one, so the displaced stream is re-offered within the pass
+instead of waiting for an event that a bare acknowledgement will not produce.
 
-Measured on this host after the fix, release, pinned to one core, both arms over the same
-transport with the same workload (200 x 16 KiB exchanges, 20 runs each):
+Measured on this host, release, pinned to one core, both arms over the same transport with the
+same workload (200 x 16 KiB exchanges), in the two rounds the run record describes:
 
-| Arm | Runs | Failures | Failure mode |
-| --- | --- | --- | --- |
-| `h3-ngnet-quic` | 20 | 0 | — |
-| `ngnet-quic-h3` (native, matched) | 20 | 2 | `ErrorKind::Closed`, "the connection has ended" |
+| Round | Arm | Runs | Failures | Failure mode |
+| --- | --- | ---: | ---: | --- |
+| 1 | `h3-ngnet-quic` | 20 | 0 | — |
+| 1 | `ngnet-quic-h3` (native, matched) | 20 | 2 | `ErrorKind::Closed`, "the connection has ended" |
+| 2 | `h3-ngnet-quic` | 20 | 0 | — |
+| 2 | `ngnet-quic-h3` (native, matched) | 50 | 0 | — |
 
-Transport held fixed, HTTP/3 layer varied, so the remaining fault is in the native stack rather
-than in the transport or in this adapter. That is the same attribution rule that was used the
-other way round for the defect above, when this adapter failed 6 in 10 and the native arm 0 in
-10 at 1 KiB.
+Round 1 attributes squarely: transport held fixed, HTTP/3 layer varied, failure on one arm and
+not the other, so it belongs to the native stack. That is the same rule used the other way round
+for the defect above, when this adapter failed 6 in 10 and the native arm 0 in 10 at 1 KiB.
+
+Round 2 saw none. Fifty clean runs make a 10% rate unlikely — about half a percent — but leave a
+2% rate perfectly plausible, so they bound the fault rather than disproving it. The section stays
+open, and the change between rounds is recorded as a plausible mechanism for part of it, not as a
+diagnosis: S9's original evidence is a different workload on a different host, and nothing here
+looked at that.
 
 Consequences for this crate:
 
@@ -130,6 +149,11 @@ Consequences for this crate:
   `quic_stack_body_throughput` target already applies to this transport.
 - Both arms stay wired into `ngnet-bench`'s `probe` example so 16 KiB and 1 MiB can be run as
   supervised, reportable probes on each stack.
+- `tests/ngnet-bench/tests/ngtcp2_fixture.rs` drives 16 KiB bodies through the native stack and
+  can fail the same way. It was seen to once, under a contended full-workspace run; 64 further
+  runs across this branch and unmodified `main`, isolated and under deliberate CPU contention,
+  did not reproduce it on either. See
+  [`../quic-h3/pending-work.md`](../quic-h3/pending-work.md).
 
 ## Zero-copy bodies
 

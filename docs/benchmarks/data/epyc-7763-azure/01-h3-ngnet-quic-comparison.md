@@ -1,11 +1,13 @@
 # 01 — Hyperium H3 and ngnet H3 over the same ngtcp2 transport
 
-> **Superseded on one point, and only one.** The adapter defect this session found has since
-> been root-caused and fixed; see [`02-h3-ngnet-quic-fin-fix`](02-h3-ngnet-quic-fin-fix.md).
-> Everything else below stands as recorded — in particular, **no performance conclusion was
-> drawn here and none has been drawn since**. The timings in this document remain what this
-> host produced on a day it could not hold still, and they are not restated or revised
-> anywhere.
+> **Superseded where it says the defect is unlocated, and where it says the large-body probes
+> cannot be run.** Both have since changed: the defect was root-caused and fixed, and the
+> 16 KiB and 1 MiB probes have been run on both arms. See
+> [`02-h3-ngnet-quic-fin-fix`](02-h3-ngnet-quic-fin-fix.md).
+>
+> **Nothing about the measurement is superseded.** No performance conclusion was drawn here
+> and none has been drawn since. The timings below remain what this host produced on a day it
+> could not hold still, and they are not restated or revised anywhere.
 
 > **New machine.** This is the first run on [`epyc-7763-azure`](README.md), which is a different
 > machine from `xeon-8370c-azure` — AMD rather than Intel, 4 vCPU rather than that host's count,
@@ -162,7 +164,8 @@ existing `quic_stack_body_throughput` already applies to this transport because 
 Supervised 16 KiB and 1 MiB probes on both arms were planned, and were **not run**: the adapter's
 own defect makes a repeated large-body probe against it meaningless until it is fixed. So the
 question of how S9 affects payload coverage for the *new* arm remains open, and is recorded as
-open rather than answered by assumption.
+open rather than answered by assumption. *(Since run: see
+[`02-h3-ngnet-quic-fin-fix`](02-h3-ngnet-quic-fin-fix.md).)*
 
 ## What this establishes
 

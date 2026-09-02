@@ -97,7 +97,35 @@ has taken all of it; the transport takes what fits. So the buffer is taken *out*
 state for the duration of one offer and put back with only the accepted prefix consumed. Zero
 acceptance puts it back untouched. A partial acceptance is ordinary — a packet filled — so the
 remainder is offered again immediately rather than parking, which is what `ngnet-quic-h3`'s
-`transmit::drain` does and what keeps the two arms comparable.
+`transmit::drain` does and what keeps the two arms comparable. A packet that carried none of the
+stream is re-offered for the same reason; see the next section for why it is a distinct outcome
+rather than a zero acceptance.
+
+## The four things a write can do, and why three is not enough
+
+A stream write reports one of four outcomes, and the fourth exists because three of them were
+once collapsed into an ambiguity that stalled connections.
+
+`ngtcp2_conn_writev_stream` fills a packet from whatever the connection owes, and the caller's
+stream is only one candidate. It may take a prefix, all of it, or nothing; and "nothing" splits
+in two. A *zero-length STREAM frame* is something ngtcp2 serialises deliberately, and only for
+an offer carrying nothing but `fin` — that frame **is** the end of the stream. A packet with no
+STREAM frame at all is the opposite: the caller's stream was skipped because something else was
+queued ahead of it, and nothing of the offer left. ngtcp2 separates them by the sign of
+`*pdatalen`, `0` against `-1` (`ngtcp2.h:5233-5243`).
+
+`ngnet-quic` used to clamp that sign, so both arrived as `Datagram { accepted: 0 }`. On a body
+write the difference is invisible — zero bytes taken either way, offer it again — which is why
+it went unnoticed. On a `fin`-only write it is the whole meaning of the call, and this crate
+read "declined" as "sent": `poll_finish` recorded the stream finished, the FIN was never
+serialised, nothing was in flight for loss recovery to retransmit, and the peer read until its
+idle timeout. That was the intermittent stall.
+
+So the transport reports `DatagramWithoutStream` separately, and this crate answers it with
+`Offered::Displaced`: send the datagram, keep the offer, try again. Trying again rather than
+parking is the right response because a produced packet means the connection had something to
+say and has now said it, so the next attempt has room — and the retry loop is bounded, ending
+in a self-wake rather than a park on an event that may never arrive.
 
 ## The two stream directions
 
@@ -116,6 +144,19 @@ A bidirectional stream splits into halves that may be dropped independently and 
 over one stream id and one `StreamState`. So the state is reference counted and discarded with
 the last handle, not the first. Dropping it early truncates whatever the survivor still had
 retained, and then resets a stream that had already finished cleanly.
+
+The other end of that lifetime is the transport's. `state()` creates an entry on demand, so a
+routed event naming a stream whose handles have all gone would leave one behind for the life of
+the connection; an entry with no handles is therefore discarded when the transport reports the
+stream closed.
+
+A locally reset sending half is recorded as a send-side terminal rather than left as a flag,
+because ngtcp2 shuts the write side at that moment and refuses anything offered to it
+afterwards. Without the record, an ordinary "abandon this request, then let the handle run its
+normal finish path" sequence reaches the transport, comes back `ERR_STREAM_SHUT_WR`, and — if
+that is treated as a transport failure — takes the whole connection down over one stream. Both
+guards are in place: the terminal stops the offer, and a refusal that arrives anyway is reported
+at stream level.
 
 ## Bounds
 
