@@ -162,6 +162,51 @@ fn quic_wrapper_links_tls_only_when_its_backend_is_enabled() {
     );
 }
 
+/// The hyperium/ngtcp2 adapter really does link OpenSSL.
+///
+/// The positive half of a claim `dependency_graph.rs` makes negatively. That check permits
+/// OpenSSL in `h3-ngnet-quic`'s graph, unlike the QMux adapter's, on the grounds that
+/// `ngnet-quic` links it. A permission is not evidence, though: if the transport ever stopped
+/// linking OpenSSL, the graph check would keep passing while quietly asserting nothing, and the
+/// difference between the two adapters -- the reason they need separate checks at all -- would
+/// have evaporated unnoticed. This is what makes that difference observable.
+///
+/// As with the QUIC wrapper's own check, **at least one** binary must link `libssl`: the
+/// adapter's test executables exercise different seams and not all of them reach TLS.
+#[test]
+fn the_hyperium_quic_adapter_links_the_tls_its_transport_brings() {
+    if !platform_uses_elf() {
+        eprintln!(
+            "SKIPPED: the_hyperium_quic_adapter_links_the_tls_its_transport_brings -- this \
+             check reads the ELF dynamic section, and this platform does not produce ELF \
+             executables. It runs on Linux, which is what CI is."
+        );
+        return;
+    }
+
+    let binaries = test_executables(&["-p", "h3-ngnet-quic"]);
+    let linking: Vec<String> = binaries
+        .iter()
+        .filter(|binary| needed_libraries(binary).iter().any(|l| is_libssl(l)))
+        .map(|binary| binary.display().to_string())
+        .collect();
+
+    assert!(
+        !linking.is_empty(),
+        "no h3-ngnet-quic test binary links libssl.\n\
+         This adapter is allowed OpenSSL in its dependency graph precisely because \
+         `ngnet-quic` links it; if nothing links it any more, that allowance has stopped \
+         meaning anything and `dependency_graph.rs` should be tightened to match.\n\
+         Inspected {} executable(s):\n{}",
+        binaries.len(),
+        binaries
+            .iter()
+            .map(|b| format!("  {}", b.display()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+}
+
 /// The QMux crates link no TLS, in any configuration.
 ///
 /// Simpler than the QUIC checks above, and simpler for a reason worth stating. `ngnet-quic`

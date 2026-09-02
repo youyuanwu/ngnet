@@ -275,6 +275,7 @@ fn the_http3_wrapper_reaches_no_quic_implementation() {
         "ngnet-qmux-sys",
         "ngnet-qmux-h3",
         "h3-ngnet-qmux",
+        "h3-ngnet-quic",
         "quinn",
     ] {
         assert!(
@@ -454,6 +455,65 @@ fn the_hyperium_qmux_adapter_has_the_exact_direct_dependencies() {
     );
 }
 
+/// The hyperium/ngtcp2 adapter joins exactly three crates, and reaches no second stack.
+///
+/// The counterpart of the check above, and it has to say something different in one place.
+/// `h3-ngnet-qmux` may not reach OpenSSL because QMux provides no confidentiality at all;
+/// `h3-ngnet-quic` legitimately does, because `ngnet-quic` links it and that is the whole
+/// point of the transport. So OpenSSL is deliberately absent from the forbidden list here,
+/// and `linkage.rs` asserts the positive form of the same fact -- that the OpenSSL really is
+/// there -- so its absence from this list cannot quietly become an unnoticed loss.
+///
+/// What must stay out is a *second* protocol stack: `ngnet-h3` (the workspace's own HTTP/3,
+/// which is what this adapter exists as an alternative to), quinn and rustls (a different
+/// QUIC implementation entirely), and the whole QMux family.
+#[test]
+fn the_hyperium_quic_adapter_has_the_exact_direct_dependencies() {
+    let tree = cargo_tree(&["-p", "h3-ngnet-quic", "-e", "normal"]);
+    let mut direct: Vec<String> = tree
+        .lines()
+        .skip(1)
+        .filter(|line| line.starts_with('\u{251c}') || line.starts_with('\u{2514}'))
+        .map(dependency_name)
+        .collect();
+    direct.sort();
+    assert_eq!(
+        direct,
+        ["bytes", "h3", "ngnet-quic"],
+        "h3-ngnet-quic must directly join bytes, hyperium h3, and ngnet-quic only.\n\
+         In particular no futures crate may appear here. The stable waker its expiry timer is \
+         polled under is built from `std::task::Wake` for exactly that reason -- an `ArcWake` \
+         would have made this a four-crate join. (`futures-util` does appear further down the \
+         tree; hyperium h3 brings it, which is h3's business and not this crate's.)\n{tree}"
+    );
+
+    for forbidden in [
+        "ngnet-h3",
+        "ngnet-h3-sys",
+        "ngnet-qmux",
+        "ngnet-qmux-sys",
+        "ngnet-qmux-h3",
+        "h3-ngnet-qmux",
+        "quinn",
+        "rustls",
+        "compio",
+    ] {
+        assert!(
+            !contains_at_word_boundary(&tree, forbidden),
+            "{forbidden} reached h3-ngnet-quic.\n\
+             Find it with:\n  cargo tree -p h3-ngnet-quic -e normal -i {forbidden}\n{tree}"
+        );
+    }
+
+    // The one difference from the QMux adapter, asserted rather than assumed.
+    assert!(
+        contains_at_word_boundary(&tree, "ngnet-quic-sys"),
+        "h3-ngnet-quic must reach ngnet-quic-sys: it is an ngtcp2 adapter, and if the \
+         transport stopped pulling in its bindings then this check and the OpenSSL linkage \
+         check are both asking about something that is no longer there.\n{tree}"
+    );
+}
+
 /// The QMux core depends only on its bindings.
 ///
 /// The same claim `http3_core_depends_only_on_its_bindings` makes, for the newest pair, and
@@ -600,6 +660,7 @@ fn no_other_protocol_stack_or_tls_reaches_qmux() {
             "ngnet-quic-h3",
             "ngnet-qmux-h3",
             "h3-ngnet-qmux",
+            "h3-ngnet-quic",
             "ngnet-h2",
             "ngnet-h2-sys",
             "ngnet-h3",
@@ -642,6 +703,10 @@ fn no_existing_crate_reaches_qmux() {
         "ngnet-h3",
         "ngnet-quic",
         "ngnet-quic-h3",
+        // The hyperium/ngtcp2 adapter belongs on this side of the line, not among the
+        // exceptions: it joins hyperium H3 to the *QUIC* transport, so QMux reaching it would
+        // mean the two transport families had met.
+        "h3-ngnet-quic",
         "ngnet-axum",
         "ngnet-util",
     ] {

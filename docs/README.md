@@ -97,6 +97,22 @@ QMux connection without owning an endpoint, TLS, runtime, or task.
 - [`h3-ngnet-qmux/invariants.md`](h3-ngnet-qmux/invariants.md) — the deterministic and end-to-end
   evidence for each contract.
 
+## Hyperium H3 over ngtcp2 — [`h3-ngnet-quic/`](h3-ngnet-quic/)
+
+The same join for the other transport family. `h3-ngnet-quic` implements hyperium H3's
+per-stream transport traits over an established `ngnet-quic` connection, so the community
+HTTP/3 stack runs on ngtcp2 — and so the two HTTP/3 implementations can be measured against
+each other over one transport, which is what
+[`benchmarks/cases/quic-h3-comparison.md`](benchmarks/cases/quic-h3-comparison.md) is for.
+
+- [`h3-ngnet-quic/design.md`](h3-ngnet-quic/design.md) — why the detached connection rather
+  than the endpoint-driven one, why there is no driver future, the three wake sources and why
+  the expiry timer needs its own, and why the two stream directions must stay apart.
+- [`h3-ngnet-quic/invariants.md`](h3-ngnet-quic/invariants.md) — each contract and the test
+  that would fail without it, including which tests were checked against the pre-fix code.
+- [`h3-ngnet-quic/pending-work.md`](h3-ngnet-quic/pending-work.md) — the inherited large-body
+  stall, the deferred zero-copy body path, and what is deliberately not implemented.
+
 ## HTTP/3 over QUIC
 
 `ngnet-quic-h3` joins the two families: HTTP/3 running on this workspace's own QUIC stack. It

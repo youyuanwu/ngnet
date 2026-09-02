@@ -140,6 +140,12 @@ jobs:
       - name: Test (hyperium HTTP/3 over QMux, release)
         run: cargo test -p h3-ngnet-qmux --release
 
+      # Release for the same reason as the ngtcp2 tests above: this adapter's tests cross a
+      # real loopback socket, and a debug build spends long enough in ngtcp2 that a timing
+      # defect would be indistinguishable from slow.
+      - name: Test (hyperium HTTP/3 over ngtcp2, release)
+        run: cargo test -p h3-ngnet-quic --release
+
       # Eighteen configurations that differ only in a package and its features, so they are one
       # step iterating a list rather than ten near-identical steps. The list is the whole
       # point of the step: a configuration is added by adding a line, and the reason it
@@ -231,6 +237,7 @@ jobs:
           # something else happened to build it.
           HTTP/3 over QMux                         | -p ngnet-qmux-h3 -p ngnet-qmux-h3-tests
           hyperium HTTP/3 over QMux                | -p h3-ngnet-qmux
+          hyperium HTTP/3 over ngtcp2              | -p h3-ngnet-quic
 
           # `ngnet-axum` has no feature matrix -- axum, tokio and the h2 transport are all
           # unconditional -- so unlike the crates above it needs exactly one invocation
@@ -318,6 +325,7 @@ jobs:
           HTTP/3 over QMux                         | -p ngnet-qmux-h3
           HTTP/3-over-QMux tests                   | -p ngnet-qmux-h3-tests
           hyperium HTTP/3 over QMux                | -p h3-ngnet-qmux
+          hyperium HTTP/3 over ngtcp2              | -p h3-ngnet-quic
 
           # One invocation each, for the same reason as their clippy entries: no features to
           # vary.
