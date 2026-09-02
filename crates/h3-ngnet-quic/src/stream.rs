@@ -101,6 +101,7 @@ pub struct SendStream<S: Session> {
 
 impl<S: Session> SendStream<S> {
     pub(crate) fn new(shared: Shared<S>, stream: StreamId) -> Self {
+        shared.lock().retain_handle(stream);
         Self { shared, stream }
     }
 
@@ -141,9 +142,21 @@ impl<S: Session> SendStream<S> {
                         if data.remaining() == 0 {
                             Step::Done
                         } else {
-                            let park = accepted < offered;
                             core.state(id).writing = Some(data);
-                            if park { Step::Pending } else { Step::Progress }
+                            if accepted == 0 {
+                                // The packet went to control frames. Re-offering the same
+                                // prefix in this pass would spin; wait to be woken.
+                                Step::Pending
+                            } else {
+                                // A partial acceptance is ordinary -- a packet filled -- so
+                                // the remainder is offered again immediately. Parking here
+                                // instead would cost a packet per wakeup and diverge from
+                                // the native stack this crate is measured against, whose
+                                // `transmit::drain` keeps filling packets until acceptance
+                                // reaches zero or capacity runs out.
+                                let _ = offered;
+                                Step::Progress
+                            }
                         }
                     }
                     Offered::Blocked | Offered::NoCapacity => {
@@ -360,11 +373,13 @@ impl<S: Session> Drop for SendStream<S> {
     fn drop(&mut self) {
         let mut core = self.shared.lock();
         if core.terminal.is_some() {
+            core.release_handle(self.stream);
             return;
         }
         let id = self.stream;
         let state = core.state(id);
-        if state.send_finished || state.send_reset || state.terminal.is_some() {
+        if state.send_finished || state.send_reset || state.send_terminal_state.is_some() {
+            core.release_handle(id);
             return;
         }
         // An unfinished send that is simply dropped would leave the peer waiting on a stream
@@ -376,6 +391,7 @@ impl<S: Session> Drop for SendStream<S> {
             .conn
             .reset_stream(id, ApplicationErrorCode::new(ABANDONED));
         pump::produce(&mut core, None);
+        core.release_handle(id);
     }
 }
 
@@ -387,6 +403,7 @@ pub struct RecvStream<S: Session> {
 
 impl<S: Session> RecvStream<S> {
     pub(crate) fn new(shared: Shared<S>, stream: StreamId) -> Self {
+        shared.lock().retain_handle(stream);
         Self { shared, stream }
     }
 }
@@ -415,11 +432,13 @@ impl<S: Session> quic::RecvStream for RecvStream<S> {
                 pump::extend_credit(core, id, chunk.len());
                 return Ok(Some(chunk));
             }
-            if let Some(terminal) = core.state(id).terminal {
-                return Err(Some(terminal.stream_error()));
-            }
+            // A clean end wins over an abnormal one: if the peer sent its FIN, the body is
+            // complete and reporting an error would be a silent truncation.
             if core.state(id).finished {
                 return Ok(None);
+            }
+            if let Some(terminal) = core.state(id).recv_terminal {
+                return Err(Some(terminal.stream_error()));
             }
             if let Some(terminal) = &core.terminal {
                 return Err(Some(ended(terminal)));
@@ -459,10 +478,13 @@ impl<S: Session> quic::RecvStream for RecvStream<S> {
 
 impl<S: Session> Drop for RecvStream<S> {
     fn drop(&mut self) {
-        let mut core = self.shared.lock();
-        core.streams.remove(&self.stream.get());
-        drop(core);
-        self.shared.wakers.forget_stream(self.stream.get());
+        // Only the *last* handle discards the state. A split bidirectional stream has two
+        // handles over one stream id, dropped independently and in either order, and the
+        // survivor still needs the retained send and the terminals.
+        let last = self.shared.lock().release_handle(self.stream);
+        if last {
+            self.shared.wakers.forget_stream(self.stream.get());
+        }
     }
 }
 
@@ -545,10 +567,8 @@ impl<S: Session> quic::BidiStream<Bytes> for BidiStream<S> {
     type RecvStream = RecvStream<S>;
 
     fn split(self) -> (Self::SendStream, Self::RecvStream) {
-        // Both halves already hold their own handle onto the shared core, so neither depends
-        // on the other surviving.
-        let send = self.send;
-        send.shared.lock().state(send.stream).recv_taken = true;
-        (send, self.recv)
+        // Both halves already count as handles onto the shared stream state, so neither
+        // depends on the other surviving and either may be dropped first.
+        (self.send, self.recv)
     }
 }

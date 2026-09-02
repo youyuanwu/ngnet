@@ -149,41 +149,41 @@ async fn a_quiet_connection_still_fires_its_own_idle_timeout() {
 
 /// The timer survives the task that armed it.
 ///
-/// The first poll comes from a task that then goes away; the timeout must still be observed by
-/// a later, different poll. This is the exact scenario a per-caller timer waker would break,
-/// and it is why the sleep is polled under the core's own waker.
+/// The connection is armed by a task that then goes away, and the timeout must still be
+/// delivered to a *different* task that parks afterwards. This is the exact scenario a
+/// per-caller timer waker would break.
+///
+/// The second poll happens well **before** the deadline, so it genuinely has to be woken: a
+/// poll made after the deadline had already passed would re-derive the expiry synchronously
+/// and pass even with no working timer at all.
 #[tokio::test]
 async fn the_expiry_timer_outlives_the_task_that_armed_it() {
     let (client, server, tasks, _endpoints) = short_idle_pair().await;
     drop(server);
 
-    // A short-lived task arms the timer and then finishes.
     let client = Arc::new(tokio::sync::Mutex::new(client));
+
+    // A short-lived task arms the timer with exactly one poll, then finishes.
     {
         let armed = Arc::clone(&client);
         tokio::spawn(async move {
             let mut guard = armed.lock().await;
-            let _ = std::future::poll_fn(|cx| {
-                let poll = guard.poll_accept_bidi(cx);
-                // One pump is all this task does; it must not keep polling.
-                std::task::Poll::Ready(poll)
-            })
-            .await;
+            let _ =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(guard.poll_accept_bidi(cx))).await;
         })
         .await
         .expect("the arming task");
     }
 
-    // Nothing polls the connection for a while: only the core's own waker can carry the timer.
-    tokio::time::sleep(IDLE * 3).await;
-
+    // Park before the deadline. Nothing external will arrive, so only the core's own stable
+    // waker can carry this to completion.
     let mut guard = client.lock().await;
     let ended = tokio::time::timeout(
         IDLE * 12,
         std::future::poll_fn(|cx| guard.poll_accept_bidi(cx)),
     )
     .await
-    .expect("the idle timeout must still be observable from a different task");
+    .expect("the idle timeout must still reach a task that parked after the arming task died");
     let err = ended.expect_err("a lapsed connection must not yield a stream");
     assert!(
         matches!(err, h3::quic::ConnectionErrorIncoming::Timeout),

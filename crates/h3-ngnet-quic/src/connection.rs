@@ -71,9 +71,24 @@ fn poll_open<S: Session>(
                 pump::produce(core, None);
                 Ok(stream)
             }
-            Err(_) => {
+            Err(err) => {
                 core.streams_extended = false;
-                Err(None)
+                // Distinguish "no stream credit left" — a temporary block that only
+                // `Observed::StreamsExtended` lifts — from a real failure. Parking on a
+                // permanent error would wait forever for a signal that is never coming.
+                let blocked = match kind {
+                    Open::Bidi => core.detached.conn.streams_bidi_left() == 0,
+                    Open::Uni => core.detached.conn.streams_uni_left() == 0,
+                };
+                if blocked {
+                    Err(None)
+                } else {
+                    let terminal = ConnectionTerminal::undefined(format!(
+                        "the transport refused to open a stream: {err}"
+                    ));
+                    core.fail(terminal.clone());
+                    Err(Some(terminal.stream_error()))
+                }
             }
         }
     });

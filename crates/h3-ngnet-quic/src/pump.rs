@@ -178,15 +178,19 @@ fn route_observed<S: Session>(core: &mut Core<S>, changed: &mut Changed) {
                 changed.connection = true;
             }
             Observed::Reset(stream, code) => {
+                // The peer abandoned the direction it sends on, which is the one we read.
+                // Our sending side is untouched: RFC 9000 keeps the two directions
+                // independent, and so does hyperium.
                 let state = core.state(stream);
-                state.terminal = Some(crate::error::DirectionTerminal::Reset(code.get()));
-                // A reset stream will never carry the rest of what we retained for it.
-                state.writing = None;
+                state.recv_terminal = Some(crate::error::DirectionTerminal::Reset(code.get()));
                 changed.stream(stream.get());
             }
             Observed::StopSending(stream, code) => {
+                // The peer asked us to stop sending, so our sending side ends and anything
+                // still retained for it will never be delivered.
                 let state = core.state(stream);
-                state.terminal = Some(crate::error::DirectionTerminal::Stopped(code.get()));
+                state.send_terminal_state =
+                    Some(crate::error::DirectionTerminal::Stopped(code.get()));
                 state.writing = None;
                 changed.stream(stream.get());
             }

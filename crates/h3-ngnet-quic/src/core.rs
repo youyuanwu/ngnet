@@ -132,31 +132,44 @@ impl Wake for TimerWake {
 }
 
 /// One stream's state, from both directions.
+///
+/// The two directions are kept strictly apart. RESET_STREAM and STOP_SENDING are not two
+/// spellings of "the stream ended": per RFC 9000 a peer's RESET_STREAM abandons the peer's
+/// *sending* side, which is our *receiving* side, while a peer's STOP_SENDING asks us to
+/// abandon our *sending* side. Hyperium draws the same line — its `StreamTerminated` doc
+/// (`h3::quic`) assigns a reset to `poll_data` and a stop-sending to the send methods. Sharing
+/// one field between them makes an ordinary exchange fail: a server that sends a complete
+/// response and then stop-sends the request-body stream would make the client's `poll_data`
+/// report an error for a response that arrived intact.
 #[derive(Default)]
 pub(crate) struct StreamState {
     /// Received but not yet handed to HTTP/3.
     pub(crate) incoming: VecDeque<Bytes>,
-    /// The peer finished its sending side.
+    /// The peer finished its sending side cleanly.
     pub(crate) finished: bool,
-    /// The peer ended one direction, and why.
-    pub(crate) terminal: Option<DirectionTerminal>,
+    /// The peer reset the stream it was sending on: our receiving side ended abnormally.
+    pub(crate) recv_terminal: Option<DirectionTerminal>,
+    /// The peer asked us to stop sending: our sending side ended abnormally.
+    pub(crate) send_terminal_state: Option<DirectionTerminal>,
     /// One hyperium logical send, retained until the transport has taken all of it.
     pub(crate) writing: Option<WriteBuf<Bytes>>,
     /// This side emitted its FIN.
     pub(crate) send_finished: bool,
     /// This side reset the stream, so `Drop` must not reset it again.
     pub(crate) send_reset: bool,
-    /// Hyperium was handed the receiving half, so a drop of the sending half is ordinary.
-    pub(crate) recv_taken: bool,
+    /// How many live handles refer to this stream.
+    ///
+    /// A bidirectional stream may be split into halves that are dropped independently and in
+    /// either order, so the state cannot be discarded when the first half goes: the survivor
+    /// still needs `writing`, `send_finished` and the terminals. Dropping it early would
+    /// silently truncate an in-flight body and then reset a stream that had finished cleanly.
+    pub(crate) handles: usize,
 }
 
 impl StreamState {
     /// Whether the sending side may still make progress.
-    ///
-    /// A peer reset ends both directions and a stop-sending ends only this one, but either
-    /// way nothing more of ours will be delivered, so the sending side treats them alike.
     pub(crate) fn send_terminal(&self) -> Option<DirectionTerminal> {
-        self.terminal
+        self.send_terminal_state
     }
 }
 
@@ -220,6 +233,24 @@ impl<S: Session> Core<S> {
 
     pub(crate) fn state(&mut self, stream: StreamId) -> &mut StreamState {
         self.streams.entry(stream.get()).or_default()
+    }
+
+    /// Records a new handle onto a stream.
+    pub(crate) fn retain_handle(&mut self, stream: StreamId) {
+        self.state(stream).handles += 1;
+    }
+
+    /// Drops a handle, discarding the state only once the last one is gone.
+    pub(crate) fn release_handle(&mut self, stream: StreamId) -> bool {
+        let Some(state) = self.streams.get_mut(&stream.get()) else {
+            return true;
+        };
+        state.handles = state.handles.saturating_sub(1);
+        if state.handles == 0 {
+            self.streams.remove(&stream.get());
+            return true;
+        }
+        false
     }
 
     /// Records the end of the connection, keeping the first reason.
