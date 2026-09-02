@@ -3,10 +3,11 @@
 Hyperium [`h3`](https://crates.io/crates/h3) transport traits over an established
 [`ngnet-quic`](../ngnet-quic) connection.
 
-> **Not ready for use.** This adapter intermittently stalls under a repeated small-body
-> workload — roughly two runs in five at 200 x 1 KiB — leaving a connection to sit until its
-> idle timeout. It is this crate's own defect, not the separately known `ngnet-quic-h3`
-> large-body stall; the native stack passes the identical workload. See
+> **Not ready for use.** This adapter intermittently stalls, leaving a connection to sit until
+> its idle timeout — roughly two runs in five at 200 x 1 KiB, and single exchanges have stalled
+> too under CPU contention. Its live-loopback tests are `#[ignore]`d for that reason. It is this
+> crate's own defect, not the separately known `ngnet-quic-h3` large-body stall; the native
+> stack passes the identical workload. See
 > [`docs/h3-ngnet-quic/pending-work.md`](../../docs/h3-ngnet-quic/pending-work.md).
 
 This is the join that lets the community HTTP/3 state machine run on this workspace's

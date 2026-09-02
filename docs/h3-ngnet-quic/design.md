@@ -119,5 +119,6 @@ retained, and then resets a stream that had already finished cleanly.
 
 ## Bounds
 
-Every loop is bounded, so no single poll can monopolise the executor: at most 64 datagrams
-produced per pass, at most 64 write attempts per send, at most two timer turns per pump.
+Every loop is bounded, so no single poll can monopolise the executor: at most four
+read/expire/produce turns per pump pass (`TIMER_TURNS`), at most 64 datagrams produced per turn,
+at most 64 write attempts per send.

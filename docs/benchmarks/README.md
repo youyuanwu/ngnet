@@ -1,6 +1,6 @@
 # Benchmarks
 
-`tests/ngnet-bench` holds five [Criterion](https://bheisler.github.io/criterion.rs/)
+`tests/ngnet-bench` holds six [Criterion](https://bheisler.github.io/criterion.rs/)
 benchmark families, which answer different questions and must not be read as one:
 
 - **The duplex family** — this stack against [hyper](https://hyper.rs) and against
@@ -18,6 +18,10 @@ benchmark families, which answer different questions and must not be read as one
 - **The matched QMux H3 family** — `ngnet-h3 + ngnet-qmux-h3` against hyperium
   `h3 + h3-ngnet-qmux`, over the same QMux configuration and either Tokio duplex or loopback
   TCP. Four targets cover serial/body × duplex/socket; results are whole-stack only.
+- **The matched ngtcp2 H3 family** — the same idea for the other transport: `ngnet-h3 +
+  ngnet-quic-h3` against hyperium `h3 + h3-ngnet-quic`, over one `ngnet-quic` configuration.
+  Two targets, serial and 1 KiB body. No result yet; see
+  [`cases/quic-h3-comparison.md`](cases/quic-h3-comparison.md).
 
 Between them they fill in the whole matrix of stack against I/O model:
 

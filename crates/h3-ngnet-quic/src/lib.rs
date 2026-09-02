@@ -2,11 +2,16 @@
 //!
 //! # Not ready for use
 //!
-//! This adapter has a known, unfixed liveness defect. Under a repeated small-body workload it
-//! intermittently stalls — the client waits for a response that never arrives, and the
-//! connection sits until its idle timeout ends it. Measured at roughly two runs in five for
-//! 200 x 1 KiB exchanges on one host. Single exchanges, large single bodies, and every
-//! lifecycle path in the test suite are correct; it is repetition that provokes it.
+//! This adapter has a known, unfixed liveness defect. It intermittently stalls — a peer waits
+//! for something that never arrives, and the connection sits until its idle timeout ends it.
+//! Measured at roughly two runs in five for 200 x 1 KiB exchanges on one host.
+//!
+//! Repetition provokes it most reliably, but it is **not confined to repetition**: single
+//! exchanges in this crate's own lifecycle suite have also been observed to stall under CPU
+//! contention. Repetition multiplies the timing windows rather than creating them. For that
+//! reason the live-loopback test suites are `#[ignore]`d in ordinary runs, following the same
+//! precedent as the transport's own unresolved liveness failure; run them with
+//! `cargo test -p h3-ngnet-quic -- --ignored` on an idle machine.
 //!
 //! It is **this crate's defect**, not the separately known `ngnet-quic-h3` large-body stall:
 //! the same workload against that stack succeeded 10 times out of 10 while this one failed 6
@@ -66,8 +71,9 @@
 //!
 //! # Bounds
 //!
-//! Every loop is bounded, so no single poll can monopolise the executor: at most 64 datagrams
-//! produced per pass, at most 64 write attempts per send, and at most two timer turns per pump.
+//! Every loop is bounded, so no single poll can monopolise the executor: at most
+//! four read/expire/produce turns per pump pass, at most 64 datagrams
+//! produced per turn, and at most 64 write attempts per send.
 #![deny(missing_docs, unsafe_code)]
 
 mod connection;

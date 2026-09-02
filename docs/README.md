@@ -40,8 +40,10 @@ each case covers is recorded there, case by case.
 | [`quic/pending-work.md`](quic/pending-work.md) | Known gaps and deferred decisions, with what would settle each. |
 | [`quic/invariants.md`](quic/invariants.md) | The properties the `ngnet-quic` suite pins, and where each is enforced. |
 
-There are no QUIC benchmarks, and the crate has not been tested against another QUIC
-implementation.
+QUIC benchmarks live at [`benchmarks/`](benchmarks/): the QUIC-stack family compares whole
+stacks over loopback UDP, and the matched ngtcp2 H3 family holds the transport fixed and varies
+the HTTP/3 implementation. The crate is tested against another QUIC implementation — see the
+quinn interoperability tests in `tests/ngnet-quic-h3-tests`.
 
 ## QMux — [`qmux/`](qmux/)
 

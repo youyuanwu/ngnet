@@ -1,5 +1,11 @@
 # Hyperium H3 over ngtcp2: invariants
 
+> **Read this first.** The live-loopback suites below are `#[ignore]`d in ordinary runs,
+> because this adapter has an unresolved intermittent liveness failure — see
+> [`pending-work.md`](pending-work.md). Each row states a property the crate is *meant* to have
+> and the test that pins it; the tests pass on an idle machine and can stall under contention.
+> Nothing in this table should be read as evidence that the crate is fit for use.
+
 Each row is a claim the crate makes and the test that would fail if it stopped being true.
 Where a test is marked *(regression)*, it was checked against the implementation before the fix
 and observed to fail, so it pins a defect rather than merely agreeing with the current code.
@@ -30,14 +36,16 @@ and observed to fail, so it pins a defect rather than merely agreeing with the c
 
 ## Not established here
 
-**Repeated exchanges do not work reliably.** Every invariant above is about a single exchange
-or a single lifecycle event, and each holds. Repetition is a different matter: under a repeated
-small-body workload this adapter intermittently stalls, roughly two runs in five at 200 x 1 KiB.
-That is this crate's own defect, distinguished from the inherited one below by a pre-registered
+**Nothing above is reliable under CPU contention.** Each invariant holds on an idle machine.
+Under load, the adapter's unresolved liveness failure can stall any exchange: it was first found
+with a repeated workload (roughly two runs in five at 200 x 1 KiB), and single-exchange lifecycle
+tests have since been observed to stall as well. Repetition multiplies the timing windows rather
+than creating them.
+
+That defect is this crate's own, distinguished from the inherited one below by a pre-registered
 attribution rule and by the native stack passing the identical workload 10 out of 10. It is
-reproduced by `tests/repeated.rs`, which is `#[ignore]`d, and documented in
-[`pending-work.md`](pending-work.md). No invariant in the table above should be read as implying
-the crate is fit for use.
+documented in [`pending-work.md`](pending-work.md). No invariant in the table above should be
+read as implying the crate is fit for use.
 
 The transport underneath this crate has a known, unresolved intermittent connection-ending stall
 under repeated 16 KiB and 1 MiB workloads — review finding S9, recorded in

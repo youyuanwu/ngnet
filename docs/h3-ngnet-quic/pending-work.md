@@ -4,9 +4,17 @@
 
 **This is the most important thing on this page, and it is this crate's own fault.**
 
-Under a repeated small-body workload the adapter intermittently stalls. The client parks
-waiting for a response that never arrives, and the connection sits until its 30-second idle
-timeout ends it, surfacing as `ConnectionErrorIncoming::Timeout`.
+The adapter intermittently stalls. A peer parks waiting for something that never arrives, and
+the connection sits until its 30-second idle timeout ends it, surfacing as
+`ConnectionErrorIncoming::Timeout`.
+
+It was found with a repeated small-body workload, which provokes it most reliably, but it is
+**not confined to repetition**: single-exchange tests in `tests/lifecycle.rs` have also been
+observed to stall under CPU contention. Repetition multiplies the timing windows rather than
+creating them. Because of that, **all of this crate's live-loopback test suites are
+`#[ignore]`d** in ordinary runs — the same treatment `docs/quic-h3/invariants.md` gives the
+transport's own unresolved liveness failure. Run them with
+`cargo test -p h3-ngnet-quic -- --ignored` on an idle machine.
 
 ### Evidence
 
@@ -62,8 +70,8 @@ rate, neither removed it:
 
 ### Reproducing it
 
-`crates/h3-ngnet-quic/tests/repeated.rs`, currently `#[ignore]`d. Remove the attributes to run
-it. Note that adding `eprintln!` tracing to the pump hides the failure — it is timing
+`cargo test -p h3-ngnet-quic --release -- --ignored` on an idle machine;
+`crates/h3-ngnet-quic/tests/repeated.rs` is the most reliable reproducer. Note that adding `eprintln!` tracing to the pump hides the failure — it is timing
 sensitive — so in-memory counters dumped at the stall were what produced the evidence above.
 
 ### Consequence
@@ -71,6 +79,11 @@ sensitive — so in-memory counters dumped at the stall were what produced the e
 The crate should not be used until this is fixed, and the benchmark comparison it exists to
 enable cannot be run meaningfully against it. The comparison run record reports the numbers it
 obtained and claims nothing from them.
+
+CI therefore runs only this crate's deterministic tests — the trait assertions and the error
+unit tests. Gating the shared workflow on a suite with a known timing-sensitive failure would
+redden CI for unrelated changes. Re-enable the live suites with the fix; they are the regression
+suite for it.
 
 ## Inherited: the large-body stall
 

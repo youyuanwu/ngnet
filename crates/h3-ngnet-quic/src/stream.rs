@@ -111,6 +111,18 @@ impl<S: Session> SendStream<S> {
         Self { shared, stream }
     }
 
+    /// Drops this stream's waker entry once no handle refers to it.
+    ///
+    /// Both halves must do this, not just the receiving one: a unidirectional send stream has
+    /// no receiving half at all, and a split bidirectional stream may have its sending half
+    /// dropped last. Leaving the entry behind leaks one waker slot per stream for the life of
+    /// the connection, and every subsequent `wake_all` then wakes tasks that no longer exist.
+    fn forget_if_last(&self, last: bool) {
+        if last {
+            self.shared.wakers.forget_stream(self.stream.get());
+        }
+    }
+
     /// Drains the retained buffer until the transport has taken all of it.
     fn poll_retained(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
         // Cloned once so the closure below does not borrow `cx`, which `pump` needs mutably.
@@ -379,13 +391,17 @@ impl<S: Session> Drop for SendStream<S> {
     fn drop(&mut self) {
         let mut core = self.shared.lock();
         if core.terminal.is_some() {
-            core.release_handle(self.stream);
+            let last = core.release_handle(self.stream);
+            drop(core);
+            self.forget_if_last(last);
             return;
         }
         let id = self.stream;
         let state = core.state(id);
         if state.send_finished || state.send_reset || state.send_terminal_state.is_some() {
-            core.release_handle(id);
+            let last = core.release_handle(id);
+            drop(core);
+            self.forget_if_last(last);
             return;
         }
         // An unfinished send that is simply dropped would leave the peer waiting on a stream
@@ -397,7 +413,9 @@ impl<S: Session> Drop for SendStream<S> {
             .conn
             .reset_stream(id, ApplicationErrorCode::new(ABANDONED));
         pump::produce(&mut core, None);
-        core.release_handle(id);
+        let last = core.release_handle(id);
+        drop(core);
+        self.forget_if_last(last);
     }
 }
 
