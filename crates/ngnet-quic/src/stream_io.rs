@@ -93,6 +93,12 @@ pub struct OwnedWrite {
     ///
     /// Shares its allocation with the retained prefix, so holding it costs no copy; a caller
     /// that drops it simply abandons the unsent tail.
+    ///
+    /// **Empty is not the same as finished.** It says nothing about a `fin`, which carries no
+    /// bytes and so cannot appear here: an offer of no data with `fin` comes back with an
+    /// empty `unsent` whether the FIN was serialised or not. [`Self::outcome`] is what
+    /// separates those — [`StreamWrite::DatagramWithoutStream`] means the packet took nothing
+    /// of this stream and the whole offer, `fin` included, must be made again.
     pub unsent: OwnedBytes,
 }
 
@@ -376,7 +382,9 @@ impl<S: Session> Conn<'_, S> {
 
         // Split off what ngtcp2 took. The prefix is already retained above; the suffix shares
         // the same allocation and is handed back for the caller to offer again. On anything
-        // but a datagram nothing was taken, so the whole buffer comes back.
+        // but a datagram nothing was taken, so the whole buffer comes back --
+        // `DatagramWithoutStream` included, which produced a packet but put none of this
+        // stream in it.
         let taken = match outcome {
             StreamWrite::Datagram { accepted, .. } => accepted,
             _ => 0,

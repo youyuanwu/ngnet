@@ -10,8 +10,16 @@ use ngnet_quic::OsslSession;
 
 /// An echo server, serving until its connection ends.
 pub async fn echo_server(connection: h3_ngnet_quic::Connection<OsslSession>) {
+    echo_server_with_grease(connection, false).await;
+}
+
+/// An echo server, with hyperium's GREASE behaviour under the caller's control.
+pub async fn echo_server_with_grease(
+    connection: h3_ngnet_quic::Connection<OsslSession>,
+    grease: bool,
+) {
     let mut builder = h3::server::builder();
-    builder.send_grease(false);
+    builder.send_grease(grease);
     let mut connection = builder
         .build::<_, bytes::Bytes>(connection)
         .await
@@ -55,13 +63,24 @@ struct Exchange {
 
 impl Exchange {
     async fn new() -> Self {
+        Self::with_grease(false).await
+    }
+
+    /// Builds an exchange with hyperium's GREASE behaviour under the caller's control.
+    ///
+    /// Every other test here disables it, so that a failure is a failure of this adapter and
+    /// not of a reserved-identifier stream nobody meant to test. That leaves hyperium's
+    /// *default* configuration unexercised, which is the one a caller actually gets: GREASE
+    /// opens an extra unidirectional stream carrying a reserved type. This is where that is
+    /// covered.
+    async fn with_grease(grease: bool) -> Self {
         let mut pair = Pair::new().await;
         let (client, server) = pair.split();
 
-        let mut tasks = vec![tokio::spawn(echo_server(server))];
+        let mut tasks = vec![tokio::spawn(echo_server_with_grease(server, grease))];
 
         let mut builder = h3::client::builder();
-        builder.send_grease(false);
+        builder.send_grease(grease);
         let (mut driver, sender) = builder.build(client).await.expect("a hyperium client");
         tasks.push(tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
@@ -140,6 +159,20 @@ async fn a_small_body_round_trips_exactly() {
 async fn a_body_spanning_many_packets_round_trips_exactly() {
     let mut exchange = Exchange::new().await;
     exchange.round_trip(64 * 1024).await;
+}
+
+/// Hyperium's own defaults, GREASE included.
+///
+/// A caller that does not reach for the builder gets this, and GREASE is not decoration here:
+/// it opens an extra peer-initiated unidirectional stream with a reserved type, which this
+/// adapter must accept, route and let hyperium ignore without disturbing the request streams
+/// beside it.
+#[tokio::test]
+async fn the_default_configuration_round_trips_with_grease_enabled() {
+    let mut exchange = Exchange::with_grease(true).await;
+    for size in [0usize, 1024, 9000] {
+        exchange.round_trip(size).await;
+    }
 }
 
 #[tokio::test]

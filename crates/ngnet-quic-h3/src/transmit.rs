@@ -79,19 +79,26 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
                     }
                     H3WriteOutcome::Accepted(accepted)
                 }
-                // The packet carried only transport work -- an acknowledgement, most often
-                // -- and no STREAM frame at all. Let it reach the peer and wait for an
-                // enabling event before offering the same stream prefix again; retrying
-                // inside this pass cannot create stream capacity.
+                // The packet carried no STREAM frame for this stream at all. ngtcp2 skips
+                // the caller's stream when another one is already queued for transmission or
+                // a queued frame did not fit -- an acknowledgement, a retransmission, a
+                // window update -- and the packet goes to that instead.
                 //
                 // Reported as `Blocked` rather than `Accepted(0)`, and the difference is
                 // load-bearing for a `fin`-only offer: the layer commits an acceptance and
                 // marks the stream ended, but abandons a block and offers it again. Ending
                 // a stream on a packet that never carried the FIN leaves the peer waiting
                 // for an end ngtcp2 has nothing in flight to retransmit.
+                //
+                // The pass is *not* ended here, and that is the other half of it. The frames
+                // that displaced the stream have now been produced, so the next offer has
+                // room for it -- and `Offers::write_next` only unblocks and re-offers a
+                // stream when it is asked again, once per pass. Breaking out instead would
+                // leave the FIN waiting for an external event, and the packet just produced
+                // may have been a bare acknowledgement: not ack-eliciting, so nothing is
+                // coming back, and the only deadline left could be the idle timeout.
                 Ok(StreamWrite::DatagramWithoutStream { len }) => {
                     produced_len = Some(len);
-                    blocked = true;
                     H3WriteOutcome::Blocked
                 }
                 // Every blocked condition is the same to the layer: nothing can be taken for
