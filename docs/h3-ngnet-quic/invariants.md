@@ -1,10 +1,9 @@
 # Hyperium H3 over ngtcp2: invariants
 
-> **Read this first.** The live-loopback suites below are `#[ignore]`d in ordinary runs,
-> because this adapter has an unresolved intermittent liveness failure — see
-> [`pending-work.md`](pending-work.md). Each row states a property the crate is *meant* to have
-> and the test that pins it; the tests pass on an idle machine and can stall under contention.
-> Nothing in this table should be read as evidence that the crate is fit for use.
+> **Read this first.** None of the suites below are `#[ignore]`d. The intermittent liveness
+> failure that once gated them was found and fixed — a lost FIN, one layer down in the
+> transport's report of what ngtcp2 serialised; see [`pending-work.md`](pending-work.md).
+> Each row states a property the crate has and the test that pins it.
 
 Each row is a claim the crate makes and the test that would fail if it stopped being true.
 Where a test is marked *(regression)*, it was checked against the implementation before the fix
@@ -36,22 +35,20 @@ and observed to fail, so it pins a defect rather than merely agreeing with the c
 
 ## Not established here
 
-**Nothing above is reliable under CPU contention.** Each invariant holds on an idle machine.
-Under load, the adapter's unresolved liveness failure can stall any exchange: it was first found
-with a repeated workload (roughly two runs in five at 200 x 1 KiB), and single-exchange lifecycle
-tests have since been observed to stall as well. Repetition multiplies the timing windows rather
-than creating them.
+**The resolved liveness defect is covered by tests, not by argument.** The fix is pinned from
+two sides: `crates/ngnet-quic/tests/fin_delivery.rs` reproduces ngtcp2's "the packet carried no
+STREAM frame" case deterministically and asserts it is never reported as a written FIN, and
+`tests/repeated.rs` runs the 200-exchange workload that used to fail roughly two runs in five.
+What is *not* established is a bound on how rare any remaining timing failure is: 25 matched
+release-mode runs of that workload on this host produced no failure on this adapter, which
+bounds it loosely and does not prove it is zero.
 
-That defect is this crate's own, distinguished from the inherited one below by a pre-registered
-attribution rule and by the native stack passing the identical workload 10 out of 10. It is
-documented in [`pending-work.md`](pending-work.md). No invariant in the table above should be
-read as implying the crate is fit for use.
-
-The transport underneath this crate has a known, unresolved intermittent connection-ending stall
-under repeated 16 KiB and 1 MiB workloads — review finding S9, recorded in
+**A distinct defect in the *other* stack remains, and it is not this crate's.** `ngnet-quic-h3`
+— the native HTTP/3 implementation over the same transport — still ends connections
+intermittently under repeated 16 KiB exchanges: review finding S9, recorded in
 [`../quic-h3/invariants.md`](../quic-h3/invariants.md) and
 [`../benchmarks/data/xeon-8370c-azure/30-ngtcp2-final-review-resolution.md`](../benchmarks/data/xeon-8370c-azure/30-ngtcp2-final-review-resolution.md).
-No test here is `#[ignore]`d for it, because none of these tests provoked it. That is not
-evidence that this adapter is immune; the workload that provokes it is repeated large-body
-exchanges, which is a benchmark shape rather than a correctness shape. See
-[`pending-work.md`](pending-work.md) and the run record for what was actually observed.
+Measured on this host after the FIN fix, at 200 x 16 KiB with both arms on the same transport
+and the same workload: this adapter completed 20 runs out of 20, the native arm failed 2 of 20
+with `ErrorKind::Closed`. Transport held fixed, HTTP/3 layer varied — so the remaining fault is
+in the native stack, and no test here is `#[ignore]`d for it.

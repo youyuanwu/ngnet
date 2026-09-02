@@ -1,5 +1,12 @@
 # 01 — Hyperium H3 and ngnet H3 over the same ngtcp2 transport
 
+> **Superseded on one point, and only one.** The adapter defect this session found has since
+> been root-caused and fixed; see [`02-h3-ngnet-quic-fin-fix`](02-h3-ngnet-quic-fin-fix.md).
+> Everything else below stands as recorded — in particular, **no performance conclusion was
+> drawn here and none has been drawn since**. The timings in this document remain what this
+> host produced on a day it could not hold still, and they are not restated or revised
+> anywhere.
+
 > **New machine.** This is the first run on [`epyc-7763-azure`](README.md), which is a different
 > machine from `xeon-8370c-azure` — AMD rather than Intel, 4 vCPU rather than that host's count,
 > different kernel and generation. **Every absolute timing and every drift threshold recorded on
@@ -178,7 +185,9 @@ open rather than answered by assumption.
 - It does not establish that `h3-ngnet-quic` is correct under sustained load. It is not.
 - It does not establish a rate or a root cause for the adapter defect beyond the figures above;
   the failing component between the server accepting a stream and the client seeing a response
-  has not been identified.
+  has not been identified. *(Since identified: see
+  [`02-h3-ngnet-quic-fin-fix`](02-h3-ngnet-quic-fin-fix.md). The rest of this list is unchanged
+  by that, because none of it depended on the defect's cause.)*
 - It does not establish anything about a real network. Loopback only.
 - It says nothing about the compio or QMux families; they were not run here beyond the one
   control arm.

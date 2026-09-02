@@ -1,22 +1,25 @@
 //! Hyperium H3 transport traits over an established ngnet QUIC connection.
 //!
-//! # Not ready for use
+//! # A resolved liveness defect, and where its regression tests are
 //!
-//! This adapter has a known, unfixed liveness defect. It intermittently stalls — a peer waits
-//! for something that never arrives, and the connection sits until its idle timeout ends it.
-//! Measured at roughly two runs in five for 200 x 1 KiB exchanges on one host.
+//! This adapter used to stall intermittently under repeated exchanges: a peer waited for a
+//! response body that never ended, and the connection sat until its idle timeout. The cause
+//! was a lost FIN, and it was not in this crate's wake plumbing but one layer down.
 //!
-//! Repetition provokes it most reliably, but it is **not confined to repetition**: single
-//! exchanges in this crate's own lifecycle suite have also been observed to stall under CPU
-//! contention. Repetition multiplies the timing windows rather than creating them. For that
-//! reason the live-loopback test suites are `#[ignore]`d in ordinary runs, following the same
-//! precedent as the transport's own unresolved liveness failure; run them with
-//! `cargo test -p h3-ngnet-quic -- --ignored` on an idle machine.
+//! `ngtcp2_conn_writev_stream` may return a packet that contains no STREAM frame at all, and
+//! reports that by leaving `*pdatalen` at `-1`. It may also serialise a *zero-length* STREAM
+//! frame, which it does exactly when the offer carries nothing but `fin`, and reports *that*
+//! with `*pdatalen == 0`. [`ngnet_quic`] clamped the sign away, so the two arrived here
+//! identically and [`poll_finish`] recorded a stream as ended on a packet that had gone to an
+//! acknowledgement. Nothing was in flight, so loss recovery had nothing to retransmit.
 //!
-//! It is **this crate's defect**, not the separately known `ngnet-quic-h3` large-body stall:
-//! the same workload against that stack succeeded 10 times out of 10 while this one failed 6
-//! times out of 10. `crates/h3-ngnet-quic/tests/repeated.rs` reproduces it and is `#[ignore]`d
-//! for now; `docs/h3-ngnet-quic/pending-work.md` records what is known.
+//! The transport now keeps them apart with
+//! [`StreamWrite::DatagramWithoutStream`](ngnet_quic::StreamWrite::DatagramWithoutStream), and
+//! this crate re-offers rather than committing. `crates/ngnet-quic/tests/fin_delivery.rs`
+//! pins the transport's half deterministically; `tests/repeated.rs` is the end-to-end gate,
+//! and neither is `#[ignore]`d.
+//!
+//! [`poll_finish`]: h3::quic::SendStream::poll_finish
 //!
 //! The caller establishes a connection through [`ngnet_quic`]'s endpoint layer, detaches it,
 //! and passes it to [`from_detached`]. What comes back is a [`Connection`] that hyperium's

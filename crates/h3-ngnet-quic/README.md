@@ -3,13 +3,6 @@
 Hyperium [`h3`](https://crates.io/crates/h3) transport traits over an established
 [`ngnet-quic`](../ngnet-quic) connection.
 
-> **Not ready for use.** This adapter intermittently stalls, leaving a connection to sit until
-> its idle timeout — roughly two runs in five at 200 x 1 KiB, and single exchanges have stalled
-> too under CPU contention. Its live-loopback tests are `#[ignore]`d for that reason. It is this
-> crate's own defect, not the separately known `ngnet-quic-h3` large-body stall; the native
-> stack passes the identical workload. See
-> [`docs/h3-ngnet-quic/pending-work.md`](../../docs/h3-ngnet-quic/pending-work.md).
-
 This is the join that lets the community HTTP/3 state machine run on this workspace's
 ngtcp2-backed QUIC transport. It is the counterpart to
 [`ngnet-quic-h3`](../ngnet-quic-h3), which joins the same transport to this workspace's own
@@ -33,6 +26,21 @@ let (mut h3, mut send_request) = h3::client::builder()
 ```
 
 The server side is the same with `accept_detached` and `h3::server::builder()`.
+
+## A resolved liveness defect
+
+This adapter used to stall intermittently under repeated exchanges — roughly two runs in five
+at 200 x 1 KiB — leaving a connection to sit until its idle timeout. The cause was a lost FIN,
+one layer down: `ngtcp2_conn_writev_stream` distinguishes "no STREAM frame was written"
+(`*pdatalen == -1`) from "a zero-length STREAM frame was written", which is what a `fin`-only
+offer produces (`*pdatalen == 0`), and `ngnet-quic` clamped the sign away. `poll_finish` then
+recorded a stream as ended on a packet that had gone to an acknowledgement, with nothing in
+flight for loss recovery to retransmit.
+
+The transport now reports the two separately and this adapter re-offers instead of committing.
+`crates/ngnet-quic/tests/fin_delivery.rs` pins the transport's half deterministically;
+`tests/repeated.rs` is the end-to-end gate. None of this crate's tests are `#[ignore]`d, and
+CI runs all of them.
 
 ## What it owns, and what it does not
 

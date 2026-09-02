@@ -79,5 +79,10 @@ the state machine move together and cannot be separated by these arms.
 [`../data/epyc-7763-azure/01-h3-ngnet-quic-comparison.md`](../data/epyc-7763-azure/01-h3-ngnet-quic-comparison.md),
 is inconclusive: an unchanged control arm drifted 4.2x within the session, roughly thirty times
 the candidate effect, on a host that could not be quiesced. That run also found a liveness defect
-in `h3-ngnet-quic` itself under repeated exchanges, which must be fixed before the comparison is
-worth running again.
+in `h3-ngnet-quic` itself under repeated exchanges.
+
+That defect has since been root-caused and fixed —
+[`../data/epyc-7763-azure/02-h3-ngnet-quic-fin-fix.md`](../data/epyc-7763-azure/02-h3-ngnet-quic-fin-fix.md)
+— so the blocker on the adapter side is gone. **The blocker on the host side is not.** Run 02
+deliberately reports completions and no timings, and run 01's verdict is unchanged. The
+comparison is worth running again on a machine that can hold still, and not before.

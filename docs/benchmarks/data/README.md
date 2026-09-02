@@ -61,6 +61,7 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [32-h3-qmux-driver-ownership](xeon-8370c-azure/32-h3-qmux-driver-ownership.md) | xeon-8370c-azure | 2026-09-01 | Driver-only lower I/O A/B — **retained; body improvement clears controls on both substrates** | — |
 | [33-h3-qmux-post-revision](xeon-8370c-azure/33-h3-qmux-post-revision.md) | xeon-8370c-azure | 2026-09-01 | Equal-topology post-revision matrix — **Criterion favors hyperium, but pinned ranges overlap; inconclusive** | — |
 | [01-h3-ngnet-quic-comparison](epyc-7763-azure/01-h3-ngnet-quic-comparison.md) | epyc-7763-azure | 2026-09-02 | Hyperium H3 against ngnet H3 over one ngtcp2 transport | inconclusive; found an `h3-ngnet-quic` liveness defect |
+| [02-h3-ngnet-quic-fin-fix](epyc-7763-azure/02-h3-ngnet-quic-fin-fix.md) | epyc-7763-azure | 2026-09-02 | Root cause of run 01's defect, and reliability after the fix | fixed — a lost FIN in the transport's report of what ngtcp2 serialised; **reliability only, no timing claimed** |
 
 Runs [`08`](xeon-8370c-azure/08-qmux-against-h2.md) and
 [`09`](xeon-8370c-azure/09-qmux-h2-mechanisms.md) are the first cross-protocol comparison and its

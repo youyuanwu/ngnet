@@ -45,8 +45,10 @@ calibrated against a machine that no longer exists in this project's hands.
 
 **Consequence: this host cannot currently produce a comparative timing result.** It can compile
 and run every arm, and it is useful for correctness and liveness work — run 01 found a real
-adapter defect precisely because it ran a repeated workload here. It is not useful for deciding
-which of two stacks is faster until it can be quiesced.
+adapter defect precisely because it ran a repeated workload here, and run 02 confirmed the fix
+for it and surfaced the native stack's own remaining one. It is not useful for deciding which of
+two stacks is faster until it can be quiesced. Nothing in run 02 changes that: it counts
+completions, not microseconds.
 
 ## Arms this machine can run
 
@@ -66,3 +68,4 @@ arm was run in this session.
 | Run | Date | Commit | Subject |
 | --- | --- | --- | --- |
 | [01-h3-ngnet-quic-comparison](01-h3-ngnet-quic-comparison.md) | 2026-09-02 | `6119972` | Hyperium H3 and ngnet H3 over the same ngtcp2 transport — inconclusive, and an adapter defect found |
+| [02-h3-ngnet-quic-fin-fix](02-h3-ngnet-quic-fin-fix.md) | 2026-09-02 | `feature/h3-ngnet-quic` | The lost FIN — root cause of run 01's defect, and reliability after the fix. **Reliability only; no timing claimed** |
