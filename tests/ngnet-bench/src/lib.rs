@@ -2063,9 +2063,37 @@ impl Drop for NgnetNgtcpH3 {
 // nothing else that could be held equal.
 //
 // `NgnetNgtcpH3` above is deliberately left alone so run 25's record stays reproducible;
-// this pair adds a separately configured native arm instead. See
-// `docs/benchmarks/cases/quic-h3-comparison.md` for the held-constant inventory and for the
-// asymmetries that could not be removed.
+// this pair adds a separately configured native arm instead.
+//
+// # The asymmetries that could not be removed
+//
+// These are listed here, next to the code, because a reader of the fixtures should not have
+// to go looking for them. `docs/benchmarks/cases/quic-h3-comparison.md` carries the same list
+// alongside the results.
+//
+// 1. **Where the HTTP/3 driving happens relative to the timed region.** `ngnet-h3` advances
+//    its state machine in its spawned driver task; hyperium advances a request stream from
+//    whichever task is polling it, which here is the task inside the measured closure. UDP I/O
+//    is *not* asymmetric -- both arms hand that to the shared endpoint driver -- but the
+//    h3-to-stream driving is, and that work lands inside the timed region on one side and
+//    partly outside it on the other. This is inherent to comparing these two drivers.
+// 2. **Two independently written QUIC pumps.** `ngnet-quic-h3`'s `pump`/`transmit` and
+//    `h3-ngnet-quic`'s pump are separate implementations of the same idea. Differences between
+//    them count as "the adapter", which is part of what is being measured, but they are not
+//    differences in the HTTP/3 state machine.
+// 3. **Hyperium clones its request handle per exchange**, because `SendRequest::send_request`
+//    takes `&mut self`; the native handle does not need it. Already disclosed for the QMux
+//    pair for the same reason.
+// 4. **Hyperium has more await points inside the timed region**: `send_request`, `send_data`,
+//    `finish`, `recv_response` and the `recv_data` loop, against the native arm's single
+//    `send_request` plus `drain`.
+// 5. **Body chunking granularity may differ** between the two HTTP/3 layers even for an
+//    identical payload; neither layer exposes a control that would let this be equalised.
+//
+// One deliberate non-match, for completeness: the native config sets `max_concurrent_streams`
+// and hyperium 0.0.8 has no equivalent setting. It does not reach the wire as a difference --
+// concurrent streams are bounded by the QUIC transport's `MAX_STREAMS`, which is identical for
+// both arms -- and the workload is serial anyway.
 // ---------------------------------------------------------------------------
 
 /// The native ngtcp2 arm, configured to match hyperium rather than to its own defaults.

@@ -11,11 +11,12 @@
 //! QPACK-matched fixture, not the default one: hyperium 0.0.8 has no dynamic table and
 //! `ngnet-h3` defaults to 4 KiB, so the default pair would differ in header state.
 //!
-//! The asymmetries that could not be removed are listed in
-//! `docs/benchmarks/cases/quic-h3-comparison.md`. The most important is that `ngnet-h3` does
-//! its transport work in its spawned driver task while hyperium calls the adapter's `poll_*`
-//! from the task inside the measured closure — so the timed region does not cover quite the
-//! same work on both sides. Read the results with that in mind.
+//! Five asymmetries could not be removed. They are enumerated next to the fixtures in
+//! `ngnet-bench`'s library, and repeated with the results in
+//! `docs/benchmarks/cases/quic-h3-comparison.md`. The one to keep in mind while reading a
+//! number: `ngnet-h3` advances its state machine in its spawned driver task, while hyperium
+//! advances a request stream from the task polling it — which here is the task inside the
+//! measured closure. UDP I/O is shared and symmetric; the h3-to-stream driving is not.
 
 use std::hint::black_box;
 
