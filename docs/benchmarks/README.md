@@ -156,6 +156,8 @@ HTTP/2 arm and an HTTP/3-over-QMux arm.
 | [`qmux_h3_body_throughput`](cases/qmux-h3-comparison.md) | QMux duplex | HTTP/3 implementation × body ∈ {0, 1 KiB, 64 KiB, 1 MiB, 8 MiB} | MB/s |
 | [`qmux_h3_socket_serial_latency`](cases/qmux-h3-comparison.md) | QMux loopback TCP | HTTP/3 implementation | latency of one empty exchange |
 | [`qmux_h3_socket_body_throughput`](cases/qmux-h3-comparison.md) | QMux loopback TCP | HTTP/3 implementation × body ∈ {0, 1 KiB, 64 KiB, 1 MiB, 8 MiB} | MB/s |
+| [`quic_stack_h3_serial_latency`](cases/quic-h3-comparison.md) | QUIC loopback | HTTP/3 implementation, one ngtcp2 transport | latency of one empty exchange |
+| [`quic_stack_h3_body_throughput`](cases/quic-h3-comparison.md) | QUIC loopback | HTTP/3 implementation at 1 KiB, one ngtcp2 transport | MB/s |
 
 ## The findings so far
 
