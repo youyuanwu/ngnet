@@ -32,13 +32,37 @@ use crate::tls::Session;
 pub enum StreamWrite {
     /// A datagram was produced, and this many bytes of the offered data went into it.
     ///
-    /// `accepted` may be less than what was offered, or zero: the packet may have been
-    /// filled with control frames instead. Whatever was not accepted must be offered again.
+    /// `accepted` may be less than what was offered. It is zero only when a *zero-length*
+    /// STREAM frame was serialised, which ngtcp2 does solely for an offer that carries
+    /// nothing but `fin` (`ngtcp2.h:5238-5243`) — so on such an offer, `accepted == 0` is
+    /// the confirmation that the FIN is on the wire.
+    ///
+    /// Whatever was not accepted must be offered again.
     Datagram {
         /// Bytes of the datagram buffer that were filled.
         len: usize,
         /// Bytes of the caller's stream data the connection took.
         accepted: usize,
+    },
+    /// A datagram was produced, but nothing of the offered stream went into it.
+    ///
+    /// ngtcp2 filled the packet with other frames — an acknowledgement, most often — and
+    /// serialised no STREAM frame at all: "The packet might not contain STREAM frame if
+    /// other frames occupy the packet. In that case, `*pdatalen` would be -1"
+    /// (`ngtcp2.h:5233-5236`).
+    ///
+    /// Kept apart from `Datagram { accepted: 0 }` because on an offer carrying `fin` the two
+    /// are opposites, and no other signal separates them. A zero-length STREAM frame *is*
+    /// the whole of such a write; a packet that omitted the stream entirely has not ended
+    /// anything. A caller that treats this as a completed FIN leaves its peer waiting for an
+    /// end that was never serialised and that ngtcp2, having nothing in flight, will never
+    /// retransmit — a stall that ends only at the idle timeout.
+    ///
+    /// The datagram is real and must still be sent. The entire offer, `fin` included, has to
+    /// be made again.
+    DatagramWithoutStream {
+        /// Bytes of the datagram buffer that were filled.
+        len: usize,
     },
     /// The stream's flow-control window is full. Wait for the peer to grant more.
     StreamBlocked,
@@ -262,6 +286,9 @@ impl<S: Session> Conn<'_, S> {
             };
             let category = match outcome {
                 StreamWrite::Datagram { .. } => crate::diagnostics::AttemptOutcome::Datagram,
+                StreamWrite::DatagramWithoutStream { .. } => {
+                    crate::diagnostics::AttemptOutcome::DatagramWithoutStream
+                }
                 StreamWrite::StreamBlocked => crate::diagnostics::AttemptOutcome::StreamBlocked,
                 StreamWrite::ConnectionBlocked => {
                     crate::diagnostics::AttemptOutcome::ConnectionBlocked
@@ -358,6 +385,9 @@ impl<S: Session> Conn<'_, S> {
         if let Some((role, sampled_payload_limit, offered, stream_offset)) = diagnostic_context {
             let category = match outcome {
                 StreamWrite::Datagram { .. } => crate::diagnostics::AttemptOutcome::Datagram,
+                StreamWrite::DatagramWithoutStream { .. } => {
+                    crate::diagnostics::AttemptOutcome::DatagramWithoutStream
+                }
                 StreamWrite::StreamBlocked => crate::diagnostics::AttemptOutcome::StreamBlocked,
                 StreamWrite::ConnectionBlocked => {
                     crate::diagnostics::AttemptOutcome::ConnectionBlocked
@@ -437,8 +467,14 @@ impl<S: Session> Conn<'_, S> {
 
         // Whatever ngtcp2 did not take was never handed over, so it must not stay retained
         // or count towards the stream's offset -- the caller will offer it again.
-        let taken = if written > 0 {
-            accepted.max(0) as usize
+        //
+        // A negative count is not a small one: `-1` is ngtcp2 saying it wrote no STREAM
+        // frame at all, which is why it is carried out of here as its own outcome rather
+        // than clamped into `accepted: 0`. Clamping is what made a declined FIN
+        // indistinguishable from a serialised one.
+        let carried_stream = accepted >= 0;
+        let taken = if written > 0 && carried_stream {
+            accepted as usize
         } else {
             0
         };
@@ -451,6 +487,9 @@ impl<S: Session> Conn<'_, S> {
             debug_assert!(len <= dest.len());
             // SAFETY: `raw` is live and the timestamp is the one just used.
             unsafe { sys::ngtcp2_conn_update_pkt_tx_time(self.raw(), now.as_raw()) };
+            if !carried_stream {
+                return Ok(StreamWrite::DatagramWithoutStream { len });
+            }
             return Ok(StreamWrite::Datagram {
                 len,
                 accepted: taken,

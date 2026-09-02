@@ -130,13 +130,16 @@ fn the_public_surface_still_has_the_shape_it_promised() {
     }
     let _ = on_expiry;
 
-    // **Closed.**
+    // **Closed.** `DatagramWithoutStream` is deliberately separate from a zero-byte
+    // acceptance: on an offer carrying only `fin` the two are opposites, and conflating
+    // them drops the FIN.
     fn on_stream_write(outcome: StreamWrite) {
         match outcome {
             StreamWrite::Datagram {
                 len: _,
                 accepted: _,
             }
+            | StreamWrite::DatagramWithoutStream { len: _ }
             | StreamWrite::StreamBlocked
             | StreamWrite::ConnectionBlocked
             | StreamWrite::Blocked

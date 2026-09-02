@@ -545,9 +545,27 @@ where
         let last = fin && chunk_len == data.len();
 
         let outcome = conn.write_stream(&mut buffer, stream, &data[..chunk_len], last, now);
+        // Three groups, and the produced one has two spellings. A packet that carried no
+        // STREAM frame is still a packet, so it is sent like any other; what differs is what
+        // has to happen afterwards. Nothing of that offer was serialised -- not even a
+        // `fin`, which is the whole of a zero-length write -- so the offer goes back on the
+        // queue in full. Folding it into a zero-byte acceptance would drop a `fin` silently,
+        // because `accepted < data.len()` is false when both are zero, and the peer would
+        // wait for an end that was never written.
+        let produced = match outcome {
+            Ok(StreamWrite::Datagram { len, accepted }) => Ok(Some((len, accepted, true))),
+            Ok(StreamWrite::DatagramWithoutStream { len }) => Ok(Some((len, 0, false))),
+            Ok(
+                StreamWrite::StreamBlocked
+                | StreamWrite::ConnectionBlocked
+                | StreamWrite::Blocked
+                | StreamWrite::Idle,
+            ) => Ok(None),
+            Err(err) => Err(err),
+        };
 
-        match outcome {
-            Ok(StreamWrite::Datagram { len, accepted }) => {
+        match produced {
+            Ok(Some((len, accepted, carried_stream))) => {
                 // The datagram is written into the reusable buffer. Offer it to the socket
                 // *before* the buffer is reused, exactly as `flush` does with a core-produced
                 // datagram: a datagram the socket accepts immediately is sent straight from
@@ -574,7 +592,7 @@ where
                     tracked.shared.set_retained(held);
                     // Whatever was not accepted -- which may be everything, since a packet
                     // can fill with control frames instead -- goes back on the queue.
-                    if accepted < data.len() {
+                    if !carried_stream || accepted < data.len() {
                         tracked.shared.push(Command::Write {
                             stream,
                             data: data[accepted..].to_vec(),
@@ -583,12 +601,7 @@ where
                     }
                 }
             }
-            Ok(
-                StreamWrite::StreamBlocked
-                | StreamWrite::ConnectionBlocked
-                | StreamWrite::Blocked
-                | StreamWrite::Idle,
-            ) => {
+            Ok(None) => {
                 // Not an error and not the end. Requeue and try again once credit or the
                 // congestion window allows; treating any of these as "finished" is the
                 // classic QUIC stall.
