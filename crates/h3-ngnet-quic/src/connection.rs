@@ -55,6 +55,8 @@ fn poll_open<S: Session>(
     kind: Open,
     cx: &mut Context<'_>,
 ) -> Poll<Result<StreamId, StreamErrorIncoming>> {
+    // Cloned once so the closure below does not borrow `cx`, which `pump` needs mutably.
+    let waker = cx.waker().clone();
     let outcome = shared.pump(cx, |core| {
         if let Some(terminal) = &core.terminal {
             return Err(Some(terminal.stream_error()));
@@ -66,13 +68,11 @@ fn poll_open<S: Session>(
         match opened {
             Ok(stream) => {
                 core.state(stream);
-                core.streams_extended = false;
                 // The stream's first frames leave with the next datagram.
                 pump::produce(core, None);
                 Ok(stream)
             }
             Err(err) => {
-                core.streams_extended = false;
                 // Distinguish "no stream credit left" — a temporary block that only
                 // `Observed::StreamsExtended` lifts — from a real failure. Parking on a
                 // permanent error would wait forever for a signal that is never coming.
@@ -81,6 +81,12 @@ fn poll_open<S: Session>(
                     Open::Uni => core.detached.conn.streams_uni_left() == 0,
                 };
                 if blocked {
+                    // Registered while the core is still held. `Observed::StreamsExtended`
+                    // is the only thing that lifts this block, and it is routed by whichever
+                    // task happens to pump -- so a wake delivered between releasing the core
+                    // and reaching the registry would find nobody and park this task for
+                    // good.
+                    shared.wakers.register_connection(&waker);
                     Err(None)
                 } else {
                     let terminal = ConnectionTerminal::undefined(format!(
@@ -95,10 +101,7 @@ fn poll_open<S: Session>(
     match outcome {
         Ok(stream) => Poll::Ready(Ok(stream)),
         Err(Some(err)) => Poll::Ready(Err(err)),
-        Err(None) => {
-            shared.wakers.register_connection(cx.waker());
-            Poll::Pending
-        }
+        Err(None) => Poll::Pending,
     }
 }
 
@@ -138,6 +141,8 @@ fn poll_accept<S: Session>(
     kind: Open,
     cx: &mut Context<'_>,
 ) -> Poll<Result<Option<StreamId>, ConnectionErrorIncoming>> {
+    // Cloned once so the closure below does not borrow `cx`, which `pump` needs mutably.
+    let waker = cx.waker().clone();
     let outcome = shared.pump(cx, |core| {
         let queued = match kind {
             Open::Bidi => core.accept_bidi.pop_front(),
@@ -155,14 +160,15 @@ fn poll_accept<S: Session>(
         if let Some(terminal) = &core.terminal {
             return Err(terminal.connection_error());
         }
+        // Under the core lock: the HTTP/3 driver spends nearly all its life parked here, and
+        // a peer-opened stream routed by another task between the check and the registration
+        // would wake an empty list and leave the driver asleep on a queued request.
+        shared.wakers.register_connection(&waker);
         Ok(None)
     });
     match outcome {
         Ok(Some(stream)) => Poll::Ready(Ok(Some(stream))),
-        Ok(None) => {
-            shared.wakers.register_connection(cx.waker());
-            Poll::Pending
-        }
+        Ok(None) => Poll::Pending,
         Err(err) => Poll::Ready(Err(err)),
     }
 }

@@ -217,12 +217,24 @@ fn route_observed<S: Session>(core: &mut Core<S>, changed: &mut Changed) {
                 changed.stream(stream.get());
             }
             Observed::StreamsExtended(_) => {
-                // The only signal that a refused open may now succeed.
-                core.streams_extended = true;
+                // The only signal that a refused open may now succeed, and waking is the
+                // whole of acting on it: `poll_open` re-asks the transport rather than
+                // consulting a flag, so a flag would only be able to disagree with it.
                 changed.connection = true;
             }
             Observed::Closed(stream, _) => {
                 changed.stream(stream.get());
+                // The transport has finished with it. If no handle is left either, nothing
+                // can reach this entry again, and `state()` creates entries on demand -- so
+                // a late event for a stream whose handles are already gone would otherwise
+                // leave one behind for the life of the connection.
+                if core
+                    .streams
+                    .get(&stream.get())
+                    .is_some_and(|state| state.handles == 0)
+                {
+                    core.streams.remove(&stream.get());
+                }
             }
             Observed::LocallyOpened(_) | Observed::Acked(..) | Observed::HandshakeCompleted => {}
             _ => {}
@@ -352,15 +364,25 @@ pub(crate) enum Offered {
     Accepted(usize),
     /// A datagram was produced, but it carried nothing of this stream.
     ///
-    /// ngtcp2 filled the packet with other frames and wrote no STREAM frame at all. Kept
-    /// apart from `Accepted(0)` because on a FIN-only offer the two are opposites: one
-    /// ended the stream, the other did not touch it. The whole offer, `fin` included, has
-    /// to be made again — nothing of it is in flight, so nothing will be retransmitted.
+    /// ngtcp2 skips the caller's stream when another stream is already queued for
+    /// transmission or a queued frame did not fit, and gives the packet to that instead
+    /// (`ngtcp2_conn.c:4251-4253`). Kept apart from `Accepted(0)` because on a FIN-only
+    /// offer the two are opposites: one ended the stream, the other did not touch it. The
+    /// whole offer, `fin` included, has to be made again — nothing of it is in flight, so
+    /// nothing will be retransmitted.
     Displaced,
     /// The transport has something to send but cannot right now. Not "finished".
     Blocked,
     /// There was no room to produce another datagram.
     NoCapacity,
+    /// The transport will take nothing more on this stream: its sending half is shut.
+    ///
+    /// A stream-level fact, and it must stay one. ngtcp2 answers a write to a shut sending
+    /// half with `ERR_STREAM_SHUT_WR`, which reaches this crate as an ordinary error; letting
+    /// it fall into the failure arm below would end the whole connection — every other
+    /// request on it included — over one abandoned stream. The native stack draws the same
+    /// line, mapping `ErrorKind::StreamClosed` to a stream-level `Gone`.
+    StreamGone,
     /// The connection failed while writing.
     Failed,
 }
@@ -414,7 +436,7 @@ pub(crate) fn offer<S: Session>(
         }
         Ok(StreamWrite::DatagramWithoutStream { len }) => {
             // A real datagram that happens to carry none of this stream. It has to be sent
-            // — withdrawing it would lose whatever the connection did put in it — but it
+            // -- withdrawing it would lose whatever the connection did put in it -- but it
             // settles nothing about the offer, which must be made again in full.
             datagram.truncate(len);
             core.detached.send(datagram);
@@ -429,6 +451,11 @@ pub(crate) fn offer<S: Session>(
             datagram.clear();
             core.scratch = datagram;
             Offered::Blocked
+        }
+        Err(err) if err.kind() == ngnet_quic::ErrorKind::StreamClosed => {
+            datagram.clear();
+            core.scratch = datagram;
+            Offered::StreamGone
         }
         Err(err) => {
             datagram.clear();

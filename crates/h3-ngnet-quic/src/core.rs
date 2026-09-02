@@ -23,6 +23,21 @@
 //! The waker set therefore lives behind its own lock rather than inside [`Core`]'s: the stable
 //! waker's `wake` runs the fan-out, and if the set were inside [`Core`] that fan-out would have
 //! to re-enter a mutex a pump may already be holding.
+//!
+//! # Why registration happens under the core's lock anyway
+//!
+//! Two locks, and the order between them is load-bearing. A task decides to park by reading
+//! the core, and it must not release the core before it has registered: in that gap another
+//! task can take the core, route the very thing being waited on, release it, and fan out to a
+//! registry the first task has not reached yet. The wake goes to nobody and the park is
+//! permanent — a lost wakeup, indistinguishable in the field from the stall this crate has
+//! already been through once.
+//!
+//! So every pending path registers while still holding the core, which makes "there is
+//! nothing here" and "wake me when there is" one indivisible step. Nesting is safe in this
+//! direction only, and it is the only direction taken: the fan-out paths below take the
+//! registry alone and never reach for the core, and they drain their lists before waking so
+//! no waker is invoked with a lock held.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -166,7 +181,10 @@ pub(crate) struct StreamState {
     pub(crate) finished: bool,
     /// The peer reset the stream it was sending on: our receiving side ended abnormally.
     pub(crate) recv_terminal: Option<DirectionTerminal>,
-    /// The peer asked us to stop sending: our sending side ended abnormally.
+    /// Our sending side ended abnormally: the peer asked us to stop, or we reset it.
+    ///
+    /// Both belong here even though only one comes from the peer, because both answer the
+    /// same question every send path asks — may this stream still be written to?
     pub(crate) send_terminal_state: Option<DirectionTerminal>,
     /// One hyperium logical send, retained until the transport has taken all of it.
     pub(crate) writing: Option<WriteBuf<Bytes>>,
@@ -212,8 +230,6 @@ pub(crate) struct Core<S: Session> {
     pub(crate) sleeping_until: Option<Timestamp>,
     /// The stable waker the sleep is polled under. Never a caller's waker.
     timer_waker: Waker,
-    /// The peer raised this endpoint's stream allowance, so a refused open may now succeed.
-    pub(crate) streams_extended: bool,
 }
 
 impl<S: Session> Core<S> {
@@ -234,7 +250,6 @@ impl<S: Session> Core<S> {
             sleeping: None,
             sleeping_until: None,
             timer_waker: Waker::from(Arc::new(TimerWake(Arc::clone(wakers)))),
-            streams_extended: false,
         }
     }
 

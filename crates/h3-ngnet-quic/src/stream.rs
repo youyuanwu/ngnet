@@ -61,10 +61,19 @@ impl<S: Session> Shared<S> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Runs one pump pass and then fans out to whatever it affected.
+    /// Runs one pump pass, lets the caller act on the result, and then fans out.
     ///
-    /// The fan-out happens after the lock is released, so a woken task can take it
-    /// immediately rather than bouncing off a lock this pass still holds.
+    /// The order inside is the whole design, and each step depends on the one before it.
+    /// `then` runs while the core is still held, which is where a caller that is about to
+    /// park registers its waker — so registration and the readiness check it is based on are
+    /// one step with respect to every other task. The fan-out happens after the lock is
+    /// released, so a woken task can take it immediately rather than bouncing off a lock this
+    /// pass still holds.
+    ///
+    /// That ordering is also what makes `rearm`'s "the timer is still due, do not park"
+    /// signal reach the task it is aimed at: `wake_everything` runs after `then`, so the
+    /// caller is already in the registry the delivery walks. Waking before it registered
+    /// would tell nobody, and the task told not to park would park anyway.
     pub(crate) fn pump<T>(&self, cx: &mut Context<'_>, then: impl FnOnce(&mut Core<S>) -> T) -> T {
         let (changed, value) = {
             let mut core = self.lock();
@@ -97,6 +106,26 @@ fn ended(terminal: &ConnectionTerminal) -> StreamErrorIncoming {
 
 fn internal(message: &str) -> StreamErrorIncoming {
     ConnectionTerminal::internal(message).stream_error()
+}
+
+/// Registers a waker for a stream while the core lock is held.
+///
+/// Every pending path in this crate goes through here rather than registering after its pass
+/// has returned. The registry has a lock of its own, so taking it under the core's is safe --
+/// nothing ever takes the core while holding the registry -- and it is what makes the
+/// readiness check and the registration one indivisible step with respect to any other task.
+fn park_on_stream<S: Session>(shared: &Shared<S>, stream: StreamId, waker: &core::task::Waker) {
+    shared.wakers.register_stream(stream.get(), waker);
+}
+
+/// The stream-level error for a sending half the transport has already shut.
+fn gone(stream: StreamId) -> StreamErrorIncoming {
+    let _ = stream;
+    // `H3_REQUEST_CANCELLED`, the same code this crate resets an abandoned send with, because
+    // by the time the transport refuses a write that is what has happened to the stream.
+    StreamErrorIncoming::StreamTerminated {
+        error_code: ABANDONED,
+    }
 }
 
 /// The sending half of a stream.
@@ -179,9 +208,9 @@ impl<S: Session> SendStream<S> {
                         }
                     }
                     Offered::Displaced => {
-                        // The packet went to control frames and carried none of this
-                        // stream. Offer the same prefix again: the frames that displaced it
-                        // have now been produced, so the next attempt has room for it. The
+                        // The packet went to whatever ngtcp2 had queued ahead of this stream
+                        // and carried none of it. Offer the same prefix again: what displaced
+                        // it has now been produced, so the next attempt has room. The
                         // enclosing loop is bounded, and exhausting it yields with a
                         // self-wake rather than parking on an event that may never come.
                         core.state(id).writing = Some(data);
@@ -189,7 +218,17 @@ impl<S: Session> SendStream<S> {
                     }
                     Offered::Blocked | Offered::NoCapacity => {
                         core.state(id).writing = Some(data);
+                        // Registered here, while the core is still held, and not after this
+                        // closure returns. Between releasing the core and taking the waker
+                        // registry, another task can route the very data being waited on and
+                        // fan out to a registry this one has not reached yet; the wake is
+                        // then delivered to nobody and the park is permanent.
+                        park_on_stream(&self.shared, id, &waker);
                         Step::Pending
+                    }
+                    Offered::StreamGone => {
+                        core.state(id).writing = None;
+                        Step::Error(gone(id))
                     }
                     Offered::Failed => {
                         let terminal = core.terminal.clone().unwrap_or_else(|| {
@@ -202,12 +241,8 @@ impl<S: Session> SendStream<S> {
             match step {
                 Step::Done => return Poll::Ready(Ok(())),
                 Step::Progress => continue,
-                Step::Pending => {
-                    self.shared
-                        .wakers
-                        .register_stream(self.stream.get(), cx.waker());
-                    return Poll::Pending;
-                }
+                // The registration already happened under the core lock, inside the closure.
+                Step::Pending => return Poll::Pending,
                 Step::Error(err) => return Poll::Ready(Err(err)),
             }
         }
@@ -297,7 +332,16 @@ impl<S: Session> quic::SendStream<Bytes> for SendStream<S> {
                     // again; recording the stream as finished here is precisely the defect
                     // that left a peer waiting until its idle timeout.
                     Offered::Displaced => Step::Progress,
-                    Offered::Blocked | Offered::NoCapacity => Step::Pending,
+                    Offered::Blocked | Offered::NoCapacity => {
+                        park_on_stream(&self.shared, id, &waker);
+                        Step::Pending
+                    }
+                    // Already shut, so there is no FIN left to send and no reason to keep
+                    // asking. Reported at stream level, not by failing the connection.
+                    Offered::StreamGone => {
+                        core.state(id).send_finished = true;
+                        Step::Done
+                    }
                     Offered::Failed => {
                         let terminal = core.terminal.clone().unwrap_or_else(|| {
                             ConnectionTerminal::internal("the transport failed")
@@ -309,12 +353,7 @@ impl<S: Session> quic::SendStream<Bytes> for SendStream<S> {
             match step {
                 Step::Done => return Poll::Ready(Ok(())),
                 Step::Progress => continue,
-                Step::Pending => {
-                    self.shared
-                        .wakers
-                        .register_stream(self.stream.get(), cx.waker());
-                    return Poll::Pending;
-                }
+                Step::Pending => return Poll::Pending,
                 Step::Error(err) => return Poll::Ready(Err(err)),
             }
         }
@@ -334,13 +373,25 @@ impl<S: Session> quic::SendStream<Bytes> for SendStream<S> {
         }
         state.send_reset = true;
         state.writing = None;
+        // Recorded, not merely flagged. ngtcp2 shuts the sending half here, and a later
+        // `poll_finish` or `poll_send` that offered to it would come back
+        // `ERR_STREAM_SHUT_WR` — a stream-level fact this crate used to escalate into a
+        // failed connection, taking every other request on it down too.
+        state.send_terminal_state = Some(crate::error::DirectionTerminal::Abandoned(reset_code));
         let _ = core
             .detached
             .conn
             .reset_stream(id, ApplicationErrorCode::new(reset_code));
         // A RESET_STREAM frame only leaves in a datagram, and `reset` is synchronous, so
-        // nothing else will send it on our behalf.
+        // nothing else will send it on our behalf. The timer is re-armed with it, because a
+        // frame that pacing refused needs a deadline to be offered again and this path has
+        // no caller coming back to create one.
         pump::produce(&mut core, None);
+        let due = pump::rearm(&mut core);
+        drop(core);
+        if due {
+            self.shared.wakers.wake_all();
+        }
     }
 
     fn send_id(&self) -> quic::StreamId {
@@ -383,7 +434,11 @@ impl<S: Session> quic::SendStreamUnframed<Bytes> for SendStream<S> {
                     // Nothing of this stream reached the packet, so the offer stands. Try
                     // it again rather than telling hyperium zero bytes were taken.
                     Offered::Displaced => Ok(None),
-                    Offered::Blocked | Offered::NoCapacity => Err(None),
+                    Offered::Blocked | Offered::NoCapacity => {
+                        park_on_stream(&self.shared, id, &waker);
+                        Err(None)
+                    }
+                    Offered::StreamGone => Err(Some(gone(id))),
                     Offered::Failed => {
                         let terminal = core.terminal.clone().unwrap_or_else(|| {
                             ConnectionTerminal::internal("the transport failed")
@@ -401,12 +456,7 @@ impl<S: Session> quic::SendStreamUnframed<Bytes> for SendStream<S> {
                     return Poll::Ready(Ok(accepted));
                 }
                 Err(Some(err)) => return Poll::Ready(Err(err)),
-                Err(None) => {
-                    self.shared
-                        .wakers
-                        .register_stream(self.stream.get(), cx.waker());
-                    return Poll::Pending;
-                }
+                Err(None) => return Poll::Pending,
             }
         }
         cx.waker().wake_by_ref();
@@ -435,13 +485,20 @@ impl<S: Session> Drop for SendStream<S> {
         // that will never end. One reset says so.
         state.send_reset = true;
         state.writing = None;
+        state.send_terminal_state = Some(crate::error::DirectionTerminal::Abandoned(ABANDONED));
         let _ = core
             .detached
             .conn
             .reset_stream(id, ApplicationErrorCode::new(ABANDONED));
         pump::produce(&mut core, None);
+        // As in `reset`: the task that owned this half is going away, so if pacing refused
+        // the frame nothing else is coming back to offer it again unless a deadline says so.
+        let due = pump::rearm(&mut core);
         let last = core.release_handle(id);
         drop(core);
+        if due {
+            self.shared.wakers.wake_all();
+        }
         self.forget_if_last(last);
     }
 }
@@ -474,6 +531,8 @@ impl<S: Session> quic::RecvStream for RecvStream<S> {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
+        // Cloned once so the closure below does not borrow `cx`, which `pump` needs mutably.
+        let waker = cx.waker().clone();
         let outcome = self.shared.pump(cx, |core| {
             let id = self.stream;
             // Bytes already delivered come out before any terminal: a peer that sent data and
@@ -494,17 +553,15 @@ impl<S: Session> quic::RecvStream for RecvStream<S> {
             if let Some(terminal) = &core.terminal {
                 return Err(Some(ended(terminal)));
             }
+            // Under the core lock, for the reason given in `poll_retained`: a wake delivered
+            // between releasing it and registering would reach an empty list.
+            park_on_stream(&self.shared, id, &waker);
             Err(None)
         });
         match outcome {
             Ok(chunk) => Poll::Ready(Ok(chunk)),
             Err(Some(err)) => Poll::Ready(Err(err)),
-            Err(None) => {
-                self.shared
-                    .wakers
-                    .register_stream(self.stream.get(), cx.waker());
-                Poll::Pending
-            }
+            Err(None) => Poll::Pending,
         }
     }
 
@@ -518,8 +575,14 @@ impl<S: Session> quic::RecvStream for RecvStream<S> {
             .detached
             .conn
             .stop_sending(id, ApplicationErrorCode::new(error_code));
-        // As with `reset`, the frame only leaves in a datagram and this call is synchronous.
+        // As with `reset`, the frame only leaves in a datagram, this call is synchronous, and
+        // a deadline is what offers it again if pacing refused it now.
         pump::produce(&mut core, None);
+        let due = pump::rearm(&mut core);
+        drop(core);
+        if due {
+            self.shared.wakers.wake_all();
+        }
     }
 
     fn recv_id(&self) -> quic::StreamId {

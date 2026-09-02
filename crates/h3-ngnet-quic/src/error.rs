@@ -131,12 +131,20 @@ pub(crate) enum DirectionTerminal {
     Stopped(u64),
     /// The peer reset the stream it was sending on.
     Reset(u64),
+    /// This endpoint reset its own sending half.
+    ///
+    /// Kept apart from the two above because they describe what the *peer* did. This one is
+    /// the local `reset`, and it has to be recorded as a send-side terminal rather than left
+    /// implicit: ngtcp2 refuses a write to a stream whose sending half it has already shut,
+    /// and a caller that goes on to offer one would turn a stream-level decision into a
+    /// transport error and take the connection down with it.
+    Abandoned(u64),
 }
 
 impl DirectionTerminal {
     pub(crate) fn stream_error(self) -> StreamErrorIncoming {
         match self {
-            Self::Stopped(error_code) | Self::Reset(error_code) => {
+            Self::Stopped(error_code) | Self::Reset(error_code) | Self::Abandoned(error_code) => {
                 StreamErrorIncoming::StreamTerminated { error_code }
             }
         }

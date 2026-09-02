@@ -121,6 +121,44 @@ async fn a_finished_stream_ends_cleanly_for_the_peer() {
 }
 
 #[tokio::test]
+async fn finishing_a_locally_reset_stream_does_not_end_the_connection() {
+    // A stream-level condition must stay at stream level. ngtcp2 refuses a write to a stream
+    // whose sending half it has already shut, and treating that refusal as a transport
+    // failure would take the whole connection down with it -- every other request on it
+    // included -- for what is an ordinary sequence: abandon a request, then let the handle
+    // run its normal finish path.
+    let mut pair = Pair::new().await;
+    let (mut sender, _receiver) = opened_pair(&mut pair).await;
+
+    h3::quic::SendStream::reset(&mut sender, 0x010c);
+
+    // Whatever this reports, it must not be reported by killing the connection.
+    let _ = within(
+        "poll_finish after reset",
+        std::future::poll_fn(|cx| sender.poll_finish(cx)),
+    )
+    .await;
+
+    let client = pair.client.as_ref().expect("a client");
+    assert!(
+        client.failure().is_none(),
+        "resetting one stream and then finishing it ended the whole connection: {:?}",
+        client.failure()
+    );
+
+    // And the connection is still usable, which is the property that matters to every other
+    // request sharing it.
+    let client = pair.client.as_mut().expect("a client");
+    let mut second = within(
+        "poll_open_bidi after a reset stream",
+        std::future::poll_fn(|cx| client.poll_open_bidi(cx)),
+    )
+    .await
+    .expect("the connection still opens streams");
+    write_all(&mut second, b"still alive").await;
+}
+
+#[tokio::test]
 async fn finish_is_idempotent_and_emits_one_end_of_stream() {
     let mut pair = Pair::new().await;
     let (mut sender, mut receiver) = opened_pair(&mut pair).await;
