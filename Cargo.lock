@@ -822,6 +822,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "h3-ngnet-quic"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "h3",
+ "http",
+ "ngnet-quic",
+ "ngnet-quic-h3-tests",
+ "tokio",
+]
+
+[[package]]
 name = "h3-quinn"
 version = "0.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"

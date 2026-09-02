@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/h3-ngnet-qmux",
+    "crates/h3-ngnet-quic",
     "crates/ngnet-axum",
     "crates/ngnet-h2",
     "crates/ngnet-h2-sys",
@@ -91,6 +92,9 @@ ngnet-h3-sys = { path = "crates/ngnet-h3-sys", version = "0.0.1" }
 # implementation instead of copying the former integration-test backend.
 ngnet-h3-quinn = { path = "crates/ngnet-h3-quinn" }
 h3-ngnet-qmux = { path = "crates/h3-ngnet-qmux" }
+# The other side of the same idea: hyperium's HTTP/3 over this workspace's ngtcp2 transport
+# rather than over QMux. Unlike the QMux adapter it reaches OpenSSL, because `ngnet-quic` does.
+h3-ngnet-quic = { path = "crates/h3-ngnet-quic" }
 ngnet-quic-sys = { path = "crates/ngnet-quic-sys", version = "0.0.1", default-features = false }
 ngnet-quic = { path = "crates/ngnet-quic", version = "0.0.1" }
 ngnet-quic-h3-tests = { path = "tests/ngnet-quic-h3-tests" }

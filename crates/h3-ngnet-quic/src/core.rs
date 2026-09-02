@@ -1,0 +1,251 @@
+//! Shared connection state, and the wake plumbing that keeps it live.
+//!
+//! # Why the wakers are split out of the core
+//!
+//! Three different things have to be woken, and they do not have the same source.
+//!
+//! Inbound datagrams are already handled by `ngnet-quic`: [`DetachedConnection::register`]
+//! appends to a *list* of wakers and every routed datagram wakes all of them, so registering
+//! the polling task each pass is enough and this crate must not reimplement it.
+//!
+//! Stream-level fan-out is this crate's job. Whichever task happens to pump routes data for
+//! streams that other tasks are parked on, so the pump has to wake them.
+//!
+//! The connection's own expiry timer is the awkward one. It is a single [`Sleep`] future, and
+//! the endpoint's timer deliberately does not cover detached connections. If it were re-armed
+//! under whichever transient task pumped last, that task could finish and leave the timer
+//! bound to a waker nobody polls — during a quiet period with no inbound datagram to rescue
+//! it, loss recovery and the idle timeout would simply never fire. So [`Core`] owns a *stable*
+//! waker built with [`std::task::Wake`], the sleep is polled only under that waker, and its
+//! wake fans out to everyone. That is the guarantee a persistent driver task would otherwise
+//! have provided, which is why this crate can do without one.
+//!
+//! The waker set therefore lives behind its own lock rather than inside [`Core`]'s: the stable
+//! waker's `wake` runs the fan-out, and if the set were inside [`Core`] that fan-out would have
+//! to re-enter a mutex a pump may already be holding.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Wake, Waker};
+
+use bytes::Bytes;
+use h3::quic::WriteBuf;
+use ngnet_quic::endpoint::{DetachedConnection, Sleep};
+use ngnet_quic::{Directionality, Initiator, Role, Session, StreamId, Timestamp};
+
+use crate::error::{ConnectionTerminal, DirectionTerminal};
+
+/// The largest datagram this crate will produce.
+///
+/// Capacity, not permission: the connection decides how much of it may actually be used.
+pub(crate) const MAX_DATAGRAM: usize = 1500;
+
+/// The most work any one pass will do before returning to the executor.
+pub(crate) const WORK_BUDGET: usize = 64;
+
+/// Everything parked on this connection.
+#[derive(Default)]
+struct WakerSet {
+    /// The HTTP/3 driver, or whoever is waiting on stream acceptance.
+    connection: Option<Waker>,
+    /// Tasks parked in a stream's `poll_data`, `poll_ready` or `poll_finish`.
+    streams: HashMap<i64, Waker>,
+}
+
+/// The wake registry, held separately from [`Core`] so a fan-out never re-enters its lock.
+#[derive(Default)]
+pub(crate) struct Wakers(Mutex<WakerSet>);
+
+impl Wakers {
+    fn set(&self) -> MutexGuard<'_, WakerSet> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn register_connection(&self, waker: &Waker) {
+        let mut set = self.set();
+        if !set
+            .connection
+            .as_ref()
+            .is_some_and(|held| held.will_wake(waker))
+        {
+            set.connection = Some(waker.clone());
+        }
+    }
+
+    pub(crate) fn register_stream(&self, stream: i64, waker: &Waker) {
+        let mut set = self.set();
+        if !set
+            .streams
+            .get(&stream)
+            .is_some_and(|held| held.will_wake(waker))
+        {
+            set.streams.insert(stream, waker.clone());
+        }
+    }
+
+    pub(crate) fn forget_stream(&self, stream: i64) {
+        self.set().streams.remove(&stream);
+    }
+
+    /// Wakes everything.
+    ///
+    /// Used by the stable timer waker and whenever the connection as a whole changed state.
+    /// Waking the task that is currently pumping costs one extra poll, which finds no new
+    /// work and parks; it does not spin, because the next pass records no change and so
+    /// fans out nothing.
+    pub(crate) fn wake_all(&self) {
+        let mut set = self.set();
+        if let Some(waker) = set.connection.take() {
+            waker.wake();
+        }
+        for (_, waker) in set.streams.drain() {
+            waker.wake();
+        }
+    }
+
+    pub(crate) fn wake_connection(&self) {
+        if let Some(waker) = self.set().connection.take() {
+            waker.wake();
+        }
+    }
+
+    pub(crate) fn wake_stream(&self, stream: i64) {
+        if let Some(waker) = self.set().streams.remove(&stream) {
+            waker.wake();
+        }
+    }
+}
+
+/// The stable wake target the expiry sleep is polled under.
+struct TimerWake(Arc<Wakers>);
+
+impl Wake for TimerWake {
+    fn wake(self: Arc<Self>) {
+        self.0.wake_all();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.wake_all();
+    }
+}
+
+/// One stream's state, from both directions.
+#[derive(Default)]
+pub(crate) struct StreamState {
+    /// Received but not yet handed to HTTP/3.
+    pub(crate) incoming: VecDeque<Bytes>,
+    /// The peer finished its sending side.
+    pub(crate) finished: bool,
+    /// The peer ended one direction, and why.
+    pub(crate) terminal: Option<DirectionTerminal>,
+    /// One hyperium logical send, retained until the transport has taken all of it.
+    pub(crate) writing: Option<WriteBuf<Bytes>>,
+    /// This side emitted its FIN.
+    pub(crate) send_finished: bool,
+    /// This side reset the stream, so `Drop` must not reset it again.
+    pub(crate) send_reset: bool,
+    /// Hyperium was handed the receiving half, so a drop of the sending half is ordinary.
+    pub(crate) recv_taken: bool,
+}
+
+impl StreamState {
+    /// Whether the sending side may still make progress.
+    ///
+    /// A peer reset ends both directions and a stop-sending ends only this one, but either
+    /// way nothing more of ours will be delivered, so the sending side treats them alike.
+    pub(crate) fn send_terminal(&self) -> Option<DirectionTerminal> {
+        self.terminal
+    }
+}
+
+/// The shared connection state.
+pub(crate) struct Core<S: Session> {
+    /// The transport, which this crate drives itself.
+    pub(crate) detached: DetachedConnection<S>,
+    /// Which side of the connection this is, so peer-opened streams can be told apart.
+    initiator: Initiator,
+    pub(crate) streams: HashMap<i64, StreamState>,
+    /// Peer-opened bidirectional streams awaiting `poll_accept_bidi`.
+    pub(crate) accept_bidi: VecDeque<StreamId>,
+    /// Peer-opened unidirectional streams awaiting `poll_accept_recv`.
+    pub(crate) accept_uni: VecDeque<StreamId>,
+    /// Set once the connection has ended, and never cleared.
+    pub(crate) terminal: Option<ConnectionTerminal>,
+    /// Whether the endpoint has been told to stop routing here.
+    pub(crate) released: bool,
+    /// One reusable datagram buffer, so a pass that produces nothing allocates nothing.
+    pub(crate) scratch: Vec<u8>,
+    /// The armed expiry sleep, and the deadline it was armed for.
+    pub(crate) sleeping: Option<Sleep>,
+    pub(crate) sleeping_until: Option<Timestamp>,
+    /// The stable waker the sleep is polled under. Never a caller's waker.
+    timer_waker: Waker,
+    /// The peer raised this endpoint's stream allowance, so a refused open may now succeed.
+    pub(crate) streams_extended: bool,
+}
+
+impl<S: Session> Core<S> {
+    pub(crate) fn new(detached: DetachedConnection<S>, wakers: &Arc<Wakers>) -> Self {
+        let initiator = match detached.conn.role() {
+            Role::Client => Initiator::Client,
+            Role::Server => Initiator::Server,
+        };
+        Self {
+            detached,
+            initiator,
+            streams: HashMap::new(),
+            accept_bidi: VecDeque::new(),
+            accept_uni: VecDeque::new(),
+            terminal: None,
+            released: false,
+            scratch: Vec::new(),
+            sleeping: None,
+            sleeping_until: None,
+            timer_waker: Waker::from(Arc::new(TimerWake(Arc::clone(wakers)))),
+            streams_extended: false,
+        }
+    }
+
+    /// The stable waker the expiry sleep is polled under.
+    pub(crate) fn timer_waker(&self) -> Waker {
+        self.timer_waker.clone()
+    }
+
+    /// Whether this endpoint opened the given stream.
+    pub(crate) fn opened_locally(&self, stream: StreamId) -> bool {
+        stream.initiator() == self.initiator
+    }
+
+    pub(crate) fn state(&mut self, stream: StreamId) -> &mut StreamState {
+        self.streams.entry(stream.get()).or_default()
+    }
+
+    /// Records the end of the connection, keeping the first reason.
+    ///
+    /// First rather than last because the first is the one that explains the others: a
+    /// close observed while draining would otherwise overwrite the application code the
+    /// peer actually sent.
+    pub(crate) fn fail(&mut self, terminal: ConnectionTerminal) {
+        if self.terminal.is_none() {
+            self.terminal = Some(terminal);
+            // Every retained send is now undeliverable.
+            for state in self.streams.values_mut() {
+                state.writing = None;
+            }
+        }
+    }
+
+    /// Queues a peer-opened stream for the matching accept queue.
+    pub(crate) fn record_opened(&mut self, stream: StreamId) {
+        if self.opened_locally(stream) {
+            return;
+        }
+        self.streams.entry(stream.get()).or_default();
+        match stream.directionality() {
+            Directionality::Bidirectional => self.accept_bidi.push_back(stream),
+            Directionality::Unidirectional => self.accept_uni.push_back(stream),
+        }
+    }
+}
