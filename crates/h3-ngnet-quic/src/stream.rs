@@ -162,8 +162,9 @@ impl<S: Session> SendStream<S> {
                         } else {
                             core.state(id).writing = Some(data);
                             if accepted == 0 {
-                                // The packet went to control frames. Re-offering the same
-                                // prefix in this pass would spin; wait to be woken.
+                                // A serialised zero-length STREAM frame, which takes nothing
+                                // from a non-empty offer. Re-offering the same prefix in this
+                                // pass would spin; wait to be woken.
                                 Step::Pending
                             } else {
                                 // A partial acceptance is ordinary -- a packet filled -- so
@@ -176,6 +177,15 @@ impl<S: Session> SendStream<S> {
                                 Step::Progress
                             }
                         }
+                    }
+                    Offered::Displaced => {
+                        // The packet went to control frames and carried none of this
+                        // stream. Offer the same prefix again: the frames that displaced it
+                        // have now been produced, so the next attempt has room for it. The
+                        // enclosing loop is bounded, and exhausting it yields with a
+                        // self-wake rather than parking on an event that may never come.
+                        core.state(id).writing = Some(data);
+                        Step::Progress
                     }
                     Offered::Blocked | Offered::NoCapacity => {
                         core.state(id).writing = Some(data);
@@ -276,10 +286,17 @@ impl<S: Session> quic::SendStream<Bytes> for SendStream<S> {
                     return Step::Error(terminal.stream_error());
                 }
                 match pump::offer(core, id, &[], true, &waker) {
+                    // A zero-length STREAM frame was serialised, and for a FIN-only offer
+                    // that frame *is* the write: the stream has ended on the wire.
                     Offered::Accepted(_) => {
                         core.state(id).send_finished = true;
                         Step::Done
                     }
+                    // The packet carried no STREAM frame, so the FIN was not written. It is
+                    // not in flight and nothing will retransmit it, so it must be offered
+                    // again; recording the stream as finished here is precisely the defect
+                    // that left a peer waiting until its idle timeout.
+                    Offered::Displaced => Step::Progress,
                     Offered::Blocked | Offered::NoCapacity => Step::Pending,
                     Offered::Failed => {
                         let terminal = core.terminal.clone().unwrap_or_else(|| {
@@ -338,52 +355,62 @@ impl<S: Session> quic::SendStreamUnframed<Bytes> for SendStream<S> {
         buf: &mut D,
     ) -> Poll<Result<usize, StreamErrorIncoming>> {
         let waker = cx.waker().clone();
-        let outcome = self.shared.pump(cx, |core| {
-            if let Some(terminal) = &core.terminal {
-                return Err(Some(ended(terminal)));
-            }
-            let id = self.stream;
-            if core.state(id).writing.is_some() {
-                // The two paths write to the same stream; running both would interleave a
-                // framed body with raw bytes.
-                return Err(Some(internal(
-                    "an unframed send was attempted while framed data is retained",
-                )));
-            }
-            if let Some(terminal) = core.state(id).send_terminal() {
-                return Err(Some(terminal.stream_error()));
-            }
-            let chunk = buf.chunk();
-            if chunk.is_empty() {
-                return Ok(0);
-            }
-            match pump::offer(core, id, chunk, false, &waker) {
-                Offered::Accepted(accepted) => Ok(accepted),
-                Offered::Blocked | Offered::NoCapacity => Err(None),
-                Offered::Failed => {
-                    let terminal = core
-                        .terminal
-                        .clone()
-                        .unwrap_or_else(|| ConnectionTerminal::internal("the transport failed"));
-                    Err(Some(ended(&terminal)))
+        // Bounded, because a packet that carried only transport work leaves the offer
+        // untouched and worth making again rather than reporting as a zero-byte write --
+        // hyperium would read that as backpressure it was never given.
+        for _ in 0..WORK_BUDGET {
+            let outcome = self.shared.pump(cx, |core| {
+                if let Some(terminal) = &core.terminal {
+                    return Err(Some(ended(terminal)));
+                }
+                let id = self.stream;
+                if core.state(id).writing.is_some() {
+                    // The two paths write to the same stream; running both would interleave
+                    // a framed body with raw bytes.
+                    return Err(Some(internal(
+                        "an unframed send was attempted while framed data is retained",
+                    )));
+                }
+                if let Some(terminal) = core.state(id).send_terminal() {
+                    return Err(Some(terminal.stream_error()));
+                }
+                let chunk = buf.chunk();
+                if chunk.is_empty() {
+                    return Ok(Some(0));
+                }
+                match pump::offer(core, id, chunk, false, &waker) {
+                    Offered::Accepted(accepted) => Ok(Some(accepted)),
+                    // Nothing of this stream reached the packet, so the offer stands. Try
+                    // it again rather than telling hyperium zero bytes were taken.
+                    Offered::Displaced => Ok(None),
+                    Offered::Blocked | Offered::NoCapacity => Err(None),
+                    Offered::Failed => {
+                        let terminal = core.terminal.clone().unwrap_or_else(|| {
+                            ConnectionTerminal::internal("the transport failed")
+                        });
+                        Err(Some(ended(&terminal)))
+                    }
+                }
+            });
+            match outcome {
+                Ok(None) => continue,
+                Ok(Some(0)) => return Poll::Ready(Ok(0)),
+                Ok(Some(accepted)) => {
+                    // Advance by exactly what was taken, never by what was offered.
+                    buf.advance(accepted);
+                    return Poll::Ready(Ok(accepted));
+                }
+                Err(Some(err)) => return Poll::Ready(Err(err)),
+                Err(None) => {
+                    self.shared
+                        .wakers
+                        .register_stream(self.stream.get(), cx.waker());
+                    return Poll::Pending;
                 }
             }
-        });
-        match outcome {
-            Ok(0) => Poll::Ready(Ok(0)),
-            Ok(accepted) => {
-                // Advance by exactly what was taken, never by what was offered.
-                buf.advance(accepted);
-                Poll::Ready(Ok(accepted))
-            }
-            Err(Some(err)) => Poll::Ready(Err(err)),
-            Err(None) => {
-                self.shared
-                    .wakers
-                    .register_stream(self.stream.get(), cx.waker());
-                Poll::Pending
-            }
         }
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 

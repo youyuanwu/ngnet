@@ -343,9 +343,20 @@ pub(crate) fn release<S: Session>(core: &mut Core<S>) {
 
 /// What one attempt to hand stream bytes to the transport did.
 pub(crate) enum Offered {
-    /// The transport took this many bytes. May be zero: the packet may have filled with
-    /// control frames instead, and whatever was not accepted must be offered again.
+    /// The transport serialised a STREAM frame and took this many bytes.
+    ///
+    /// May be zero, and zero is meaningful rather than empty: ngtcp2 serialises a
+    /// zero-length STREAM frame only for an offer that carries nothing but `fin`
+    /// (`ngtcp2.h:5238-5243`), so on a FIN-only offer this is the confirmation that the FIN
+    /// is on the wire.
     Accepted(usize),
+    /// A datagram was produced, but it carried nothing of this stream.
+    ///
+    /// ngtcp2 filled the packet with other frames and wrote no STREAM frame at all. Kept
+    /// apart from `Accepted(0)` because on a FIN-only offer the two are opposites: one
+    /// ended the stream, the other did not touch it. The whole offer, `fin` included, has
+    /// to be made again — nothing of it is in flight, so nothing will be retransmitted.
+    Displaced,
     /// The transport has something to send but cannot right now. Not "finished".
     Blocked,
     /// There was no room to produce another datagram.
@@ -400,6 +411,14 @@ pub(crate) fn offer<S: Session>(
                 core.detached.send(datagram);
             }
             Offered::Accepted(accepted)
+        }
+        Ok(StreamWrite::DatagramWithoutStream { len }) => {
+            // A real datagram that happens to carry none of this stream. It has to be sent
+            // — withdrawing it would lose whatever the connection did put in it — but it
+            // settles nothing about the offer, which must be made again in full.
+            datagram.truncate(len);
+            core.detached.send(datagram);
+            Offered::Displaced
         }
         Ok(
             StreamWrite::StreamBlocked
