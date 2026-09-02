@@ -43,6 +43,7 @@ ngnet-qmux = { workspace = true, features = ["tokio"] }
 ngnet-h3.workspace = true
 ngnet-h3-quinn.workspace = true
 ngnet-quic = { workspace = true, features = ["tokio"] }
+h3-ngnet-quic.workspace = true
 ngnet-quic-h3.workspace = true
 # Reuse the established ngtcp2/OpenSSL endpoint and certificate harness rather than keeping
 # a second benchmark-only copy that could drift from the integration tests.
@@ -147,4 +148,12 @@ harness = false
 
 [[bench]]
 name = "qmux_h3_socket_body_throughput"
+harness = false
+
+[[bench]]
+name = "quic_stack_h3_serial_latency"
+harness = false
+
+[[bench]]
+name = "quic_stack_h3_body_throughput"
 harness = false
