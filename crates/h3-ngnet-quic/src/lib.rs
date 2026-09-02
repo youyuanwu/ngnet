@@ -1,5 +1,18 @@
 //! Hyperium H3 transport traits over an established ngnet QUIC connection.
 //!
+//! # Not ready for use
+//!
+//! This adapter has a known, unfixed liveness defect. Under a repeated small-body workload it
+//! intermittently stalls — the client waits for a response that never arrives, and the
+//! connection sits until its idle timeout ends it. Measured at roughly two runs in five for
+//! 200 x 1 KiB exchanges on one host. Single exchanges, large single bodies, and every
+//! lifecycle path in the test suite are correct; it is repetition that provokes it.
+//!
+//! It is **this crate's defect**, not the separately known `ngnet-quic-h3` large-body stall:
+//! the same workload against that stack succeeded 10 times out of 10 while this one failed 6
+//! times out of 10. `crates/h3-ngnet-quic/tests/repeated.rs` reproduces it and is `#[ignore]`d
+//! for now; `docs/h3-ngnet-quic/pending-work.md` records what is known.
+//!
 //! The caller establishes a connection through [`ngnet_quic`]'s endpoint layer, detaches it,
 //! and passes it to [`from_detached`]. What comes back is a [`Connection`] that hyperium's
 //! `h3` accepts as its transport, for either role.

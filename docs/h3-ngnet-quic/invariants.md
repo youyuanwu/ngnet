@@ -30,6 +30,15 @@ and observed to fail, so it pins a defect rather than merely agreeing with the c
 
 ## Not established here
 
+**Repeated exchanges do not work reliably.** Every invariant above is about a single exchange
+or a single lifecycle event, and each holds. Repetition is a different matter: under a repeated
+small-body workload this adapter intermittently stalls, roughly two runs in five at 200 x 1 KiB.
+That is this crate's own defect, distinguished from the inherited one below by a pre-registered
+attribution rule and by the native stack passing the identical workload 10 out of 10. It is
+reproduced by `tests/repeated.rs`, which is `#[ignore]`d, and documented in
+[`pending-work.md`](pending-work.md). No invariant in the table above should be read as implying
+the crate is fit for use.
+
 The transport underneath this crate has a known, unresolved intermittent connection-ending stall
 under repeated 16 KiB and 1 MiB workloads — review finding S9, recorded in
 [`../quic-h3/invariants.md`](../quic-h3/invariants.md) and

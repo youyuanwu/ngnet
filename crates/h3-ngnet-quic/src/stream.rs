@@ -68,8 +68,14 @@ impl<S: Session> Shared<S> {
     pub(crate) fn pump<T>(&self, cx: &mut Context<'_>, then: impl FnOnce(&mut Core<S>) -> T) -> T {
         let (changed, value) = {
             let mut core = self.lock();
-            let changed = pump::pump(&mut core, cx);
+            let mut changed = pump::pump(&mut core, cx);
             let value = then(&mut core);
+            // The caller's operation may have moved when the connection next wants attention —
+            // a blocked write creates a pacing deadline — so the timer is armed against the
+            // state being left behind, not the state that was found.
+            if pump::rearm(&mut core) {
+                changed.wake_everything(&core.streams);
+            }
             (changed, value)
         };
         changed.deliver(&self.wakers);

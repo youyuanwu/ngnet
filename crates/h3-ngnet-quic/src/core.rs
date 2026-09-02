@@ -43,13 +43,34 @@ pub(crate) const MAX_DATAGRAM: usize = 1500;
 /// The most work any one pass will do before returning to the executor.
 pub(crate) const WORK_BUDGET: usize = 64;
 
+/// How many read/expire/produce turns one pump pass may take.
+///
+/// More than one because a fired timer produces work that wants reading and sending, and going
+/// round again is cheaper than returning `Pending` and being woken. Bounded because a
+/// connection that always has something to say must not keep a pass from returning.
+pub(crate) const TIMER_TURNS: usize = 4;
+
 /// Everything parked on this connection.
+///
+/// Both registries hold *lists*, which is load-bearing rather than defensive. More than one
+/// task waits at connection level: the HTTP/3 driver parks in `poll_accept_*` while a request
+/// task parks in `poll_open_*`. More than one waits on a single stream too, once a
+/// bidirectional stream has been split and its halves sent to different tasks. A single slot
+/// lets the second registration displace the first, and the displaced task is then reachable
+/// only through `ngnet-quic`'s own inbound waker list — which does not carry the expiry timer.
 #[derive(Default)]
 struct WakerSet {
-    /// The HTTP/3 driver, or whoever is waiting on stream acceptance.
-    connection: Option<Waker>,
+    /// The HTTP/3 driver, and anyone else waiting on stream opening or acceptance.
+    connection: Vec<Waker>,
     /// Tasks parked in a stream's `poll_data`, `poll_ready` or `poll_finish`.
-    streams: HashMap<i64, Waker>,
+    streams: HashMap<i64, Vec<Waker>>,
+}
+
+/// Adds a waker to a list unless an equivalent one is already there.
+fn remember(list: &mut Vec<Waker>, waker: &Waker) {
+    if !list.iter().any(|held| held.will_wake(waker)) {
+        list.push(waker.clone());
+    }
 }
 
 /// The wake registry, held separately from [`Core`] so a fan-out never re-enters its lock.
@@ -64,25 +85,11 @@ impl Wakers {
     }
 
     pub(crate) fn register_connection(&self, waker: &Waker) {
-        let mut set = self.set();
-        if !set
-            .connection
-            .as_ref()
-            .is_some_and(|held| held.will_wake(waker))
-        {
-            set.connection = Some(waker.clone());
-        }
+        remember(&mut self.set().connection, waker);
     }
 
     pub(crate) fn register_stream(&self, stream: i64, waker: &Waker) {
-        let mut set = self.set();
-        if !set
-            .streams
-            .get(&stream)
-            .is_some_and(|held| held.will_wake(waker))
-        {
-            set.streams.insert(stream, waker.clone());
-        }
+        remember(self.set().streams.entry(stream).or_default(), waker);
     }
 
     pub(crate) fn forget_stream(&self, stream: i64) {
@@ -96,23 +103,33 @@ impl Wakers {
     /// work and parks; it does not spin, because the next pass records no change and so
     /// fans out nothing.
     pub(crate) fn wake_all(&self) {
-        let mut set = self.set();
-        if let Some(waker) = set.connection.take() {
+        let (connection, streams) = {
+            let mut set = self.set();
+            (
+                core::mem::take(&mut set.connection),
+                set.streams.drain().collect::<Vec<_>>(),
+            )
+        };
+        for waker in connection {
             waker.wake();
         }
-        for (_, waker) in set.streams.drain() {
-            waker.wake();
+        for (_, wakers) in streams {
+            for waker in wakers {
+                waker.wake();
+            }
         }
     }
 
     pub(crate) fn wake_connection(&self) {
-        if let Some(waker) = self.set().connection.take() {
+        let wakers = core::mem::take(&mut self.set().connection);
+        for waker in wakers {
             waker.wake();
         }
     }
 
     pub(crate) fn wake_stream(&self, stream: i64) {
-        if let Some(waker) = self.set().streams.remove(&stream) {
+        let wakers = self.set().streams.remove(&stream).unwrap_or_default();
+        for waker in wakers {
             waker.wake();
         }
     }

@@ -17,7 +17,7 @@ use std::task::{Context, Poll, Waker};
 use bytes::Buf;
 use ngnet_quic::{ExpiryOutcome, ReadOutcome, Session, StreamId, StreamWrite, WriteOutcome};
 
-use crate::core::{Core, MAX_DATAGRAM, WORK_BUDGET, Wakers};
+use crate::core::{Core, MAX_DATAGRAM, TIMER_TURNS, WORK_BUDGET, Wakers};
 use crate::error::ConnectionTerminal;
 
 /// What a pass observed, so the fan-out only fires when something actually changed.
@@ -31,6 +31,14 @@ pub(crate) struct Changed {
 }
 
 impl Changed {
+    /// Marks the connection and every live stream, so nothing is left parked.
+    pub(crate) fn wake_everything<T>(&mut self, streams: &std::collections::HashMap<i64, T>) {
+        self.connection = true;
+        for stream in streams.keys() {
+            self.stream(*stream);
+        }
+    }
+
     fn stream(&mut self, stream: i64) {
         if !self.streams.contains(&stream) {
             self.streams.push(stream);
@@ -66,9 +74,10 @@ pub(crate) fn pump<S: Session>(core: &mut Core<S>, cx: &mut Context<'_>) -> Chan
     // task that pumps may register without displacing the others.
     let _ = core.detached.register(cx.waker());
 
-    // Two turns at most: a fired timer produces work that wants reading and sending, and
-    // going round once more here is cheaper than returning Pending and being woken again.
-    for _ in 0..2 {
+    // A few turns at most: a fired timer produces work that wants reading and sending, and
+    // going round again is cheaper than returning Pending and being woken.
+    let mut timer_still_due = false;
+    for turn in 0..TIMER_TURNS {
         read_inbound(core, &mut changed);
         if core.terminal.is_some() {
             break;
@@ -83,8 +92,21 @@ pub(crate) fn pump<S: Session>(core: &mut Core<S>, cx: &mut Context<'_>) -> Chan
             break;
         }
         if arm_timer(core).is_pending() {
+            timer_still_due = false;
             break;
         }
+        // The deadline had already passed, so the sleep resolved instead of arming. Ordinary
+        // on an early turn; on the last one it means we are about to return with no armed
+        // timer and nothing scheduled to poll us again.
+        timer_still_due = turn == TIMER_TURNS - 1;
+    }
+
+    if timer_still_due {
+        // Returning with an unarmed, already-due timer is one way a connection silently stops:
+        // nothing would pump again until a datagram happened to arrive, and the very reason the
+        // timer was due may be that a lost packet needs retransmitting, so no datagram is
+        // coming. Waking everything forces one more pass.
+        changed.wake_everything(&core.streams);
     }
 
     if core.terminal.is_some() {
@@ -278,6 +300,34 @@ fn arm_timer<S: Session>(core: &mut Core<S>) -> Poll<()> {
         }
         Poll::Pending => Poll::Pending,
     }
+}
+
+/// Re-arms the expiry timer against the connection's state *now*.
+///
+/// Called after a caller's operation, not only before it, and that ordering is the point. A
+/// pass runs `pump` first and the caller's stream write second, but a write that comes back
+/// `Blocked` — congestion window closed, or pacing — is precisely what *creates* the deadline
+/// that will unblock it. Arming only beforehand leaves that deadline unwaited: if the
+/// connection had no earlier expiry, nothing is armed at all.
+///
+/// Returns whether the timer is still due, in which case the caller must force another pass
+/// rather than park.
+pub(crate) fn rearm<S: Session>(core: &mut Core<S>) -> bool {
+    if core.terminal.is_some() {
+        return false;
+    }
+    for _ in 0..TIMER_TURNS {
+        if arm_timer(core).is_pending() {
+            return false;
+        }
+        let mut ignored = Changed::default();
+        expire(core, &mut ignored);
+        if core.terminal.is_some() {
+            return false;
+        }
+        produce(core, None);
+    }
+    true
 }
 
 /// Tells the endpoint to stop routing here.
