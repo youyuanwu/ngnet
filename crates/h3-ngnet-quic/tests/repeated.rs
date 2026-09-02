@@ -1,37 +1,23 @@
 //! Many exchanges on one connection.
 //!
-//! # These tests are `#[ignore]`d because they fail, and the defect is this crate's
+//! # Why this file exists
 //!
-//! Under a repeated small-body workload this adapter intermittently stalls: the client parks
-//! waiting for a response that never arrives, and the connection sits until its 30-second idle
-//! timeout ends it. Measured on `epyc-7763-azure` with a release build pinned to one core,
-//! roughly two runs in five of 200 x 1 KiB exchanges fail this way. The failing exchange index
-//! is random (observed at 3, 8, 11, 13, 99, 113, 142, 186), so it is a race rather than
-//! state that accumulates.
+//! Repetition on one connection used to stall this adapter intermittently: the client parked
+//! waiting for a response body that never ended, and the connection sat until its 30-second
+//! idle timeout. Roughly two runs in five of 200 x 1 KiB exchanges failed that way, at a
+//! random exchange index, which made it a race rather than state that accumulated.
 //!
-//! **It is not the known `ngnet-quic-h3` large-body stall (review finding S9).** The
-//! attribution rule fixed before measuring required reproducing a failure on both stacks
-//! before blaming that one, and the same workload run against the native arm succeeded 10
-//! times out of 10 while this adapter failed 6 times out of 10. S9 is also a defect in
-//! `ngnet-h3`'s driver, which this crate does not use.
+//! It was a lost FIN. `ngtcp2_conn_writev_stream` may return a packet that contains no STREAM
+//! frame at all, and says so by leaving `*pdatalen` at `-1`; it may also serialise a
+//! *zero-length* STREAM frame, which it does exactly when the offer carries nothing but
+//! `fin`, and says *that* with `*pdatalen == 0`. The transport wrapper clamped the sign away,
+//! so a packet that had gone to an acknowledgement was indistinguishable from one carrying
+//! the FIN, and `poll_finish` recorded the stream as ended. Nothing was in flight, so nothing
+//! was ever retransmitted. See `crates/ngnet-quic/tests/fin_delivery.rs`, which reproduces
+//! that decision deterministically.
 //!
-//! What was established about it, from instrumented runs:
-//!
-//! - The request is fully delivered and acknowledged: the client's transport reports zero
-//!   retained bytes, so the server received everything.
-//! - No datagrams were dropped on either side.
-//! - The server observed the stream open (`Opened` counts track the exchange count) and then
-//!   returned to accepting, with an empty accept queue.
-//! - The client is parked in `poll_data` for that stream; both sides have their expiry timer
-//!   armed.
-//!
-//! Two genuine defects were found and fixed while chasing this, and both reduced the failure
-//! rate without removing it: the waker registries were single-slot where two tasks legitimately
-//! wait (see `core.rs`), and the expiry timer was armed before the caller's write rather than
-//! after it (see `pump::rearm`). The remaining fault is not yet located.
-//!
-//! Un-ignore these tests when it is fixed; they reproduce it reliably enough to be the
-//! regression test. See `docs/h3-ngnet-quic/pending-work.md`.
+//! These tests are the end-to-end gate on it. They are not `#[ignore]`d: a reliability defect
+//! that only shows up under repetition is exactly the kind CI has to run.
 
 mod common;
 
@@ -120,13 +106,11 @@ async fn repeated(count: usize, size: usize) {
 }
 
 #[tokio::test]
-#[ignore = "known defect: this adapter intermittently stalls under repeated exchanges; see the module docs"]
 async fn two_hundred_small_exchanges_on_one_connection() {
     repeated(200, 1024).await;
 }
 
 #[tokio::test]
-#[ignore = "known defect: this adapter intermittently stalls under repeated exchanges; see the module docs"]
 async fn two_hundred_empty_exchanges_on_one_connection() {
     repeated(200, 0).await;
 }

@@ -100,7 +100,6 @@ async fn opened_pair(
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn a_finished_stream_ends_cleanly_for_the_peer() {
     let mut pair = Pair::new().await;
     let (mut sender, mut receiver) = opened_pair(&mut pair).await;
@@ -122,7 +121,6 @@ async fn a_finished_stream_ends_cleanly_for_the_peer() {
 }
 
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn finish_is_idempotent_and_emits_one_end_of_stream() {
     let mut pair = Pair::new().await;
     let (mut sender, mut receiver) = opened_pair(&mut pair).await;
@@ -156,7 +154,6 @@ async fn finish_is_idempotent_and_emits_one_end_of_stream() {
 
 /// A reset is observed with its code, *after* the data that was already delivered.
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn a_peer_reset_is_observed_with_its_code_after_delivered_data() {
     let mut pair = Pair::new().await;
     let (mut sender, mut receiver) = opened_pair(&mut pair).await;
@@ -201,7 +198,6 @@ async fn a_peer_reset_is_observed_with_its_code_after_delivered_data() {
 /// This is the regression test for the direction conflation: our sending side is untouched by
 /// the peer abandoning its own.
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn a_peer_reset_does_not_terminate_our_sending_side() {
     let mut pair = Pair::new().await;
     let (mut client_stream, mut server_stream) = opened_pair(&mut pair).await;
@@ -239,7 +235,6 @@ async fn a_peer_reset_does_not_terminate_our_sending_side() {
 
 /// Stop-sending reaches the peer's send side with its code, and discards what it retained.
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn stop_sending_terminates_the_peers_send_side_with_its_code() {
     let mut pair = Pair::new().await;
     let (mut client_stream, mut server_stream) = opened_pair(&mut pair).await;
@@ -276,7 +271,6 @@ async fn stop_sending_terminates_the_peers_send_side_with_its_code() {
 /// complete response and then stop-sends the request stream is ordinary; the client must still
 /// read that response to a clean end.
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn stop_sending_does_not_terminate_our_receiving_side() {
     let mut pair = Pair::new().await;
     let (mut client_stream, mut server_stream) = opened_pair(&mut pair).await;
@@ -308,7 +302,6 @@ async fn stop_sending_does_not_terminate_our_receiving_side() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn an_overlapping_logical_send_is_rejected() {
     let mut pair = Pair::new().await;
     let client = pair.client.as_mut().expect("a client");
@@ -333,7 +326,6 @@ async fn an_overlapping_logical_send_is_rejected() {
 }
 
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn an_unframed_send_while_framed_data_is_retained_is_rejected() {
     let mut pair = Pair::new().await;
     let client = pair.client.as_mut().expect("a client");
@@ -375,7 +367,6 @@ async fn an_unframed_send_while_framed_data_is_retained_is_rejected() {
 /// data: destroying the shared state took `writing` with it, `poll_ready` then found nothing
 /// outstanding and reported success, and the bytes were silently dropped on the floor.
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn dropping_one_split_half_does_not_invalidate_the_other() {
     let mut pair = Pair::new().await;
     let (client_stream, mut server_stream) = opened_pair(&mut pair).await;
@@ -420,7 +411,6 @@ async fn dropping_one_split_half_does_not_invalidate_the_other() {
 
 /// Dropping an unfinished sending half is observed as exactly one reset, not an endless wait.
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn dropping_an_unfinished_send_is_observed_as_one_reset() {
     let mut pair = Pair::new().await;
     let (client_stream, mut server_stream) = opened_pair(&mut pair).await;
@@ -447,7 +437,6 @@ async fn dropping_an_unfinished_send_is_observed_as_one_reset() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn a_connection_close_is_observed_with_its_application_code() {
     let mut pair = Pair::new().await;
     let (client, mut server) = pair.split();
@@ -474,7 +463,6 @@ async fn a_connection_close_is_observed_with_its_application_code() {
 
 /// A terminated connection resolves everything outstanding rather than leaving it pending.
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn a_terminated_connection_resolves_every_outstanding_operation() {
     let mut pair = Pair::new().await;
     let (mut client, mut server) = pair.split();

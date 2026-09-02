@@ -120,14 +120,12 @@ impl Drop for Exchange {
 }
 
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn an_empty_body_round_trips() {
     let mut exchange = Exchange::new().await;
     exchange.round_trip(0).await;
 }
 
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn a_small_body_round_trips_exactly() {
     let mut exchange = Exchange::new().await;
     exchange.round_trip(1024).await;
@@ -139,14 +137,12 @@ async fn a_small_body_round_trips_exactly() {
 /// optimistically would truncate, and one that re-offered from the wrong position would
 /// duplicate. Both show up as a length or content mismatch here.
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn a_body_spanning_many_packets_round_trips_exactly() {
     let mut exchange = Exchange::new().await;
     exchange.round_trip(64 * 1024).await;
 }
 
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn several_exchanges_on_one_connection_each_round_trip_exactly() {
     let mut exchange = Exchange::new().await;
     for size in [0usize, 37, 1024, 9000] {

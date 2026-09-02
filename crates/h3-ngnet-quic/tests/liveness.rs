@@ -117,7 +117,6 @@ async fn short_idle_pair() -> (
 /// end it is its own expiry timer. If the timer were bound to a dead waker the poll below
 /// would stay pending forever and the test would fail on its bound.
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn a_quiet_connection_still_fires_its_own_idle_timeout() {
     let (mut client, server, tasks, _endpoints) = short_idle_pair().await;
 
@@ -158,7 +157,6 @@ async fn a_quiet_connection_still_fires_its_own_idle_timeout() {
 /// poll made after the deadline had already passed would re-derive the expiry synchronously
 /// and pass even with no working timer at all.
 #[tokio::test]
-#[ignore = "live-loopback: this adapter has an unresolved intermittent liveness failure, so its socket tests are ignored in ordinary runs; see docs/h3-ngnet-quic/pending-work.md"]
 async fn the_expiry_timer_outlives_the_task_that_armed_it() {
     let (client, server, tasks, _endpoints) = short_idle_pair().await;
     drop(server);
