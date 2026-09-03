@@ -918,6 +918,23 @@ pub fn record_timer_ready(connection_id: u64, role: Role) {
     record_enabling(connection_id, role, "timer-ready");
 }
 
+/// Records the adapter's one-shot fallback wake for a sub-tick expiry.
+#[doc(hidden)]
+pub fn record_timer_kick(connection_id: u64, role: Role) {
+    let Some(_guard) = recording_guard() else {
+        return;
+    };
+    push_liveness(
+        connection_id,
+        role,
+        LivenessKind::LocalProduction,
+        "imminent-timer-kick",
+        None,
+        None,
+        None,
+    );
+}
+
 /// Records a new general connection-waker registration.
 #[doc(hidden)]
 pub fn record_wake_registration(_connection_id: u64, role: Role) {

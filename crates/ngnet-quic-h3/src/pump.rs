@@ -30,6 +30,20 @@ fn close_reason(close: &ngnet_quic::CloseError) -> &'static str {
 ///
 /// Capacity, not permission: the connection decides how much of it may actually be used.
 pub(crate) const MAX_DATAGRAM: usize = 1500;
+const IMMINENT_EXPIRY_NANOS: u64 = 100_000;
+
+fn take_imminent_wake(
+    state: &mut State,
+    now: ngnet_quic::Timestamp,
+    deadline: ngnet_quic::Timestamp,
+) -> bool {
+    let remaining = deadline.as_nanos().saturating_sub(now.as_nanos());
+    if remaining > IMMINENT_EXPIRY_NANOS || state.imminent_wake_until == Some(deadline) {
+        return false;
+    }
+    state.imminent_wake_until = Some(deadline);
+    true
+}
 
 /// Drives the connection one pass.
 ///
@@ -215,6 +229,7 @@ pub(crate) fn poll_timer<S: Session>(
     let Some(deadline) = detached.conn.expiry() else {
         state.sleeping = None;
         state.sleeping_until = None;
+        state.imminent_wake_until = None;
         return Poll::Pending;
     };
 
@@ -224,11 +239,25 @@ pub(crate) fn poll_timer<S: Session>(
     if state.sleeping_until != Some(deadline) {
         state.sleeping = Some(detached.sleep_until(deadline));
         state.sleeping_until = Some(deadline);
+        state.imminent_wake_until = None;
         #[cfg(feature = "diagnostics")]
         ngnet_quic::diagnostics::record_timer_rearm(
             detached.conn.diagnostic_id(),
             detached.conn.role(),
         );
+    }
+
+    let now = detached.now();
+    if take_imminent_wake(state, now, deadline) {
+        #[cfg(feature = "diagnostics")]
+        ngnet_quic::diagnostics::record_timer_kick(
+            detached.conn.diagnostic_id(),
+            detached.conn.role(),
+        );
+        // Tokio's timer wheel can coalesce a sub-tick sleep with the task currently being
+        // polled. Preserve one scheduling edge for this exact deadline. This is not a busy
+        // retry: the deadline identity suppresses further kicks until ngtcp2 moves it.
+        cx.waker().wake_by_ref();
     }
 
     let Some(sleep) = state.sleeping.as_mut() else {
@@ -243,8 +272,10 @@ pub(crate) fn poll_timer<S: Session>(
             );
             state.sleeping = None;
             state.sleeping_until = None;
+            state.imminent_wake_until = None;
             Poll::Ready(())
         }
+
         Poll::Pending => Poll::Pending,
     }
 }
@@ -252,4 +283,73 @@ pub(crate) fn poll_timer<S: Session>(
 /// The error a caller sees once the connection has ended.
 pub(crate) fn ended() -> Error {
     Error::new(ErrorKind::Closed, "the connection has ended")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Wake, Waker};
+
+    use ngnet_quic::Timestamp;
+
+    use super::{State, take_imminent_wake};
+
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn kick(state: &mut State, now: Timestamp, deadline: Timestamp, cx: &Context<'_>) {
+        if take_imminent_wake(state, now, deadline) {
+            cx.waker().wake_by_ref();
+        }
+    }
+
+    fn state() -> State {
+        State {
+            closed: false,
+            reported_closed: false,
+            emitted_since_pending: false,
+            sleeping: None,
+            sleeping_until: None,
+            imminent_wake_until: None,
+            #[cfg(feature = "diagnostics")]
+            capacity_parked: false,
+            #[cfg(feature = "diagnostics")]
+            idle_parked: false,
+            limit_wakers: Vec::new(),
+            opened_bidi: std::collections::VecDeque::new(),
+            opened_uni: std::collections::VecDeque::new(),
+            scratch: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn imminent_timer_fallback_wakes_once_per_deadline() {
+        let count = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&count));
+        let cx = Context::from_waker(&waker);
+        let now = Timestamp::from_nanos(1_000_000).unwrap();
+        let imminent = Timestamp::from_nanos(1_000_015).unwrap();
+        let later = Timestamp::from_nanos(2_000_000).unwrap();
+        let mut state = state();
+
+        kick(&mut state, now, imminent, &cx);
+        kick(&mut state, now, imminent, &cx);
+        kick(&mut state, now, later, &cx);
+
+        assert_eq!(
+            count.0.load(Ordering::Relaxed),
+            1,
+            "an imminent deadline needs one fallback wake, not a retry loop"
+        );
+    }
 }
