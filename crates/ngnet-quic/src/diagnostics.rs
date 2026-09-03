@@ -92,6 +92,8 @@ pub enum LivenessKind {
     Retry,
     /// The connection reached a terminal transport state.
     Terminal,
+    /// The adapter armed or replaced its expiry sleep.
+    TimerArmed,
 }
 
 /// A reasoned, sequenced liveness observation.
@@ -881,11 +883,20 @@ pub fn record_packet(connection_id: u64, role: Role, stream_carrying: bool) {
 
 /// Records replacement of the adapter's armed sleep.
 #[doc(hidden)]
-pub fn record_timer_rearm(_connection_id: u64, role: Role) {
+pub fn record_timer_rearm(connection_id: u64, role: Role) {
     let Some(_guard) = recording_guard() else {
         return;
     };
     add(&counters(role).timer_rearms, 1);
+    push_liveness(
+        connection_id,
+        role,
+        LivenessKind::TimerArmed,
+        "timer-armed",
+        None,
+        None,
+        None,
+    );
 }
 
 /// Records an adapter sleep resolving at its deadline.
