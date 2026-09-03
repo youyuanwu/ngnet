@@ -79,12 +79,19 @@ write can therefore return blocked while stream, connection, and congestion cred
 with its next useful action only nanoseconds away. The detached adapter owns the sleep for that
 expiry; the endpoint driver cannot wake a detached connection's HTTP/3 task for it.
 
-Runtime timers may coalesce such sub-tick deadlines with the task currently being polled. The
-adapter keeps the ordinary expiry sleep and also schedules a bounded fallback wake when the
-deadline is within 100 microseconds. The fallback is capped at 64 wakes for one unchanged
-deadline and resets when ngtcp2 changes the deadline, the sleep becomes ready, or the
-connection has no expiry. It is therefore deadline-backed rather than an unconditional retry
-loop.
+The captures establish that the ordinary sleep did not produce a timer-ready event; they do
+not establish whether the runtime coalesced or otherwise lost the sub-tick wake. The adapter
+keeps that sleep and also schedules bounded fallback wakes when the deadline is within
+20 microseconds and the preceding stream-drain pass made no progress. The fallback is capped
+at 64 wakes for one unchanged deadline and resets when ngtcp2 changes the deadline, the sleep
+becomes ready, or the connection has no expiry. It is therefore deadline-backed rather than
+an unconditional retry loop.
+
+The fallback is not a rare error-only branch: on this host, one armed exact 1 MiB exchange
+recorded 368 timer kicks across both endpoints and 1,564 produced packets. It is gated on a
+stream-drain pass that made no stream progress, but pacing can create that state repeatedly
+during a healthy transfer. The reliability evidence supports liveness; this host's drift does
+not support a CPU-cost or throughput claim.
 
 This rule was added for S9, the intermittent native large-body stall. Same-occurrence traces
 showed blocked writes with positive stream, connection, and congestion credit, an armed expiry

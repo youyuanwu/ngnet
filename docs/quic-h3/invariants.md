@@ -44,13 +44,14 @@ default snapshot; this catches range/retention traversal or behavior leaking int
 ## An imminent expiry cannot depend only on a sub-tick sleep
 
 The detached connection owns ngtcp2's pacing, loss, and idle expiry. When that deadline is no
-more than 100 microseconds away, the adapter schedules bounded fallback polls in addition to
+more than 20 microseconds away, the adapter schedules bounded fallback polls in addition to
 the runtime sleep. One unchanged deadline can schedule at most 64 fallback wakes; moving the
 deadline starts a fresh budget.
 
 The focused test includes the exact threshold, excludes threshold plus one nanosecond, exhausts
 the per-deadline cap, and verifies that a new deadline gets a fresh budget. The cap makes the
-fallback finite. The runtime sleep remains armed throughout.
+fallback finite. The runtime sleep remains armed throughout. Production enables the fallback
+only after a stream-drain pass made no stream progress and ended on generic transport blocking.
 
 ## Module files are flat
 

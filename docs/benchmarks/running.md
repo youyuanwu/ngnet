@@ -263,7 +263,7 @@ and verifies that the group is empty before continuing:
 cargo build -p ngnet-bench --examples --release --features diagnostics
 ./target/release/examples/s9_supervisor \
   ./target/release/examples/probe ngnet-quic-h3 reliability \
-  1048576 125 100 180 1
+  1048576 125 100 180 1 target/s9-native-final.log
 ```
 
 `reliability` mode is unarmed. Each exchange has its payload-scaled inner timeout and the
@@ -271,14 +271,17 @@ whole probe self-classifies before the 180-second outer bound where possible. Tr
 `PROBE-FAIL`, outer kill, unclassified exit, or cleanup failure as a failed process. A clean
 100-process result is reliability evidence (approximately a 3% one-sided 95% upper
 failure-rate bound), not a timing result or proof that failure is impossible.
+The final path is an append-only manifest. The supervisor rejects duplicate run numbers and
+records each start, classified result, checkpoint, cleanup status, and final summary so a
+terminal scrollback limit cannot change the evidence denominator.
 
 Use fixture mode for the ignored exact stress tests:
 
 ```sh
 ./target/release/examples/s9_supervisor fixture \
-  ngtcp2_fixture_repeats_16_kib_exactly 5 900 1
+  ngtcp2_fixture_repeats_16_kib_exactly 5 900 1 target/s9-fixture-16k.log
 ./target/release/examples/s9_supervisor fixture \
-  ngtcp2_fixture_repeats_1_mib_exactly 5 900 1
+  ngtcp2_fixture_repeats_1_mib_exactly 5 900 1 target/s9-fixture-1m.log
 ```
 
 Before stability is claimed, predetermine and run five default-profile and five release-profile

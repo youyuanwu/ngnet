@@ -61,8 +61,9 @@ That distinguishes this mechanism from both flow-control starvation and the pure
 above.
 
 The adapter now gives imminent expiries bounded fallback wakes in addition to the ordinary
-runtime sleep. Two separate post-change schedules each completed 100/100 processes of
-125 × 1 MiB exchanges exactly. Each schedule independently bounds the observed per-process
+runtime sleep. The final implementation at `088e6c0` completed 100/100 processes of
+125 × 1 MiB exchanges exactly, as did two earlier fallback revisions. Each schedule
+independently bounds the observed per-process
 failure rate below approximately 3% at one-sided 95% confidence; they are not pooled because
 they exercised successive revisions of the bounded regression.
 
