@@ -21,10 +21,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ngnet_bench::{
-    CheckedPhase, CheckedProgress, NgnetH2, NgnetH3Quinn, NgnetNgtcpH3, NgnetNgtcpH3Matched,
-    NgnetQmuxH3, NgnetQmuxH3Matched, NgnetQmuxH3MatchedSocket, NgnetQmuxH3Socket, TokioSocket,
-    UpstreamH3Ngtcp, UpstreamH3Qmux, UpstreamH3QmuxSocket, UpstreamH3Quinn, body_of,
-    current_thread_runtime,
+    CheckedFailure, CheckedFailureKind, CheckedIntegrity, CheckedPhase, CheckedProgress,
+    CheckedProgressSnapshot, NgnetH2, NgnetH3Quinn, NgnetNgtcpH3, NgnetNgtcpH3Matched, NgnetQmuxH3,
+    NgnetQmuxH3Matched, NgnetQmuxH3MatchedSocket, NgnetQmuxH3Socket, TokioSocket, UpstreamH3Ngtcp,
+    UpstreamH3Qmux, UpstreamH3QmuxSocket, UpstreamH3Quinn, body_of, current_thread_runtime,
 };
 
 enum Arm {
@@ -68,15 +68,30 @@ impl Arm {
         &self,
         body: bytes::Bytes,
         progress: &CheckedProgress,
-    ) -> Result<(usize, bool), String> {
+    ) -> Result<(usize, bool), CheckedFailure> {
         match self {
             Arm::NgnetNgtcpH3(a) => a.try_round_trip_checked_observed(body, progress).await,
             Arm::NgnetNgtcpH3Matched(a) => a.try_round_trip_checked_observed(body, progress).await,
-            Arm::UpstreamH3Ngtcp(a) => a.try_round_trip_checked_observed(body, progress).await,
-            Arm::NgnetQmuxMatchedDuplex(a) => a.try_round_trip_checked(body).await,
-            Arm::NgnetQmuxMatchedSocket(a) => a.try_round_trip_checked(body).await,
-            Arm::UpstreamQmuxDuplex(a) => a.try_round_trip_checked(body).await,
-            Arm::UpstreamQmuxSocket(a) => a.try_round_trip_checked(body).await,
+            Arm::UpstreamH3Ngtcp(a) => a
+                .try_round_trip_checked_observed(body, progress)
+                .await
+                .map_err(CheckedFailure::other),
+            Arm::NgnetQmuxMatchedDuplex(a) => a
+                .try_round_trip_checked(body)
+                .await
+                .map_err(CheckedFailure::other),
+            Arm::NgnetQmuxMatchedSocket(a) => a
+                .try_round_trip_checked(body)
+                .await
+                .map_err(CheckedFailure::other),
+            Arm::UpstreamQmuxDuplex(a) => a
+                .try_round_trip_checked(body)
+                .await
+                .map_err(CheckedFailure::other),
+            Arm::UpstreamQmuxSocket(a) => a
+                .try_round_trip_checked(body)
+                .await
+                .map_err(CheckedFailure::other),
             _ => unreachable!("request validation restricts diagnostic mode to supported arms"),
         }
     }
@@ -150,8 +165,21 @@ fn phase_name(phase: CheckedPhase) -> &'static str {
     }
 }
 
-fn timeout_classifier(phase: CheckedPhase) -> &'static str {
-    match phase {
+fn integrity_name(integrity: CheckedIntegrity) -> &'static str {
+    match integrity {
+        CheckedIntegrity::ExactSoFar => "exact-so-far",
+        CheckedIntegrity::ContentMismatch => "content-mismatch",
+        CheckedIntegrity::LengthMismatch => "length-mismatch",
+    }
+}
+
+fn timeout_classifier(snapshot: CheckedProgressSnapshot) -> &'static str {
+    match snapshot.integrity {
+        CheckedIntegrity::ContentMismatch => return "wrong-content",
+        CheckedIntegrity::LengthMismatch => return "wrong-length",
+        CheckedIntegrity::ExactSoFar => {}
+    }
+    match snapshot.phase {
         CheckedPhase::ResponseHead => "s9-response-head-timeout",
         CheckedPhase::BodyDrain => "s9-body-drain-timeout",
         CheckedPhase::TerminalWait => "unclassified-terminal-wait",
@@ -159,12 +187,21 @@ fn timeout_classifier(phase: CheckedPhase) -> &'static str {
     }
 }
 
-fn error_classifier(phase: CheckedPhase, error: &str, lost_fin_proof: bool) -> &'static str {
+fn error_classifier(
+    snapshot: CheckedProgressSnapshot,
+    error: &CheckedFailure,
+    lost_fin_proof: bool,
+) -> &'static str {
     if lost_fin_proof {
         return "lost-fin-signature";
     }
-    let closed = error.contains("kind: Closed") || error.contains("connection went away");
-    match (phase, closed) {
+    match snapshot.integrity {
+        CheckedIntegrity::ContentMismatch => return "wrong-content",
+        CheckedIntegrity::LengthMismatch => return "wrong-length",
+        CheckedIntegrity::ExactSoFar => {}
+    }
+    let closed = error.kind() == CheckedFailureKind::Closed;
+    match (snapshot.phase, closed) {
         (CheckedPhase::ResponseHead, true) => "s9-unexpected-close-response-head",
         (CheckedPhase::BodyDrain, true) => "s9-unexpected-close-body-drain",
         (CheckedPhase::TerminalWait, true) => "unclassified-terminal-wait",
@@ -179,7 +216,7 @@ fn error_classifier(phase: CheckedPhase, error: &str, lost_fin_proof: bool) -> &
 fn process_timeout(mode: Mode) -> Option<Duration> {
     match mode {
         Mode::Timing => None,
-        Mode::Reliability => Some(Duration::from_secs(150)),
+        Mode::Reliability => Some(Duration::from_secs(135)),
         Mode::Diagnostic => Some(Duration::from_secs(600)),
     }
 }
@@ -531,6 +568,11 @@ fn main() {
          --release --features diagnostics`"
     );
 
+    eprintln!(
+        "PROBE-CHECKPOINT exchange=0 phase=setup received_bytes=0 \
+         integrity=exact-so-far terminal=false"
+    );
+    flush_stderr();
     let rt = current_thread_runtime();
     rt.block_on(async move {
         let arm = match arm_name.as_str() {
@@ -588,7 +630,17 @@ fn main() {
         // observation. Keeping the warm-up fixed matters for failure routing: if a large
         // workload fails, it does so after readiness and is classified as workload failure
         // rather than disappearing inside setup.
-        let warmup_received = arm.round_trip(body_of(0)).await;
+        eprintln!(
+            "PROBE-CHECKPOINT exchange=0 phase=warmup received_bytes=0 \
+             integrity=exact-so-far terminal=false"
+        );
+        flush_stderr();
+        let warmup_received = tokio::time::timeout(
+            exchange_timeout(0),
+            arm.round_trip(body_of(0)),
+        )
+        .await
+        .expect("warm-up exceeded its workload-scaled timeout");
         assert_eq!(warmup_received, 0, "warm-up response was not exact");
 
         eprintln!(
@@ -630,22 +682,32 @@ fn main() {
             "body" => {
                 let payload = body_payload.expect("body workload has a payload");
                 let active_exchange = Arc::new(AtomicUsize::new(1));
-                let emitted = Arc::new(Mutex::new((CheckedPhase::Complete, usize::MAX)));
+                let emitted = Arc::new(Mutex::new((
+                    CheckedPhase::Complete,
+                    usize::MAX,
+                    CheckedIntegrity::ExactSoFar,
+                )));
                 let progress = CheckedProgress::observed({
                     let active_exchange = Arc::clone(&active_exchange);
                     let emitted = Arc::clone(&emitted);
                     move |snapshot| {
                         let bucket = snapshot.received / (64 * 1024);
                         let mut prior = emitted.lock().expect("probe checkpoint mutex poisoned");
-                        if prior.0 == snapshot.phase && prior.1 == bucket {
+                        if prior.0 == snapshot.phase
+                            && prior.1 == bucket
+                            && prior.2 == snapshot.integrity
+                        {
                             return;
                         }
-                        *prior = (snapshot.phase, bucket);
+                        *prior = (snapshot.phase, bucket, snapshot.integrity);
                         eprintln!(
-                            "PROBE-CHECKPOINT exchange={} phase={} received_bytes={}",
+                            "PROBE-CHECKPOINT exchange={} phase={} received_bytes={} \
+                             integrity={} terminal={}",
                             active_exchange.load(Ordering::Acquire),
                             phase_name(snapshot.phase),
-                            snapshot.received
+                            snapshot.received,
+                            integrity_name(snapshot.integrity),
+                            snapshot.phase == CheckedPhase::Complete,
                         );
                         flush_stderr();
                     }
@@ -656,7 +718,8 @@ fn main() {
                         if mode != Mode::Timing {
                             eprintln!(
                                 "PROBE-CHECKPOINT exchange={exchange} last_completed={} \
-                                 phase={} received_bytes=0 diagnostics_armed={}",
+                                 phase={} received_bytes=0 integrity=exact-so-far terminal=false \
+                                 diagnostics_armed={}",
                                 exchange - 1,
                                 phase_name(CheckedPhase::ResponseHead),
                                 mode == Mode::Diagnostic && arm_name == "ngnet-quic-h3"
@@ -678,29 +741,33 @@ fn main() {
                                     let snapshot = progress.snapshot();
                                     eprintln!(
                                         "PROBE-FAIL exchange={exchange} last_completed={} \
-                                         phase={} received_bytes={} classifier={} \
+                                         phase={} received_bytes={} integrity={} terminal={} classifier={} \
                                          supervisor=inner-error diagnostics_armed={} error={error:?}",
                                         exchange - 1,
                                         phase_name(snapshot.phase),
                                         snapshot.received,
+                                        integrity_name(snapshot.integrity),
+                                        snapshot.phase == CheckedPhase::Complete,
                                         error_classifier(
-                                            snapshot.phase,
-                                            &format!("{error:?}"),
+                                            snapshot,
+                                            &error,
                                             false,
                                         ),
                                         mode == Mode::Diagnostic && arm_name == "ngnet-quic-h3"
                                     );
-                                    emit_rss("failure-request-or-body", exchange, failure_rss);
-                                    emit_diagnostics(
-                                        &arm_name,
-                                        exchange,
-                                        "failure-request-or-body",
-                                        None,
-                                    );
-                                    arm.emit_symmetric_counters(
-                                        exchange,
-                                        "failure-request-or-body",
-                                    );
+                                    if mode == Mode::Diagnostic {
+                                        emit_rss("failure-request-or-body", exchange, failure_rss);
+                                        emit_diagnostics(
+                                            &arm_name,
+                                            exchange,
+                                            "failure-request-or-body",
+                                            None,
+                                        );
+                                        arm.emit_symmetric_counters(
+                                            exchange,
+                                            "failure-request-or-body",
+                                        );
+                                    }
                                     flush_stderr();
                                     panic!("exchange {exchange} failed before an exact response");
                                 }
@@ -709,18 +776,27 @@ fn main() {
                                     let snapshot = progress.snapshot();
                                     eprintln!(
                                         "PROBE-FAIL exchange={exchange} last_completed={} \
-                                         phase={} received_bytes={} classifier={} \
+                                         phase={} received_bytes={} integrity={} terminal={} classifier={} \
                                          supervisor=inner-timeout diagnostics_armed={} timeout_ms={}",
                                         exchange - 1,
                                         phase_name(snapshot.phase),
                                         snapshot.received,
-                                        timeout_classifier(snapshot.phase),
+                                        integrity_name(snapshot.integrity),
+                                        snapshot.phase == CheckedPhase::Complete,
+                                        timeout_classifier(snapshot),
                                         mode == Mode::Diagnostic && arm_name == "ngnet-quic-h3",
                                         exchange_timeout(param).as_millis()
                                     );
-                                    emit_rss("failure-timeout", exchange, failure_rss);
-                                    emit_diagnostics(&arm_name, exchange, "failure-timeout", None);
-                                    arm.emit_symmetric_counters(exchange, "failure-timeout");
+                                    if mode == Mode::Diagnostic {
+                                        emit_rss("failure-timeout", exchange, failure_rss);
+                                        emit_diagnostics(
+                                            &arm_name,
+                                            exchange,
+                                            "failure-timeout",
+                                            None,
+                                        );
+                                        arm.emit_symmetric_counters(exchange, "failure-timeout");
+                                    }
                                     flush_stderr();
                                     panic!(
                                         "exchange {exchange} exceeded its workload-scaled timeout"
@@ -732,9 +808,14 @@ fn main() {
                         if received != param || !exact {
                             eprintln!(
                                 "PROBE-FAIL exchange={exchange} last_completed={} phase=complete \
-                                 received_bytes={received} classifier={} supervisor=inner-error \
+                                 received_bytes={received} integrity={} terminal=true classifier={} supervisor=inner-error \
                                  diagnostics_armed={} expected_bytes={param}",
                                 exchange - 1,
+                                if received != param {
+                                    "length-mismatch"
+                                } else {
+                                    "content-mismatch"
+                                },
                                 if received != param {
                                     "wrong-length"
                                 } else {
@@ -762,7 +843,8 @@ fn main() {
                         if mode != Mode::Timing {
                             eprintln!(
                                 "PROBE-CHECKPOINT exchange={exchange} completed={exchange} \
-                                 phase=complete received_bytes={received} classifier=completed \
+                                 phase=complete received_bytes={received} integrity=exact-so-far \
+                                 terminal=true classifier=completed \
                                  diagnostics_armed={}",
                                 mode == Mode::Diagnostic && arm_name == "ngnet-quic-h3"
                             );
@@ -782,16 +864,25 @@ fn main() {
                         let snapshot = progress.snapshot();
                         eprintln!(
                             "PROBE-FAIL exchange={exchange} last_completed={} phase={} \
-                             received_bytes={} classifier={} supervisor=process-timeout \
+                             received_bytes={} integrity={} terminal={} classifier={} supervisor=process-timeout \
                              diagnostics_armed={} timeout_ms={}",
                             exchange.saturating_sub(1),
                             phase_name(snapshot.phase),
                             snapshot.received,
-                            timeout_classifier(snapshot.phase),
+                            integrity_name(snapshot.integrity),
+                            snapshot.phase == CheckedPhase::Complete,
+                            timeout_classifier(snapshot),
                             mode == Mode::Diagnostic && arm_name == "ngnet-quic-h3",
                             limit.as_millis()
                         );
-                        emit_diagnostics(&arm_name, exchange, "failure-process-timeout", None);
+                        if mode == Mode::Diagnostic {
+                            emit_diagnostics(
+                                &arm_name,
+                                exchange,
+                                "failure-process-timeout",
+                                None,
+                            );
+                        }
                         flush_stderr();
                         panic!("probe body workload exceeded its process deadline");
                     }
@@ -898,7 +989,7 @@ mod tests {
         assert_eq!(process_timeout(Mode::Timing), None);
         assert_eq!(
             process_timeout(Mode::Reliability),
-            Some(Duration::from_secs(150))
+            Some(Duration::from_secs(135))
         );
         assert_eq!(
             process_timeout(Mode::Diagnostic),
@@ -908,22 +999,44 @@ mod tests {
 
     #[test]
     fn terminal_wait_is_not_assumed_to_be_the_lost_fin_defect() {
+        let snapshot = |phase, integrity| CheckedProgressSnapshot {
+            phase,
+            received: 0,
+            integrity,
+        };
+        let terminal = snapshot(CheckedPhase::TerminalWait, CheckedIntegrity::ExactSoFar);
         assert_eq!(phase_name(CheckedPhase::TerminalWait), "terminal-wait");
+        assert_eq!(timeout_classifier(terminal), "unclassified-terminal-wait");
         assert_eq!(
-            timeout_classifier(CheckedPhase::TerminalWait),
+            error_classifier(terminal, &CheckedFailure::closed("connection ended"), false,),
             "unclassified-terminal-wait"
         );
         assert_eq!(
-            error_classifier(CheckedPhase::TerminalWait, "kind: Closed", false),
-            "unclassified-terminal-wait"
-        );
-        assert_eq!(
-            error_classifier(CheckedPhase::TerminalWait, "kind: Closed", true),
+            error_classifier(terminal, &CheckedFailure::other("not a close"), true),
             "lost-fin-signature"
         );
         assert_eq!(
-            error_classifier(CheckedPhase::BodyDrain, "frame decode failed", false),
+            error_classifier(
+                snapshot(CheckedPhase::BodyDrain, CheckedIntegrity::ExactSoFar),
+                &CheckedFailure::other("frame decode failed"),
+                false,
+            ),
             "body-error"
+        );
+        assert_eq!(
+            timeout_classifier(snapshot(
+                CheckedPhase::BodyDrain,
+                CheckedIntegrity::ContentMismatch,
+            )),
+            "wrong-content"
+        );
+        assert_eq!(
+            error_classifier(
+                snapshot(CheckedPhase::BodyDrain, CheckedIntegrity::LengthMismatch,),
+                &CheckedFailure::closed("connection ended"),
+                false,
+            ),
+            "wrong-length"
         );
     }
 }

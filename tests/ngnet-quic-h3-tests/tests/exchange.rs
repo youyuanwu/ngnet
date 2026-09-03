@@ -12,14 +12,15 @@ use ngnet_quic_h3_tests::{Credentials, TEST_SERVER_NAME, client_endpoint, server
 
 type Payload = Full<Bytes>;
 
+#[cfg(feature = "diagnostics")]
+static DIAGNOSTICS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Serves one connection with a fixed response, and returns once it has finished.
 async fn serve_one(
     endpoint: ngnet_quic::endpoint::Endpoint<ngnet_quic::OsslSession>,
     body: Vec<u8>,
 ) {
-    let backend = accept(&endpoint)
-        .await
-        .expect("accepting a connection");
+    let backend = accept(&endpoint).await.expect("accepting a connection");
 
     let connection = ngnet_h3::http::serve(backend, move |request| {
         let body = body.clone();
@@ -44,6 +45,8 @@ async fn serve_one(
 
 #[tokio::test]
 async fn a_request_and_response_cross_a_real_socket() {
+    #[cfg(feature = "diagnostics")]
+    let _diagnostics_guard = DIAGNOSTICS_LOCK.lock().await;
     let credentials = Credentials::generate();
     let (server, server_driver, address) = server_endpoint(&credentials).await;
     let (client, client_driver) = client_endpoint(&credentials, 0xA1).await;
@@ -101,6 +104,13 @@ async fn a_request_and_response_cross_a_real_socket() {
 
 #[tokio::test]
 async fn a_body_larger_than_the_flow_control_window_completes() {
+    #[cfg(feature = "diagnostics")]
+    let _diagnostics_guard = DIAGNOSTICS_LOCK.lock().await;
+    #[cfg(feature = "diagnostics")]
+    {
+        ngnet_quic::diagnostics::reset();
+        ngnet_quic::diagnostics::arm(true);
+    }
     // Large enough to exceed both the per-stream window (256 KiB) and the connection window
     // (1 MiB), so finishing it requires credit to be returned mid-transfer rather than the
     // whole thing fitting in what was advertised up front.
@@ -155,10 +165,37 @@ async fn a_body_larger_than_the_flow_control_window_completes() {
         "every byte of a multi-window body must arrive"
     );
     assert_eq!(received.as_ref(), expected.as_slice());
+
+    #[cfg(feature = "diagnostics")]
+    {
+        let drained = ngnet_quic::diagnostics::drain();
+        let captured_selected_state = drained.attempts.iter().any(|attempt| {
+            attempt.outcome == ngnet_quic::diagnostics::AttemptOutcome::Blocked
+                && attempt.connection_credit_before > 0
+                && attempt.stream_credit_before > 0
+                && attempt.congestion_credit_before > 0
+                && attempt
+                    .expiry_after
+                    .is_some_and(|expiry| expiry.saturating_sub(attempt.now) <= 20_000)
+        });
+        assert!(
+            captured_selected_state,
+            "the exact exchange never entered the reproduced credit-positive imminent block"
+        );
+        assert!(
+            drained.snapshot.client.timer_kicks + drained.snapshot.server.timer_kicks > 0,
+            "the exact exchange never exercised the imminent timer fallback"
+        );
+        assert_eq!(drained.snapshot.dropped_attempt_records, 0);
+        assert_eq!(drained.snapshot.dropped_liveness_records, 0);
+        ngnet_quic::diagnostics::reset();
+    }
 }
 
 #[tokio::test]
 async fn a_body_in_flight_is_held_once_not_twice() {
+    #[cfg(feature = "diagnostics")]
+    let _diagnostics_guard = DIAGNOSTICS_LOCK.lock().await;
     // `ngnet-quic` copies every byte it accepts, because ngtcp2 keeps the pointer it is
     // handed until the peer acknowledges. The HTTP/3 layer holds its own buffer until the
     // transport reports the bytes released. If release were reported on *acknowledgement*

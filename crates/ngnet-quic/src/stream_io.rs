@@ -258,7 +258,7 @@ impl<S: Session> Conn<'_, S> {
                     .iter()
                     .fold(0usize, |total, range| total.saturating_add(range.len())),
                 self.retained_next_offset(stream),
-                // SAFETY: both calls are pure queries on the live connection.
+                // SAFETY: all three calls are pure queries on the live connection.
                 unsafe { sys::ngtcp2_conn_get_max_data_left2(self.raw()) },
                 unsafe { sys::ngtcp2_conn_get_max_stream_data_left2(self.raw(), stream.get()) },
                 unsafe { sys::ngtcp2_conn_get_cwnd_left2(self.raw()) },
@@ -396,7 +396,7 @@ impl<S: Session> Conn<'_, S> {
                 self.max_tx_udp_payload_size(),
                 data.len(),
                 self.retained_next_offset(stream),
-                // SAFETY: both calls are pure queries on the live connection.
+                // SAFETY: all three calls are pure queries on the live connection.
                 unsafe { sys::ngtcp2_conn_get_max_data_left2(self.raw()) },
                 unsafe { sys::ngtcp2_conn_get_max_stream_data_left2(self.raw(), stream.get()) },
                 unsafe { sys::ngtcp2_conn_get_cwnd_left2(self.raw()) },

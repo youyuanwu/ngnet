@@ -30,8 +30,8 @@ fn close_reason(close: &ngnet_quic::CloseError) -> &'static str {
 ///
 /// Capacity, not permission: the connection decides how much of it may actually be used.
 pub(crate) const MAX_DATAGRAM: usize = 1500;
-/// Runtime timers may coalesce deadlines shorter than one scheduler tick.
-const IMMINENT_EXPIRY_NANOS: u64 = 100_000;
+/// Threshold covering the sub-tick deadlines observed in S9 captures.
+const IMMINENT_EXPIRY_NANOS: u64 = 20_000;
 /// Caps fallback repolls for one unchanged deadline, preventing an unbounded retry loop.
 const MAX_IMMINENT_WAKES: u8 = 64;
 
@@ -70,12 +70,14 @@ fn poll_timer_state(
     }
 
     let remaining = deadline.as_nanos().saturating_sub(now.as_nanos());
-    let kicked =
-        remaining <= IMMINENT_EXPIRY_NANOS && state.imminent_wake_count < MAX_IMMINENT_WAKES;
+    let kicked = state.timer_fallback_needed
+        && remaining <= IMMINENT_EXPIRY_NANOS
+        && state.imminent_wake_count < MAX_IMMINENT_WAKES;
     if kicked {
-        // Some runtimes can coalesce a sub-tick sleep with the task currently being polled.
+        // The S9 captures showed an armed sub-tick expiry with no later timer-ready event.
         // Preserve bounded scheduling edges until the deadline passes; the per-deadline cap
-        // prevents this fallback from becoming an unconditional retry loop.
+        // prevents this fallback from becoming an unconditional retry loop. The runtime-level
+        // reason the ordinary sleep did not wake is not established.
         state.imminent_wake_count += 1;
         cx.waker().wake_by_ref();
     }
@@ -366,6 +368,7 @@ mod tests {
             sleeping: None,
             sleeping_until: None,
             imminent_wake_count: 0,
+            timer_fallback_needed: true,
             #[cfg(feature = "diagnostics")]
             capacity_parked: false,
             #[cfg(feature = "diagnostics")]
@@ -386,6 +389,11 @@ mod tests {
         let threshold = Timestamp::from_nanos(1_000_000 + IMMINENT_EXPIRY_NANOS).unwrap();
         let outside = Timestamp::from_nanos(1_000_001 + IMMINENT_EXPIRY_NANOS).unwrap();
         let mut state = state();
+
+        state.timer_fallback_needed = false;
+        let idle_result = poll(&mut state, now, Some(threshold), &mut cx);
+        assert!(!idle_result.kicked, "progressing streams do not self-wake");
+        state.timer_fallback_needed = true;
 
         let outside_result = poll(&mut state, now, Some(outside), &mut cx);
         assert!(outside_result.rearmed);

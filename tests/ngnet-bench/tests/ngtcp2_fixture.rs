@@ -1,8 +1,25 @@
 use bytes::Bytes;
-use ngnet_bench::{CheckedPhase, CheckedProgress, NgnetNgtcpH3};
+use ngnet_bench::{CheckedIntegrity, CheckedPhase, CheckedProgress, NgnetNgtcpH3};
 use std::sync::{Arc, Mutex};
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn phase_name(phase: CheckedPhase) -> &'static str {
+    match phase {
+        CheckedPhase::ResponseHead => "response-head",
+        CheckedPhase::BodyDrain => "body-drain",
+        CheckedPhase::TerminalWait => "terminal-wait",
+        CheckedPhase::Complete => "complete",
+    }
+}
+
+fn integrity_name(integrity: CheckedIntegrity) -> &'static str {
+    match integrity {
+        CheckedIntegrity::ExactSoFar => "exact-so-far",
+        CheckedIntegrity::ContentMismatch => "content-mismatch",
+        CheckedIntegrity::LengthMismatch => "length-mismatch",
+    }
+}
 
 fn establishment_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(if cfg!(debug_assertions) { 60 } else { 30 })
@@ -132,14 +149,11 @@ async fn repeated_exact_echo(size: usize, exchanges: usize) {
                 *prior = (snapshot.phase, bucket);
                 eprintln!(
                     "S9-FIXTURE-CHECKPOINT size={size} exchange={exchange} phase={} \
-                     received_bytes={}",
-                    match snapshot.phase {
-                        CheckedPhase::ResponseHead => "response-head",
-                        CheckedPhase::BodyDrain => "body-drain",
-                        CheckedPhase::TerminalWait => "terminal-wait",
-                        CheckedPhase::Complete => "complete",
-                    },
-                    snapshot.received
+                     received_bytes={} integrity={} terminal={}",
+                    phase_name(snapshot.phase),
+                    snapshot.received,
+                    integrity_name(snapshot.integrity),
+                    snapshot.phase == CheckedPhase::Complete,
                 );
             }
         });
@@ -157,25 +171,24 @@ async fn repeated_exact_echo(size: usize, exchanges: usize) {
             let snapshot = progress.snapshot();
             panic!(
                 "{size}-byte exchange {exchange} stalled; last completed exchange was {}; \
-                 phase={} received_bytes={}",
+                 phase={} received_bytes={} integrity={} terminal={}",
                 exchange - 1,
-                match snapshot.phase {
-                    CheckedPhase::ResponseHead => "response-head",
-                    CheckedPhase::BodyDrain => "body-drain",
-                    CheckedPhase::TerminalWait => "terminal-wait",
-                    CheckedPhase::Complete => "complete",
-                },
+                phase_name(snapshot.phase),
                 snapshot.received,
+                integrity_name(snapshot.integrity),
+                snapshot.phase == CheckedPhase::Complete,
             )
         })
         .unwrap_or_else(|error| {
             let snapshot = progress.snapshot();
             panic!(
                 "{size}-byte exchange {exchange} failed; last completed exchange was {}; \
-                 phase={:?} received_bytes={} error={error}",
+                 phase={} received_bytes={} integrity={} terminal={} error={error}",
                 exchange - 1,
-                snapshot.phase,
+                phase_name(snapshot.phase),
                 snapshot.received,
+                integrity_name(snapshot.integrity),
+                snapshot.phase == CheckedPhase::Complete,
             )
         });
         assert_eq!(
@@ -223,14 +236,14 @@ async fn ngtcp2_fixture_reuses_more_than_the_initial_stream_limit() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "known intermittent outer-driver liveness failure; see benchmark run 30"]
+#[ignore = "long-running S9 stress; run through the documented process-group supervisor"]
 async fn ngtcp2_fixture_repeats_16_kib_exactly() {
     let _guard = TEST_LOCK.lock().await;
     repeated_exact_echo(16 * 1024, 125).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "known intermittent outer-driver liveness failure; see benchmark run 30"]
+#[ignore = "long-running S9 stress; run through the documented process-group supervisor"]
 async fn ngtcp2_fixture_repeats_1_mib_exactly() {
     let _guard = TEST_LOCK.lock().await;
     repeated_exact_echo(1024 * 1024, 125).await;

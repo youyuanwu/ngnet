@@ -44,6 +44,7 @@
 //! are aliased to `NgHttpIo` and `HyperHttpIo` at the import site below so no reader has to
 //! guess which is in play.
 
+use std::any::Any;
 use std::convert::Infallible;
 use std::fmt::Debug;
 use std::future::{Future, poll_fn};
@@ -338,8 +339,19 @@ pub enum CheckedPhase {
     BodyDrain,
     /// All expected bytes arrived and the body is waiting for its terminal indication.
     TerminalWait,
-    /// The exact body and terminal indication both arrived.
+    /// The body stream reached its terminal indication; integrity is reported separately.
     Complete,
+}
+
+/// Integrity known about response bytes observed so far.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckedIntegrity {
+    /// Every observed byte matches and the expected length has not been exceeded.
+    ExactSoFar,
+    /// At least one observed byte differs from the expected body.
+    ContentMismatch,
+    /// More response bytes arrived than the expected body contains.
+    LengthMismatch,
 }
 
 /// Last durable application-level progress for one checked exchange.
@@ -349,6 +361,64 @@ pub struct CheckedProgressSnapshot {
     pub phase: CheckedPhase,
     /// Response bytes observed so far.
     pub received: usize,
+    /// Integrity known before any later timeout or transport failure.
+    pub integrity: CheckedIntegrity,
+}
+
+/// Stable failure category used by supervised checked exchanges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckedFailureKind {
+    /// The native HTTP/3 connection ended.
+    Closed,
+    /// A request, protocol, body, or peer response failed for another reason.
+    Other,
+}
+
+/// A checked-exchange failure with a typed category and printable detail.
+#[derive(Debug)]
+pub struct CheckedFailure {
+    kind: CheckedFailureKind,
+    detail: String,
+}
+
+impl CheckedFailure {
+    /// Builds a connection-ending failure.
+    pub fn closed(detail: impl Into<String>) -> Self {
+        Self {
+            kind: CheckedFailureKind::Closed,
+            detail: detail.into(),
+        }
+    }
+
+    /// Builds a non-connection-ending failure.
+    pub fn other(detail: impl Into<String>) -> Self {
+        Self {
+            kind: CheckedFailureKind::Other,
+            detail: detail.into(),
+        }
+    }
+
+    fn ngnet(context: &'static str, error: ngnet_h3::http::Error) -> Self {
+        Self {
+            kind: if error.kind() == ngnet_h3::http::ErrorKind::Closed {
+                CheckedFailureKind::Closed
+            } else {
+                CheckedFailureKind::Other
+            },
+            detail: format!("{context}: {error:?}"),
+        }
+    }
+
+    /// Stable failure category.
+    pub fn kind(&self) -> CheckedFailureKind {
+        self.kind
+    }
+}
+
+impl core::fmt::Display for CheckedFailure {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
 }
 
 /// Shared progress cell used by an external supervisor while an exchange is pending.
@@ -364,6 +434,7 @@ impl Default for CheckedProgress {
             state: Arc::new(Mutex::new(CheckedProgressSnapshot {
                 phase: CheckedPhase::ResponseHead,
                 received: 0,
+                integrity: CheckedIntegrity::ExactSoFar,
             })),
             observer: None,
         }
@@ -384,8 +455,12 @@ impl CheckedProgress {
         *self.state.lock().expect("checked progress mutex poisoned")
     }
 
-    fn record(&self, phase: CheckedPhase, received: usize) {
-        let snapshot = CheckedProgressSnapshot { phase, received };
+    fn record(&self, phase: CheckedPhase, received: usize, integrity: CheckedIntegrity) {
+        let snapshot = CheckedProgressSnapshot {
+            phase,
+            received,
+            integrity,
+        };
         *self.state.lock().expect("checked progress mutex poisoned") = snapshot;
         if let Some(observer) = &self.observer {
             observer(snapshot);
@@ -411,7 +486,7 @@ impl core::fmt::Debug for CheckedProgress {
 async fn drain<B>(mut body: B) -> usize
 where
     B: Body<Data = Bytes> + Unpin,
-    B::Error: Debug,
+    B::Error: Debug + 'static,
 {
     let mut total = 0;
     while let Some(frame) = poll_fn(|context| Pin::new(&mut body).poll_frame(context)).await {
@@ -426,24 +501,27 @@ where
 async fn try_drain_checked<B>(mut body: B, expected: &[u8]) -> Result<(usize, bool), String>
 where
     B: Body<Data = Bytes> + Unpin,
-    B::Error: Debug,
+    B::Error: Debug + 'static,
 {
-    try_drain_checked_observed(&mut body, expected, None).await
+    try_drain_checked_observed(&mut body, expected, None)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn try_drain_checked_observed<B>(
     body: &mut B,
     expected: &[u8],
     progress: Option<&CheckedProgress>,
-) -> Result<(usize, bool), String>
+) -> Result<(usize, bool), CheckedFailure>
 where
     B: Body<Data = Bytes> + Unpin,
-    B::Error: Debug,
+    B::Error: Debug + 'static,
 {
     let mut total = 0usize;
     let mut exact = true;
+    let mut integrity = CheckedIntegrity::ExactSoFar;
     if let Some(progress) = progress {
-        progress.record(CheckedPhase::BodyDrain, 0);
+        progress.record(CheckedPhase::BodyDrain, 0, CheckedIntegrity::ExactSoFar);
     }
     loop {
         if let Some(progress) = progress {
@@ -454,15 +532,34 @@ where
                     CheckedPhase::BodyDrain
                 },
                 total,
+                integrity,
             );
         }
         let Some(frame) = poll_fn(|context| Pin::new(&mut *body).poll_frame(context)).await else {
             break;
         };
-        let frame = frame.map_err(|error| format!("response body frame failed: {error:?}"))?;
+        let frame = frame.map_err(|error| {
+            let kind = (&error as &dyn Any)
+                .downcast_ref::<ngnet_h3::http::Error>()
+                .map_or(CheckedFailureKind::Other, |error| {
+                    if error.kind() == ngnet_h3::http::ErrorKind::Closed {
+                        CheckedFailureKind::Closed
+                    } else {
+                        CheckedFailureKind::Other
+                    }
+                });
+            CheckedFailure {
+                kind,
+                detail: format!("response body frame failed: {error:?}"),
+            }
+        })?;
         if let Some(data) = frame.data_ref() {
             let end = total.saturating_add(data.len());
             let expected_range = expected.get(total..end);
+            let exceeded = expected_range.is_none();
+            if exceeded {
+                integrity = CheckedIntegrity::LengthMismatch;
+            }
             if exact && !expected_range.is_some_and(|range| range == data.as_ref()) {
                 let mismatch = expected_range
                     .and_then(|range| {
@@ -482,13 +579,31 @@ where
                     &data[frame_offset..actual_end],
                 );
                 exact = false;
+                if integrity != CheckedIntegrity::LengthMismatch {
+                    integrity = CheckedIntegrity::ContentMismatch;
+                }
             }
             total = end;
+            if let Some(progress) = progress {
+                progress.record(
+                    if total >= expected.len() {
+                        CheckedPhase::TerminalWait
+                    } else {
+                        CheckedPhase::BodyDrain
+                    },
+                    total,
+                    if total != expected.len() {
+                        CheckedIntegrity::LengthMismatch
+                    } else {
+                        integrity
+                    },
+                );
+            }
         }
     }
     let exact = exact && total == expected.len();
     if let Some(progress) = progress {
-        progress.record(CheckedPhase::Complete, total);
+        progress.record(CheckedPhase::Complete, total, integrity);
     }
     Ok((total, exact))
 }
@@ -2133,7 +2248,10 @@ impl NgnetNgtcpH3 {
     }
 
     /// Sends one request and reports response-head/body failures without panicking.
-    pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
+    pub async fn try_round_trip_checked(
+        &self,
+        body: Bytes,
+    ) -> Result<(usize, bool), CheckedFailure> {
         self.try_round_trip_checked_observed(body, &CheckedProgress::default())
             .await
     }
@@ -2143,19 +2261,19 @@ impl NgnetNgtcpH3 {
         &self,
         body: Bytes,
         progress: &CheckedProgress,
-    ) -> Result<(usize, bool), String> {
-        progress.record(CheckedPhase::ResponseHead, 0);
+    ) -> Result<(usize, bool), CheckedFailure> {
+        progress.record(CheckedPhase::ResponseHead, 0, CheckedIntegrity::ExactSoFar);
         let expected = body.clone();
         let response = self
             .handle
             .send_request(quic_request_for(body))
             .await
-            .map_err(|error| format!("ngtcp2 response head failed: {error:?}"))?;
+            .map_err(|error| CheckedFailure::ngnet("ngtcp2 response head failed", error))?;
         if !response.status().is_success() {
-            return Err(format!(
+            return Err(CheckedFailure::other(format!(
                 "ngtcp2 response status was not successful: {}",
                 response.status()
-            ));
+            )));
         }
         try_drain_checked_observed(&mut response.into_body(), &expected, Some(progress)).await
     }
@@ -2298,7 +2416,10 @@ impl NgnetNgtcpH3Matched {
     /// The supervised-probe path: a stall or a truncation has to be reportable, because the
     /// transport under both arms has a known unresolved large-body liveness defect and a probe
     /// that panicked would lose the evidence.
-    pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
+    pub async fn try_round_trip_checked(
+        &self,
+        body: Bytes,
+    ) -> Result<(usize, bool), CheckedFailure> {
         self.try_round_trip_checked_observed(body, &CheckedProgress::default())
             .await
     }
@@ -2308,19 +2429,19 @@ impl NgnetNgtcpH3Matched {
         &self,
         body: Bytes,
         progress: &CheckedProgress,
-    ) -> Result<(usize, bool), String> {
-        progress.record(CheckedPhase::ResponseHead, 0);
+    ) -> Result<(usize, bool), CheckedFailure> {
+        progress.record(CheckedPhase::ResponseHead, 0, CheckedIntegrity::ExactSoFar);
         let expected = body.clone();
         let response = self
             .handle
             .send_request(quic_request_for(body))
             .await
-            .map_err(|error| format!("ngtcp2 response head failed: {error:?}"))?;
+            .map_err(|error| CheckedFailure::ngnet("ngtcp2 response head failed", error))?;
         if !response.status().is_success() {
-            return Err(format!(
+            return Err(CheckedFailure::other(format!(
                 "ngtcp2 response status was not successful: {}",
                 response.status()
-            ));
+            )));
         }
         try_drain_checked_observed(&mut response.into_body(), &expected, Some(progress)).await
     }
@@ -2529,7 +2650,7 @@ impl UpstreamH3Ngtcp {
             .finish()
             .await
             .map_err(|error| format!("upstream ngtcp2 finish failed: {error:?}"))?;
-        progress.record(CheckedPhase::ResponseHead, 0);
+        progress.record(CheckedPhase::ResponseHead, 0, CheckedIntegrity::ExactSoFar);
         let response = stream
             .recv_response()
             .await
@@ -2542,6 +2663,7 @@ impl UpstreamH3Ngtcp {
         }
         let mut total = 0usize;
         let mut exact = true;
+        let mut integrity = CheckedIntegrity::ExactSoFar;
         loop {
             progress.record(
                 if total == expected.len() {
@@ -2550,14 +2672,21 @@ impl UpstreamH3Ngtcp {
                     CheckedPhase::BodyDrain
                 },
                 total,
+                integrity,
             );
             match stream.recv_data().await {
                 Ok(Some(mut chunk)) => {
                     while chunk.has_remaining() {
                         let piece = chunk.chunk();
                         let end = total + piece.len();
-                        if end > expected.len() || piece != &expected[total..end] {
+                        if end > expected.len() {
                             exact = false;
+                            integrity = CheckedIntegrity::LengthMismatch;
+                        } else if piece != &expected[total..end] {
+                            exact = false;
+                            if integrity != CheckedIntegrity::LengthMismatch {
+                                integrity = CheckedIntegrity::ContentMismatch;
+                            }
                         }
                         total = end;
                         let taken = piece.len();
@@ -2573,7 +2702,15 @@ impl UpstreamH3Ngtcp {
         if total != expected.len() {
             exact = false;
         }
-        progress.record(CheckedPhase::Complete, total);
+        progress.record(
+            CheckedPhase::Complete,
+            total,
+            if total != expected.len() {
+                CheckedIntegrity::LengthMismatch
+            } else {
+                integrity
+            },
+        );
         Ok((total, exact))
     }
 }

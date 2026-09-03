@@ -32,6 +32,7 @@ pub enum AttemptOutcome {
 
 /// One complete stream-write attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Attempt {
     /// Monotonic process-local diagnostic sequence.
     pub sequence: u64,
@@ -556,7 +557,7 @@ fn push_liveness(
 ) -> u64 {
     let sequence = next_sequence();
     let mut records = LIVENESS.lock().unwrap_or_else(|error| error.into_inner());
-    if records.len() == RECORD_LIMIT {
+    if records.len() >= RECORD_LIMIT {
         add(&DROPPED_LIVENESS, 1);
     } else {
         records.push(LivenessEvent {
@@ -827,7 +828,7 @@ pub(crate) fn record_attempt(mut attempt: Attempt) {
         }
     }
     let mut records = ATTEMPTS.lock().unwrap_or_else(|error| error.into_inner());
-    if records.len() == RECORD_LIMIT {
+    if records.len() >= RECORD_LIMIT {
         add(&DROPPED_ATTEMPTS, 1);
     } else {
         records.push(attempt);
@@ -908,7 +909,7 @@ pub fn record_timer_rearm(connection_id: u64, role: Role) {
     );
 }
 
-/// Records an adapter sleep resolving at its deadline.
+/// Records a connection expiry observed due at the start of an adapter pump.
 #[doc(hidden)]
 pub fn record_timer_fire(connection_id: u64, role: Role) {
     let Some(_guard) = recording_guard() else {

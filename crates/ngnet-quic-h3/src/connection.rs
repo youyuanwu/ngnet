@@ -110,6 +110,8 @@ pub(crate) struct State {
     pub(crate) sleeping_until: Option<Timestamp>,
     /// Fallback wakes already issued for the current `sleeping_until` deadline.
     pub(crate) imminent_wake_count: u8,
+    /// Whether the latest stream drain stopped on transport/pacing block without progress.
+    pub(crate) timer_fallback_needed: bool,
     /// Whether the previous pass parked on a full outbound queue.
     #[cfg(feature = "diagnostics")]
     pub(crate) capacity_parked: bool,
@@ -159,6 +161,7 @@ impl<S: Session> NgtcpConnection<S> {
                 sleeping: None,
                 sleeping_until: None,
                 imminent_wake_count: 0,
+                timer_fallback_needed: false,
                 #[cfg(feature = "diagnostics")]
                 capacity_parked: false,
                 #[cfg(feature = "diagnostics")]
