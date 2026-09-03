@@ -59,9 +59,11 @@ stream-count, acknowledgement, pacing, or congestion settings would answer a dif
 configuration study rather than which default stack performs better today. The body case is
 limited to 1 KiB because only that size has a calibrated, low-drift multi-arm performance
 protocol. The native crash describes the historical pre-repair path, while later final review
-still reproduced outer-driver stalls at 16 KiB/1 MiB. Supervised exactness and diagnostic
-protocols cover the path; the flaky live repetition tests are ignored pending that liveness
-repair, and the Quinn-only Criterion target retains both larger sizes.
+still reproduced outer-driver stalls at 16 KiB/1 MiB. That timer-wake mechanism is now
+corrected and covered by supervised exactness and diagnostic protocols. The long-running live
+repetition tests remain ignored outside their supervisor, and larger Criterion points remain
+excluded because this host has not passed the calibrated measurement gates; the Quinn-only
+target retains both larger sizes.
 
 ## The HTTP/2 comparison: `ngnet-h2` against hyper
 
