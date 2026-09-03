@@ -94,6 +94,8 @@ pub enum LivenessKind {
     Terminal,
     /// The adapter armed or replaced its expiry sleep.
     TimerArmed,
+    /// The adapter scheduled a bounded fallback poll for an imminent expiry.
+    TimerKick,
 }
 
 /// A reasoned, sequenced liveness observation.
@@ -152,6 +154,8 @@ pub struct RoleSnapshot {
     pub timer_rearms: u64,
     /// Connection expiry deadlines observed due, whether by the sleep or the next pump.
     pub timer_fires: u64,
+    /// Bounded fallback wakes scheduled for imminent expiry deadlines.
+    pub timer_kicks: u64,
     /// General inbound/work wake registrations.
     pub wake_registrations: u64,
     /// Inbound deliveries that consumed general registrations.
@@ -243,6 +247,7 @@ struct AtomicRole {
     produced_packets: AtomicU64,
     timer_rearms: AtomicU64,
     timer_fires: AtomicU64,
+    timer_kicks: AtomicU64,
     wake_registrations: AtomicU64,
     inbound_wakes: AtomicU64,
     capacity_registrations: AtomicU64,
@@ -282,6 +287,7 @@ impl AtomicRole {
             produced_packets: AtomicU64::new(0),
             timer_rearms: AtomicU64::new(0),
             timer_fires: AtomicU64::new(0),
+            timer_kicks: AtomicU64::new(0),
             wake_registrations: AtomicU64::new(0),
             inbound_wakes: AtomicU64::new(0),
             capacity_registrations: AtomicU64::new(0),
@@ -321,6 +327,7 @@ impl AtomicRole {
             &self.produced_packets,
             &self.timer_rearms,
             &self.timer_fires,
+            &self.timer_kicks,
             &self.wake_registrations,
             &self.inbound_wakes,
             &self.capacity_registrations,
@@ -363,6 +370,7 @@ impl AtomicRole {
             produced_packets: load(&self.produced_packets),
             timer_rearms: load(&self.timer_rearms),
             timer_fires: load(&self.timer_fires),
+            timer_kicks: load(&self.timer_kicks),
             wake_registrations: load(&self.wake_registrations),
             inbound_wakes: load(&self.inbound_wakes),
             capacity_registrations: load(&self.capacity_registrations),
@@ -414,6 +422,7 @@ impl AtomicRole {
             produced_packets: take(&self.produced_packets),
             timer_rearms: take(&self.timer_rearms),
             timer_fires: take(&self.timer_fires),
+            timer_kicks: take(&self.timer_kicks),
             wake_registrations: take(&self.wake_registrations),
             inbound_wakes: take(&self.inbound_wakes),
             capacity_registrations: take(&self.capacity_registrations),
@@ -924,10 +933,11 @@ pub fn record_timer_kick(connection_id: u64, role: Role) {
     let Some(_guard) = recording_guard() else {
         return;
     };
+    add(&counters(role).timer_kicks, 1);
     push_liveness(
         connection_id,
         role,
-        LivenessKind::LocalProduction,
+        LivenessKind::TimerKick,
         "imminent-timer-kick",
         None,
         None,
