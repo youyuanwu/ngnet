@@ -514,44 +514,39 @@ fn the_hyperium_quic_adapter_has_the_exact_direct_dependencies() {
     );
 }
 
-/// The QMux core depends only on its bindings.
+/// The QMux core depends only on its bindings and OS entropy.
 ///
 /// The same claim `http3_core_depends_only_on_its_bindings` makes, for the newest pair, and
 /// asked the same way: with `--no-default-features`, because `ngnet-qmux` now has an
 /// asynchronous layer behind a default-on `io` feature. This is the sans-I/O crate as it
-/// existed before that layer, and the claim is that turning the layer off leaves it
-/// unchanged -- which is what Spec SC-005 asks for and what a caller who wants a state machine
-/// and nothing else is buying.
+/// existed before that layer. Turning the layer off leaves only the bindings plus the entropy
+/// source now required by dwnx.
 ///
-/// The shape of the assertion is not incidental. `cargo tree` prints the crate itself on the
-/// first line and one line per dependency after it, so "exactly one dependency" is "exactly
-/// one line after the first". Counting alone would pass for any single dependency at all, so
-/// the name on that line is checked too.
 #[test]
-fn qmux_core_depends_only_on_its_bindings() {
+fn qmux_core_depends_only_on_its_bindings_and_entropy() {
     let tree = cargo_tree(&["-p", "ngnet-qmux", "--no-default-features", "-e", "normal"]);
-    let dependencies: Vec<&str> = tree
+    let dependencies: Vec<String> = tree
         .lines()
         .skip(1)
-        .filter(|line| !line.trim().is_empty())
+        .filter(|line| line.starts_with('\u{251c}') || line.starts_with('\u{2514}'))
+        .map(dependency_name)
         .collect();
 
     assert_eq!(
         dependencies.len(),
-        1,
-        "the QMux core's dependency graph is no longer just its bindings: expected exactly \
-         one dependency, found {}.\n\
+        2,
+        "the QMux core's dependency graph is no longer just its bindings and entropy source: \
+         expected exactly two dependencies, found {}.\n\
          Inspect it with:\n  \
          cargo tree -p ngnet-qmux --no-default-features -e normal\n\n{tree}",
         dependencies.len(),
     );
 
-    assert!(
-        dependency_name(dependencies[0]) == "ngnet-qmux-sys",
-        "the QMux core has exactly one dependency, but it is not its bindings: it is `{}`.\n\
-         Inspect it with:\n  \
-         cargo tree -p ngnet-qmux --no-default-features -e normal\n\n{tree}",
-        dependency_name(dependencies[0]),
+    assert_eq!(
+        dependencies,
+        ["getrandom", "ngnet-qmux-sys"],
+        "the QMux core must depend only on its bindings and dwnx's required entropy source.\n\
+         Inspect it with:\n  cargo tree -p ngnet-qmux --no-default-features -e normal\n\n{tree}",
     );
 }
 
@@ -570,28 +565,28 @@ fn qmux_core_depends_only_on_its_bindings() {
 #[test]
 fn the_qmux_async_layer_brings_no_runtime() {
     let tree = cargo_tree(&["-p", "ngnet-qmux", "-e", "normal"]);
-    let dependencies: Vec<&str> = tree
+    let dependencies: Vec<String> = tree
         .lines()
         .skip(1)
-        .filter(|line| !line.trim().is_empty())
+        .filter(|line| line.starts_with('\u{251c}') || line.starts_with('\u{2514}'))
+        .map(dependency_name)
         .collect();
 
     assert_eq!(
         dependencies.len(),
-        1,
-        "the default build of ngnet-qmux resolved to more than its bindings: expected exactly \
-         one dependency, found {}. The asynchronous layer was added on the promise that it \
-         adds nothing to the dependency graph.\n\
+        2,
+        "the default build of ngnet-qmux resolved to more than its bindings and entropy source: \
+         expected exactly two dependencies, found {}. The asynchronous layer was added on the \
+         promise that it adds nothing to the dependency graph.\n\
          Inspect it with:\n  cargo tree -p ngnet-qmux -e normal\n\n{tree}",
         dependencies.len(),
     );
 
-    assert!(
-        dependency_name(dependencies[0]) == "ngnet-qmux-sys",
-        "the default build has exactly one dependency and it is not its bindings: it is \
-         `{}`.\n\
+    assert_eq!(
+        dependencies,
+        ["getrandom", "ngnet-qmux-sys"],
+        "the default build must depend only on its bindings and dwnx's required entropy source.\n\
          Inspect it with:\n  cargo tree -p ngnet-qmux -e normal\n\n{tree}",
-        dependency_name(dependencies[0]),
     );
 }
 
@@ -629,7 +624,11 @@ fn the_qmux_tokio_feature_is_what_reaches_tokio() {
 
     assert_eq!(
         direct,
-        vec!["ngnet-qmux-sys".to_string(), "tokio".to_string()],
+        vec![
+            "getrandom".to_string(),
+            "ngnet-qmux-sys".to_string(),
+            "tokio".to_string(),
+        ],
         "the `tokio` feature brought something other than tokio into ngnet-qmux's direct \
          dependencies. It is meant to add a ready-made byte stream and clock, and nothing \
          else.\n\

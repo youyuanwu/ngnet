@@ -189,11 +189,12 @@ where
 
 /// Build the callback table dwnx is given.
 ///
-/// Every entry is populated. dwnx documents most as optional, but registering them all and
-/// deciding per-event whether a caller handler exists keeps the decision in Rust, where the
-/// peer's transport parameters can also be cached whether or not anybody asked for them.
+/// The mandatory random source and every application event callback are populated. The
+/// write-offset notification stays unset because this API reports accepted bytes synchronously
+/// from each write, before the asynchronous layer can dequeue a stream-close event.
 pub(crate) fn callbacks() -> sys::dwnx_callbacks {
     sys::dwnx_callbacks {
+        rand: Some(fill_random),
         recv_transport_params: Some(on_recv_transport_params),
         recv_stream_data: Some(on_recv_stream_data),
         stream_open: Some(on_stream_open),
@@ -206,6 +207,23 @@ pub(crate) fn callbacks() -> sys::dwnx_callbacks {
         extend_max_local_streams_uni: Some(on_extend_max_local_streams_uni),
         extend_max_remote_streams_bidi: Some(on_extend_max_remote_streams_bidi),
         extend_max_remote_streams_uni: Some(on_extend_max_remote_streams_uni),
+        write_stream_data_offset: None,
+    }
+}
+
+unsafe extern "C" fn fill_random(dest: *mut u8, destlen: usize) {
+    if destlen == 0 {
+        return;
+    }
+    if dest.is_null() {
+        std::process::abort();
+    }
+
+    // SAFETY: dwnx provides a writable buffer of exactly `destlen` bytes.
+    let dest = unsafe { core::slice::from_raw_parts_mut(dest, destlen) };
+    if getrandom::fill(dest).is_err() {
+        // dwnx's callback cannot report failure, and unwinding through C is undefined.
+        std::process::abort();
     }
 }
 

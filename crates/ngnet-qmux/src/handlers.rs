@@ -124,9 +124,9 @@ pub enum StreamLimitKind {
 
 /// The set of reactions to protocol events.
 ///
-/// Every handler is optional; dwnx documents all but `recv_transport_params` as optional, and
-/// omitting even that one is allowed here because the parameters are cached by the connection
-/// regardless, so a caller who only wants to read them later need not supply a closure.
+/// Every application event handler is optional. dwnx's mandatory random callback is installed
+/// internally, and peer parameters are cached by the connection regardless of whether a caller
+/// supplies a closure.
 ///
 /// Handlers are `FnMut` and live for as long as the connection, so they may own state.
 #[derive(Default)]

@@ -3,8 +3,8 @@
 //! These assert properties of the source and the manifest rather than of runtime behaviour:
 //! that `unsafe` stays confined to the modules that touch the raw bindings, that the
 //! asynchronous layer contains none at all, that nothing outside that layer acquires an async
-//! facility, and that the crate still asks for exactly one non-optional dependency with the
-//! runtime integration reachable only through a feature.
+//! facility, and that the crate asks only for its bindings and dwnx's required entropy source
+//! as non-optional dependencies, with runtime integration reachable only through a feature.
 //!
 //! The `unsafe` boundary is enforced twice over, deliberately. `lib.rs` carries
 //! `#![deny(unsafe_code)]` with a per-module `#[allow(unsafe_code)]`, so the compiler already
@@ -488,7 +488,13 @@ fn the_core_reaches_for_no_io_threading_or_time_facility() {
     let mut offenders = Vec::new();
     for path in core_files() {
         let source = std::fs::read_to_string(&path).expect("reading a source file");
-        let code = strip_comments_and_literals(&source);
+        let mut code = strip_comments_and_literals(&source);
+        if path.ends_with("callbacks.rs") {
+            // dwnx's mandatory entropy callback has no error return. Aborting if the OS
+            // entropy source fails is the only sound failure path: predictable bytes violate
+            // the callback contract, and panicking would unwind through C.
+            code = code.replace("std::process::abort", "");
+        }
         for forbidden in FORBIDDEN {
             if code.contains(forbidden) {
                 offenders.push(format!("{} names {forbidden}", path.display()));
@@ -583,7 +589,7 @@ fn the_async_layer_brings_no_runtime() {
 }
 
 #[test]
-fn the_crate_declares_exactly_one_non_optional_dependency() {
+fn the_crate_declares_only_required_non_optional_dependencies() {
     let mut declared = Vec::new();
     let mut optional = Vec::new();
     for line in manifest_table("[dependencies]") {
@@ -603,7 +609,7 @@ fn the_crate_declares_exactly_one_non_optional_dependency() {
 
     assert_eq!(
         declared,
-        vec!["ngnet-qmux-sys".to_string()],
+        vec!["getrandom".to_string(), "ngnet-qmux-sys".to_string()],
         "the crate's non-optional dependency list has changed; the asynchronous layer was \
          added on the promise that it adds nothing to it"
     );

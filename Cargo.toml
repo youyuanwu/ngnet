@@ -68,6 +68,7 @@ cmake = "0.1"
 # `async_tokio` drives the async benches on a tokio runtime; the default features (HTML
 # reports, `cargo bench` support) are kept so a saved baseline can be compared the usual way.
 criterion = { version = "0.8", features = ["async_tokio"] }
+getrandom = "0.4"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
