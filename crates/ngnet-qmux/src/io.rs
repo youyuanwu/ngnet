@@ -1,8 +1,8 @@
 //! An asynchronous QMux connection over a byte stream the caller supplies.
 //!
 //! Enabled by the default `io` feature. Disabling it returns the crate to the sans-I/O state
-//! machine described in [the crate documentation](crate), with exactly one dependency and no
-//! asynchrony of any kind.
+//! machine described in [the crate documentation](crate), with only its bindings and dwnx's
+//! required entropy source and no asynchrony of any kind.
 //!
 //! Everything asynchronous is confined to this subtree: nothing outside `src/io/` names a
 //! waker, a future or a clock, and a structural test enforces that. The subtree contains no

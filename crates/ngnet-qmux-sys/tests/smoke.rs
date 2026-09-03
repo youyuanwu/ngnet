@@ -90,7 +90,8 @@ fn client_and_server_connections_construct_and_free() {
                 &callbacks,
                 &settings,
                 &params,
-                // Default allocator, and no user data: this test never takes a callback.
+                // Default allocator, and no user data: only the mandatory random callback
+                // fires, and it does not receive user data.
                 ptr::null(),
                 ptr::null_mut(),
             )
@@ -227,11 +228,12 @@ fn every_public_function_is_reachable() {
     ];
 }
 
-/// The callback table has twelve members, each an `Option<unsafe extern "C" fn>`.
+/// The callback table has one mandatory member; the remaining members are optional.
 #[test]
-fn callback_table_is_fully_optional() {
+fn callback_table_has_only_the_mandatory_random_source() {
     let callbacks = callbacks();
 
+    assert!(callbacks.rand.is_some());
     assert!(callbacks.recv_transport_params.is_none());
     assert!(callbacks.recv_stream_data.is_none());
     assert!(callbacks.stream_open.is_none());
@@ -244,11 +246,22 @@ fn callback_table_is_fully_optional() {
     assert!(callbacks.extend_max_local_streams_uni.is_none());
     assert!(callbacks.extend_max_remote_streams_bidi.is_none());
     assert!(callbacks.extend_max_remote_streams_uni.is_none());
+    assert!(callbacks.write_stream_data_offset.is_none());
 }
 
 fn callbacks() -> sys::dwnx_callbacks {
-    // `Default` is derived by bindgen; all twelve members are null function pointers.
-    sys::dwnx_callbacks::default()
+    // `Default` is derived by bindgen; install the one callback dwnx requires.
+    sys::dwnx_callbacks {
+        rand: Some(fill_with_zeroes),
+        ..Default::default()
+    }
+}
+
+unsafe extern "C" fn fill_with_zeroes(dest: *mut u8, destlen: usize) {
+    if !dest.is_null() {
+        // SAFETY: dwnx supplies a writable buffer of `destlen` bytes.
+        unsafe { ptr::write_bytes(dest, 0, destlen) };
+    }
 }
 
 fn default_params() -> sys::dwnx_transport_params {
