@@ -271,9 +271,11 @@ whole probe self-classifies before the 180-second outer bound where possible. Tr
 `PROBE-FAIL`, outer kill, unclassified exit, or cleanup failure as a failed process. A clean
 100-process result is reliability evidence (approximately a 3% one-sided 95% upper
 failure-rate bound), not a timing result or proof that failure is impossible.
-The final path is an append-only manifest. The supervisor rejects duplicate run numbers and
-records each start, classified result, checkpoint, cleanup status, and final summary so a
-terminal scrollback limit cannot change the evidence denominator.
+The final path is an append-only manifest. The supervisor rejects duplicate completed run
+numbers but permits a run with only an interrupted `START` record to be retried. It records
+each start, exact failure classifier/detail, captured process identities, checkpoint, cleanup
+status, and final summary so a terminal scrollback limit cannot change the evidence
+denominator.
 
 Use fixture mode for the ignored exact stress tests:
 
