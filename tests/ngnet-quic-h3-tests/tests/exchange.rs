@@ -170,7 +170,7 @@ async fn a_body_larger_than_the_flow_control_window_completes() {
     {
         let drained = ngnet_quic::diagnostics::drain();
         assert!(
-            drained.snapshot.client.timer_kicks + drained.snapshot.server.timer_kicks > 0,
+            drained.snapshot.client.timer_fallbacks + drained.snapshot.server.timer_fallbacks > 0,
             "the exact exchange never exercised the no-progress transport-block fallback"
         );
         assert_eq!(drained.snapshot.dropped_attempt_records, 0);

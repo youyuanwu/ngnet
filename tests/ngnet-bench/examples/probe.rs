@@ -415,7 +415,7 @@ fn emit_diagnostics(
              retained_backing_high_water={} transport_stream_release_bytes={} \
              acknowledged_bytes={} \
              released_backing_capacity={} produced_packets={} transport_only_packets={} \
-             stream_carrying_packets={} timer_rearms={} timer_fires={} timer_kicks={} \
+             stream_carrying_packets={} timer_rearms={} timer_fires={} timer_fallbacks={} \
              wake_registrations={} inbound_wakes={} \
              capacity_registrations={} capacity_wakes={} retries={} parks={} \
              zero_accept_retries={} zero_accept_retries_without_enable={} \
@@ -441,7 +441,7 @@ fn emit_diagnostics(
             values.stream_carrying_packets,
             values.timer_rearms,
             values.timer_fires,
-            values.timer_kicks,
+            values.timer_fallbacks,
             values.wake_registrations,
             values.inbound_wakes,
             values.capacity_registrations,
