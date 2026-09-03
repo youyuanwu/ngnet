@@ -44,8 +44,8 @@ The deterministic reproduction of the transport's half is
 the end-to-end story, including which stack this actually stalled, is in
 [`../h3-ngnet-quic/pending-work.md`](../h3-ngnet-quic/pending-work.md).
 
-**This is not the large-body stall and does not fix it.** That was re-measured afterwards and
-survives; see the next section.
+**This is not the large-body stall and did not fix it.** That was re-measured afterwards and
+survived until the separate timer-wake correction described in the next section.
 
 ## The reproduced large-body failure was a missed imminent timer wake
 
@@ -87,9 +87,8 @@ since that is what constructing a datagram means.
 Run [`27`](../benchmarks/data/xeon-8370c-azure/27-ngtcp2-packet-bounded-staging.md) records
 historical staged backing, accepted progress, exactness, and sampled RSS. Final-review
 [`run 30`](../benchmarks/data/xeon-8370c-azure/30-ngtcp2-final-review-resolution.md) records
-fresh diagnostic timeouts, so current persistent stability and the RSS envelope remain unmet.
-Neither record isolates copy CPU cost from packet protection, endpoint, adapter, or generic
-HTTP/3 work.
+the historical diagnostic timeouts. The later S9 reliability qualification does not isolate
+copy CPU cost from packet protection, endpoint, adapter, or generic HTTP/3 work.
 
 **What would settle the remaining copy:** route ownership-taking HTTP/3 buffers through
 `Conn::write_stream_owned`, change release to acknowledgement, and change

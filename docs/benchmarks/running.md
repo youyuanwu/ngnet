@@ -354,9 +354,9 @@ done
 
 ### Validating the ngtcp2 HTTP/3 path
 
-The live-loopback large-body repetitions are ignored while the intermittent outer-driver
-liveness failure remains open; run them explicitly under the repetition/supervisor protocol
-above. Then run the active diagnostic invariant/allocation coverage:
+The live-loopback large-body repetitions remain ignored because they are long-running stress
+tests; run them explicitly under the process-group supervisor protocol above. Then run the
+active diagnostic invariant/allocation coverage:
 
 ```sh
 cargo test -p ngnet-bench --test ngtcp2_fixture --release

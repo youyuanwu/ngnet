@@ -57,8 +57,8 @@ Two separate post-change schedules each exited successfully:
 
 | Revision | Processes | Exchanges | Classified failures | Outer kills | Cleanup failures |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| initial one-wake fallback | 100 | 12,500 | 0 | 0 | 0 |
-| bounded-64 final fallback | 100 | 12,500 | 0 | 0 | 0 |
+| `ad14c82` initial one-wake fallback | 100 | 12,500 | 0 | 0 | 0 |
+| `fb8257d` bounded-64 final fallback | 100 | 12,500 | 0 | 0 | 0 |
 
 The schedules are not pooled because they exercised successive revisions. Each 0/100 result
 independently gives an approximate one-sided 95% upper per-process failure-rate bound of 3%.

@@ -107,16 +107,16 @@ Found while chasing it, both genuine, both reduced the failure rate without remo
   returns `Blocked` is exactly what creates the pacing deadline that will unblock it, so arming
   beforehand left that deadline unwaited (`pump::rearm`).
 
-## Inherited, and still open: the native stack's large-body stall
+## Inherited history: the native stack's large-body stall
 
-`ngnet-quic-h3` has an unresolved intermittent connection-ending failure under repeated 16 KiB
-and 1 MiB exchanges — review finding S9. The evidence is in
+`ngnet-quic-h3` had an intermittent connection-ending failure under repeated 16 KiB and 1 MiB
+exchanges — review finding S9. The historical evidence is in
 [`../quic-h3/invariants.md`](../quic-h3/invariants.md) and
 [`../benchmarks/data/xeon-8370c-azure/30-ngtcp2-final-review-resolution.md`](../benchmarks/data/xeon-8370c-azure/30-ngtcp2-final-review-resolution.md),
 and the root-cause area recorded there is the outer HTTP/3 sendability-generation scheduling
 interacting with `ngnet-quic`'s packet-bounded staging and its zero-acceptance re-offers.
 
-**It is not claimed resolved, and the evidence is mixed rather than tidy.** The FIN change
+**The FIN change did not resolve it, and that evidence was mixed rather than tidy.** The FIN change
 touched this stack twice: `transmit::drain` reports a stream-less packet as `Blocked`, which
 reaches the arm in `ngnet-h3`'s driver written for exactly that case, and — after review — it
 no longer ends the drain pass on one, so the displaced stream is re-offered within the pass
@@ -136,11 +136,10 @@ Round 1 attributes squarely: transport held fixed, HTTP/3 layer varied, failure 
 not the other, so it belongs to the native stack. That is the same rule used the other way round
 for the defect above, when this adapter failed 6 in 10 and the native arm 0 in 10 at 1 KiB.
 
-Round 2 saw none. Fifty clean runs make a 10% rate unlikely — about half a percent — but leave a
-2% rate perfectly plausible, so they bound the fault rather than disproving it. The section stays
-open, and the change between rounds is recorded as a plausible mechanism for part of it, not as a
-diagnosis: S9's original evidence is a different workload on a different host, and nothing here
-looked at that.
+Round 2 saw none. Fifty clean runs bounded the fault rather than disproving it. Later native
+work reproduced S9 directly, attributed it to a missed imminent timer wake in
+`ngnet-quic-h3`, and completed two separate 100-process post-change schedules. See
+[`../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md`](../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md).
 
 Consequences for this crate:
 
