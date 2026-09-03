@@ -85,6 +85,10 @@ with the other cargo gates failed the basic request/response test and timed out 
 flow-control response. An isolated rerun passed. The final evidence-only branch therefore
 retains the contention-sensitive workspace caveat.
 
+At the final evidence-only HEAD, the first isolated all-feature workspace rerun timed out an
+`h3-ngnet-quic` lifecycle test (the separate adapter); its immediate isolated rerun passed.
+This is recorded as validation instability, not attributed to native S9.
+
 ### Residual fixture observation
 
 The backup-sleep candidate's ignored 125 × 16 KiB fixture completed 5/5. Its ignored
