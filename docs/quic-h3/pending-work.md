@@ -16,6 +16,64 @@ whose transport parameters differ meaningfully from quinn's.
 **What would settle it:** entering the QUIC Interop Runner, which exercises exactly these
 against a matrix of implementations.
 
+## A packet that carries no STREAM frame is a block, not an acceptance
+
+`ngtcp2_conn_writev_stream` may produce a packet containing no STREAM frame for the offered
+stream, because something else was queued ahead of it — an acknowledgement, a retransmission, a
+window update. It says so by leaving `*pdatalen` at `-1`, and it is a different thing from the
+*zero-length* STREAM frame it writes for an offer carrying nothing but `fin`, which is
+`*pdatalen == 0`.
+
+`ngnet-quic` used to clamp the sign, so both arrived here as `Datagram { accepted: 0 }` and
+`transmit::drain` reported `WriteOutcome::Accepted(0)`. For a `fin`-only offer that is a
+commitment: `Offers::write_next` commits an acceptance and marks the stream ended
+([`../../crates/ngnet-h3/src/http/driver.rs`](../../crates/ngnet-h3/src/http/driver.rs), the
+`Accepted(taken)` arm), so the FIN was recorded as sent on a packet that never carried it. The
+arm immediately above it — the one whose comment reads "a transport that declined it leaves the
+peer waiting for an end that never comes" — was written for exactly this and was unreachable,
+because the transport never reported a block for it.
+
+The transport now reports `StreamWrite::DatagramWithoutStream`, `transmit::drain` maps it to
+`WriteOutcome::Blocked`, and the offer is abandoned and made again rather than committed. The
+drain pass is deliberately *not* ended on it: `Offers::write_next` only unblocks and re-offers a
+stream when it is asked again, once per pass, and the packet just produced may be a bare
+acknowledgement — not ack-eliciting, so nothing is coming back to prompt another pass.
+
+The deterministic reproduction of the transport's half is
+[`../../crates/ngnet-quic/tests/fin_delivery.rs`](../../crates/ngnet-quic/tests/fin_delivery.rs);
+the end-to-end story, including which stack this actually stalled, is in
+[`../h3-ngnet-quic/pending-work.md`](../h3-ngnet-quic/pending-work.md).
+
+**This is not the large-body stall and does not fix it.** That was re-measured afterwards and
+survives; see the next section.
+
+## The intermittent large-body failure survives, and it reaches the test suite
+
+Run 30's outer-driver liveness failure — S9 — is still open. It was re-measured on
+`epyc-7763-azure` after the FIN change above, release build, pinned to one core, against the
+new `h3-ngnet-quic` arm over the identical transport, fixtures, payload and exchange count
+(200 x 16 KiB): this stack failed 2 of 20, the hyperium-over-ngtcp2 stack 0 of 20. The failures
+were `ErrorKind::Closed`, "the connection has ended", not timeouts. Transport held fixed and
+HTTP/3 layer varied, so it belongs here.
+
+A later revision — not ending the drain pass on a stream-less packet, so `Offers::write_next` is
+asked again and unblocks the displaced stream within the pass — was then measured over 50 runs
+of the same workload with no failure. That is a plausible mechanism for part of this defect and
+is **not** a claim that it is fixed: fifty clean runs make a 10% rate unlikely and leave a 2%
+rate entirely plausible, and S9's original evidence is a different workload on a different host,
+which nothing here re-examined.
+
+`tests/ngnet-bench/tests/ngtcp2_fixture.rs::unarmed_and_armed_diagnostics_preserve_and_reconcile_echoes`
+drives 16 KiB bodies through this stack and can therefore fail the same way. It was seen to do
+so once, with that exact signature, during a full `cargo test --workspace --all-features` run —
+the contended case, with every test binary competing for four cores.
+
+It was **not** reproduced afterwards, and the attempt to attribute it is recorded rather than
+skipped: 12 isolated runs and 20 runs under deliberate CPU contention, on this branch and on
+unmodified `main`, gave 64 runs and no failure on either. So there is no measured difference
+between the two, the signature is S9's, and nothing here claims otherwise in either direction.
+It is not attributed to the FIN change, and it is not claimed fixed.
+
 ## Body bytes are copied twice
 
 The HTTP/3 layer lends its buffers through `StreamSource::write_next` and the slices are

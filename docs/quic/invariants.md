@@ -146,6 +146,12 @@ tests that pass for the wrong reason:
 | `the_verification_test_would_notice_if_verification_were_disabled` | Runs the mismatched-certificate setup with verification *off* and asserts it completes. Without it, the two negative verification tests could both be passing because the handshake was broken for some unrelated reason. |
 | `the_handshake_reports_progress_rather_than_hanging` | The relay is bounded and returns a datagram count. A handshake that stopped making progress would otherwise hang the suite rather than fail it. |
 
+## Stream endings — `crates/ngnet-quic/tests/fin_delivery.rs`
+
+| Test | Claim |
+| --- | --- |
+| `a_packet_that_carried_no_stream_frame_is_not_reported_as_a_written_fin` *(regression)* | A produced datagram that contains no STREAM frame is reported as `StreamWrite::DatagramWithoutStream`, never as `Datagram { accepted: 0 }`. ngtcp2 distinguishes the two through the sign of `*pdatalen` (`ngtcp2.h:5233-5243`) and the distinction only matters for one shape of write — an offer carrying nothing but `fin` — where `0` means the FIN is on the wire and `-1` means the stream was not touched at all. Clamping the sign made a declined FIN indistinguishable from a written one; a caller then stopped sending, ngtcp2 had nothing in flight to retransmit, and the peer waited until its idle timeout. That was the cause of `h3-ngnet-quic`'s intermittent stall. The test builds the condition deterministically — an in-memory pair, a hand-driven clock, and several packets' worth of data dropped on purpose so the rescheduled data still occupies the send queue when the FIN is offered — and asserts non-vacuity, so a change that stopped provoking it fails rather than passing for the wrong reason. |
+
 ## The TLS seam — `crates/ngnet-quic/tests/invariants.rs`, `tests/safe_backend.rs`
 
 | Test | Claim |

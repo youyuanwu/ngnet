@@ -73,7 +73,7 @@ use ngnet_h2::http::{
 
 use ngnet_h3::http::{
     IncomingBody as H3IncomingBody, SendRequest as H3SendRequest, handshake as h3_handshake,
-    serve as h3_serve,
+    handshake_with as h3_handshake_with, serve as h3_serve, serve_with as h3_serve_with,
 };
 use ngnet_h3_quinn::QuinnBackend;
 use ngnet_qmux::io::{AsyncByteStream, TokioClock, TokioStream, Written};
@@ -254,6 +254,21 @@ pub fn qmux_h3_config() -> HttpConfig {
 /// Hyperium H3 0.0.8 exposes no dynamic-table-capacity control, so the matched QMux pair
 /// disables the ngnet side's dynamic table rather than silently comparing unlike state.
 pub fn qmux_h3_matched_config() -> HttpConfig {
+    HttpConfig::default()
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .max_field_section_size(MAX_HEADER_LIST_SIZE as u64)
+        .qpack_max_dtable_capacity(0)
+}
+
+/// Comparison-only ngnet H3 configuration for the ngtcp2 pair, matched to hyperium H3.
+///
+/// Identical in value to [`qmux_h3_matched_config`] and separate on purpose: the two
+/// comparisons are free to diverge, and a shared helper would silently couple them. The
+/// reason for zeroing the dynamic table is the same in both — hyperium H3 0.0.8 exposes no
+/// QPACK dynamic-table control, and `ngnet-h3` defaults to a 4 KiB table, so leaving the
+/// default in place would compare unlike header state and call the difference "the HTTP/3
+/// implementation".
+pub fn ngtcp_h3_matched_config() -> HttpConfig {
     HttpConfig::default()
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
         .max_field_section_size(MAX_HEADER_LIST_SIZE as u64)
@@ -2031,6 +2046,392 @@ impl NgnetNgtcpH3 {
 }
 
 impl Drop for NgnetNgtcpH3 {
+    fn drop(&mut self) {
+        self.client.abort();
+        self.server.abort();
+        self.client_endpoint_driver.abort();
+        self.server_endpoint_driver.abort();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/3 over ngtcp2: ngnet-h3 against hyperium h3 + h3-ngnet-quic
+//
+// The matched pair. Both arms run the *same* QUIC transport -- the same
+// `ngnet-quic-h3-tests` credentials, endpoints, ALPN, server name and `Config` -- so what
+// differs is the HTTP/3 implementation and the adapter that joins it to the transport, and
+// nothing else that could be held equal.
+//
+// `NgnetNgtcpH3` above is deliberately left alone so run 25's record stays reproducible;
+// this pair adds a separately configured native arm instead.
+//
+// # The asymmetries that could not be removed
+//
+// These are listed here, next to the code, because a reader of the fixtures should not have
+// to go looking for them. `docs/benchmarks/cases/quic-h3-comparison.md` carries the same list
+// alongside the results.
+//
+// 1. **Where the HTTP/3 driving happens relative to the timed region.** `ngnet-h3` advances
+//    its state machine in its spawned driver task; hyperium advances a request stream from
+//    whichever task is polling it, which here is the task inside the measured closure. UDP I/O
+//    is *not* asymmetric -- both arms hand that to the shared endpoint driver -- but the
+//    h3-to-stream driving is, and that work lands inside the timed region on one side and
+//    partly outside it on the other. This is inherent to comparing these two drivers.
+// 2. **Two independently written QUIC pumps.** `ngnet-quic-h3`'s `pump`/`transmit` and
+//    `h3-ngnet-quic`'s pump are separate implementations of the same idea. Differences between
+//    them count as "the adapter", which is part of what is being measured, but they are not
+//    differences in the HTTP/3 state machine.
+// 3. **Hyperium clones its request handle per exchange**, because `SendRequest::send_request`
+//    takes `&mut self`; the native handle does not need it. Already disclosed for the QMux
+//    pair for the same reason.
+// 4. **Hyperium has more await points inside the timed region**: `send_request`, `send_data`,
+//    `finish`, `recv_response` and the `recv_data` loop, against the native arm's single
+//    `send_request` plus `drain`.
+// 5. **Body chunking granularity may differ** between the two HTTP/3 layers even for an
+//    identical payload; neither layer exposes a control that would let this be equalised.
+//
+// One deliberate non-match, for completeness: the native config sets `max_concurrent_streams`
+// and hyperium 0.0.8 has no equivalent setting. It does not reach the wire as a difference --
+// concurrent streams are bounded by the QUIC transport's `MAX_STREAMS`, which is identical for
+// both arms -- and the workload is serial anyway.
+// ---------------------------------------------------------------------------
+
+/// The native ngtcp2 arm, configured to match hyperium rather than to its own defaults.
+///
+/// Identical to [`NgnetNgtcpH3`] except that it goes through `handshake_with`/`serve_with`
+/// with [`ngtcp_h3_matched_config`]. Without that, this arm would carry a 4 KiB QPACK dynamic
+/// table its comparison partner cannot have.
+pub struct NgnetNgtcpH3Matched {
+    handle: H3SendRequest<BenchBody>,
+    client: JoinHandle<()>,
+    server: JoinHandle<()>,
+    client_endpoint_driver: JoinHandle<()>,
+    server_endpoint_driver: JoinHandle<()>,
+    _endpoints: (NgtcpEndpoint<OsslSession>, NgtcpEndpoint<OsslSession>),
+}
+
+impl NgnetNgtcpH3Matched {
+    /// Establishes and warms a matched native ngtcp2 pair outside the measured closure.
+    pub async fn establish() -> Self {
+        let credentials = NgtcpCredentials::generate();
+        let (server_endpoint, server_endpoint_driver, address) =
+            ngtcp_server_endpoint(&credentials).await;
+        let (client_endpoint, client_endpoint_driver) =
+            ngtcp_client_endpoint(&credentials, 0xBEE5).await;
+
+        // One spawned endpoint driver per endpoint, exactly as the upstream arm spawns.
+        let server_endpoint_driver = tokio::spawn(async move {
+            server_endpoint_driver
+                .await
+                .expect("the ngtcp2 server endpoint driver");
+        });
+        let client_endpoint_driver = tokio::spawn(async move {
+            client_endpoint_driver
+                .await
+                .expect("the ngtcp2 client endpoint driver");
+        });
+
+        let accepting = server_endpoint.clone();
+        let server = tokio::spawn(async move {
+            let backend = ngnet_quic_h3::accept(&accepting)
+                .await
+                .expect("an ngtcp2 server connection");
+            let driver = h3_serve_with(backend, ngnet_h3_echo, ngtcp_h3_matched_config())
+                .expect("a matched ngtcp2 HTTP/3 server");
+            driver.await.expect("the ngtcp2 HTTP/3 server driver");
+        });
+
+        let backend = ngnet_quic_h3::connect(&client_endpoint, address, Some(NGTCP_SERVER_NAME))
+            .await
+            .expect("an ngtcp2 client connection");
+        let (handle, client_driver) =
+            h3_handshake_with::<_, BenchBody>(backend, ngtcp_h3_matched_config())
+                .expect("a matched ngtcp2 HTTP/3 client");
+        let client = tokio::spawn(async move {
+            client_driver
+                .await
+                .expect("the ngtcp2 HTTP/3 client driver");
+        });
+
+        let fixture = Self {
+            handle,
+            client,
+            server,
+            client_endpoint_driver,
+            server_endpoint_driver,
+            _endpoints: (client_endpoint, server_endpoint),
+        };
+        // One empty warm-up, outside every measured closure, exactly as the upstream arm does.
+        assert_eq!(fixture.round_trip(Bytes::new()).await, 0);
+        fixture
+    }
+
+    /// Sends one request and drains the echoed response body.
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        let response = self
+            .handle
+            .send_request(quic_request_for(body))
+            .await
+            .expect("an ngtcp2 response head");
+        assert!(response.status().is_success());
+        drain(response.into_body()).await
+    }
+
+    /// Sends one request and reports response-head/body failures without panicking.
+    ///
+    /// The supervised-probe path: a stall or a truncation has to be reportable, because the
+    /// transport under both arms has a known unresolved large-body liveness defect and a probe
+    /// that panicked would lose the evidence.
+    pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
+        let expected = body.clone();
+        let response = self
+            .handle
+            .send_request(quic_request_for(body))
+            .await
+            .map_err(|error| format!("ngtcp2 response head failed: {error:?}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "ngtcp2 response status was not successful: {}",
+                response.status()
+            ));
+        }
+        try_drain_checked(response.into_body(), &expected).await
+    }
+}
+
+impl Drop for NgnetNgtcpH3Matched {
+    fn drop(&mut self) {
+        self.client.abort();
+        self.server.abort();
+        self.client_endpoint_driver.abort();
+        self.server_endpoint_driver.abort();
+    }
+}
+
+/// The hyperium request head, byte-identical to the native arm's.
+///
+/// Written out rather than borrowed from the QMux comparison: that one uses a different
+/// scheme, and a `:scheme` that differs between arms is an unmatched variable in the one
+/// place the comparison is about.
+fn ngtcp_upstream_request_head() -> http::Request<()> {
+    http::Request::builder()
+        .method(http::Method::POST)
+        .uri(QUINN_WORKLOAD_URI)
+        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+        .header("x-bench", "1")
+        .body(())
+        .expect("a well-formed HTTP/3 request")
+}
+
+/// The hyperium echo server, matched to `ngnet_h3_echo`.
+async fn upstream_h3_ngtcp_server(connection: h3_ngnet_quic::Connection<OsslSession>) {
+    let mut builder = h3::server::builder();
+    builder.send_grease(false);
+    builder.max_field_section_size(MAX_HEADER_LIST_SIZE as u64);
+    let mut connection = builder
+        .build::<_, Bytes>(connection)
+        .await
+        .expect("an upstream H3 ngtcp2 server");
+    'requests: loop {
+        let resolver = match connection.accept().await {
+            Ok(Some(resolver)) => resolver,
+            Ok(None) | Err(_) => return,
+        };
+        let (_request, mut stream) = match resolver.resolve_request().await {
+            Ok(request) => request,
+            Err(_) => continue,
+        };
+        let mut body = BytesMut::new();
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(chunk)) => body.put(chunk),
+                Ok(None) => break,
+                Err(_) => continue 'requests,
+            }
+        }
+        if stream
+            .send_response(
+                http::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(())
+                    .expect("an upstream H3 ngtcp2 response"),
+            )
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        if !body.is_empty() && stream.send_data(body.freeze()).await.is_err() {
+            continue;
+        }
+        let _ = stream.finish().await;
+    }
+}
+
+/// Hyperium H3 over the same ngtcp2 transport, through `h3-ngnet-quic`.
+pub struct UpstreamH3Ngtcp {
+    sender: h3::client::SendRequest<h3_ngnet_quic::OpenStreams<OsslSession>, Bytes>,
+    client: JoinHandle<()>,
+    server: JoinHandle<()>,
+    client_endpoint_driver: JoinHandle<()>,
+    server_endpoint_driver: JoinHandle<()>,
+    _endpoints: (NgtcpEndpoint<OsslSession>, NgtcpEndpoint<OsslSession>),
+}
+
+impl UpstreamH3Ngtcp {
+    /// Establishes and warms a hyperium/ngtcp2 pair outside the measured closure.
+    pub async fn establish() -> Self {
+        let credentials = NgtcpCredentials::generate();
+        let (server_endpoint, server_endpoint_driver, address) =
+            ngtcp_server_endpoint(&credentials).await;
+        let (client_endpoint, client_endpoint_driver) =
+            ngtcp_client_endpoint(&credentials, 0xBEE5).await;
+
+        let server_endpoint_driver = tokio::spawn(async move {
+            server_endpoint_driver
+                .await
+                .expect("the ngtcp2 server endpoint driver");
+        });
+        let client_endpoint_driver = tokio::spawn(async move {
+            client_endpoint_driver
+                .await
+                .expect("the ngtcp2 client endpoint driver");
+        });
+
+        // The adapter has no driver of its own, so this is one spawned task per endpoint
+        // beyond the endpoint driver -- the same count as the native arm's HTTP/3 driver.
+        let accepting = server_endpoint.clone();
+        let server = tokio::spawn(async move {
+            let detached = accepting
+                .accept_detached()
+                .await
+                .expect("an ngtcp2 server connection");
+            upstream_h3_ngtcp_server(h3_ngnet_quic::from_detached(detached)).await;
+        });
+
+        let detached = client_endpoint
+            .connect_detached(address, Some(NGTCP_SERVER_NAME))
+            .await
+            .expect("an ngtcp2 client connection");
+        let mut builder = h3::client::builder();
+        builder.send_grease(false);
+        builder.max_field_section_size(MAX_HEADER_LIST_SIZE as u64);
+        let (mut driver, sender) = builder
+            .build(h3_ngnet_quic::from_detached(detached))
+            .await
+            .expect("an upstream H3 ngtcp2 client");
+        let client = tokio::spawn(async move {
+            let _ = poll_fn(|context| driver.poll_close(context)).await;
+        });
+
+        let fixture = Self {
+            sender,
+            client,
+            server,
+            client_endpoint_driver,
+            server_endpoint_driver,
+            _endpoints: (client_endpoint, server_endpoint),
+        };
+        assert_eq!(fixture.round_trip(Bytes::new()).await, 0);
+        fixture
+    }
+
+    /// Sends one request and drains the echoed response body.
+    ///
+    /// The request handle is cloned per exchange because hyperium's `SendRequest::send_request`
+    /// takes `&mut self`; the native arm's does not. That asymmetry cannot be removed and is
+    /// disclosed with the results.
+    pub async fn round_trip(&self, body: Bytes) -> usize {
+        let mut sender = self.sender.clone();
+        let mut stream = sender
+            .send_request(ngtcp_upstream_request_head())
+            .await
+            .expect("an upstream ngtcp2 request stream");
+        if !body.is_empty() {
+            stream
+                .send_data(body)
+                .await
+                .expect("upstream ngtcp2 request data");
+        }
+        stream
+            .finish()
+            .await
+            .expect("finish upstream ngtcp2 request");
+        let response = stream
+            .recv_response()
+            .await
+            .expect("an upstream ngtcp2 response head");
+        assert!(response.status().is_success());
+        let mut total = 0;
+        while let Some(chunk) = stream
+            .recv_data()
+            .await
+            .expect("upstream ngtcp2 response data")
+        {
+            total += chunk.remaining();
+        }
+        total
+    }
+
+    /// Sends one request and reports failures without panicking, for supervised probes.
+    pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
+        let expected = body.clone();
+        let mut sender = self.sender.clone();
+        let mut stream = sender
+            .send_request(ngtcp_upstream_request_head())
+            .await
+            .map_err(|error| format!("upstream ngtcp2 request failed: {error:?}"))?;
+        if !expected.is_empty() {
+            stream
+                .send_data(expected.clone())
+                .await
+                .map_err(|error| format!("upstream ngtcp2 request data failed: {error:?}"))?;
+        }
+        stream
+            .finish()
+            .await
+            .map_err(|error| format!("upstream ngtcp2 finish failed: {error:?}"))?;
+        let response = stream
+            .recv_response()
+            .await
+            .map_err(|error| format!("upstream ngtcp2 response head failed: {error:?}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "upstream ngtcp2 response status was not successful: {}",
+                response.status()
+            ));
+        }
+        let mut total = 0usize;
+        let mut exact = true;
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(mut chunk)) => {
+                    while chunk.has_remaining() {
+                        let piece = chunk.chunk();
+                        let end = total + piece.len();
+                        if end > expected.len() || piece != &expected[total..end] {
+                            exact = false;
+                        }
+                        total = end;
+                        let taken = piece.len();
+                        chunk.advance(taken);
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    return Err(format!("upstream ngtcp2 response data failed: {error:?}"));
+                }
+            }
+        }
+        if total != expected.len() {
+            exact = false;
+        }
+        Ok((total, exact))
+    }
+}
+
+impl Drop for UpstreamH3Ngtcp {
     fn drop(&mut self) {
         self.client.abort();
         self.server.abort();

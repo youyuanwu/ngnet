@@ -157,6 +157,12 @@ fn send_on(
                 }
                 to.read_pkt(&buf[..len], clock.now()).expect("delivering");
             }
+            // The packet was produced but carried nothing of this stream, so the offer —
+            // `fin` included — has not been sent and is made again unchanged. Recording it
+            // as sent here is exactly the mistake this variant exists to prevent.
+            StreamWrite::DatagramWithoutStream { len } => {
+                to.read_pkt(&buf[..len], clock.now()).expect("delivering");
+            }
             StreamWrite::Idle
             | StreamWrite::Blocked
             | StreamWrite::StreamBlocked

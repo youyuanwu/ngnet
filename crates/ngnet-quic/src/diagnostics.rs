@@ -14,8 +14,12 @@ use crate::Role;
 /// One stream-write outcome recorded after ngtcp2 returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttemptOutcome {
-    /// A datagram was produced.
+    /// A datagram was produced, carrying a STREAM frame for the offered stream.
     Datagram,
+    /// A datagram was produced, but it carried no STREAM frame for the offered stream.
+    ///
+    /// Distinct from a zero-byte acceptance, which is a serialised zero-length STREAM frame.
+    DatagramWithoutStream,
     /// Stream flow control prevented acceptance.
     StreamBlocked,
     /// Connection flow control prevented acceptance.
@@ -729,6 +733,7 @@ pub(crate) fn record_attempt(mut attempt: Attempt) {
             LivenessKind::Park,
             match attempt.outcome {
                 AttemptOutcome::Datagram => "zero-accept-datagram",
+                AttemptOutcome::DatagramWithoutStream => "datagram-without-stream",
                 AttemptOutcome::StreamBlocked => "stream-flow-control",
                 AttemptOutcome::ConnectionBlocked => "connection-flow-control",
                 AttemptOutcome::Blocked => "transport-blocked",

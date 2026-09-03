@@ -5,7 +5,8 @@
 //!   arm      = h2-duplex | h2-socket | qmux-duplex | qmux-socket |
 //!              ngnet-qmux-matched-duplex | ngnet-qmux-matched-socket |
 //!              h3-qmux-duplex | h3-qmux-socket |
-//!              ngnet-h3-quinn | ngnet-quic-h3 | h3-quinn
+//!              ngnet-h3-quinn | ngnet-quic-h3 | h3-quinn |
+//!              ngnet-quic-h3-matched | h3-ngnet-quic
 //!   workload = body | concurrent
 //!   param    = body size in bytes, or stream count
 //!
@@ -18,9 +19,9 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use ngnet_bench::{
-    NgnetH2, NgnetH3Quinn, NgnetNgtcpH3, NgnetQmuxH3, NgnetQmuxH3Matched, NgnetQmuxH3MatchedSocket,
-    NgnetQmuxH3Socket, TokioSocket, UpstreamH3Qmux, UpstreamH3QmuxSocket, UpstreamH3Quinn, body_of,
-    current_thread_runtime,
+    NgnetH2, NgnetH3Quinn, NgnetNgtcpH3, NgnetNgtcpH3Matched, NgnetQmuxH3, NgnetQmuxH3Matched,
+    NgnetQmuxH3MatchedSocket, NgnetQmuxH3Socket, TokioSocket, UpstreamH3Ngtcp, UpstreamH3Qmux,
+    UpstreamH3QmuxSocket, UpstreamH3Quinn, body_of, current_thread_runtime,
 };
 
 enum Arm {
@@ -35,6 +36,10 @@ enum Arm {
     NgnetH3Quinn(NgnetH3Quinn),
     NgnetNgtcpH3(NgnetNgtcpH3),
     UpstreamH3Quinn(UpstreamH3Quinn),
+    /// The QPACK-matched native arm of the ngtcp2 HTTP/3 comparison.
+    NgnetNgtcpH3Matched(NgnetNgtcpH3Matched),
+    /// Hyperium H3 over the same ngtcp2 transport, through `h3-ngnet-quic`.
+    UpstreamH3Ngtcp(UpstreamH3Ngtcp),
 }
 
 impl Arm {
@@ -51,12 +56,16 @@ impl Arm {
             Arm::NgnetH3Quinn(a) => a.round_trip(body).await,
             Arm::NgnetNgtcpH3(a) => a.round_trip(body).await,
             Arm::UpstreamH3Quinn(a) => a.round_trip(body).await,
+            Arm::NgnetNgtcpH3Matched(a) => a.round_trip(body).await,
+            Arm::UpstreamH3Ngtcp(a) => a.round_trip(body).await,
         }
     }
 
     async fn round_trip_checked(&self, body: bytes::Bytes) -> Result<(usize, bool), String> {
         match self {
             Arm::NgnetNgtcpH3(a) => a.try_round_trip_checked(body).await,
+            Arm::NgnetNgtcpH3Matched(a) => a.try_round_trip_checked(body).await,
+            Arm::UpstreamH3Ngtcp(a) => a.try_round_trip_checked(body).await,
             Arm::NgnetQmuxMatchedDuplex(a) => a.try_round_trip_checked(body).await,
             Arm::NgnetQmuxMatchedSocket(a) => a.try_round_trip_checked(body).await,
             Arm::UpstreamQmuxDuplex(a) => a.try_round_trip_checked(body).await,
@@ -77,7 +86,9 @@ impl Arm {
             | Arm::UpstreamQmuxSocket(_)
             | Arm::NgnetH3Quinn(_)
             | Arm::NgnetNgtcpH3(_)
-            | Arm::UpstreamH3Quinn(_) => {
+            | Arm::UpstreamH3Quinn(_)
+            | Arm::NgnetNgtcpH3Matched(_)
+            | Arm::UpstreamH3Ngtcp(_) => {
                 unreachable!("QUIC arms reject concurrent before setup")
             }
         }
@@ -381,6 +392,8 @@ fn validate_request(
         "ngnet-h3-quinn"
             | "ngnet-quic-h3"
             | "h3-quinn"
+            | "ngnet-quic-h3-matched"
+            | "h3-ngnet-quic"
             | "ngnet-qmux-matched-duplex"
             | "ngnet-qmux-matched-socket"
             | "h3-qmux-duplex"
@@ -400,6 +413,8 @@ fn validate_request(
         && (!matches!(
             arm_name,
             "ngnet-quic-h3"
+                | "ngnet-quic-h3-matched"
+                | "h3-ngnet-quic"
                 | "ngnet-qmux-matched-duplex"
                 | "ngnet-qmux-matched-socket"
                 | "h3-qmux-duplex"
@@ -407,7 +422,8 @@ fn validate_request(
         ) || workload != "body")
     {
         return Err(
-            "diagnostic mode supports only `ngnet-quic-h3` or the four matched QMux body arms"
+            "diagnostic mode supports only the ngtcp2 HTTP/3 arms or the four matched QMux \
+             body arms"
                 .to_string(),
         );
     }
@@ -461,6 +477,29 @@ fn main() {
                     }),
             ),
             "h3-quinn" => Arm::UpstreamH3Quinn(UpstreamH3Quinn::establish().await),
+            // The two arms of the ngtcp2 HTTP/3 comparison. Both are bounded the same way as
+            // `ngnet-quic-h3` above, because both run the transport with the known large-body
+            // liveness defect and an establishment that hangs must be reported, not waited on.
+            "ngnet-quic-h3-matched" => Arm::NgnetNgtcpH3Matched(
+                tokio::time::timeout(establishment_timeout(), NgnetNgtcpH3Matched::establish())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "ngnet-quic-h3-matched establishment exceeded {} ms",
+                            establishment_timeout().as_millis()
+                        )
+                    }),
+            ),
+            "h3-ngnet-quic" => Arm::UpstreamH3Ngtcp(
+                tokio::time::timeout(establishment_timeout(), UpstreamH3Ngtcp::establish())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "h3-ngnet-quic establishment exceeded {} ms",
+                            establishment_timeout().as_millis()
+                        )
+                    }),
+            ),
             other => panic!("unknown arm {other}"),
         };
 

@@ -231,6 +231,16 @@ fn a_partially_accepted_write_offers_its_remainder_again_exactly_once() {
                     .expect("delivering");
                 clock.advance(PACING_STEP_NANOS);
             }
+            // A produced packet that carried nothing of this stream: the offer stands and is
+            // made again unchanged. It counts as a partial acceptance for the assertion
+            // below — the payload was not taken in one go — but consumes no offset.
+            StreamWrite::DatagramWithoutStream { len } => {
+                partial_acceptances += 1;
+                server
+                    .read_pkt(&buf[..len], clock.now())
+                    .expect("delivering");
+                clock.advance(PACING_STEP_NANOS);
+            }
             StreamWrite::Idle
             | StreamWrite::Blocked
             | StreamWrite::StreamBlocked

@@ -40,8 +40,10 @@ each case covers is recorded there, case by case.
 | [`quic/pending-work.md`](quic/pending-work.md) | Known gaps and deferred decisions, with what would settle each. |
 | [`quic/invariants.md`](quic/invariants.md) | The properties the `ngnet-quic` suite pins, and where each is enforced. |
 
-There are no QUIC benchmarks, and the crate has not been tested against another QUIC
-implementation.
+QUIC benchmarks live at [`benchmarks/`](benchmarks/): the QUIC-stack family compares whole
+stacks over loopback UDP, and the matched ngtcp2 H3 family holds the transport fixed and varies
+the HTTP/3 implementation. The crate is tested against another QUIC implementation — see the
+quinn interoperability tests in `tests/ngnet-quic-h3-tests`.
 
 ## QMux — [`qmux/`](qmux/)
 
@@ -96,6 +98,23 @@ QMux connection without owning an endpoint, TLS, runtime, or task.
   bounded lower progress, routing, credit, lifecycle, close, and measurement.
 - [`h3-ngnet-qmux/invariants.md`](h3-ngnet-qmux/invariants.md) — the deterministic and end-to-end
   evidence for each contract.
+
+## Hyperium H3 over ngtcp2 — [`h3-ngnet-quic/`](h3-ngnet-quic/)
+
+The same join for the other transport family. `h3-ngnet-quic` implements hyperium H3's
+per-stream transport traits over an established `ngnet-quic` connection, so the community
+HTTP/3 stack runs on ngtcp2 — and so the two HTTP/3 implementations can be measured against
+each other over one transport, which is what
+[`benchmarks/cases/quic-h3-comparison.md`](benchmarks/cases/quic-h3-comparison.md) is for.
+
+- [`h3-ngnet-quic/design.md`](h3-ngnet-quic/design.md) — why the detached connection rather
+  than the endpoint-driven one, why there is no driver future, the three wake sources and why
+  the expiry timer needs its own, and why the two stream directions must stay apart.
+- [`h3-ngnet-quic/invariants.md`](h3-ngnet-quic/invariants.md) — each contract and the test
+  that would fail without it, including which tests were checked against the pre-fix code.
+- [`h3-ngnet-quic/pending-work.md`](h3-ngnet-quic/pending-work.md) — the lost FIN that caused
+  this adapter's intermittent stall and how it was fixed, the native stack's still-open
+  large-body stall, the deferred zero-copy body path, and what is deliberately not implemented.
 
 ## HTTP/3 over QUIC
 
