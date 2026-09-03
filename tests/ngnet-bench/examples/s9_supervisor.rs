@@ -2,11 +2,11 @@
 //!
 //! Usage:
 //! `s9_supervisor <probe> <arm> <mode> <body-bytes> <exchanges> <runs> <outer-seconds> [start-run]`
+//! `s9_supervisor fixture <test-name> <runs> <outer-seconds> [start-run]`
 //!
 //! The optional start number makes a resumed invocation explicit without storing hidden state.
 
 use std::io::Write;
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -27,7 +27,10 @@ fn classify(code: Option<i32>, stderr: &str, cleanup_failed: bool) -> Outcome {
         Outcome::Completed
     } else if code == Some(124) || code == Some(137) {
         Outcome::OuterKilled
-    } else if stderr.contains("PROBE-FAIL") {
+    } else if stderr.contains("PROBE-FAIL")
+        || stderr.contains("stalled; last completed exchange")
+        || stderr.contains("failed; last completed exchange")
+    {
         Outcome::ClassifiedFailure
     } else {
         Outcome::UnclassifiedFailure
@@ -49,10 +52,6 @@ fn process_group_pids(group: u32) -> Vec<u32> {
         .collect()
 }
 
-fn process_exists(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-}
-
 fn terminate_pids(pids: &[u32], signal: &str) {
     for pid in pids {
         let _ = Command::new("kill")
@@ -65,28 +64,21 @@ fn last_checkpoint(stderr: &str) -> &str {
     stderr
         .lines()
         .rev()
-        .find(|line| line.starts_with("PROBE-CHECKPOINT"))
+        .find(|line| {
+            line.starts_with("PROBE-CHECKPOINT") || line.starts_with("S9-FIXTURE-CHECKPOINT")
+        })
         .unwrap_or("unavailable")
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let probe = args.get(1).expect("probe executable");
-    let arm = args.get(2).expect("arm");
-    let mode = args.get(3).expect("mode");
-    let body = args.get(4).expect("body bytes");
-    let exchanges = args.get(5).expect("exchanges");
-    let runs = args
-        .get(6)
-        .expect("runs")
-        .parse::<usize>()
-        .expect("runs is a number");
-    let outer = args
-        .get(7)
-        .expect("outer seconds")
+    let fixture = args.get(1).is_some_and(|value| value == "fixture");
+    let (runs_index, outer_index, start_index) = if fixture { (3, 4, 5) } else { (6, 7, 8) };
+    let runs = args[runs_index].parse::<usize>().expect("runs is a number");
+    let outer = args[outer_index]
         .parse::<u64>()
         .expect("outer seconds is a number");
-    let start = args.get(8).map_or(1, |value| {
+    let start = args.get(start_index).map_or(1, |value| {
         value.parse::<usize>().expect("start is a number")
     });
     assert!(runs > 0, "runs must be non-zero");
@@ -99,31 +91,49 @@ fn main() {
     let mut cleanup_failed = 0usize;
 
     for run in start..start + runs {
-        eprintln!(
-            "S9-SUPERVISOR-START run={run} arm={arm} mode={mode} body={body} \
-             exchanges={exchanges} outer_seconds={outer}"
-        );
+        if fixture {
+            eprintln!(
+                "S9-SUPERVISOR-START run={run} fixture={} outer_seconds={outer}",
+                args[2]
+            );
+        } else {
+            eprintln!(
+                "S9-SUPERVISOR-START run={run} arm={} mode={} body={} \
+                 exchanges={} outer_seconds={outer}",
+                args[2], args[3], args[4], args[5]
+            );
+        }
         std::io::stderr()
             .flush()
             .expect("flush supervisor start record");
 
-        let child = Command::new("setsid")
+        let mut command = Command::new("setsid");
+        command
             .arg("timeout")
-            .args([
-                "--signal=TERM",
-                "--kill-after=5s",
-                &format!("{outer}s"),
-                probe,
-                arm,
-                "body",
-                body,
-                exchanges,
-                mode,
-            ])
+            .args(["--signal=TERM", "--kill-after=5s", &format!("{outer}s")]);
+        if fixture {
+            command.args([
+                "cargo",
+                "test",
+                "-p",
+                "ngnet-bench",
+                "--test",
+                "ngtcp2_fixture",
+                "--release",
+                &args[2],
+                "--",
+                "--ignored",
+                "--exact",
+                "--nocapture",
+            ]);
+        } else {
+            command.args([&args[1], &args[2], "body", &args[4], &args[5], &args[3]]);
+        }
+        let child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn supervised probe");
+            .expect("spawn supervised S9 cell");
         let supervisor_pid = child.id();
         thread::sleep(Duration::from_millis(100));
         let output = child.wait_with_output().expect("wait for supervised probe");
@@ -137,10 +147,10 @@ fn main() {
         terminate_pids(&remaining, "-TERM");
         if !remaining.is_empty() {
             thread::sleep(Duration::from_millis(100));
-            remaining.retain(|pid| process_exists(*pid));
+            remaining = process_group_pids(supervisor_pid);
             terminate_pids(&remaining, "-KILL");
             thread::sleep(Duration::from_millis(100));
-            remaining.retain(|pid| process_exists(*pid));
+            remaining = process_group_pids(supervisor_pid);
         }
         let outcome = classify(
             output.status.code(),
@@ -216,6 +226,37 @@ mod tests {
         assert_eq!(
             last_checkpoint(output),
             "PROBE-CHECKPOINT exchange=1 phase=body-drain received_bytes=65536"
+        );
+        assert_eq!(
+            last_checkpoint(
+                "S9-FIXTURE-CHECKPOINT size=16384 exchange=4 phase=body-drain received_bytes=8\n"
+            ),
+            "S9-FIXTURE-CHECKPOINT size=16384 exchange=4 phase=body-drain received_bytes=8"
+        );
+    }
+
+    #[test]
+    fn terminates_every_member_of_a_finite_process_group() {
+        let mut child = Command::new("setsid")
+            .args(["sh", "-c", "sleep 30 & wait"])
+            .spawn()
+            .expect("spawn finite process group");
+        let group = child.id();
+        thread::sleep(Duration::from_millis(100));
+        let members = process_group_pids(group);
+        assert!(
+            members.len() >= 2,
+            "the test must observe both the shell and its child"
+        );
+        terminate_pids(&members, "-TERM");
+        let _ = child.wait();
+        thread::sleep(Duration::from_millis(100));
+        let survivors = process_group_pids(group);
+        terminate_pids(&survivors, "-KILL");
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            process_group_pids(group).is_empty(),
+            "the exact process group retained a child after cleanup"
         );
     }
 }

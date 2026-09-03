@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use ngnet_bench::{CheckedPhase, CheckedProgress, NgnetNgtcpH3};
+use std::sync::{Arc, Mutex};
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -119,7 +120,29 @@ async fn repeated_exact_echo(size: usize, exchanges: usize) {
     );
 
     for exchange in 1..=exchanges {
-        let progress = CheckedProgress::default();
+        let emitted = Arc::new(Mutex::new((CheckedPhase::Complete, usize::MAX)));
+        let progress = CheckedProgress::observed({
+            let emitted = Arc::clone(&emitted);
+            move |snapshot| {
+                let bucket = snapshot.received / (64 * 1024);
+                let mut prior = emitted.lock().expect("fixture checkpoint mutex poisoned");
+                if prior.0 == snapshot.phase && prior.1 == bucket {
+                    return;
+                }
+                *prior = (snapshot.phase, bucket);
+                eprintln!(
+                    "S9-FIXTURE-CHECKPOINT size={size} exchange={exchange} phase={} \
+                     received_bytes={}",
+                    match snapshot.phase {
+                        CheckedPhase::ResponseHead => "response-head",
+                        CheckedPhase::BodyDrain => "body-drain",
+                        CheckedPhase::TerminalWait => "terminal-wait",
+                        CheckedPhase::Complete => "complete",
+                    },
+                    snapshot.received
+                );
+            }
+        });
         eprintln!(
             "S9-FIXTURE-CHECKPOINT size={size} exchange={exchange} last_completed={} \
              phase=response-head received_bytes=0",
