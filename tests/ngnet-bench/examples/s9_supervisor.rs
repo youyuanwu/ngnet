@@ -143,11 +143,23 @@ fn last_checkpoint(stderr: &str) -> &str {
         .unwrap_or("unavailable")
 }
 
-fn manifest_has_run(contents: &str, run: usize) -> bool {
+fn manifest_has_completed_run(contents: &str, run: usize) -> bool {
     let target = format!("run={run}");
     contents
         .lines()
+        .filter(|line| line.starts_with("S9-SUPERVISOR-RESULT"))
         .any(|line| line.split_whitespace().any(|field| field == target))
+}
+
+fn failure_record(output: &str) -> &str {
+    output
+        .lines()
+        .find(|line| {
+            line.starts_with("PROBE-FAIL")
+                || line.contains("stalled; last completed exchange")
+                || line.contains("failed; last completed exchange")
+        })
+        .unwrap_or("unavailable")
 }
 
 fn append_manifest(path: Option<&str>, record: &str) {
@@ -214,7 +226,7 @@ fn main() {
     {
         for run in selected_runs.clone() {
             assert!(
-                !manifest_has_run(&contents, run),
+                !manifest_has_completed_run(&contents, run),
                 "manifest {path} already contains run {run}"
             );
         }
@@ -301,6 +313,7 @@ fn main() {
                 Some(format!("checking supervised process: {error}")),
             ),
         };
+        let captured_for_record = captured.clone();
         let wait_deadline = Instant::now() + Duration::from_secs(outer.saturating_add(10));
         let status = loop {
             match child.try_wait() {
@@ -392,7 +405,8 @@ fn main() {
         let result_record = format!(
             "S9-SUPERVISOR-RESULT run={run} timeout_pid={supervisor_pid} \
              exit_code={} outcome={outcome:?} remaining_pids={:?} inspection_error={inspection_error:?} \
-             success_marker={success_marker} last_checkpoint={:?}",
+             success_marker={success_marker} captured={captured_for_record:?} \
+             classifier_detail={:?} last_checkpoint={:?}",
             status
                 .code()
                 .map_or_else(|| "signal".to_string(), |code| code.to_string()),
@@ -400,6 +414,7 @@ fn main() {
                 .iter()
                 .map(|identity| identity.pid)
                 .collect::<Vec<_>>(),
+            failure_record(&combined),
             last_checkpoint(&String::from_utf8_lossy(&stderr)),
         );
         eprintln!("{result_record}");
@@ -549,9 +564,10 @@ mod tests {
     #[test]
     fn manifest_run_detection_matches_whole_fields() {
         let manifest = "S9-SUPERVISOR-RESULT run=2 outcome=Completed\n";
-        assert!(manifest_has_run(manifest, 2));
-        assert!(!manifest_has_run(manifest, 1));
-        assert!(!manifest_has_run(manifest, 20));
+        assert!(manifest_has_completed_run(manifest, 2));
+        assert!(!manifest_has_completed_run(manifest, 1));
+        assert!(!manifest_has_completed_run(manifest, 20));
+        assert!(!manifest_has_completed_run("S9-SUPERVISOR-START run=2", 2));
     }
 
     #[test]

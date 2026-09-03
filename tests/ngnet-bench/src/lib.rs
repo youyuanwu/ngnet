@@ -597,18 +597,22 @@ where
                         CheckedPhase::BodyDrain
                     },
                     total,
-                    if total != expected.len() {
-                        CheckedIntegrity::LengthMismatch
-                    } else {
-                        integrity
-                    },
+                    integrity,
                 );
             }
         }
     }
     let exact = exact && total == expected.len();
     if let Some(progress) = progress {
-        progress.record(CheckedPhase::Complete, total, integrity);
+        progress.record(
+            CheckedPhase::Complete,
+            total,
+            if total != expected.len() {
+                CheckedIntegrity::LengthMismatch
+            } else {
+                integrity
+            },
+        );
     }
     Ok((total, exact))
 }
