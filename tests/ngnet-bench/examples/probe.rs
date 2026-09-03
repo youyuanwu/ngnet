@@ -512,9 +512,13 @@ fn validate_request(
             "the {arm_name} arm supports the body workload only"
         ));
     }
-    if arm_name == "ngnet-quic-h3" && !matches!(param, 0 | 1024 | 16384 | 1_048_576) {
+    if matches!(
+        arm_name,
+        "ngnet-quic-h3" | "ngnet-quic-h3-matched" | "h3-ngnet-quic"
+    ) && !matches!(param, 0 | 1024 | 16384 | 1_048_576)
+    {
         return Err(
-            "ngnet-quic-h3 fixed-count probes support 0, 1024, 16384, or 1048576 bytes".to_string(),
+            "ngtcp2 fixed-count probes support 0, 1024, 16384, or 1048576 bytes".to_string(),
         );
     }
     if mode == Mode::Diagnostic
@@ -861,6 +865,11 @@ fn main() {
                     if tokio::time::timeout(limit, workload).await.is_err() {
                         let exchange = active_exchange.load(Ordering::Acquire);
                         let snapshot = progress.snapshot();
+                        let classifier = if exchange > 1 || snapshot.received > 0 {
+                            "process-deadline-with-progress"
+                        } else {
+                            timeout_classifier(snapshot)
+                        };
                         eprintln!(
                             "PROBE-FAIL exchange={exchange} last_completed={} phase={} \
                              received_bytes={} integrity={} terminal={} classifier={} supervisor=process-timeout \
@@ -870,7 +879,7 @@ fn main() {
                             snapshot.received,
                             integrity_name(snapshot.integrity),
                             snapshot.phase == CheckedPhase::Complete,
-                            timeout_classifier(snapshot),
+                            classifier,
                             mode == Mode::Diagnostic && arm_name == "ngnet-quic-h3",
                             limit.as_millis()
                         );

@@ -218,6 +218,8 @@ pub(crate) fn poll_timer<S: Session>(
         return Poll::Pending;
     };
 
+    // Rearm whenever the deadline moves, including after a pass that only wrote: ngtcp2
+    // folds pacing into the same expiry, so arming only after reads can strand a write.
     if state.sleeping_until != Some(deadline) {
         state.sleeping = Some(detached.sleep_until(deadline));
         state.sleeping_until = Some(deadline);

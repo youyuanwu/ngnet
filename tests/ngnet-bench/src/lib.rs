@@ -290,6 +290,31 @@ pub fn current_thread_runtime() -> Runtime {
         .expect("a current-thread runtime")
 }
 
+#[cfg(test)]
+mod checked_progress_tests {
+    use super::{CheckedIntegrity, reported_integrity};
+
+    #[test]
+    fn partial_exact_progress_is_not_a_length_mismatch() {
+        assert_eq!(
+            reported_integrity(512, 1024, CheckedIntegrity::ExactSoFar, false),
+            CheckedIntegrity::ExactSoFar
+        );
+    }
+
+    #[test]
+    fn terminal_short_or_overlong_bodies_are_length_mismatches() {
+        assert_eq!(
+            reported_integrity(512, 1024, CheckedIntegrity::ExactSoFar, true),
+            CheckedIntegrity::LengthMismatch
+        );
+        assert_eq!(
+            reported_integrity(2048, 1024, CheckedIntegrity::LengthMismatch, false),
+            CheckedIntegrity::LengthMismatch
+        );
+    }
+}
+
 /// A multi-threaded runtime, used only by the explicitly-named multi-thread concurrency
 /// group so the deterministic single-threaded numbers stay the headline.
 pub fn multi_thread_runtime(workers: usize) -> Runtime {
@@ -350,8 +375,21 @@ pub enum CheckedIntegrity {
     ExactSoFar,
     /// At least one observed byte differs from the expected body.
     ContentMismatch,
-    /// More response bytes arrived than the expected body contains.
+    /// Received length differs from expected: an overrun, or a short body at completion.
     LengthMismatch,
+}
+
+fn reported_integrity(
+    total: usize,
+    expected: usize,
+    integrity: CheckedIntegrity,
+    terminal: bool,
+) -> CheckedIntegrity {
+    if terminal && total != expected {
+        CheckedIntegrity::LengthMismatch
+    } else {
+        integrity
+    }
 }
 
 /// Last durable application-level progress for one checked exchange.
@@ -526,7 +564,7 @@ where
     loop {
         if let Some(progress) = progress {
             progress.record(
-                if total == expected.len() {
+                if total >= expected.len() {
                     CheckedPhase::TerminalWait
                 } else {
                     CheckedPhase::BodyDrain
@@ -607,11 +645,7 @@ where
         progress.record(
             CheckedPhase::Complete,
             total,
-            if total != expected.len() {
-                CheckedIntegrity::LengthMismatch
-            } else {
-                integrity
-            },
+            reported_integrity(total, expected.len(), integrity, true),
         );
     }
     Ok((total, exact))
@@ -2714,11 +2748,7 @@ impl UpstreamH3Ngtcp {
         progress.record(
             CheckedPhase::Complete,
             total,
-            if total != expected.len() {
-                CheckedIntegrity::LengthMismatch
-            } else {
-                integrity
-            },
+            reported_integrity(total, expected.len(), integrity, true),
         );
         Ok((total, exact))
     }

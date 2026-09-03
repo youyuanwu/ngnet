@@ -191,6 +191,24 @@ async fn repeated_exact_echo(size: usize, exchanges: usize) {
                 snapshot.phase == CheckedPhase::Complete,
             )
         });
+        if received != size || !exact {
+            eprintln!(
+                "S9-FIXTURE-FAIL size={size} exchange={exchange} last_completed={} \
+                 phase=complete received_bytes={received} integrity={} terminal=true \
+                 classifier={}",
+                exchange - 1,
+                if received != size {
+                    "length-mismatch"
+                } else {
+                    "content-mismatch"
+                },
+                if received != size {
+                    "wrong-length"
+                } else {
+                    "wrong-content"
+                }
+            );
+        }
         assert_eq!(
             received, size,
             "{size}-byte exchange {exchange} did not echo exactly"

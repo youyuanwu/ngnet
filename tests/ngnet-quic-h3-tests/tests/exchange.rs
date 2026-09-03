@@ -17,7 +17,9 @@ async fn serve_one(
     endpoint: ngnet_quic::endpoint::Endpoint<ngnet_quic::OsslSession>,
     body: Vec<u8>,
 ) {
-    let backend = accept(&endpoint).await.expect("accepting a connection");
+    let backend = accept(&endpoint)
+        .await
+        .expect("accepting a connection");
 
     let connection = ngnet_h3::http::serve(backend, move |request| {
         let body = body.clone();

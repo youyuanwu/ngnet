@@ -35,6 +35,7 @@ fn classify(
     } else if code == Some(124) || code == Some(137) {
         Outcome::OuterKilled
     } else if stderr.contains("PROBE-FAIL")
+        || stderr.contains("S9-FIXTURE-FAIL")
         || stderr.contains("stalled; last completed exchange")
         || stderr.contains("failed; last completed exchange")
     {
@@ -113,9 +114,20 @@ fn descendant_identities(root: u32) -> Result<Vec<ProcessIdentity>, String> {
     let mut pending = vec![root];
     let mut found = BTreeMap::new();
     while let Some(parent) = pending.pop() {
-        for child in child_pids(parent)? {
+        let children = match child_pids(parent) {
+            Ok(children) => children,
+            Err(_) if !std::path::Path::new(&format!("/proc/{parent}")).exists() => continue,
+            Err(error) => return Err(error),
+        };
+        for child in children {
             pending.push(child);
-            found.insert(child, process_identity(child)?);
+            match process_identity(child) {
+                Ok(identity) => {
+                    found.insert(child, identity);
+                }
+                Err(_) if !std::path::Path::new(&format!("/proc/{child}")).exists() => {}
+                Err(error) => return Err(error),
+            }
         }
     }
     Ok(found.into_values().collect())
@@ -156,6 +168,7 @@ fn failure_record(output: &str) -> &str {
         .lines()
         .find(|line| {
             line.starts_with("PROBE-FAIL")
+                || line.starts_with("S9-FIXTURE-FAIL")
                 || line.contains("stalled; last completed exchange")
                 || line.contains("failed; last completed exchange")
         })
@@ -221,14 +234,18 @@ fn main() {
     let selected_runs = run_range(start, runs).unwrap_or_else(|error| panic!("{error}"));
     validate_outer(fixture, (!fixture).then(|| args[3].as_str()), outer)
         .unwrap_or_else(|error| panic!("{error}"));
-    if let Some(path) = manifest
-        && let Ok(contents) = std::fs::read_to_string(path)
-    {
-        for run in selected_runs.clone() {
-            assert!(
-                !manifest_has_completed_run(&contents, run),
-                "manifest {path} already contains run {run}"
-            );
+    if let Some(path) = manifest {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                for run in selected_runs.clone() {
+                    assert!(
+                        !manifest_has_completed_run(&contents, run),
+                        "manifest {path} already contains run {run}"
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("reading S9 manifest {path}: {error}"),
         }
     }
 
@@ -313,7 +330,6 @@ fn main() {
                 Some(format!("checking supervised process: {error}")),
             ),
         };
-        let captured_for_record = captured.clone();
         let wait_deadline = Instant::now() + Duration::from_secs(outer.saturating_add(10));
         let status = loop {
             match child.try_wait() {
@@ -347,24 +363,12 @@ fn main() {
                 }
             }
         };
+        let captured_for_record = captured.clone();
 
         let mut remaining = captured
             .into_iter()
             .filter(|identity| still_same_process(*identity))
             .collect::<Vec<_>>();
-        match process_group_pids(supervisor_pid) {
-            Ok(group) => {
-                for identity in group {
-                    if !remaining.contains(&identity) {
-                        remaining.push(identity);
-                    }
-                }
-            }
-            Err(error) => {
-                eprintln!("S9-SUPERVISOR-INSPECTION-FAIL run={run} error={error:?}");
-                inspection_error = Some(error);
-            }
-        }
         terminate_pids(&remaining, "-TERM");
         if !remaining.is_empty() {
             thread::sleep(Duration::from_millis(100));
