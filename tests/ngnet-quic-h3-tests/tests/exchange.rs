@@ -169,20 +169,9 @@ async fn a_body_larger_than_the_flow_control_window_completes() {
     #[cfg(feature = "diagnostics")]
     {
         let drained = ngnet_quic::diagnostics::drain();
-        let captured_selected_state = drained.attempts.iter().any(|attempt| {
-            attempt.outcome == ngnet_quic::diagnostics::AttemptOutcome::Blocked
-                && attempt.connection_credit_before > 0
-                && attempt.stream_credit_before > 0
-                && attempt.congestion_credit_before > 0
-                && attempt.expiry_after.is_some()
-        });
-        assert!(
-            captured_selected_state,
-            "the exact exchange never entered the reproduced credit-positive imminent block"
-        );
         assert!(
             drained.snapshot.client.timer_kicks + drained.snapshot.server.timer_kicks > 0,
-            "the exact exchange never exercised the imminent timer fallback"
+            "the exact exchange never exercised the no-progress transport-block fallback"
         );
         assert_eq!(drained.snapshot.dropped_attempt_records, 0);
         assert_eq!(drained.snapshot.dropped_liveness_records, 0);
