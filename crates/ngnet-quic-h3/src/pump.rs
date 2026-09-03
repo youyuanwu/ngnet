@@ -333,6 +333,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Wake, Waker};
 
+    use core::future;
     use ngnet_quic::Timestamp;
 
     use super::{IMMINENT_EXPIRY_NANOS, MAX_IMMINENT_WAKES, State, poll_timer_state};
@@ -419,5 +420,20 @@ mod tests {
             usize::from(MAX_IMMINENT_WAKES) + 1,
             "a new imminent deadline gets a fresh bounded wake budget"
         );
+
+        let ready_deadline = Timestamp::from_nanos(next.as_nanos() + 1).unwrap();
+        let ready = poll_timer_state(&mut state, next, Some(ready_deadline), &mut cx, |_| {
+            Box::pin(future::ready(()))
+        });
+        assert!(ready.ready);
+        assert!(ready.poll.is_ready());
+        assert_eq!(state.imminent_wake_count, 0);
+        assert_eq!(state.sleeping_until, None);
+
+        state.imminent_wake_count = 7;
+        let none = poll(&mut state, next, None, &mut cx);
+        assert!(none.poll.is_pending());
+        assert_eq!(state.imminent_wake_count, 0);
+        assert_eq!(state.sleeping_until, None);
     }
 }

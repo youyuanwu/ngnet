@@ -8,10 +8,10 @@
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
@@ -144,10 +144,10 @@ fn last_checkpoint(stderr: &str) -> &str {
 }
 
 fn manifest_has_run(contents: &str, run: usize) -> bool {
-    contents.lines().any(|line| {
-        line.split_whitespace()
-            .any(|field| field == format!("run={run}"))
-    })
+    let target = format!("run={run}");
+    contents
+        .lines()
+        .any(|line| line.split_whitespace().any(|field| field == target))
 }
 
 fn append_manifest(path: Option<&str>, record: &str) {
@@ -183,6 +183,16 @@ fn validate_outer(fixture: bool, mode: Option<&str>, outer: u64) -> Result<(), S
     Ok(())
 }
 
+fn run_range(start: usize, runs: usize) -> Result<std::ops::Range<usize>, String> {
+    if start == 0 || runs == 0 {
+        return Err("start-run and runs must be non-zero".to_string());
+    }
+    let end = start
+        .checked_add(runs)
+        .ok_or_else(|| "run range overflowed usize".to_string())?;
+    Ok(start..end)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let fixture = args.get(1).is_some_and(|value| value == "fixture");
@@ -196,14 +206,13 @@ fn main() {
         value.parse::<usize>().expect("start is a number")
     });
     let manifest = args.get(manifest_index).map(String::as_str);
-    assert!(runs > 0, "runs must be non-zero");
-    assert!(start > 0, "start-run must be non-zero");
+    let selected_runs = run_range(start, runs).unwrap_or_else(|error| panic!("{error}"));
     validate_outer(fixture, (!fixture).then(|| args[3].as_str()), outer)
         .unwrap_or_else(|error| panic!("{error}"));
     if let Some(path) = manifest
         && let Ok(contents) = std::fs::read_to_string(path)
     {
-        for run in start..start + runs {
+        for run in selected_runs.clone() {
             assert!(
                 !manifest_has_run(&contents, run),
                 "manifest {path} already contains run {run}"
@@ -217,7 +226,7 @@ fn main() {
     let mut unclassified = 0usize;
     let mut cleanup_failed = 0usize;
 
-    for run in start..start + runs {
+    for run in selected_runs {
         let start_record = if fixture {
             format!(
                 "S9-SUPERVISOR-START run={run} fixture={} outer_seconds={outer}",
@@ -264,8 +273,24 @@ fn main() {
             .spawn()
             .expect("spawn supervised S9 cell");
         let supervisor_pid = child.id();
+        let mut child_stdout = child.stdout.take().expect("capture supervised stdout");
+        let mut child_stderr = child.stderr.take().expect("capture supervised stderr");
+        let stdout_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            child_stdout
+                .read_to_end(&mut bytes)
+                .expect("read supervised stdout");
+            bytes
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            child_stderr
+                .read_to_end(&mut bytes)
+                .expect("read supervised stderr");
+            bytes
+        });
         thread::sleep(Duration::from_millis(100));
-        let (captured, mut inspection_error) = match child.try_wait() {
+        let (mut captured, mut inspection_error) = match child.try_wait() {
             Ok(Some(_)) => (Vec::new(), None),
             Ok(None) => match descendant_identities(supervisor_pid) {
                 Ok(captured) => (captured, None),
@@ -276,12 +301,39 @@ fn main() {
                 Some(format!("checking supervised process: {error}")),
             ),
         };
-        let output = child.wait_with_output().expect("wait for supervised probe");
-
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-        std::io::stdout().flush().expect("flush probe stdout");
-        std::io::stderr().flush().expect("flush probe stderr");
+        let wait_deadline = Instant::now() + Duration::from_secs(outer.saturating_add(10));
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < wait_deadline => {
+                    match descendant_identities(supervisor_pid) {
+                        Ok(descendants) => {
+                            for identity in descendants {
+                                if !captured.contains(&identity) {
+                                    captured.push(identity);
+                                }
+                            }
+                        }
+                        Err(error) => inspection_error = Some(error),
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Ok(None) => {
+                    inspection_error =
+                        Some("supervisor wait exceeded outer bound plus grace".to_string());
+                    let identities =
+                        process_group_pids(supervisor_pid).unwrap_or_else(|_| Vec::new());
+                    terminate_pids(&identities, "-KILL");
+                    let _ = child.kill();
+                    break child.wait().expect("reap over-bound supervisor");
+                }
+                Err(error) => {
+                    inspection_error = Some(format!("waiting for supervised process: {error}"));
+                    let _ = child.kill();
+                    break child.wait().expect("reap failed supervisor wait");
+                }
+            }
+        };
 
         let mut remaining = captured
             .into_iter()
@@ -308,10 +360,16 @@ fn main() {
             thread::sleep(Duration::from_millis(100));
             remaining.retain(|identity| still_same_process(*identity));
         }
+        let stdout = stdout_reader.join().expect("join supervised stdout reader");
+        let stderr = stderr_reader.join().expect("join supervised stderr reader");
+        print!("{}", String::from_utf8_lossy(&stdout));
+        eprint!("{}", String::from_utf8_lossy(&stderr));
+        std::io::stdout().flush().expect("flush probe stdout");
+        std::io::stderr().flush().expect("flush probe stderr");
         let combined = format!(
             "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
         );
         let success_marker = if fixture {
             combined.contains("test result: ok. 1 passed")
@@ -319,8 +377,8 @@ fn main() {
             combined.contains(&format!("PROBE-DONE completed={}", args[5]))
         };
         let outcome = classify(
-            output.status.code(),
-            &String::from_utf8_lossy(&output.stderr),
+            status.code(),
+            &String::from_utf8_lossy(&stderr),
             inspection_error.is_some() || !remaining.is_empty(),
             success_marker,
         );
@@ -335,15 +393,14 @@ fn main() {
             "S9-SUPERVISOR-RESULT run={run} timeout_pid={supervisor_pid} \
              exit_code={} outcome={outcome:?} remaining_pids={:?} inspection_error={inspection_error:?} \
              success_marker={success_marker} last_checkpoint={:?}",
-            output
-                .status
+            status
                 .code()
                 .map_or_else(|| "signal".to_string(), |code| code.to_string()),
             remaining
                 .iter()
                 .map(|identity| identity.pid)
                 .collect::<Vec<_>>(),
-            last_checkpoint(&String::from_utf8_lossy(&output.stderr)),
+            last_checkpoint(&String::from_utf8_lossy(&stderr)),
         );
         eprintln!("{result_record}");
         append_manifest(manifest, &result_record);
@@ -385,6 +442,16 @@ mod tests {
             Outcome::ClassifiedFailure
         );
         assert_eq!(classify(Some(124), "", false, false), Outcome::OuterKilled);
+        assert_eq!(classify(Some(137), "", false, false), Outcome::OuterKilled);
+        assert_eq!(
+            classify(
+                Some(101),
+                "16384-byte exchange 2 stalled; last completed exchange was 1",
+                false,
+                false,
+            ),
+            Outcome::ClassifiedFailure
+        );
         assert_eq!(
             classify(Some(2), "plain failure", false, false),
             Outcome::UnclassifiedFailure
@@ -394,9 +461,13 @@ mod tests {
 
     #[test]
     fn start_run_range_does_not_double_count_prior_runs() {
-        let start = 21usize;
-        let runs = 3usize;
-        assert_eq!((start..start + runs).collect::<Vec<_>>(), vec![21, 22, 23]);
+        assert_eq!(
+            run_range(21, 3).unwrap().collect::<Vec<_>>(),
+            vec![21, 22, 23]
+        );
+        assert!(run_range(0, 3).is_err());
+        assert!(run_range(1, 0).is_err());
+        assert!(run_range(usize::MAX, 1).is_err());
     }
 
     #[test]
