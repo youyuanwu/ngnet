@@ -66,6 +66,11 @@ failure in 30 exact-fixture processes, and an earlier self-wake candidate produc
 close-before-response failure in eight all-feature workspace runs. The candidates were
 therefore removed rather than shipping a speculative scheduling change.
 
+After removal, an all-feature workspace invocation run concurrently with the other final cargo
+gates failed both the basic request/response and large flow-control exchange tests; an isolated
+rerun passed. This preserves the known contention-sensitive signature rather than treating one
+clean rerun as resolution.
+
 The committed harness and diagnostics are the result: they preserve phase, integrity,
 terminal/close category, flow and congestion credit, expiry, queue/wake state, bounded record
 loss, exact completion markers, and process cleanup. A safe correction remains blocked on an

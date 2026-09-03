@@ -80,6 +80,11 @@ The backup-sleep candidate also completed ten pre-declared sequential
 `cargo test --workspace --all-features` invocations. An earlier self-wake candidate produced
 one close-before-response failure in eight such invocations.
 
+With all fallback candidates removed, a final all-feature workspace invocation run concurrently
+with the other cargo gates failed the basic request/response test and timed out the large
+flow-control response. An isolated rerun passed. The final evidence-only branch therefore
+retains the contention-sensitive workspace caveat.
+
 ### Residual fixture observation
 
 The backup-sleep candidate's ignored 125 × 16 KiB fixture completed 5/5. Its ignored
