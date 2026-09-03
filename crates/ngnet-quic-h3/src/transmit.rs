@@ -22,8 +22,6 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
 ) -> Result<()> {
     let mut failure: Option<Error> = None;
     let mut blocked = false;
-    let mut made_stream_progress = false;
-    state.timer_fallback_needed = false;
     #[cfg(feature = "diagnostics")]
     let role = detached.conn.role();
     #[cfg(feature = "diagnostics")]
@@ -72,7 +70,6 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
                 Ok(StreamWrite::Datagram { len, accepted }) => {
                     produced_len = Some(len);
                     if accepted > 0 {
-                        made_stream_progress = true;
                         released = Some((id, accepted));
                     } else {
                         // A zero-byte acceptance here is a *serialised* zero-length STREAM
@@ -106,15 +103,11 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
                 }
                 // Every blocked condition is the same to the layer: nothing can be taken for
                 // this stream now, so it is set aside and offered again later.
-                Ok(StreamWrite::Blocked) => {
-                    if !made_stream_progress {
-                        state.timer_fallback_needed = true;
-                    }
-                    blocked = true;
-                    H3WriteOutcome::Blocked
-                }
                 Ok(
-                    StreamWrite::StreamBlocked | StreamWrite::ConnectionBlocked | StreamWrite::Idle,
+                    StreamWrite::Blocked
+                    | StreamWrite::StreamBlocked
+                    | StreamWrite::ConnectionBlocked
+                    | StreamWrite::Idle,
                 ) => {
                     blocked = true;
                     H3WriteOutcome::Blocked

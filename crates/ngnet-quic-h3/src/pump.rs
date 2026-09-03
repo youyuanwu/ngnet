@@ -10,7 +10,7 @@ use core::task::{Context, Poll};
 use ngnet_quic::endpoint::DetachedConnection;
 use ngnet_quic::{Session, WriteOutcome};
 
-use crate::connection::{Shared, Sleep, State};
+use crate::connection::{Shared, State};
 use crate::error::{Error, ErrorKind, Result};
 
 #[cfg(feature = "diagnostics")]
@@ -30,116 +30,6 @@ fn close_reason(close: &ngnet_quic::CloseError) -> &'static str {
 ///
 /// Capacity, not permission: the connection decides how much of it may actually be used.
 pub(crate) const MAX_DATAGRAM: usize = 1500;
-/// Threshold covering the sub-tick deadlines observed in S9 captures.
-const IMMINENT_EXPIRY_NANOS: u64 = 20_000;
-/// Places the backup timer on a later runtime tick instead of immediately repolling.
-const FALLBACK_SLACK_NANOS: u64 = 1_000_000;
-
-struct TimerPoll {
-    poll: Poll<()>,
-    rearmed: bool,
-    fallback_armed: bool,
-    ready: bool,
-    fallback_ready: bool,
-}
-
-/// Polls the adapter-owned expiry state, including its bounded imminent fallback.
-fn poll_timer_state(
-    state: &mut State,
-    now: ngnet_quic::Timestamp,
-    deadline: Option<ngnet_quic::Timestamp>,
-    cx: &mut Context<'_>,
-    mut sleep_until: impl FnMut(ngnet_quic::Timestamp) -> Sleep,
-) -> TimerPoll {
-    let Some(deadline) = deadline else {
-        state.sleeping = None;
-        state.sleeping_until = None;
-        state.fallback_sleeping = None;
-        state.fallback_for = None;
-        return TimerPoll {
-            poll: Poll::Pending,
-            rearmed: false,
-            fallback_armed: false,
-            ready: false,
-            fallback_ready: false,
-        };
-    };
-
-    let rearmed = state.sleeping_until != Some(deadline);
-    if rearmed {
-        state.sleeping = Some(sleep_until(deadline));
-        state.sleeping_until = Some(deadline);
-        state.fallback_sleeping = None;
-        state.fallback_for = None;
-    }
-
-    let remaining = deadline.as_nanos().saturating_sub(now.as_nanos());
-    let fallback_armed = state.timer_fallback_needed
-        && remaining <= IMMINENT_EXPIRY_NANOS
-        && state.fallback_for != Some(deadline);
-    if fallback_armed {
-        // The S9 captures showed an armed sub-tick expiry with no later timer-ready event.
-        // A second sleep on a later scheduler tick preserves a deadline-backed wake without
-        // immediate self-polling. The runtime-level reason the first sleep did not wake is
-        // not established.
-        let fallback_nanos = deadline
-            .as_nanos()
-            .saturating_add(FALLBACK_SLACK_NANOS)
-            .min(u64::MAX - 1);
-        let fallback = ngnet_quic::Timestamp::from_nanos(fallback_nanos)
-            .expect("fallback timestamp stays below the reserved sentinel");
-        state.fallback_sleeping = Some(sleep_until(fallback));
-        state.fallback_for = Some(deadline);
-    }
-
-    let Some(sleep) = state.sleeping.as_mut() else {
-        return TimerPoll {
-            poll: Poll::Pending,
-            rearmed,
-            fallback_armed,
-            ready: false,
-            fallback_ready: false,
-        };
-    };
-    match core::pin::Pin::new(sleep).poll(cx) {
-        Poll::Ready(()) => {
-            state.sleeping = None;
-            state.sleeping_until = None;
-            state.fallback_sleeping = None;
-            state.fallback_for = None;
-            TimerPoll {
-                poll: Poll::Ready(()),
-                rearmed,
-                fallback_armed,
-                ready: true,
-                fallback_ready: false,
-            }
-        }
-        Poll::Pending => {
-            let fallback_ready = state
-                .fallback_sleeping
-                .as_mut()
-                .is_some_and(|sleep| core::pin::Pin::new(sleep).poll(cx).is_ready());
-            if fallback_ready {
-                state.sleeping = None;
-                state.sleeping_until = None;
-                state.fallback_sleeping = None;
-                state.fallback_for = None;
-            }
-            TimerPoll {
-                poll: if fallback_ready {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                },
-                rearmed,
-                fallback_armed,
-                ready: false,
-                fallback_ready,
-            }
-        }
-    }
-}
 
 /// Drives the connection one pass.
 ///
@@ -322,153 +212,41 @@ pub(crate) fn poll_timer<S: Session>(
     state: &mut State,
     cx: &mut Context<'_>,
 ) -> Poll<()> {
-    let now = detached.now();
-    let result = poll_timer_state(state, now, detached.conn.expiry(), cx, |deadline| {
-        detached.sleep_until(deadline)
-    });
-    #[cfg(feature = "diagnostics")]
-    if result.rearmed {
+    let Some(deadline) = detached.conn.expiry() else {
+        state.sleeping = None;
+        state.sleeping_until = None;
+        return Poll::Pending;
+    };
+
+    if state.sleeping_until != Some(deadline) {
+        state.sleeping = Some(detached.sleep_until(deadline));
+        state.sleeping_until = Some(deadline);
+        #[cfg(feature = "diagnostics")]
         ngnet_quic::diagnostics::record_timer_rearm(
             detached.conn.diagnostic_id(),
             detached.conn.role(),
         );
     }
-    #[cfg(feature = "diagnostics")]
-    if result.fallback_armed {
-        ngnet_quic::diagnostics::record_timer_fallback(
-            detached.conn.diagnostic_id(),
-            detached.conn.role(),
-        );
+
+    let Some(sleep) = state.sleeping.as_mut() else {
+        return Poll::Pending;
+    };
+    match core::pin::Pin::new(sleep).poll(cx) {
+        Poll::Ready(()) => {
+            #[cfg(feature = "diagnostics")]
+            ngnet_quic::diagnostics::record_timer_ready(
+                detached.conn.diagnostic_id(),
+                detached.conn.role(),
+            );
+            state.sleeping = None;
+            state.sleeping_until = None;
+            Poll::Ready(())
+        }
+        Poll::Pending => Poll::Pending,
     }
-    #[cfg(feature = "diagnostics")]
-    if result.ready {
-        ngnet_quic::diagnostics::record_timer_ready(
-            detached.conn.diagnostic_id(),
-            detached.conn.role(),
-        );
-    }
-    #[cfg(feature = "diagnostics")]
-    if result.fallback_ready {
-        ngnet_quic::diagnostics::record_timer_ready(
-            detached.conn.diagnostic_id(),
-            detached.conn.role(),
-        );
-    }
-    #[cfg(not(feature = "diagnostics"))]
-    let _ = (
-        result.rearmed,
-        result.fallback_armed,
-        result.ready,
-        result.fallback_ready,
-    );
-    result.poll
 }
 
 /// The error a caller sees once the connection has ended.
 pub(crate) fn ended() -> Error {
     Error::new(ErrorKind::Closed, "the connection has ended")
-}
-
-#[cfg(test)]
-mod tests {
-    use std::task::{Context, Waker};
-
-    use core::future;
-    use ngnet_quic::Timestamp;
-
-    use super::{IMMINENT_EXPIRY_NANOS, Sleep, State, poll_timer_state};
-
-    fn poll(
-        state: &mut State,
-        now: Timestamp,
-        deadline: Option<Timestamp>,
-        cx: &mut Context<'_>,
-    ) -> super::TimerPoll {
-        poll_timer_state(state, now, deadline, cx, |_| {
-            Box::pin(core::future::pending())
-        })
-    }
-
-    fn state() -> State {
-        State {
-            closed: false,
-            reported_closed: false,
-            emitted_since_pending: false,
-            sleeping: None,
-            sleeping_until: None,
-            fallback_sleeping: None,
-            fallback_for: None,
-            timer_fallback_needed: true,
-            #[cfg(feature = "diagnostics")]
-            capacity_parked: false,
-            #[cfg(feature = "diagnostics")]
-            idle_parked: false,
-            limit_wakers: Vec::new(),
-            opened_bidi: std::collections::VecDeque::new(),
-            opened_uni: std::collections::VecDeque::new(),
-            scratch: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn imminent_timer_fallback_is_thresholded_and_deadline_scheduled() {
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(waker);
-        let now = Timestamp::from_nanos(1_000_000).unwrap();
-        let threshold = Timestamp::from_nanos(1_000_000 + IMMINENT_EXPIRY_NANOS).unwrap();
-        let outside = Timestamp::from_nanos(1_000_001 + IMMINENT_EXPIRY_NANOS).unwrap();
-        let mut state = state();
-
-        state.timer_fallback_needed = false;
-        let idle_result = poll(&mut state, now, Some(threshold), &mut cx);
-        assert!(
-            !idle_result.fallback_armed,
-            "progressing streams do not arm a fallback"
-        );
-        state.timer_fallback_needed = true;
-
-        let outside_result = poll(&mut state, now, Some(outside), &mut cx);
-        assert!(outside_result.rearmed);
-        assert!(!outside_result.fallback_armed);
-
-        let mut calls = 0usize;
-        let fallback = poll_timer_state(&mut state, now, Some(threshold), &mut cx, |_| {
-            calls += 1;
-            if calls == 2 {
-                Box::pin(future::ready(())) as Sleep
-            } else {
-                Box::pin(future::pending()) as Sleep
-            }
-        });
-        assert!(fallback.fallback_armed, "the exact threshold is included");
-        assert!(fallback.fallback_ready);
-        assert!(fallback.poll.is_ready());
-
-        let next = Timestamp::from_nanos(threshold.as_nanos() + 1).unwrap();
-        let next_now = Timestamp::from_nanos(next.as_nanos() - 15).unwrap();
-        let next_result = poll(&mut state, next_now, Some(next), &mut cx);
-        assert!(next_result.rearmed);
-        assert!(next_result.fallback_armed);
-        let same_result = poll(&mut state, next_now, Some(next), &mut cx);
-        assert!(
-            !same_result.fallback_armed,
-            "one unchanged deadline gets one backup sleep"
-        );
-
-        let ready_deadline = Timestamp::from_nanos(next.as_nanos() + 1).unwrap();
-        state.timer_fallback_needed = false;
-        let ready = poll_timer_state(&mut state, next, Some(ready_deadline), &mut cx, |_| {
-            Box::pin(future::ready(()))
-        });
-        assert!(ready.ready);
-        assert!(ready.poll.is_ready());
-        assert_eq!(state.fallback_for, None);
-        assert_eq!(state.sleeping_until, None);
-
-        state.fallback_for = Some(ready_deadline);
-        let none = poll(&mut state, next, None, &mut cx);
-        assert!(none.poll.is_pending());
-        assert_eq!(state.fallback_for, None);
-        assert_eq!(state.sleeping_until, None);
-    }
 }
