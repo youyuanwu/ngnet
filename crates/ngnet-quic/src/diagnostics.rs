@@ -43,6 +43,16 @@ pub struct Attempt {
     pub direction: &'static str,
     /// QUIC stream identifier.
     pub stream_id: i64,
+    /// Connection-level send credit immediately before the native write.
+    pub connection_credit_before: u64,
+    /// Stream-level send credit immediately before the native write.
+    pub stream_credit_before: u64,
+    /// Congestion-window credit immediately before the native write.
+    pub congestion_credit_before: u64,
+    /// Timestamp supplied to the native write.
+    pub now: u64,
+    /// Earliest connection expiry immediately before the native write.
+    pub expiry_before: Option<u64>,
     /// Logical stream offset of the offered prefix.
     pub stream_offset: u64,
     /// Bytes supplied by the caller.
@@ -78,6 +88,8 @@ pub enum LivenessKind {
     Park,
     /// A previously parked path attempted progress again.
     Retry,
+    /// The connection reached a terminal transport state.
+    Terminal,
 }
 
 /// A reasoned, sequenced liveness observation.
@@ -134,7 +146,7 @@ pub struct RoleSnapshot {
     pub produced_packets: u64,
     /// Timer deadline changes that created a replacement sleep.
     pub timer_rearms: u64,
-    /// Armed timers observed ready.
+    /// Connection expiry deadlines observed due, whether by the sleep or the next pump.
     pub timer_fires: u64,
     /// General inbound/work wake registrations.
     pub wake_registrations: u64,
@@ -171,6 +183,10 @@ pub struct RoleSnapshot {
     /// The detached endpoint preserves queued output, including CONNECTION_CLOSE, so this
     /// is expected to remain zero.
     pub terminal_discarded_outbound: u64,
+    /// Stream-level receive credit applied to the transport.
+    pub stream_credit_bytes: u64,
+    /// Connection-level receive credit applied to the transport.
+    pub connection_credit_bytes: u64,
 }
 
 /// A process-wide snapshot.
@@ -184,6 +200,10 @@ pub struct Snapshot {
     pub overflowed: bool,
     /// Packet retransmission attribution is not exposed by the current safe ngtcp2 API.
     pub retransmissions_available: bool,
+    /// Attempt records omitted after the bounded diagnostic collection filled.
+    pub dropped_attempt_records: u64,
+    /// Liveness records omitted after the bounded diagnostic collection filled.
+    pub dropped_liveness_records: u64,
 }
 
 /// One exclusive interval observation.
@@ -235,6 +255,8 @@ struct AtomicRole {
     outbound_capacity_transitions: AtomicU64,
     terminal_discarded_inbound: AtomicU64,
     terminal_discarded_outbound: AtomicU64,
+    stream_credit_bytes: AtomicU64,
+    connection_credit_bytes: AtomicU64,
 }
 
 impl AtomicRole {
@@ -272,6 +294,8 @@ impl AtomicRole {
             outbound_capacity_transitions: AtomicU64::new(0),
             terminal_discarded_inbound: AtomicU64::new(0),
             terminal_discarded_outbound: AtomicU64::new(0),
+            stream_credit_bytes: AtomicU64::new(0),
+            connection_credit_bytes: AtomicU64::new(0),
         }
     }
 
@@ -309,6 +333,8 @@ impl AtomicRole {
             &self.outbound_capacity_transitions,
             &self.terminal_discarded_inbound,
             &self.terminal_discarded_outbound,
+            &self.stream_credit_bytes,
+            &self.connection_credit_bytes,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -349,6 +375,8 @@ impl AtomicRole {
             outbound_capacity_transitions: load(&self.outbound_capacity_transitions),
             terminal_discarded_inbound: load(&self.terminal_discarded_inbound),
             terminal_discarded_outbound: load(&self.terminal_discarded_outbound),
+            stream_credit_bytes: load(&self.stream_credit_bytes),
+            connection_credit_bytes: load(&self.connection_credit_bytes),
         }
     }
 
@@ -402,6 +430,8 @@ impl AtomicRole {
             outbound_capacity_transitions: take(&self.outbound_capacity_transitions),
             terminal_discarded_inbound: take(&self.terminal_discarded_inbound),
             terminal_discarded_outbound: take(&self.terminal_discarded_outbound),
+            stream_credit_bytes: take(&self.stream_credit_bytes),
+            connection_credit_bytes: take(&self.connection_credit_bytes),
         }
     }
 }
@@ -411,6 +441,9 @@ static OVERFLOWED: AtomicBool = AtomicBool::new(false);
 static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 static TEST_STAGING_LIMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+const RECORD_LIMIT: usize = 65_536;
+static DROPPED_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static DROPPED_LIVENESS: AtomicU64 = AtomicU64::new(0);
 static ROLES: [AtomicRole; 2] = [AtomicRole::new(), AtomicRole::new()];
 static RECORDING_GATE: RwLock<()> = RwLock::new(());
 static LAST_ENABLING: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
@@ -509,10 +542,11 @@ fn push_liveness(
     enabling_sequence: Option<u64>,
 ) -> u64 {
     let sequence = next_sequence();
-    LIVENESS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .push(LivenessEvent {
+    let mut records = LIVENESS.lock().unwrap_or_else(|error| error.into_inner());
+    if records.len() == RECORD_LIMIT {
+        add(&DROPPED_LIVENESS, 1);
+    } else {
+        records.push(LivenessEvent {
             sequence,
             connection_id,
             role,
@@ -522,6 +556,7 @@ fn push_liveness(
             parked_attempt_sequence,
             enabling_sequence,
         });
+    }
     sequence
 }
 
@@ -555,6 +590,8 @@ pub fn reset() {
         role.reset();
     }
     OVERFLOWED.store(false, Ordering::Relaxed);
+    DROPPED_ATTEMPTS.store(0, Ordering::Relaxed);
+    DROPPED_LIVENESS.store(0, Ordering::Relaxed);
     NEXT_SEQUENCE.store(1, Ordering::Relaxed);
     TEST_STAGING_LIMIT.store(u64::MAX, Ordering::Relaxed);
     LAST_ENABLING
@@ -620,6 +657,8 @@ pub fn snapshot() -> Snapshot {
         server: ROLES[1].snapshot(),
         overflowed: OVERFLOWED.load(Ordering::Relaxed),
         retransmissions_available: false,
+        dropped_attempt_records: DROPPED_ATTEMPTS.load(Ordering::Relaxed),
+        dropped_liveness_records: DROPPED_LIVENESS.load(Ordering::Relaxed),
     }
 }
 
@@ -660,6 +699,8 @@ pub fn drain() -> DrainedDiagnostics {
             server: ROLES[1].drain_interval(),
             overflowed: OVERFLOWED.swap(false, Ordering::Relaxed),
             retransmissions_available: false,
+            dropped_attempt_records: DROPPED_ATTEMPTS.swap(0, Ordering::Relaxed),
+            dropped_liveness_records: DROPPED_LIVENESS.swap(0, Ordering::Relaxed),
         },
         attempts: core::mem::take(&mut *ATTEMPTS.lock().unwrap_or_else(|error| error.into_inner())),
         liveness: core::mem::take(&mut *LIVENESS.lock().unwrap_or_else(|error| error.into_inner())),
@@ -772,10 +813,12 @@ pub(crate) fn record_attempt(mut attempt: Attempt) {
             );
         }
     }
-    ATTEMPTS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .push(attempt);
+    let mut records = ATTEMPTS.lock().unwrap_or_else(|error| error.into_inner());
+    if records.len() == RECORD_LIMIT {
+        add(&DROPPED_ATTEMPTS, 1);
+    } else {
+        records.push(attempt);
+    }
 }
 
 pub(crate) fn record_retained(
@@ -999,6 +1042,37 @@ pub(crate) fn record_terminal_inventory(
     add(&role.terminal_discarded_outbound, outbound_discarded as u64);
 }
 
+/// Records why a detached connection reached its terminal state.
+#[doc(hidden)]
+pub fn record_terminal(connection_id: u64, role: Role, reason: &'static str) {
+    let Some(_guard) = recording_guard() else {
+        return;
+    };
+    push_liveness(
+        connection_id,
+        role,
+        LivenessKind::Terminal,
+        reason,
+        None,
+        None,
+        None,
+    );
+}
+
+/// Records receive credit applied by an HTTP/3 adapter.
+#[doc(hidden)]
+pub fn record_credit(role: Role, stream: bool, bytes: u64) {
+    let Some(_guard) = recording_guard() else {
+        return;
+    };
+    let role = counters(role);
+    if stream {
+        add(&role.stream_credit_bytes, bytes);
+    } else {
+        add(&role.connection_credit_bytes, bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1028,6 +1102,11 @@ mod tests {
             role: Role::Server,
             direction: "outbound",
             stream_id: 0,
+            connection_credit_before: 32,
+            stream_credit_before: 16,
+            congestion_credit_before: 24,
+            now: 1,
+            expiry_before: Some(2),
             stream_offset: 0,
             offered_bytes: 16,
             sampled_payload_limit: 1200,
@@ -1042,11 +1121,16 @@ mod tests {
         record_release(1, Role::Server, 7);
         record_packet(1, Role::Server, true);
         record_inbound_wakes(1, Role::Server, 1);
+        record_credit(Role::Server, true, 7);
+        record_credit(Role::Server, false, 7);
+        record_terminal(1, Role::Server, "idle-timeout");
 
         let snapshot = snapshot();
         assert_eq!(snapshot.server.accepted_bytes, 7);
         assert_eq!(snapshot.server.release_event_bytes, 7);
         assert_eq!(snapshot.server.stream_carrying_packets, 1);
+        assert_eq!(snapshot.server.stream_credit_bytes, 7);
+        assert_eq!(snapshot.server.connection_credit_bytes, 7);
         assert_eq!(
             snapshot.server.produced_packets,
             snapshot.server.transport_only_packets + snapshot.server.stream_carrying_packets
@@ -1073,6 +1157,11 @@ mod tests {
                 role: Role::Client,
                 direction: "outbound",
                 stream_id: 0,
+                connection_credit_before: 32,
+                stream_credit_before: 16,
+                congestion_credit_before: 24,
+                now: 1,
+                expiry_before: Some(2),
                 stream_offset: 0,
                 offered_bytes: 8,
                 sampled_payload_limit: 1200,
@@ -1102,6 +1191,11 @@ mod tests {
             role: Role::Client,
             direction: "outbound",
             stream_id: 0,
+            connection_credit_before: 32,
+            stream_credit_before: 16,
+            congestion_credit_before: 24,
+            now: 1,
+            expiry_before: Some(2),
             stream_offset: 0,
             offered_bytes: 8,
             sampled_payload_limit: 1200,
@@ -1153,6 +1247,47 @@ mod tests {
         assert_eq!(second.snapshot.server.logical_retained_high_water, 7);
         assert_eq!(second.snapshot.server.inbound_queue_depth, 3);
         assert_eq!(second.snapshot.server.inbound_queue_high_water, 3);
+        reset();
+    }
+
+    #[test]
+    fn diagnostic_record_collections_are_bounded_and_report_drops() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset();
+        arm(true);
+        for _ in 0..=RECORD_LIMIT {
+            record_driver_wake(1, Role::Client);
+            record_attempt(Attempt {
+                sequence: 0,
+                connection_id: 1,
+                role: Role::Client,
+                direction: "outbound",
+                stream_id: 0,
+                connection_credit_before: 32,
+                stream_credit_before: 16,
+                congestion_credit_before: 24,
+                now: 1,
+                expiry_before: Some(2),
+                stream_offset: 0,
+                offered_bytes: 1,
+                sampled_payload_limit: 1200,
+                prepared_backing_capacity: 1,
+                accepted_prefix: 1,
+                fin_offered: false,
+                zero_acceptance: false,
+                logical_retained_bytes: 1,
+                retained_backing_capacity: 1,
+                outcome: AttemptOutcome::Datagram,
+            });
+        }
+
+        let drained = drain();
+        assert_eq!(drained.attempts.len(), RECORD_LIMIT);
+        assert_eq!(drained.liveness.len(), RECORD_LIMIT);
+        assert_eq!(drained.snapshot.dropped_attempt_records, 1);
+        assert_eq!(drained.snapshot.dropped_liveness_records, 1);
+        assert_eq!(snapshot().dropped_attempt_records, 0);
+        assert_eq!(snapshot().dropped_liveness_records, 0);
         reset();
     }
 }

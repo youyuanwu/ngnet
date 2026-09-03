@@ -57,6 +57,8 @@ pub(crate) fn pump<S: Session>(
             ) => {}
             Ok(ngnet_quic::ReadOutcome::Draining | ngnet_quic::ReadOutcome::Closing) => {
                 state.closed = true;
+                #[cfg(feature = "diagnostics")]
+                ngnet_quic::diagnostics::record_terminal(connection_id, role, "peer-close");
                 shared.record_connection_closed(detached.conn.close_error());
                 // Nothing further is read into a connection that has ended. Continuing
                 // would re-enter the same branch for every datagram still queued and record
@@ -65,6 +67,12 @@ pub(crate) fn pump<S: Session>(
             }
             Err(err) => {
                 state.closed = true;
+                #[cfg(feature = "diagnostics")]
+                ngnet_quic::diagnostics::record_terminal(
+                    connection_id,
+                    role,
+                    "read-transport-error",
+                );
                 shared.record_connection_closed_bare();
                 return Err(Error::transport(err));
             }
@@ -79,17 +87,34 @@ pub(crate) fn pump<S: Session>(
     // Then the timer. Its deadline already folds in the pacing deadline, so this is also
     // what releases a connection that is waiting to send rather than waiting to hear.
     if detached.conn.expiry().is_some_and(|at| at <= now) {
+        #[cfg(feature = "diagnostics")]
+        ngnet_quic::diagnostics::record_timer_fire(connection_id, role);
         match detached.conn.handle_expiry(now) {
             Ok(ngnet_quic::ExpiryOutcome::Handled) => {}
-            Ok(ngnet_quic::ExpiryOutcome::IdleClose | ngnet_quic::ExpiryOutcome::Terminal) => {
+            Ok(ngnet_quic::ExpiryOutcome::IdleClose) => {
                 // An idle timeout is how a connection to a peer that stopped answering ends.
                 // Reported as the connection closing, because otherwise it is silence.
                 state.closed = true;
+                #[cfg(feature = "diagnostics")]
+                ngnet_quic::diagnostics::record_terminal(connection_id, role, "idle-timeout");
+                shared.record_connection_closed(detached.conn.close_error());
+                return Ok(());
+            }
+            Ok(ngnet_quic::ExpiryOutcome::Terminal) => {
+                state.closed = true;
+                #[cfg(feature = "diagnostics")]
+                ngnet_quic::diagnostics::record_terminal(connection_id, role, "expiry-terminal");
                 shared.record_connection_closed(detached.conn.close_error());
                 return Ok(());
             }
             Err(err) => {
                 state.closed = true;
+                #[cfg(feature = "diagnostics")]
+                ngnet_quic::diagnostics::record_terminal(
+                    connection_id,
+                    role,
+                    "expiry-transport-error",
+                );
                 shared.record_connection_closed_bare();
                 return Err(Error::transport(err));
             }
@@ -199,11 +224,6 @@ pub(crate) fn poll_timer<S: Session>(
         Poll::Ready(()) => {
             state.sleeping = None;
             state.sleeping_until = None;
-            #[cfg(feature = "diagnostics")]
-            ngnet_quic::diagnostics::record_timer_fire(
-                detached.conn.diagnostic_id(),
-                detached.conn.role(),
-            );
             Poll::Ready(())
         }
         Poll::Pending => Poll::Pending,

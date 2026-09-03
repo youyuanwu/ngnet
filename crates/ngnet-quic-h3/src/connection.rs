@@ -447,6 +447,8 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
     }
 
     fn extend_credit(&mut self, stream: Option<H3StreamId>, bytes: u64) -> Result<()> {
+        #[cfg(feature = "diagnostics")]
+        let role = self.detached.conn.role();
         match stream {
             Some(stream) => {
                 let id = quic_stream(stream);
@@ -454,11 +456,17 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
                     .conn
                     .extend_max_stream_offset(id, bytes)
                     .map_err(Error::transport)?;
+                #[cfg(feature = "diagnostics")]
+                ngnet_quic::diagnostics::record_credit(role, true, bytes);
             }
             // The connection window, which is shared across every stream. The layer calls
             // once per level for the same bytes; extending only one stalls the connection
             // once enough total has flowed, late and with nothing to explain it.
-            None => self.detached.conn.extend_max_offset(bytes),
+            None => {
+                self.detached.conn.extend_max_offset(bytes);
+                #[cfg(feature = "diagnostics")]
+                ngnet_quic::diagnostics::record_credit(role, false, bytes);
+            }
         }
         Ok(())
     }

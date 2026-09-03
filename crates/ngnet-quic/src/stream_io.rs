@@ -258,6 +258,12 @@ impl<S: Session> Conn<'_, S> {
                     .iter()
                     .fold(0usize, |total, range| total.saturating_add(range.len())),
                 self.retained_next_offset(stream),
+                // SAFETY: both calls are pure queries on the live connection.
+                unsafe { sys::ngtcp2_conn_get_max_data_left2(self.raw()) },
+                unsafe { sys::ngtcp2_conn_get_max_stream_data_left2(self.raw(), stream.get()) },
+                unsafe { sys::ngtcp2_conn_get_cwnd_left2(self.raw()) },
+                now.as_raw(),
+                self.expiry().map(|expiry| expiry.as_raw()),
             )
         });
 
@@ -283,8 +289,19 @@ impl<S: Session> Conn<'_, S> {
 
         let outcome = self.submit_one_vec(dest, stream, StagedVec::new(staged), flags, now);
         #[cfg(feature = "diagnostics")]
-        if let (Some((role, offered, stream_offset)), Some(outcome)) =
-            (diagnostic_context, outcome.as_ref().ok().copied())
+        if let (
+            Some((
+                role,
+                offered,
+                stream_offset,
+                connection_credit_before,
+                stream_credit_before,
+                congestion_credit_before,
+                diagnostic_now,
+                expiry_before,
+            )),
+            Some(outcome),
+        ) = (diagnostic_context, outcome.as_ref().ok().copied())
         {
             let accepted = match outcome {
                 StreamWrite::Datagram { accepted, .. } => accepted,
@@ -308,6 +325,11 @@ impl<S: Session> Conn<'_, S> {
                 role,
                 direction: "outbound",
                 stream_id: stream.get(),
+                connection_credit_before,
+                stream_credit_before,
+                congestion_credit_before,
+                now: diagnostic_now,
+                expiry_before,
                 stream_offset,
                 offered_bytes: offered as u64,
                 sampled_payload_limit: sampled_payload_limit as u64,
@@ -373,6 +395,12 @@ impl<S: Session> Conn<'_, S> {
                 self.max_tx_udp_payload_size(),
                 data.len(),
                 self.retained_next_offset(stream),
+                // SAFETY: both calls are pure queries on the live connection.
+                unsafe { sys::ngtcp2_conn_get_max_data_left2(self.raw()) },
+                unsafe { sys::ngtcp2_conn_get_max_stream_data_left2(self.raw(), stream.get()) },
+                unsafe { sys::ngtcp2_conn_get_cwnd_left2(self.raw()) },
+                now.as_raw(),
+                self.expiry().map(|expiry| expiry.as_raw()),
             )
         });
 
@@ -390,7 +418,18 @@ impl<S: Session> Conn<'_, S> {
             _ => 0,
         };
         #[cfg(feature = "diagnostics")]
-        if let Some((role, sampled_payload_limit, offered, stream_offset)) = diagnostic_context {
+        if let Some((
+            role,
+            sampled_payload_limit,
+            offered,
+            stream_offset,
+            connection_credit_before,
+            stream_credit_before,
+            congestion_credit_before,
+            diagnostic_now,
+            expiry_before,
+        )) = diagnostic_context
+        {
             let category = match outcome {
                 StreamWrite::Datagram { .. } => crate::diagnostics::AttemptOutcome::Datagram,
                 StreamWrite::DatagramWithoutStream { .. } => {
@@ -409,6 +448,11 @@ impl<S: Session> Conn<'_, S> {
                 role,
                 direction: "outbound",
                 stream_id: stream.get(),
+                connection_credit_before,
+                stream_credit_before,
+                congestion_credit_before,
+                now: diagnostic_now,
+                expiry_before,
                 stream_offset,
                 offered_bytes: offered as u64,
                 sampled_payload_limit: sampled_payload_limit as u64,

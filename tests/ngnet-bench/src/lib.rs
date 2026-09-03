@@ -49,8 +49,8 @@ use std::fmt::Debug;
 use std::future::{Future, poll_fn};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -329,6 +329,53 @@ fn response_for(body: Bytes) -> http::Response<BenchBody> {
         .expect("a well-formed response")
 }
 
+/// Stable application boundary for supervised HTTP/3 liveness probes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckedPhase {
+    /// Waiting for the response headers.
+    ResponseHead,
+    /// Reading response body bytes before the expected length has arrived.
+    BodyDrain,
+    /// All expected bytes arrived and the body is waiting for its terminal indication.
+    TerminalWait,
+    /// The exact body and terminal indication both arrived.
+    Complete,
+}
+
+/// Last durable application-level progress for one checked exchange.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckedProgressSnapshot {
+    /// Current application boundary.
+    pub phase: CheckedPhase,
+    /// Response bytes observed so far.
+    pub received: usize,
+}
+
+/// Shared progress cell used by an external supervisor while an exchange is pending.
+#[derive(Clone, Debug)]
+pub struct CheckedProgress(Arc<Mutex<CheckedProgressSnapshot>>);
+
+impl Default for CheckedProgress {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(CheckedProgressSnapshot {
+            phase: CheckedPhase::ResponseHead,
+            received: 0,
+        })))
+    }
+}
+
+impl CheckedProgress {
+    /// Returns the most recently recorded phase and byte offset.
+    pub fn snapshot(&self) -> CheckedProgressSnapshot {
+        *self.0.lock().expect("checked progress mutex poisoned")
+    }
+
+    fn record(&self, phase: CheckedPhase, received: usize) {
+        *self.0.lock().expect("checked progress mutex poisoned") =
+            CheckedProgressSnapshot { phase, received };
+    }
+}
+
 /// Reads a whole received body and reports its length, without accumulating it.
 ///
 /// The point is that the client actually *drains* the response: the two stacks defer
@@ -355,9 +402,37 @@ where
     B: Body<Data = Bytes> + Unpin,
     B::Error: Debug,
 {
+    try_drain_checked_observed(&mut body, expected, None).await
+}
+
+async fn try_drain_checked_observed<B>(
+    body: &mut B,
+    expected: &[u8],
+    progress: Option<&CheckedProgress>,
+) -> Result<(usize, bool), String>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: Debug,
+{
     let mut total = 0usize;
     let mut exact = true;
-    while let Some(frame) = poll_fn(|context| Pin::new(&mut body).poll_frame(context)).await {
+    if let Some(progress) = progress {
+        progress.record(CheckedPhase::BodyDrain, 0);
+    }
+    loop {
+        if let Some(progress) = progress {
+            progress.record(
+                if total == expected.len() {
+                    CheckedPhase::TerminalWait
+                } else {
+                    CheckedPhase::BodyDrain
+                },
+                total,
+            );
+        }
+        let Some(frame) = poll_fn(|context| Pin::new(&mut *body).poll_frame(context)).await else {
+            break;
+        };
         let frame = frame.map_err(|error| format!("response body frame failed: {error:?}"))?;
         if let Some(data) = frame.data_ref() {
             let end = total.saturating_add(data.len());
@@ -385,7 +460,11 @@ where
             total = end;
         }
     }
-    Ok((total, exact && total == expected.len()))
+    let exact = exact && total == expected.len();
+    if let Some(progress) = progress {
+        progress.record(CheckedPhase::Complete, total);
+    }
+    Ok((total, exact))
 }
 
 /// Reads a whole received body into contiguous bytes, so a server can echo it back. Both
@@ -2029,6 +2108,17 @@ impl NgnetNgtcpH3 {
 
     /// Sends one request and reports response-head/body failures without panicking.
     pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
+        self.try_round_trip_checked_observed(body, &CheckedProgress::default())
+            .await
+    }
+
+    /// Checked round trip that records its current application boundary.
+    pub async fn try_round_trip_checked_observed(
+        &self,
+        body: Bytes,
+        progress: &CheckedProgress,
+    ) -> Result<(usize, bool), String> {
+        progress.record(CheckedPhase::ResponseHead, 0);
         let expected = body.clone();
         let response = self
             .handle
@@ -2041,7 +2131,7 @@ impl NgnetNgtcpH3 {
                 response.status()
             ));
         }
-        try_drain_checked(response.into_body(), &expected).await
+        try_drain_checked_observed(&mut response.into_body(), &expected, Some(progress)).await
     }
 }
 
@@ -2183,6 +2273,17 @@ impl NgnetNgtcpH3Matched {
     /// transport under both arms has a known unresolved large-body liveness defect and a probe
     /// that panicked would lose the evidence.
     pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
+        self.try_round_trip_checked_observed(body, &CheckedProgress::default())
+            .await
+    }
+
+    /// Checked round trip that records its current application boundary.
+    pub async fn try_round_trip_checked_observed(
+        &self,
+        body: Bytes,
+        progress: &CheckedProgress,
+    ) -> Result<(usize, bool), String> {
+        progress.record(CheckedPhase::ResponseHead, 0);
         let expected = body.clone();
         let response = self
             .handle
@@ -2195,7 +2296,7 @@ impl NgnetNgtcpH3Matched {
                 response.status()
             ));
         }
-        try_drain_checked(response.into_body(), &expected).await
+        try_drain_checked_observed(&mut response.into_body(), &expected, Some(progress)).await
     }
 }
 
@@ -2376,6 +2477,16 @@ impl UpstreamH3Ngtcp {
 
     /// Sends one request and reports failures without panicking, for supervised probes.
     pub async fn try_round_trip_checked(&self, body: Bytes) -> Result<(usize, bool), String> {
+        self.try_round_trip_checked_observed(body, &CheckedProgress::default())
+            .await
+    }
+
+    /// Checked round trip that records its current application boundary.
+    pub async fn try_round_trip_checked_observed(
+        &self,
+        body: Bytes,
+        progress: &CheckedProgress,
+    ) -> Result<(usize, bool), String> {
         let expected = body.clone();
         let mut sender = self.sender.clone();
         let mut stream = sender
@@ -2392,6 +2503,7 @@ impl UpstreamH3Ngtcp {
             .finish()
             .await
             .map_err(|error| format!("upstream ngtcp2 finish failed: {error:?}"))?;
+        progress.record(CheckedPhase::ResponseHead, 0);
         let response = stream
             .recv_response()
             .await
@@ -2405,6 +2517,14 @@ impl UpstreamH3Ngtcp {
         let mut total = 0usize;
         let mut exact = true;
         loop {
+            progress.record(
+                if total == expected.len() {
+                    CheckedPhase::TerminalWait
+                } else {
+                    CheckedPhase::BodyDrain
+                },
+                total,
+            );
             match stream.recv_data().await {
                 Ok(Some(mut chunk)) => {
                     while chunk.has_remaining() {
@@ -2427,6 +2547,7 @@ impl UpstreamH3Ngtcp {
         if total != expected.len() {
             exact = false;
         }
+        progress.record(CheckedPhase::Complete, total);
         Ok((total, exact))
     }
 }

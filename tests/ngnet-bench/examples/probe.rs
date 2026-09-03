@@ -1,7 +1,7 @@
 //! A single-arm driver for profiling. Not a benchmark: it exists so `perf` and `strace` can be
 //! pointed at exactly one fixture, which Criterion's multi-arm process makes impossible.
 //!
-//! Usage: `probe <arm> <workload> <param> <iters> [timing|diagnostic]`
+//! Usage: `probe <arm> <workload> <param> <iters> [timing|reliability|diagnostic]`
 //!   arm      = h2-duplex | h2-socket | qmux-duplex | qmux-socket |
 //!              ngnet-qmux-matched-duplex | ngnet-qmux-matched-socket |
 //!              h3-qmux-duplex | h3-qmux-socket |
@@ -12,16 +12,19 @@
 //!
 //! The QUIC arms support `body` only. Diagnostic mode uses bench-local symmetric counters for
 //! the four QMux arms. `ngnet-quic-h3 body` additionally requires `--features diagnostics`;
-//! timing mode is always unarmed.
+//! reliability and timing modes are always unarmed.
 
 use std::hint::black_box;
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ngnet_bench::{
-    NgnetH2, NgnetH3Quinn, NgnetNgtcpH3, NgnetNgtcpH3Matched, NgnetQmuxH3, NgnetQmuxH3Matched,
-    NgnetQmuxH3MatchedSocket, NgnetQmuxH3Socket, TokioSocket, UpstreamH3Ngtcp, UpstreamH3Qmux,
-    UpstreamH3QmuxSocket, UpstreamH3Quinn, body_of, current_thread_runtime,
+    CheckedPhase, CheckedProgress, NgnetH2, NgnetH3Quinn, NgnetNgtcpH3, NgnetNgtcpH3Matched,
+    NgnetQmuxH3, NgnetQmuxH3Matched, NgnetQmuxH3MatchedSocket, NgnetQmuxH3Socket, TokioSocket,
+    UpstreamH3Ngtcp, UpstreamH3Qmux, UpstreamH3QmuxSocket, UpstreamH3Quinn, body_of,
+    current_thread_runtime,
 };
 
 enum Arm {
@@ -61,11 +64,15 @@ impl Arm {
         }
     }
 
-    async fn round_trip_checked(&self, body: bytes::Bytes) -> Result<(usize, bool), String> {
+    async fn round_trip_checked(
+        &self,
+        body: bytes::Bytes,
+        progress: &CheckedProgress,
+    ) -> Result<(usize, bool), String> {
         match self {
-            Arm::NgnetNgtcpH3(a) => a.try_round_trip_checked(body).await,
-            Arm::NgnetNgtcpH3Matched(a) => a.try_round_trip_checked(body).await,
-            Arm::UpstreamH3Ngtcp(a) => a.try_round_trip_checked(body).await,
+            Arm::NgnetNgtcpH3(a) => a.try_round_trip_checked_observed(body, progress).await,
+            Arm::NgnetNgtcpH3Matched(a) => a.try_round_trip_checked_observed(body, progress).await,
+            Arm::UpstreamH3Ngtcp(a) => a.try_round_trip_checked_observed(body, progress).await,
             Arm::NgnetQmuxMatchedDuplex(a) => a.try_round_trip_checked(body).await,
             Arm::NgnetQmuxMatchedSocket(a) => a.try_round_trip_checked(body).await,
             Arm::UpstreamQmuxDuplex(a) => a.try_round_trip_checked(body).await,
@@ -130,7 +137,34 @@ impl Arm {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Timing,
+    Reliability,
     Diagnostic,
+}
+
+fn phase_name(phase: CheckedPhase) -> &'static str {
+    match phase {
+        CheckedPhase::ResponseHead => "response-head",
+        CheckedPhase::BodyDrain => "body-drain",
+        CheckedPhase::TerminalWait => "terminal-wait",
+        CheckedPhase::Complete => "complete",
+    }
+}
+
+fn timeout_classifier(phase: CheckedPhase) -> &'static str {
+    match phase {
+        CheckedPhase::ResponseHead => "s9-response-head-timeout",
+        CheckedPhase::BodyDrain => "s9-body-drain-timeout",
+        CheckedPhase::TerminalWait => "unclassified-terminal-wait",
+        CheckedPhase::Complete => "unclassified-after-complete",
+    }
+}
+
+fn process_timeout(mode: Mode) -> Option<Duration> {
+    match mode {
+        Mode::Timing => None,
+        Mode::Reliability => Some(Duration::from_secs(150)),
+        Mode::Diagnostic => Some(Duration::from_secs(600)),
+    }
 }
 
 fn flush_stderr() {
@@ -212,7 +246,8 @@ fn emit_diagnostics(
         eprintln!(
             "PROBE-DIAGNOSTIC exchange={exchange} attempt={attempt_index} sequence={} \
              connection_id={} role={:?} direction={} stream_id={} stream_offset={} \
-             offered={} sampled_payload_limit={} \
+             connection_credit_before={} stream_credit_before={} congestion_credit_before={} \
+             now={} expiry_before={} offered={} sampled_payload_limit={} \
              prepared_backing_capacity={} \
              accepted_prefix={} fin={} zero_acceptance={} logical_retained={} \
              retained_backing_capacity={} outcome={:?}",
@@ -222,6 +257,13 @@ fn emit_diagnostics(
             attempt.direction,
             attempt.stream_id,
             attempt.stream_offset,
+            attempt.connection_credit_before,
+            attempt.stream_credit_before,
+            attempt.congestion_credit_before,
+            attempt.now,
+            attempt
+                .expiry_before
+                .map_or_else(|| "none".to_string(), |expiry| expiry.to_string()),
             attempt.offered_bytes,
             attempt.sampled_payload_limit,
             attempt.prepared_backing_capacity,
@@ -280,10 +322,12 @@ fn emit_diagnostics(
                     && event.enabling_sequence.is_none()
             })
             .count() as u64;
-        assert_eq!(
-            values.zero_accept_retries_without_enable, retries_without_enable,
-            "{role} zero-accept retry/event reconciliation failed at exchange {exchange}"
-        );
+        if snapshot.dropped_liveness_records == 0 {
+            assert_eq!(
+                values.zero_accept_retries_without_enable, retries_without_enable,
+                "{role} zero-accept retry/event reconciliation failed at exchange {exchange}"
+            );
+        }
         assert_eq!(
             values.inbound_drops, 0,
             "{role} observed an unexpected inbound drop at exchange {exchange}"
@@ -320,7 +364,9 @@ fn emit_diagnostics(
              inbound_queue_depth={} inbound_queue_high_water={} inbound_drops={} \
              outbound_queue_depth={} outbound_queue_high_water={} \
              outbound_capacity_transitions={} terminal_discarded_inbound={} \
-             terminal_discarded_outbound={} retransmissions=unavailable overflow={}",
+             terminal_discarded_outbound={} stream_credit_bytes={} \
+             connection_credit_bytes={} dropped_attempt_records={} \
+             dropped_liveness_records={} retransmissions=unavailable overflow={}",
             values.offered_bytes,
             values.prepared_backing_capacity,
             values.accepted_bytes,
@@ -353,6 +399,10 @@ fn emit_diagnostics(
             values.outbound_capacity_transitions,
             values.terminal_discarded_inbound,
             values.terminal_discarded_outbound,
+            values.stream_credit_bytes,
+            values.connection_credit_bytes,
+            snapshot.dropped_attempt_records,
+            snapshot.dropped_liveness_records,
             snapshot.overflowed,
         );
     }
@@ -427,6 +477,14 @@ fn validate_request(
                 .to_string(),
         );
     }
+    if mode == Mode::Reliability
+        && (!matches!(
+            arm_name,
+            "ngnet-quic-h3" | "ngnet-quic-h3-matched" | "h3-ngnet-quic"
+        ) || workload != "body")
+    {
+        return Err("reliability mode supports only the three ngtcp2 HTTP/3 body arms".to_string());
+    }
     Ok(())
 }
 
@@ -438,14 +496,15 @@ fn main() {
     let iters: usize = args.get(4).expect("iters").parse().expect("a number");
     let mode = match args.get(5).map(String::as_str).unwrap_or("timing") {
         "timing" => Mode::Timing,
+        "reliability" => Mode::Reliability,
         "diagnostic" => Mode::Diagnostic,
-        other => panic!("unknown mode {other}; expected timing or diagnostic"),
+        other => panic!("unknown mode {other}; expected timing, reliability, or diagnostic"),
     };
     validate_request(&arm_name, &workload, param, iters, mode)
         .unwrap_or_else(|message| panic!("{message}"));
     #[cfg(not(feature = "diagnostics"))]
     assert!(
-        mode == Mode::Timing || arm_name != "ngnet-quic-h3",
+        mode != Mode::Diagnostic || arm_name != "ngnet-quic-h3",
         "ngnet-quic-h3 diagnostic mode requires `cargo build -p ngnet-bench --example probe \
          --release --features diagnostics`"
     );
@@ -513,10 +572,10 @@ fn main() {
         eprintln!(
             "PROBE-METADATA arm={arm_name} workload={workload} param={param} count={iters} \
              warmup=1-explicit mode={} os={} arch={} build={} pid={} host={}",
-            if mode == Mode::Timing {
-                "timing"
-            } else {
-                "diagnostic"
+            match mode {
+                Mode::Timing => "timing",
+                Mode::Reliability => "reliability",
+                Mode::Diagnostic => "diagnostic",
             },
             std::env::consts::OS,
             std::env::consts::ARCH,
@@ -548,87 +607,162 @@ fn main() {
         match workload.as_str() {
             "body" => {
                 let payload = body_payload.expect("body workload has a payload");
-                for exchange in 1..=iters {
-                    let (received, exact) = if mode == Mode::Timing {
-                        (arm.round_trip(payload.clone()).await, true)
-                    } else {
-                        match tokio::time::timeout(
-                            exchange_timeout(param),
-                            arm.round_trip_checked(payload.clone()),
-                        )
-                        .await
-                        {
-                            Ok(Ok(received)) => received,
-                            Ok(Err(error)) => {
-                                let failure_rss = rss_kib();
-                                eprintln!(
-                                    "PROBE-FAIL exchange={exchange} last_completed={} \
-                                     reason=request-or-body error={error:?}",
-                                    exchange - 1,
-                                );
-                                emit_rss("failure-request-or-body", exchange, failure_rss);
+                let progress = CheckedProgress::default();
+                let active_exchange = Arc::new(AtomicUsize::new(1));
+                let workload = async {
+                    for exchange in 1..=iters {
+                        active_exchange.store(exchange, Ordering::Release);
+                        if mode != Mode::Timing {
+                            eprintln!(
+                                "PROBE-CHECKPOINT exchange={exchange} last_completed={} \
+                                 phase={} received_bytes=0 diagnostics_armed={}",
+                                exchange - 1,
+                                phase_name(CheckedPhase::ResponseHead),
+                                mode == Mode::Diagnostic && arm_name == "ngnet-quic-h3"
+                            );
+                            flush_stderr();
+                        }
+                        let (received, exact) = if mode == Mode::Timing {
+                            (arm.round_trip(payload.clone()).await, true)
+                        } else {
+                            match tokio::time::timeout(
+                                exchange_timeout(param),
+                                arm.round_trip_checked(payload.clone(), &progress),
+                            )
+                            .await
+                            {
+                                Ok(Ok(received)) => received,
+                                Ok(Err(error)) => {
+                                    let failure_rss = rss_kib();
+                                    let snapshot = progress.snapshot();
+                                    eprintln!(
+                                        "PROBE-FAIL exchange={exchange} last_completed={} \
+                                         phase={} received_bytes={} classifier={} \
+                                         supervisor=inner-error diagnostics_armed={} error={error:?}",
+                                        exchange - 1,
+                                        phase_name(snapshot.phase),
+                                        snapshot.received,
+                                        match snapshot.phase {
+                                            CheckedPhase::ResponseHead => {
+                                                "s9-unexpected-close-response-head"
+                                            }
+                                            CheckedPhase::BodyDrain => {
+                                                "s9-unexpected-close-body-drain"
+                                            }
+                                            CheckedPhase::TerminalWait => {
+                                                "unclassified-terminal-wait"
+                                            }
+                                            CheckedPhase::Complete => "unclassified-after-complete",
+                                        },
+                                        mode == Mode::Diagnostic && arm_name == "ngnet-quic-h3"
+                                    );
+                                    emit_rss("failure-request-or-body", exchange, failure_rss);
+                                    emit_diagnostics(
+                                        &arm_name,
+                                        exchange,
+                                        "failure-request-or-body",
+                                        None,
+                                    );
+                                    arm.emit_symmetric_counters(
+                                        exchange,
+                                        "failure-request-or-body",
+                                    );
+                                    flush_stderr();
+                                    panic!("exchange {exchange} failed before an exact response");
+                                }
+                                Err(_) => {
+                                    let failure_rss = rss_kib();
+                                    let snapshot = progress.snapshot();
+                                    eprintln!(
+                                        "PROBE-FAIL exchange={exchange} last_completed={} \
+                                         phase={} received_bytes={} classifier={} \
+                                         supervisor=inner-timeout diagnostics_armed={} timeout_ms={}",
+                                        exchange - 1,
+                                        phase_name(snapshot.phase),
+                                        snapshot.received,
+                                        timeout_classifier(snapshot.phase),
+                                        mode == Mode::Diagnostic && arm_name == "ngnet-quic-h3",
+                                        exchange_timeout(param).as_millis()
+                                    );
+                                    emit_rss("failure-timeout", exchange, failure_rss);
+                                    emit_diagnostics(&arm_name, exchange, "failure-timeout", None);
+                                    arm.emit_symmetric_counters(exchange, "failure-timeout");
+                                    flush_stderr();
+                                    panic!(
+                                        "exchange {exchange} exceeded its workload-scaled timeout"
+                                    );
+                                }
+                            }
+                        };
+                        let post_drain_rss = (mode == Mode::Diagnostic).then(rss_kib).flatten();
+                        if received != param || !exact {
+                            eprintln!(
+                                "PROBE-FAIL exchange={exchange} last_completed={} phase=complete \
+                                 received_bytes={received} classifier={} supervisor=inner-error \
+                                 diagnostics_armed={} expected_bytes={param}",
+                                exchange - 1,
+                                if received != param {
+                                    "wrong-length"
+                                } else {
+                                    "wrong-content"
+                                },
+                                mode == Mode::Diagnostic && arm_name == "ngnet-quic-h3"
+                            );
+                            if mode == Mode::Diagnostic {
+                                emit_rss("failure-response-drained", exchange, post_drain_rss);
                                 emit_diagnostics(
                                     &arm_name,
                                     exchange,
-                                    "failure-request-or-body",
+                                    "failure-response-drained",
                                     None,
                                 );
-                                arm.emit_symmetric_counters(exchange, "failure-request-or-body");
-                                flush_stderr();
-                                panic!("exchange {exchange} failed before an exact response");
-                            }
-                            Err(_) => {
-                                let failure_rss = rss_kib();
-                                eprintln!(
-                                    "PROBE-FAIL exchange={exchange} last_completed={} \
-                                     reason=timeout timeout_ms={}",
-                                    exchange - 1,
-                                    exchange_timeout(param).as_millis()
+                                arm.emit_symmetric_counters(
+                                    exchange,
+                                    "failure-response-drained",
                                 );
-                                emit_rss("failure-timeout", exchange, failure_rss);
-                                emit_diagnostics(&arm_name, exchange, "failure-timeout", None);
-                                arm.emit_symmetric_counters(exchange, "failure-timeout");
-                                flush_stderr();
-                                panic!("exchange {exchange} exceeded its workload-scaled timeout");
                             }
+                            flush_stderr();
+                            panic!("exchange {exchange} response was not exact");
                         }
-                    };
-                    // Capture immediately after the response drain, before exactness or
-                    // diagnostic formatting can perturb the resident-set observation.
-                    let post_drain_rss = (mode == Mode::Diagnostic).then(rss_kib).flatten();
-                    if received != param || !exact {
-                        eprintln!(
-                            "PROBE-FAIL exchange={exchange} last_completed={} reason={} \
-                             expected={param} actual={received}",
-                            exchange - 1,
-                            if received != param {
-                                "wrong-length"
-                            } else {
-                                "wrong-content"
-                            }
-                        );
+                        black_box(received);
+                        if mode != Mode::Timing {
+                            eprintln!(
+                                "PROBE-CHECKPOINT exchange={exchange} completed={exchange} \
+                                 phase=complete received_bytes={received} classifier=completed \
+                                 diagnostics_armed={}",
+                                mode == Mode::Diagnostic && arm_name == "ngnet-quic-h3"
+                            );
+                            flush_stderr();
+                        }
                         if mode == Mode::Diagnostic {
-                            emit_rss("failure-response-drained", exchange, post_drain_rss);
-                            emit_diagnostics(&arm_name, exchange, "failure-response-drained", None);
-                            arm.emit_symmetric_counters(exchange, "failure-response-drained");
+                            tokio::task::yield_now().await;
+                            emit_rss("response-drained", exchange, post_drain_rss);
+                            emit_diagnostics(&arm_name, exchange, "both-endpoints", Some(param));
+                            arm.emit_symmetric_counters(exchange, "both-endpoints");
                         }
-                        flush_stderr();
-                        panic!("exchange {exchange} response was not exact");
                     }
-                    black_box(received);
-                    if mode == Mode::Diagnostic {
-                        // Let the counted endpoint consume its already-scheduled credit/flush
-                        // continuation before this per-exchange interval is observed.
-                        tokio::task::yield_now().await;
-                        emit_rss("response-drained", exchange, post_drain_rss);
-                        emit_diagnostics(&arm_name, exchange, "both-endpoints", Some(param));
-                        arm.emit_symmetric_counters(exchange, "both-endpoints");
+                };
+                if let Some(limit) = process_timeout(mode) {
+                    if tokio::time::timeout(limit, workload).await.is_err() {
+                        let exchange = active_exchange.load(Ordering::Acquire);
+                        let snapshot = progress.snapshot();
                         eprintln!(
-                            "PROBE-PROGRESS exchange={exchange} completed={exchange} \
-                             expected_bytes={param} received_bytes={received}"
+                            "PROBE-FAIL exchange={exchange} last_completed={} phase={} \
+                             received_bytes={} classifier={} supervisor=process-timeout \
+                             diagnostics_armed={} timeout_ms={}",
+                            exchange.saturating_sub(1),
+                            phase_name(snapshot.phase),
+                            snapshot.received,
+                            timeout_classifier(snapshot.phase),
+                            mode == Mode::Diagnostic && arm_name == "ngnet-quic-h3",
+                            limit.as_millis()
                         );
+                        emit_diagnostics(&arm_name, exchange, "failure-process-timeout", None);
                         flush_stderr();
+                        panic!("probe body workload exceeded its process deadline");
                     }
+                } else {
+                    workload.await;
                 }
             }
             "concurrent" => {
@@ -658,7 +792,7 @@ fn main() {
                     elapsed.as_nanos()
                 );
             }
-        } else {
+        } else if mode == Mode::Diagnostic {
             emit_diagnostics(&arm_name, iters, "final", None);
             arm.emit_symmetric_counters(iters, "final");
             emit_rss("final", iters, rss_kib());
@@ -709,5 +843,41 @@ mod tests {
         } else {
             assert!(exchange_timeout(1024 * 1024) >= Duration::from_secs(60));
         }
+    }
+
+    #[test]
+    fn reliability_mode_and_process_deadlines_are_explicit() {
+        assert!(
+            validate_request("ngnet-quic-h3", "body", 1_048_576, 125, Mode::Reliability).is_ok()
+        );
+        assert!(
+            validate_request(
+                "ngnet-quic-h3-matched",
+                "body",
+                1_048_576,
+                30,
+                Mode::Reliability
+            )
+            .is_ok()
+        );
+        assert!(validate_request("ngnet-h3-quinn", "body", 1024, 1, Mode::Reliability).is_err());
+        assert_eq!(process_timeout(Mode::Timing), None);
+        assert_eq!(
+            process_timeout(Mode::Reliability),
+            Some(Duration::from_secs(150))
+        );
+        assert_eq!(
+            process_timeout(Mode::Diagnostic),
+            Some(Duration::from_secs(600))
+        );
+    }
+
+    #[test]
+    fn terminal_wait_is_not_assumed_to_be_the_lost_fin_defect() {
+        assert_eq!(phase_name(CheckedPhase::TerminalWait), "terminal-wait");
+        assert_eq!(
+            timeout_classifier(CheckedPhase::TerminalWait),
+            "unclassified-terminal-wait"
+        );
     }
 }
