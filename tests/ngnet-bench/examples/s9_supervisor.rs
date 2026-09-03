@@ -133,8 +133,12 @@ fn descendant_identities(root: u32) -> Result<Vec<ProcessIdentity>, String> {
     Ok(found.into_values().collect())
 }
 
-fn still_same_process(identity: ProcessIdentity) -> bool {
-    process_identity(identity.pid).is_ok_and(|current| current == identity)
+fn still_same_process(identity: ProcessIdentity) -> Result<bool, String> {
+    match process_identity(identity.pid) {
+        Ok(current) => Ok(current == identity),
+        Err(_) if !std::path::Path::new(&format!("/proc/{}", identity.pid)).exists() => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn terminate_pids(pids: &[ProcessIdentity], signal: &str) {
@@ -173,6 +177,11 @@ fn failure_record(output: &str) -> &str {
                 || line.contains("failed; last completed exchange")
         })
         .unwrap_or("unavailable")
+}
+
+fn probe_completed_exactly(output: &str, expected: &str) -> bool {
+    let marker = format!("PROBE-DONE completed={expected}");
+    output.lines().any(|line| line == marker)
 }
 
 fn append_manifest(path: Option<&str>, record: &str) {
@@ -363,19 +372,49 @@ fn main() {
                 }
             }
         };
+        match descendant_identities(supervisor_pid) {
+            Ok(descendants) => {
+                for identity in descendants {
+                    if !captured.contains(&identity) {
+                        captured.push(identity);
+                    }
+                }
+            }
+            Err(_error) if !std::path::Path::new(&format!("/proc/{supervisor_pid}")).exists() => {}
+            Err(error) => inspection_error = Some(error),
+        }
         let captured_for_record = captured.clone();
-
-        let mut remaining = captured
-            .into_iter()
-            .filter(|identity| still_same_process(*identity))
-            .collect::<Vec<_>>();
+        let mut remaining = Vec::new();
+        for identity in captured {
+            match still_same_process(identity) {
+                Ok(true) => remaining.push(identity),
+                Ok(false) => {}
+                Err(error) => inspection_error = Some(error),
+            }
+        }
         terminate_pids(&remaining, "-TERM");
         if !remaining.is_empty() {
             thread::sleep(Duration::from_millis(100));
-            remaining.retain(|identity| still_same_process(*identity));
+            let mut survivors = Vec::new();
+            for identity in remaining {
+                match still_same_process(identity) {
+                    Ok(true) => survivors.push(identity),
+                    Ok(false) => {}
+                    Err(error) => inspection_error = Some(error),
+                }
+            }
+            remaining = survivors;
             terminate_pids(&remaining, "-KILL");
             thread::sleep(Duration::from_millis(100));
-            remaining.retain(|identity| still_same_process(*identity));
+            let mut survivors = Vec::new();
+            for identity in remaining {
+                match still_same_process(identity) {
+                    Ok(true) => survivors.push(identity),
+                    Ok(false) => {}
+                    Err(error) => inspection_error = Some(error),
+                }
+            }
+            remaining = survivors;
         }
         let stdout = stdout_reader.join().expect("join supervised stdout reader");
         let stderr = stderr_reader.join().expect("join supervised stderr reader");
@@ -391,7 +430,7 @@ fn main() {
         let success_marker = if fixture {
             combined.contains("test result: ok. 1 passed")
         } else {
-            combined.contains(&format!("PROBE-DONE completed={}", args[5]))
+            probe_completed_exactly(&combined, &args[5])
         };
         let outcome = classify(
             status.code(),
@@ -553,14 +592,14 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
         let survivors = descendants
             .into_iter()
-            .filter(|identity| still_same_process(*identity))
+            .filter(|identity| still_same_process(*identity).unwrap_or(true))
             .collect::<Vec<_>>();
         terminate_pids(&survivors, "-KILL");
         thread::sleep(Duration::from_millis(100));
         assert!(
             survivors
                 .into_iter()
-                .all(|identity| !still_same_process(identity)),
+                .all(|identity| !still_same_process(identity).unwrap_or(true)),
             "an escaped captured descendant survived TERM"
         );
     }
@@ -572,6 +611,12 @@ mod tests {
         assert!(!manifest_has_completed_run(manifest, 1));
         assert!(!manifest_has_completed_run(manifest, 20));
         assert!(!manifest_has_completed_run("S9-SUPERVISOR-START run=2", 2));
+    }
+
+    #[test]
+    fn probe_completion_marker_matches_the_exact_count() {
+        assert!(probe_completed_exactly("PROBE-DONE completed=1\n", "1"));
+        assert!(!probe_completed_exactly("PROBE-DONE completed=10\n", "1"));
     }
 
     #[test]
