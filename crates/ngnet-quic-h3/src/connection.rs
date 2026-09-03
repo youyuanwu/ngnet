@@ -108,9 +108,7 @@ pub(crate) struct State {
     pub(crate) sleeping: Option<Sleep>,
     /// The deadline that sleep is for.
     pub(crate) sleeping_until: Option<Timestamp>,
-    /// Imminent deadline for which one bounded fallback wake has already been scheduled.
-    pub(crate) imminent_wake_until: Option<Timestamp>,
-    /// Fallback wakes already issued for `imminent_wake_until`.
+    /// Fallback wakes already issued for the current `sleeping_until` deadline.
     pub(crate) imminent_wake_count: u8,
     /// Whether the previous pass parked on a full outbound queue.
     #[cfg(feature = "diagnostics")]
@@ -160,7 +158,6 @@ impl<S: Session> NgtcpConnection<S> {
                 emitted_since_pending: false,
                 sleeping: None,
                 sleeping_until: None,
-                imminent_wake_until: None,
                 imminent_wake_count: 0,
                 #[cfg(feature = "diagnostics")]
                 capacity_parked: false,

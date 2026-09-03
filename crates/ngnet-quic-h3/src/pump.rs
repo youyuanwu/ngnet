@@ -53,7 +53,6 @@ fn poll_timer_state(
     let Some(deadline) = deadline else {
         state.sleeping = None;
         state.sleeping_until = None;
-        state.imminent_wake_until = None;
         state.imminent_wake_count = 0;
         return TimerPoll {
             poll: Poll::Pending,
@@ -67,7 +66,6 @@ fn poll_timer_state(
     if rearmed {
         state.sleeping = Some(sleep_until(deadline));
         state.sleeping_until = Some(deadline);
-        state.imminent_wake_until = None;
         state.imminent_wake_count = 0;
     }
 
@@ -75,7 +73,9 @@ fn poll_timer_state(
     let kicked =
         remaining <= IMMINENT_EXPIRY_NANOS && state.imminent_wake_count < MAX_IMMINENT_WAKES;
     if kicked {
-        state.imminent_wake_until = Some(deadline);
+        // Some runtimes can coalesce a sub-tick sleep with the task currently being polled.
+        // Preserve bounded scheduling edges until the deadline passes; the per-deadline cap
+        // prevents this fallback from becoming an unconditional retry loop.
         state.imminent_wake_count += 1;
         cx.waker().wake_by_ref();
     }
@@ -92,7 +92,6 @@ fn poll_timer_state(
         Poll::Ready(()) => {
             state.sleeping = None;
             state.sleeping_until = None;
-            state.imminent_wake_until = None;
             state.imminent_wake_count = 0;
             TimerPoll {
                 poll: Poll::Ready(()),
@@ -304,14 +303,10 @@ pub(crate) fn poll_timer<S: Session>(
     }
     #[cfg(feature = "diagnostics")]
     if result.kicked {
-        #[cfg(feature = "diagnostics")]
         ngnet_quic::diagnostics::record_timer_kick(
             detached.conn.diagnostic_id(),
             detached.conn.role(),
         );
-        // Some runtimes can coalesce a sub-tick sleep with the task currently being polled.
-        // Preserve bounded scheduling edges until the deadline passes; the per-deadline cap
-        // prevents this fallback from becoming an unconditional retry loop.
     }
     #[cfg(feature = "diagnostics")]
     if result.ready {
@@ -370,7 +365,6 @@ mod tests {
             emitted_since_pending: false,
             sleeping: None,
             sleeping_until: None,
-            imminent_wake_until: None,
             imminent_wake_count: 0,
             #[cfg(feature = "diagnostics")]
             capacity_parked: false,
