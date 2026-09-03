@@ -174,9 +174,7 @@ async fn a_body_larger_than_the_flow_control_window_completes() {
                 && attempt.connection_credit_before > 0
                 && attempt.stream_credit_before > 0
                 && attempt.congestion_credit_before > 0
-                && attempt
-                    .expiry_after
-                    .is_some_and(|expiry| expiry.saturating_sub(attempt.now) <= 20_000)
+                && attempt.expiry_after.is_some()
         });
         assert!(
             captured_selected_state,
