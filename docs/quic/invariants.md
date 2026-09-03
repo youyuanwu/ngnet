@@ -115,7 +115,7 @@ body offer.
 The `tests/ngnet-bench/tests/ngtcp2_fixture.rs` live repetition tests run 125 sequential exact
 echoes at both 16 KiB and 1 MiB under the documented supervisor. They are ignored in ordinary
 workspace runs because they are long-running stress tests. The reproduced run 30 liveness
-mechanism is resolved in the native adapter; its current reliability record is
+symptom remains open; its current reproduction and rejected timer candidates are recorded in
 [`../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md`](../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md).
 With the additive `diagnostics` feature, the active fixture coverage checks every attempt's
 `accepted <= staged <= min(offered, sampled payload)`, FIN suppression on a truncated prefix,

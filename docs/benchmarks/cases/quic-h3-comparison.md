@@ -62,9 +62,9 @@ the transport's `MAX_STREAMS`, identical on both arms — and the workload is se
 ## Why the body sweep stops at 1 KiB
 
 The sweep was restricted because the native stack had an intermittent connection-ending stall
-under repeated 16 KiB and 1 MiB workloads (review finding S9). That reproduced timer-wake
-mechanism is now corrected, but this host still fails the calibrated measurement gates and the
-large-body points have not been re-qualified as comparative benchmarks. Larger payloads remain
+under repeated 16 KiB and 1 MiB workloads (review finding S9). Timer-fallback candidates were
+rejected after residual failures, and this host also fails the calibrated measurement gates.
+The large-body points have not been re-qualified as comparative benchmarks. Larger payloads remain
 supervised reliability probes through `examples/probe.rs`, on both arms, rather than timing
 measurements inferred from one stack's history.
 

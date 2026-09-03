@@ -69,4 +69,4 @@ arm was run in this session.
 | --- | --- | --- | --- |
 | [01-h3-ngnet-quic-comparison](01-h3-ngnet-quic-comparison.md) | 2026-09-02 | `6119972` | Hyperium H3 and ngnet H3 over the same ngtcp2 transport — inconclusive, and an adapter defect found |
 | [02-h3-ngnet-quic-fin-fix](02-h3-ngnet-quic-fin-fix.md) | 2026-09-02 | `feature/h3-ngnet-quic` | The lost FIN — root cause of run 01's defect, and reliability after the fix. **Reliability only; no timing claimed** |
-| [03-native-h3-s9-timer-wake](03-native-h3-s9-timer-wake.md) | 2026-09-03 | `088e6c0` | Native large-body S9 — reproduced timer-wake stall and final 100-process qualification. **Reliability only; no timing claimed** |
+| [03-native-h3-s9-timer-wake](03-native-h3-s9-timer-wake.md) | 2026-09-03 | final branch | Native large-body S9 — conclusive harness and timer evidence; fallback candidates rejected after residual failures. **Reliability only; no timing claimed** |

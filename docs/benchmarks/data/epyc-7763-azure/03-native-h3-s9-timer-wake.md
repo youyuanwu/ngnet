@@ -1,9 +1,10 @@
-# Native HTTP/3 S9 timer wake
+# Native HTTP/3 S9 timer investigation
 
 **Date:** 2026-09-03
 **Pre-fix base:** `c78cd78719d89ac0e0ed57bdd5772201ec159123`
-**Qualified implementation:** `088e6c0`
-**Result type:** reliability and correctness only; no performance claim
+**Harness implementation:** final branch
+**Production result:** no timer fallback retained; S9 remains open
+**Result type:** reproduction and correctness evidence only; no performance claim
 
 ## Workload and supervision
 
@@ -45,47 +46,61 @@ This is not PR #57's lost FIN: substantial body data remained, the native result
 transport blocking, and the failure was not a complete body waiting only for its terminal
 frame.
 
-## Change and regression
+## Candidate changes
 
-The detached adapter keeps its ordinary expiry sleep. For an expiry no more than 20 µs away,
-it additionally schedules fallback polls, capped at 64 for one unchanged deadline and reset
-when the deadline moves or the timer completes. The focused regression checks the exact
-threshold, threshold plus one nanosecond, the cap, and a fresh budget for a new deadline.
-
-This is a bounded scheduling fallback, not an unconditional poll loop. Armed observations
-count it separately as `TimerKick`; record retention remains bounded and reports drops.
+Three timer-fallback revisions were evaluated: an immediate one-wake edge, a bounded self-wake
+budget, and a coarse backup sleep gated on no-progress transport blocking. Their focused tests
+and exact exchanges passed, but none deterministically reproduced the missing runtime wake or
+proved progress from the captured state. The fallback changes were removed from production.
 
 ## Post-change result
 
-Three separate post-change schedules each exited successfully:
+Three candidate schedules each exited successfully:
 
 | Revision | Processes | Exchanges | Classified failures | Outer kills | Cleanup failures |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `ad14c82` initial one-wake fallback | 100 | 12,500 | 0 | 0 | 0 |
 | `fb8257d` bounded-64 final fallback | 100 | 12,500 | 0 | 0 | 0 |
-| `088e6c0` no-progress-gated final implementation | 100 | 12,500 | 0 | 0 | 0 |
+| `4dec3b1` deadline-backed candidate | 100 | 12,500 | 0 | 0 | 0 |
 
-The schedules are not pooled because they exercised successive revisions. Each 0/100 result
+The schedules are not pooled because they exercised successive candidates. Each 0/100 result
 independently gives an approximate one-sided 95% upper per-process failure-rate bound of 3%.
-It does not prove that intermittent failure is impossible.
+They did not prove that intermittent failure is impossible or that the candidate was causal.
 
-A separate armed 16 KiB schedule on the earlier broad gate completed 10/10 and recorded 35,054
-bounded timer kicks. The final gate at `088e6c0` is narrower: it applies only after a no-progress transport
-block and uses a 20 µs threshold. One final armed exact 1 MiB exchange recorded 368 kicks across
-both endpoints and 1,564 produced packets, with zero diagnostic-record drops. The fallback is
-therefore exercised during healthy transfers, not only failures; its CPU cost is unmeasured on
-this host. Both ignored exact fixtures also completed under the committed supervisor. These are
-supporting correctness observations, not timing measurements.
+A separate armed 16 KiB schedule on the self-wake candidate completed 10/10. The backup-sleep
+candidate completed 20/20 armed 125 × 1 MiB processes. Nevertheless, its ignored 1 MiB fixture
+recorded one response-head failure in 30 processes, and the earlier self-wake candidate had one
+close-before-response failure in eight all-feature workspace runs.
 
 The timer-fire counter now means "expiry observed due at pump entry"; historical captures used
 the narrower "sleep observed ready" hook. Current runs separately report `timer-ready`, so old
 and new `timer_fires` counts must not be compared directly.
 
-## Limits
+The backup-sleep candidate also completed ten pre-declared sequential
+`cargo test --workspace --all-features` invocations. An earlier self-wake candidate produced
+one close-before-response failure in eight such invocations.
 
-- The current reliability result applies to the reproduced missing imminent-timer wake.
-- Response-head and body-drain occurrences shared that transport state; a future failure with
-  different evidence must be classified independently.
+### Residual fixture observation
+
+The backup-sleep candidate's ignored 125 × 16 KiB fixture completed 5/5. Its ignored
+125 × 1 MiB fixture recorded one classified response-head failure in its first five processes;
+25 subsequent processes completed, for 1/30 overall. The failing process had no armed
+same-occurrence trace, so it cannot be attributed to the timer state or another mechanism.
+
+This residual prevents a claim that every S9-shaped failure is eliminated. The committed
+fixture supervisor and typed checkpoints make it reproducible and classify the exact phase,
+integrity, terminal state, completion marker, and cleanup result. A future occurrence needs an
+armed same-occurrence capture before another production change is justified.
+
+## Decision and limits
+
+- The timer state is a high-confidence correlation, not a deterministically proven root cause.
+- No production timer fallback is retained because residual failures remained and the
+  candidates added steady-state scheduling work.
+- The committed supervisor and bounded diagnostics provide a high-confidence reproducer.
+- A fix remains blocked on an armed same-occurrence residual capture.
+- After removing the candidates, 20 additional primary processes completed. That clean sample
+  does not override the earlier repeated failures or prove the residual absent.
 - ngtcp2 frame inventory and retransmission attribution remain unavailable through the safe
   wrapper.
 - The host remains unsuitable for cross-run or cross-machine performance conclusions.

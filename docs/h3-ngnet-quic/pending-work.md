@@ -137,9 +137,9 @@ not the other, so it belongs to the native stack. That is the same rule used the
 for the defect above, when this adapter failed 6 in 10 and the native arm 0 in 10 at 1 KiB.
 
 Round 2 saw none. Fifty clean runs bounded the fault rather than disproving it. Later native
-work reproduced S9 directly, attributed it to a missed imminent timer wake in
-`ngnet-quic-h3`; the final implementation and two earlier revisions each completed a separate
-100-process post-change schedule. See
+work reproduced S9 directly and localized failures around an armed imminent timer with no
+observed wake. Several fallback candidates passed 100-process schedules, but residual failures
+remained and the candidates were removed. The native S9 symptom therefore remains open. See
 [`../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md`](../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md).
 
 Consequences for this crate:

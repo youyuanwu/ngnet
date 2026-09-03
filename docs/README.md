@@ -114,7 +114,7 @@ each other over one transport, which is what
   that would fail without it, including which tests were checked against the pre-fix code.
 - [`h3-ngnet-quic/pending-work.md`](h3-ngnet-quic/pending-work.md) — the lost FIN that caused
   this adapter's intermittent stall and how it was fixed, the native stack's separately
-  reproduced and corrected large-body timer stall, the deferred zero-copy body path, and what
+  reproduced open large-body stall, the deferred zero-copy body path, and what
   is deliberately not implemented.
 
 ## HTTP/3 over QUIC

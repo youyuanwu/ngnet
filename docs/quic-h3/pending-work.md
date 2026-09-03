@@ -45,11 +45,11 @@ the end-to-end story, including which stack this actually stalled, is in
 [`../h3-ngnet-quic/pending-work.md`](../h3-ngnet-quic/pending-work.md).
 
 **This is not the large-body stall and did not fix it.** That was re-measured afterwards and
-survived until the separate timer-wake correction described in the next section.
+remains open; see the next section.
 
-## The reproduced large-body failure was a missed imminent timer wake
+## The reproduced large-body failure remains open
 
-S9 was reproduced on the current EPYC host before the correction: five of the first 73
+S9 was reproduced on the current EPYC host during this investigation: five of the first 73
 supervised native processes failed while each attempted 125 exact 1 MiB POST/echo exchanges.
 Armed 1 MiB and 16 KiB processes reproduced both response-head and body-drain forms.
 
@@ -60,16 +60,17 @@ timeout. Endpoint queues had capacity and no inbound drop; receive credit had be
 That distinguishes this mechanism from both flow-control starvation and the pure-FIN defect
 above.
 
-The adapter now gives imminent expiries bounded fallback wakes in addition to the ordinary
-runtime sleep. The final implementation at `088e6c0` completed 100/100 processes of
-125 × 1 MiB exchanges exactly, as did two earlier fallback revisions. Each schedule
-independently bounds the observed per-process
-failure rate below approximately 3% at one-sided 95% confidence; they are not pooled because
-they exercised successive revisions of the bounded regression.
+Three bounded fallback candidates completed separate 100/100 process schedules, but none
+proved causality. The final deadline-backed candidate still produced one unarmed response-head
+failure in 30 exact-fixture processes, and an earlier self-wake candidate produced one
+close-before-response failure in eight all-feature workspace runs. The candidates were
+therefore removed rather than shipping a speculative scheduling change.
 
-This closes the reproduced S9 mechanism, including captured response-head and body-drain
-failures. It does not prove that no distinct future large-body failure exists. Keep using the
-supervised harness and report any new classification separately. See
+The committed harness and diagnostics are the result: they preserve phase, integrity,
+terminal/close category, flow and congestion credit, expiry, queue/wake state, bounded record
+loss, exact completion markers, and process cleanup. A safe correction remains blocked on an
+armed same-occurrence capture that either proves why an armed sub-tick sleep fails to wake or
+selects a different seam. See
 [`03-native-h3-s9-timer-wake.md`](../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md).
 
 ## Body bytes are copied twice
