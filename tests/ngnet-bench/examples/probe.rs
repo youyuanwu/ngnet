@@ -16,8 +16,8 @@
 
 use std::hint::black_box;
 use std::io::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ngnet_bench::{
@@ -159,6 +159,23 @@ fn timeout_classifier(phase: CheckedPhase) -> &'static str {
     }
 }
 
+fn error_classifier(phase: CheckedPhase, error: &str, lost_fin_proof: bool) -> &'static str {
+    if lost_fin_proof {
+        return "lost-fin-signature";
+    }
+    let closed = error.contains("kind: Closed") || error.contains("connection went away");
+    match (phase, closed) {
+        (CheckedPhase::ResponseHead, true) => "s9-unexpected-close-response-head",
+        (CheckedPhase::BodyDrain, true) => "s9-unexpected-close-body-drain",
+        (CheckedPhase::TerminalWait, true) => "unclassified-terminal-wait",
+        (CheckedPhase::Complete, true) => "unclassified-after-complete",
+        (CheckedPhase::ResponseHead, false) => "request-error-response-head",
+        (CheckedPhase::BodyDrain, false) => "body-error",
+        (CheckedPhase::TerminalWait, false) => "terminal-error",
+        (CheckedPhase::Complete, false) => "error-after-complete",
+    }
+}
+
 fn process_timeout(mode: Mode) -> Option<Duration> {
     match mode {
         Mode::Timing => None,
@@ -247,7 +264,7 @@ fn emit_diagnostics(
             "PROBE-DIAGNOSTIC exchange={exchange} attempt={attempt_index} sequence={} \
              connection_id={} role={:?} direction={} stream_id={} stream_offset={} \
              connection_credit_before={} stream_credit_before={} congestion_credit_before={} \
-             now={} expiry_before={} offered={} sampled_payload_limit={} \
+             now={} expiry_before={} expiry_after={} offered={} sampled_payload_limit={} \
              prepared_backing_capacity={} \
              accepted_prefix={} fin={} zero_acceptance={} logical_retained={} \
              retained_backing_capacity={} outcome={:?}",
@@ -263,6 +280,9 @@ fn emit_diagnostics(
             attempt.now,
             attempt
                 .expiry_before
+                .map_or_else(|| "none".to_string(), |expiry| expiry.to_string()),
+            attempt
+                .expiry_after
                 .map_or_else(|| "none".to_string(), |expiry| expiry.to_string()),
             attempt.offered_bytes,
             attempt.sampled_payload_limit,
@@ -607,8 +627,27 @@ fn main() {
         match workload.as_str() {
             "body" => {
                 let payload = body_payload.expect("body workload has a payload");
-                let progress = CheckedProgress::default();
                 let active_exchange = Arc::new(AtomicUsize::new(1));
+                let emitted = Arc::new(Mutex::new((CheckedPhase::Complete, usize::MAX)));
+                let progress = CheckedProgress::observed({
+                    let active_exchange = Arc::clone(&active_exchange);
+                    let emitted = Arc::clone(&emitted);
+                    move |snapshot| {
+                        let bucket = snapshot.received / (64 * 1024);
+                        let mut prior = emitted.lock().expect("probe checkpoint mutex poisoned");
+                        if prior.0 == snapshot.phase && prior.1 == bucket {
+                            return;
+                        }
+                        *prior = (snapshot.phase, bucket);
+                        eprintln!(
+                            "PROBE-CHECKPOINT exchange={} phase={} received_bytes={}",
+                            active_exchange.load(Ordering::Acquire),
+                            phase_name(snapshot.phase),
+                            snapshot.received
+                        );
+                        flush_stderr();
+                    }
+                });
                 let workload = async {
                     for exchange in 1..=iters {
                         active_exchange.store(exchange, Ordering::Release);
@@ -642,18 +681,11 @@ fn main() {
                                         exchange - 1,
                                         phase_name(snapshot.phase),
                                         snapshot.received,
-                                        match snapshot.phase {
-                                            CheckedPhase::ResponseHead => {
-                                                "s9-unexpected-close-response-head"
-                                            }
-                                            CheckedPhase::BodyDrain => {
-                                                "s9-unexpected-close-body-drain"
-                                            }
-                                            CheckedPhase::TerminalWait => {
-                                                "unclassified-terminal-wait"
-                                            }
-                                            CheckedPhase::Complete => "unclassified-after-complete",
-                                        },
+                                        error_classifier(
+                                            snapshot.phase,
+                                            &format!("{error:?}"),
+                                            false,
+                                        ),
                                         mode == Mode::Diagnostic && arm_name == "ngnet-quic-h3"
                                     );
                                     emit_rss("failure-request-or-body", exchange, failure_rss);
@@ -878,6 +910,18 @@ mod tests {
         assert_eq!(
             timeout_classifier(CheckedPhase::TerminalWait),
             "unclassified-terminal-wait"
+        );
+        assert_eq!(
+            error_classifier(CheckedPhase::TerminalWait, "kind: Closed", false),
+            "unclassified-terminal-wait"
+        );
+        assert_eq!(
+            error_classifier(CheckedPhase::TerminalWait, "kind: Closed", true),
+            "lost-fin-signature"
+        );
+        assert_eq!(
+            error_classifier(CheckedPhase::BodyDrain, "frame decode failed", false),
+            "body-error"
         );
     }
 }

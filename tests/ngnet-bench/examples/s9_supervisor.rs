@@ -34,16 +34,17 @@ fn classify(code: Option<i32>, stderr: &str, cleanup_failed: bool) -> Outcome {
     }
 }
 
-fn child_pids(parent: u32) -> Vec<u32> {
-    let path = format!("/proc/{parent}/task/{parent}/children");
-    std::fs::read_to_string(path)
-        .ok()
-        .into_iter()
-        .flat_map(|children| {
-            children
-                .split_whitespace()
-                .filter_map(|pid| pid.parse::<u32>().ok())
-                .collect::<Vec<_>>()
+fn process_group_pids(group: u32) -> Vec<u32> {
+    let Ok(output) = Command::new("ps").args(["-eo", "pid=,pgid="]).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            let pgid = fields.next()?.parse::<u32>().ok()?;
+            (pgid == group && pid != std::process::id()).then_some(pid)
         })
         .collect()
 }
@@ -52,8 +53,20 @@ fn process_exists(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
-fn terminate_pid(pid: u32) {
-    let _ = Command::new("kill").arg(pid.to_string()).status();
+fn terminate_pids(pids: &[u32], signal: &str) {
+    for pid in pids {
+        let _ = Command::new("kill")
+            .args([signal, "--", &pid.to_string()])
+            .status();
+    }
+}
+
+fn last_checkpoint(stderr: &str) -> &str {
+    stderr
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("PROBE-CHECKPOINT"))
+        .unwrap_or("unavailable")
 }
 
 fn main() {
@@ -94,7 +107,8 @@ fn main() {
             .flush()
             .expect("flush supervisor start record");
 
-        let child = Command::new("timeout")
+        let child = Command::new("setsid")
+            .arg("timeout")
             .args([
                 "--signal=TERM",
                 "--kill-after=5s",
@@ -112,7 +126,6 @@ fn main() {
             .expect("spawn supervised probe");
         let supervisor_pid = child.id();
         thread::sleep(Duration::from_millis(100));
-        let observed_children = child_pids(supervisor_pid);
         let output = child.wait_with_output().expect("wait for supervised probe");
 
         print!("{}", String::from_utf8_lossy(&output.stdout));
@@ -120,12 +133,14 @@ fn main() {
         std::io::stdout().flush().expect("flush probe stdout");
         std::io::stderr().flush().expect("flush probe stderr");
 
-        let remaining = observed_children
-            .into_iter()
-            .filter(|pid| process_exists(*pid))
-            .collect::<Vec<_>>();
-        for pid in &remaining {
-            terminate_pid(*pid);
+        let mut remaining = process_group_pids(supervisor_pid);
+        terminate_pids(&remaining, "-TERM");
+        if !remaining.is_empty() {
+            thread::sleep(Duration::from_millis(100));
+            remaining.retain(|pid| process_exists(*pid));
+            terminate_pids(&remaining, "-KILL");
+            thread::sleep(Duration::from_millis(100));
+            remaining.retain(|pid| process_exists(*pid));
         }
         let outcome = classify(
             output.status.code(),
@@ -141,11 +156,12 @@ fn main() {
         }
         eprintln!(
             "S9-SUPERVISOR-RESULT run={run} timeout_pid={supervisor_pid} \
-             exit_code={} outcome={outcome:?} remaining_pids={remaining:?}",
+             exit_code={} outcome={outcome:?} remaining_pids={remaining:?} last_checkpoint={:?}",
             output
                 .status
                 .code()
-                .map_or_else(|| "signal".to_string(), |code| code.to_string())
+                .map_or_else(|| "signal".to_string(), |code| code.to_string()),
+            last_checkpoint(&String::from_utf8_lossy(&output.stderr)),
         );
         if outcome == Outcome::CleanupFailure {
             break;
@@ -190,5 +206,16 @@ mod tests {
         let start = 21usize;
         let runs = 3usize;
         assert_eq!((start..start + runs).collect::<Vec<_>>(), vec![21, 22, 23]);
+    }
+
+    #[test]
+    fn extracts_the_last_durable_checkpoint() {
+        let output = "PROBE-CHECKPOINT exchange=1 phase=response-head received_bytes=0\n\
+                      noise\n\
+                      PROBE-CHECKPOINT exchange=1 phase=body-drain received_bytes=65536\n";
+        assert_eq!(
+            last_checkpoint(output),
+            "PROBE-CHECKPOINT exchange=1 phase=body-drain received_bytes=65536"
+        );
     }
 }

@@ -352,27 +352,53 @@ pub struct CheckedProgressSnapshot {
 }
 
 /// Shared progress cell used by an external supervisor while an exchange is pending.
-#[derive(Clone, Debug)]
-pub struct CheckedProgress(Arc<Mutex<CheckedProgressSnapshot>>);
+#[derive(Clone)]
+pub struct CheckedProgress {
+    state: Arc<Mutex<CheckedProgressSnapshot>>,
+    observer: Option<Arc<dyn Fn(CheckedProgressSnapshot) + Send + Sync>>,
+}
 
 impl Default for CheckedProgress {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(CheckedProgressSnapshot {
-            phase: CheckedPhase::ResponseHead,
-            received: 0,
-        })))
+        Self {
+            state: Arc::new(Mutex::new(CheckedProgressSnapshot {
+                phase: CheckedPhase::ResponseHead,
+                received: 0,
+            })),
+            observer: None,
+        }
     }
 }
 
 impl CheckedProgress {
+    /// Creates a progress cell that reports durable application-boundary changes.
+    pub fn observed(observer: impl Fn(CheckedProgressSnapshot) + Send + Sync + 'static) -> Self {
+        Self {
+            observer: Some(Arc::new(observer)),
+            ..Self::default()
+        }
+    }
+
     /// Returns the most recently recorded phase and byte offset.
     pub fn snapshot(&self) -> CheckedProgressSnapshot {
-        *self.0.lock().expect("checked progress mutex poisoned")
+        *self.state.lock().expect("checked progress mutex poisoned")
     }
 
     fn record(&self, phase: CheckedPhase, received: usize) {
-        *self.0.lock().expect("checked progress mutex poisoned") =
-            CheckedProgressSnapshot { phase, received };
+        let snapshot = CheckedProgressSnapshot { phase, received };
+        *self.state.lock().expect("checked progress mutex poisoned") = snapshot;
+        if let Some(observer) = &self.observer {
+            observer(snapshot);
+        }
+    }
+}
+
+impl core::fmt::Debug for CheckedProgress {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CheckedProgress")
+            .field("snapshot", &self.snapshot())
+            .field("observed", &self.observer.is_some())
+            .finish()
     }
 }
 

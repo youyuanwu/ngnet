@@ -13,6 +13,19 @@ use ngnet_quic::{Session, WriteOutcome};
 use crate::connection::{Shared, State};
 use crate::error::{Error, ErrorKind, Result};
 
+#[cfg(feature = "diagnostics")]
+fn close_reason(close: &ngnet_quic::CloseError) -> &'static str {
+    match close.reason() {
+        ngnet_quic::CloseReason::Transport(_) => "peer-transport-close",
+        ngnet_quic::CloseReason::Application(_) => "peer-application-close",
+        ngnet_quic::CloseReason::VersionNegotiation => "version-negotiation",
+        ngnet_quic::CloseReason::IdleTimeout => "idle-timeout",
+        ngnet_quic::CloseReason::Dropped => "dropped",
+        ngnet_quic::CloseReason::Retry => "retry",
+        _ => "peer-close-other",
+    }
+}
+
 /// The largest datagram this crate will produce.
 ///
 /// Capacity, not permission: the connection decides how much of it may actually be used.
@@ -57,9 +70,10 @@ pub(crate) fn pump<S: Session>(
             ) => {}
             Ok(ngnet_quic::ReadOutcome::Draining | ngnet_quic::ReadOutcome::Closing) => {
                 state.closed = true;
+                let close = detached.conn.close_error();
                 #[cfg(feature = "diagnostics")]
-                ngnet_quic::diagnostics::record_terminal(connection_id, role, "peer-close");
-                shared.record_connection_closed(detached.conn.close_error());
+                ngnet_quic::diagnostics::record_terminal(connection_id, role, close_reason(&close));
+                shared.record_connection_closed(close);
                 // Nothing further is read into a connection that has ended. Continuing
                 // would re-enter the same branch for every datagram still queued and record
                 // the close again for each.
@@ -222,6 +236,11 @@ pub(crate) fn poll_timer<S: Session>(
     };
     match core::pin::Pin::new(sleep).poll(cx) {
         Poll::Ready(()) => {
+            #[cfg(feature = "diagnostics")]
+            ngnet_quic::diagnostics::record_timer_ready(
+                detached.conn.diagnostic_id(),
+                detached.conn.role(),
+            );
             state.sleeping = None;
             state.sleeping_until = None;
             Poll::Ready(())

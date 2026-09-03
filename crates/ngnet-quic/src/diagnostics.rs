@@ -53,6 +53,8 @@ pub struct Attempt {
     pub now: u64,
     /// Earliest connection expiry immediately before the native write.
     pub expiry_before: Option<u64>,
+    /// Earliest connection expiry immediately after the native write.
+    pub expiry_after: Option<u64>,
     /// Logical stream offset of the offered prefix.
     pub stream_offset: u64,
     /// Bytes supplied by the caller.
@@ -896,6 +898,15 @@ pub fn record_timer_fire(connection_id: u64, role: Role) {
     record_enabling(connection_id, role, "timer");
 }
 
+/// Records that the detached adapter consumed a ready expiry sleep.
+#[doc(hidden)]
+pub fn record_timer_ready(connection_id: u64, role: Role) {
+    let Some(_guard) = recording_guard() else {
+        return;
+    };
+    record_enabling(connection_id, role, "timer-ready");
+}
+
 /// Records a new general connection-waker registration.
 #[doc(hidden)]
 pub fn record_wake_registration(_connection_id: u64, role: Role) {
@@ -1107,6 +1118,7 @@ mod tests {
             congestion_credit_before: 24,
             now: 1,
             expiry_before: Some(2),
+            expiry_after: Some(2),
             stream_offset: 0,
             offered_bytes: 16,
             sampled_payload_limit: 1200,
@@ -1162,6 +1174,7 @@ mod tests {
                 congestion_credit_before: 24,
                 now: 1,
                 expiry_before: Some(2),
+                expiry_after: Some(2),
                 stream_offset: 0,
                 offered_bytes: 8,
                 sampled_payload_limit: 1200,
@@ -1196,6 +1209,7 @@ mod tests {
             congestion_credit_before: 24,
             now: 1,
             expiry_before: Some(2),
+            expiry_after: Some(2),
             stream_offset: 0,
             offered_bytes: 8,
             sampled_payload_limit: 1200,
@@ -1268,6 +1282,7 @@ mod tests {
                 congestion_credit_before: 24,
                 now: 1,
                 expiry_before: Some(2),
+                expiry_after: Some(2),
                 stream_offset: 0,
                 offered_bytes: 1,
                 sampled_payload_limit: 1200,

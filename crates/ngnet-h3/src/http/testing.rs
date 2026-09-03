@@ -140,6 +140,11 @@ impl Knobs {
         self.0.borrow_mut().accept_at_most = Some(bytes);
     }
 
+    /// Number of transport write turns accepted so far.
+    pub fn writes(&self) -> usize {
+        self.0.borrow().writes
+    }
+
     /// Stops reporting release, so retained buffers stay retained.
     ///
     /// The sharpest tool here: it is what lets a test prove *when* a buffer is freed rather
