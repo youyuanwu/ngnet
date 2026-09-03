@@ -72,6 +72,26 @@ transport, without a silent default. The adapter is compiled by the targeted rel
 both workspace test modes, full all-target clippy, and its warning-denying Rust documentation
 build.
 
+## Imminent transport deadlines keep a bounded fallback wake
+
+ngtcp2 folds pacing into the same expiry used for loss recovery and idle timeout. A stream
+write can therefore return blocked while stream, connection, and congestion credit all remain,
+with its next useful action only nanoseconds away. The detached adapter owns the sleep for that
+expiry; the endpoint driver cannot wake a detached connection's HTTP/3 task for it.
+
+Runtime timers may coalesce such sub-tick deadlines with the task currently being polled. The
+adapter keeps the ordinary expiry sleep and also schedules a bounded fallback wake when the
+deadline is within 100 microseconds. The fallback is capped at 64 wakes for one unchanged
+deadline and resets when ngtcp2 changes the deadline, the sleep becomes ready, or the
+connection has no expiry. It is therefore deadline-backed rather than an unconditional retry
+loop.
+
+This rule was added for S9, the intermittent native large-body stall. Same-occurrence traces
+showed blocked writes with positive stream, connection, and congestion credit, an armed expiry
+15 ns to 11.8 µs away, no subsequent timer-ready or driver wake, and eventual idle timeout.
+The full reliability record is
+[`03-native-h3-s9-timer-wake.md`](../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md).
+
 ## A stream's close needs a batch of its own
 
 Found by running it. The whole exchange worked — request sent, response body received intact

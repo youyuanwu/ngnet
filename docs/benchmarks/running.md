@@ -255,6 +255,32 @@ Record exit `0`, `124` (outer timeout), or `128 + signal`, the final
 `PROBE-PROGRESS`, and the final complete snapshot. Never exclude a stalled, signalled,
 wrong-length, or unexpectedly dropped run from correctness results.
 
+For native S9 reliability, build the probe and committed process supervisor together. The
+supervisor creates one process group per run, records the last durable application checkpoint,
+and verifies that the group is empty before continuing:
+
+```sh
+cargo build -p ngnet-bench --examples --release --features diagnostics
+./target/release/examples/s9_supervisor \
+  ./target/release/examples/probe ngnet-quic-h3 reliability \
+  1048576 125 100 180 1
+```
+
+`reliability` mode is unarmed. Each exchange has its payload-scaled inner timeout and the
+whole probe self-classifies before the 180-second outer bound where possible. Treat a
+`PROBE-FAIL`, outer kill, unclassified exit, or cleanup failure as a failed process. A clean
+100-process result is reliability evidence (approximately a 3% one-sided 95% upper
+failure-rate bound), not a timing result or proof that failure is impossible.
+
+Use fixture mode for the ignored exact stress tests:
+
+```sh
+./target/release/examples/s9_supervisor fixture \
+  ngtcp2_fixture_repeats_16_kib_exactly 5 900 1
+./target/release/examples/s9_supervisor fixture \
+  ngtcp2_fixture_repeats_1_mib_exactly 5 900 1
+```
+
 Before stability is claimed, predetermine and run five default-profile and five release-profile
 125 × 1 MiB exact repetitions. Each process is externally bounded and every status is kept:
 

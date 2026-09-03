@@ -33,13 +33,24 @@ The transport copies because ngtcp2 retains stream pointers, but a drain must ne
 the caller's complete large offer. The allocation suite offers 1 MiB, requires actual accepted
 progress, and rejects every allocation larger than 64 KiB. The fixed-count fixture separately
 keeps supervised 125 × 16 KiB and 125 × 1 MiB exact protocols. Their live-loopback tests are
-ignored while run 30's intermittent outer-driver liveness failure remains unresolved.
+ignored because they are long-running supervised stress cases rather than ordinary CI tests.
 
 Compiling diagnostics does not arm them. The feature-enabled unarmed allocation proof records
 representative packet, release, timer, wake, and park hooks and requires zero allocations plus
 the default snapshot. A separate integrated drain proof leaves a one-byte diagnostic-only
 staging control set while unarmed, requires actual multi-byte progress, and still requires the
 default snapshot; this catches range/retention traversal or behavior leaking into timing.
+
+## An imminent expiry cannot depend only on a sub-tick sleep
+
+The detached connection owns ngtcp2's pacing, loss, and idle expiry. When that deadline is no
+more than 100 microseconds away, the adapter schedules bounded fallback polls in addition to
+the runtime sleep. One unchanged deadline can schedule at most 64 fallback wakes; moving the
+deadline starts a fresh budget.
+
+The focused test includes the exact threshold, excludes threshold plus one nanosecond, exhausts
+the per-deadline cap, and verifies that a new deadline gets a fresh budget. The cap makes the
+fallback finite. The runtime sleep remains armed throughout.
 
 ## Module files are flat
 

@@ -47,32 +47,29 @@ the end-to-end story, including which stack this actually stalled, is in
 **This is not the large-body stall and does not fix it.** That was re-measured afterwards and
 survives; see the next section.
 
-## The intermittent large-body failure survives, and it reaches the test suite
+## The reproduced large-body failure was a missed imminent timer wake
 
-Run 30's outer-driver liveness failure — S9 — is still open. It was re-measured on
-`epyc-7763-azure` after the FIN change above, release build, pinned to one core, against the
-new `h3-ngnet-quic` arm over the identical transport, fixtures, payload and exchange count
-(200 x 16 KiB): this stack failed 2 of 20, the hyperium-over-ngtcp2 stack 0 of 20. The failures
-were `ErrorKind::Closed`, "the connection has ended", not timeouts. Transport held fixed and
-HTTP/3 layer varied, so it belongs here.
+S9 was reproduced on the current EPYC host before the correction: five of the first 73
+supervised native processes failed while each attempted 125 exact 1 MiB POST/echo exchanges.
+Armed 1 MiB and 16 KiB processes reproduced both response-head and body-drain forms.
 
-A later revision — not ending the drain pass on a stream-less packet, so `Offers::write_next` is
-asked again and unblocks the displaced stream within the pass — was then measured over 50 runs
-of the same workload with no failure. That is a plausible mechanism for part of this defect and
-is **not** a claim that it is fixed: fifty clean runs make a 10% rate unlikely and leave a 2%
-rate entirely plausible, and S9's original evidence is a different workload on a different host,
-which nothing here re-examined.
+The final write in captured failures was generically transport-blocked while stream,
+connection, and congestion credit remained. The adapter armed an expiry 15 ns to 11.8 µs
+away, parked, and recorded no timer-ready or driver wake before both endpoints reached idle
+timeout. Endpoint queues had capacity and no inbound drop; receive credit had been returned.
+That distinguishes this mechanism from both flow-control starvation and the pure-FIN defect
+above.
 
-`tests/ngnet-bench/tests/ngtcp2_fixture.rs::unarmed_and_armed_diagnostics_preserve_and_reconcile_echoes`
-drives 16 KiB bodies through this stack and can therefore fail the same way. It was seen to do
-so once, with that exact signature, during a full `cargo test --workspace --all-features` run —
-the contended case, with every test binary competing for four cores.
+The adapter now gives imminent expiries bounded fallback wakes in addition to the ordinary
+runtime sleep. Two separate post-change schedules each completed 100/100 processes of
+125 × 1 MiB exchanges exactly. Each schedule independently bounds the observed per-process
+failure rate below approximately 3% at one-sided 95% confidence; they are not pooled because
+they exercised successive revisions of the bounded regression.
 
-It was **not** reproduced afterwards, and the attempt to attribute it is recorded rather than
-skipped: 12 isolated runs and 20 runs under deliberate CPU contention, on this branch and on
-unmodified `main`, gave 64 runs and no failure on either. So there is no measured difference
-between the two, the signature is S9's, and nothing here claims otherwise in either direction.
-It is not attributed to the FIN change, and it is not claimed fixed.
+This closes the reproduced S9 mechanism, including captured response-head and body-drain
+failures. It does not prove that no distinct future large-body failure exists. Keep using the
+supervised harness and report any new classification separately. See
+[`03-native-h3-s9-timer-wake.md`](../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md).
 
 ## Body bytes are copied twice
 
