@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-04
 **Base:** `ecedcc295c043385b74af404055a56830a20ce78` (PR #58)
-**Last production revision tested:** `85062e839e4b` (post-review hardening)
+**Last production revision tested:** `3dccd672b139` (final-review hardening)
 **Result:** evidence-selected pump/retry correction retained; resolution claim blocked
 **Result type:** reliability and root-cause evidence only; no performance claim
 
@@ -146,6 +146,12 @@ isolated armed sample from zero:
 The 1 MiB sample took 700,908 ms and is retained as a final-code confirmation, not as a
 replacement for the earlier 9/10 blocker denominator or as a 3% bound.
 
+Final review then required the second `poll_timer` caller to propagate the same actual
+one-shot readiness and added direct regression coverage for both callers. Revision
+`3dccd672b139` completed another fresh armed 10/10 at 16 KiB and 10/10 at 1 MiB. The latter
+took 777,727 ms. These samples confirm the delivered code and do not erase or replace the
+earlier blocker denominator.
+
 ## Regression and repository gates
 
 `captured_s9_progress_seam_regression` constructs a packet-bounded large write on the
@@ -198,6 +204,8 @@ record includes their hashes so local evidence can be verified:
 | `72b173c6eb7d/final-fixture-1m.manifest` | 9,602 | `4cd11ec44c95be5d68eced0bbda1b559fcef8502a87cfb7dfb13157bef47ed47` |
 | `85062e839e4b/postreview-armed-16k.manifest` | 10,415 | `4497f0b3314af37e271e72b83eb935926c4b0e627be01e3ff271b453f49a3304` |
 | `85062e839e4b/postreview-armed-1m.manifest` | 10,507 | `e6199e18255247742e8294b0e4a28ab2747c0fc9ccb9aa8be47d579f19a5e9e2` |
+| `3dccd672b139/final-r2-armed-16k.manifest` | 10,415 | `95fc2233df9164032e92b0f53ca9f3bf56a4a44434e28de1deb8d8d93f4a36e7` |
+| `3dccd672b139/final-r2-armed-1m.manifest` | 10,507 | `d60f76c138f3de458d6d2db1da7ad287f71fdeabfae9882c30603e9bf5bd0acf` |
 
 At the final qualification build, the supervisor SHA-256 was
 `1b2d06e2edeb5a9966d40594e49ec33a68fd8f656701dc130dc69b7b8053fc89`
@@ -212,6 +220,12 @@ at 801,984 bytes
 and the probe SHA-256 was
 `7f815f18895004e2c7e1d44826eda691d000c5be2f0f27c4a014238b5dfa7058`
 at 11,316,992 bytes.
+
+For delivered code revision `3dccd672b139`, the supervisor SHA-256 was
+`8d633f504016b30dcbb7f99db8d5f3810d9794945ce3904f7327eac9ec518ec4`
+at 802,648 bytes and the probe SHA-256 was
+`b3c1d4f5881a1ac0b8fc85cfcf47e38f3a9b97b0f3035590073ce250483b58d0`
+at 11,316,728 bytes.
 
 ## Blocker and next capture
 
