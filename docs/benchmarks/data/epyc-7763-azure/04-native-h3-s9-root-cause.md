@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-04
 **Base:** `ecedcc295c043385b74af404055a56830a20ce78` (PR #58)
-**Last production revision tested:** `72b173c6eb7d9148c9c009eeccfed7c598f45d1d`
+**Last production revision tested:** `85062e839e4b` (post-review hardening)
 **Result:** evidence-selected pump/retry correction retained; resolution claim blocked
 **Result type:** reliability and root-cause evidence only; no performance claim
 
@@ -80,7 +80,7 @@ polled to readiness before the replacement is installed and registered.
 
 ## Final observed processes
 
-The final production revision was `72b173c6eb7d`:
+The blocker-producing qualification revision was `72b173c6eb7d`:
 
 | Schedule | Processes | Completed | Classified | Unclassified | Outer kills | Cleanup failures |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -126,6 +126,25 @@ No controlled-contention batch was run at the final revision. All final attempts
 there were zero interrupted attempts, outer kills or cleanup failures. “Eligible/confounded”
 is therefore not applicable to these final schedules.
 
+### Post-review production revision
+
+Final review found that sampling `now` and cancelling the earlier sleep still left a
+nanosecond-scale transition race. Revision `85062e839e4b` instead retains and polls an earlier
+sleep whenever ngtcp2 reports a later deadline; only after that sleep resolves does it install
+and poll the replacement. It also makes interrupted cleanup fail closed and records resource
+guards durably.
+
+The production change did not restart the blocked 100-process claim. It did receive a new
+isolated armed sample from zero:
+
+| Schedule | Processes | Completed | Failures | Guarded/unexecuted |
+| --- | ---: | ---: | ---: | ---: |
+| Armed diagnostic, 125 × 16 KiB | 10 | 10 | 0 | 0/0 |
+| Armed diagnostic, 125 × 1 MiB | 10 | 10 | 0 | 0/0 |
+
+The 1 MiB sample took 700,908 ms and is retained as a final-code confirmation, not as a
+replacement for the earlier 9/10 blocker denominator or as a 3% bound.
+
 ## Regression and repository gates
 
 `captured_s9_progress_seam_regression` constructs a packet-bounded large write on the
@@ -167,6 +186,8 @@ record includes their hashes so local evidence can be verified:
 | `72b173c6eb7d/final-reliability-1m.manifest` | 10,418 | `1821fcef5eba5c9ea8b2138b045af743690e88d723275d38c65815554056f208` |
 | `72b173c6eb7d/final-fixture-16k.manifest` | 9,562 | `aeab6eb0edc39c8884e53bb9aea91186123b470ff74c9f18a55e983591eb64c8` |
 | `72b173c6eb7d/final-fixture-1m.manifest` | 9,602 | `4cd11ec44c95be5d68eced0bbda1b559fcef8502a87cfb7dfb13157bef47ed47` |
+| `85062e839e4b/postreview-armed-16k.manifest` | 10,415 | `4497f0b3314af37e271e72b83eb935926c4b0e627be01e3ff271b453f49a3304` |
+| `85062e839e4b/postreview-armed-1m.manifest` | 10,507 | `e6199e18255247742e8294b0e4a28ab2747c0fc9ccb9aa8be47d579f19a5e9e2` |
 
 At the final qualification build, the supervisor SHA-256 was
 `1b2d06e2edeb5a9966d40594e49ec33a68fd8f656701dc130dc69b7b8053fc89`
@@ -174,6 +195,13 @@ at 797,112 bytes
 and the probe SHA-256 was
 `b441a1e0a3d854aa46e81a489119fcf82e003a183fd94e22f3ac3573326ba047`
 at 11,316,816 bytes.
+
+For post-review revision `85062e839e4b`, the supervisor SHA-256 was
+`067b5217b2474f7d5a94d2b717008a8eb353c1a9140732f1391e428ee63b7a8e`
+at 801,984 bytes
+and the probe SHA-256 was
+`7f815f18895004e2c7e1d44826eda691d000c5be2f0f27c4a014238b5dfa7058`
+at 11,316,992 bytes.
 
 ## Blocker and next capture
 
