@@ -45,9 +45,9 @@ the end-to-end story, including which stack this actually stalled, is in
 [`../h3-ngnet-quic/pending-work.md`](../h3-ngnet-quic/pending-work.md).
 
 **This is not the large-body stall and did not fix it.** That was re-measured afterwards and
-remains open; see the next section.
+now has a separate evidence-selected correction and residual blocker; see the next section.
 
-## The reproduced large-body failure remains open
+## The reproduced large-body failure has an evidence-selected correction, but remains blocked
 
 S9 was reproduced on the current EPYC host during this investigation: five of the first 73
 supervised native processes failed while each attempted 125 exact 1 MiB POST/echo exchanges.
@@ -71,12 +71,19 @@ gates failed both the basic request/response and large flow-control exchange tes
 rerun passed. This preserves the known contention-sensitive signature rather than treating one
 clean rerun as resolution.
 
-The committed harness and diagnostics are the result: they preserve phase, integrity,
-terminal/close category, flow and congestion credit, expiry, queue/wake state, bounded record
-loss, exact completion markers, and process cleanup. A safe correction remains blocked on an
-armed same-occurrence capture that either proves why an armed sub-tick sleep fails to wake or
-selects a different seam. See
-[`03-native-h3-s9-timer-wake.md`](../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md).
+Follow-up armed captures proved that the imminent timer did wake and that ngtcp2 then moved
+directly to its 30-second idle deadline without a stream retry. A second ordering showed
+`poll_timer` replacing an already-due armed sleep with that idle deadline before preserving
+the old ready edge. The adapter now preserves exactly one such ready edge; its deterministic
+regression fails without it and passes without forming a self-wake loop.
+
+This is not yet an end-to-end resolution claim. After the one allowed correction re-entry,
+the final 16 KiB armed canary completed 10/10 and unarmed/fixture samples completed 10/10 for
+both sizes, but the armed 1 MiB canary completed 9/10. The remaining process failed during
+setup/warm-up before diagnostics were armed, so it cannot validate or refute the correction.
+The exact next capture is a typed pre-readiness response-head failure followed by a fresh
+armed 1 MiB canary. See
+[`04-native-h3-s9-root-cause.md`](../benchmarks/data/epyc-7763-azure/04-native-h3-s9-root-cause.md).
 
 ## Body bytes are copied twice
 

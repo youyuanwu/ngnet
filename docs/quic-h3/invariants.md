@@ -34,6 +34,11 @@ the caller's complete large offer. The allocation suite offers 1 MiB, requires a
 progress, and rejects every allocation larger than 64 KiB. The fixed-count fixture separately
 keeps supervised 125 × 16 KiB and 125 × 1 MiB exact protocols. Their live-loopback tests are
 ignored because they are long-running supervised stress cases rather than ordinary CI tests.
+The S9 timer correlation and rejected fallbacks are recorded in
+[`../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md`](../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md);
+the later pump/retry root-cause evidence, one-shot correction and remaining pre-readiness
+blocker are recorded in
+[`../benchmarks/data/epyc-7763-azure/04-native-h3-s9-root-cause.md`](../benchmarks/data/epyc-7763-azure/04-native-h3-s9-root-cause.md).
 
 Compiling diagnostics does not arm them. The feature-enabled unarmed allocation proof records
 representative packet, release, timer, wake, and park hooks and requires zero allocations plus

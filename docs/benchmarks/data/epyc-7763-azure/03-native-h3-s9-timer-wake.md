@@ -113,3 +113,8 @@ armed same-occurrence capture before another production change is justified.
 - ngtcp2 frame inventory and retransmission attribution remain unavailable through the safe
   wrapper.
 - The host remains unsuitable for cross-run or cross-machine performance conclusions.
+
+Follow-up root-cause work is recorded in
+[`04-native-h3-s9-root-cause.md`](04-native-h3-s9-root-cause.md). It selected the
+pump/no-progress scheduling seam and retained a surgical correction, but a separate
+pre-readiness 1 MiB failure blocked a full resolution claim.

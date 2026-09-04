@@ -2,7 +2,7 @@
 
 **Status:** current
 **First run:** 2026-09-02
-**Last run:** 2026-09-03
+**Last run:** 2026-09-04
 
 A different machine from [`xeon-8370c-azure`](../xeon-8370c-azure/), not a re-labelling of it.
 Different vendor, different core count, different generation. **No absolute figure recorded on
@@ -70,3 +70,4 @@ arm was run in this session.
 | [01-h3-ngnet-quic-comparison](01-h3-ngnet-quic-comparison.md) | 2026-09-02 | `6119972` | Hyperium H3 and ngnet H3 over the same ngtcp2 transport — inconclusive, and an adapter defect found |
 | [02-h3-ngnet-quic-fin-fix](02-h3-ngnet-quic-fin-fix.md) | 2026-09-02 | `feature/h3-ngnet-quic` | The lost FIN — root cause of run 01's defect, and reliability after the fix. **Reliability only; no timing claimed** |
 | [03-native-h3-s9-timer-wake](03-native-h3-s9-timer-wake.md) | 2026-09-03 | final branch | Native large-body S9 — conclusive harness and timer evidence; fallback candidates rejected after residual failures. **Reliability only; no timing claimed** |
+| [04-native-h3-s9-root-cause](04-native-h3-s9-root-cause.md) | 2026-09-04 | `72b173c` | Native large-body S9 — pump/retry seam selected and corrected; pre-readiness residual blocks a resolution claim. **Reliability only; no timing claimed** |

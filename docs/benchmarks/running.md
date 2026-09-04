@@ -212,6 +212,12 @@ high-water intervals start at those values. A field the safe transport cannot cu
 distinguish, such as retransmission attribution, is printed as `unavailable`, never as a
 guessed zero.
 
+Timer-arm, timer-due and timer-ready liveness records also carry `now` and `deadline` in
+ngtcp2's monotonic nanosecond clock domain. Non-timer liveness records print both fields as
+`unavailable`. `timer-ready` means an elapsed armed edge was preserved: it can be emitted
+either when the sleep itself returns ready or when ngtcp2 moves directly from an already-due
+deadline to a replacement deadline before the old sleep is polled.
+
 `application_body_bytes` is the body drained by one endpoint for that exchange.
 `transport_stream_accepted` and `transport_stream_release_bytes` are QUIC stream bytes and
 include HTTP/3 HEADERS/DATA framing and control-stream bytes. Diagnostics assert that accepted
@@ -271,11 +277,21 @@ whole probe self-classifies before the 180-second outer bound where possible. Tr
 `PROBE-FAIL`, outer kill, unclassified exit, or cleanup failure as a failed process. A clean
 100-process result is reliability evidence (approximately a 3% one-sided 95% upper
 failure-rate bound), not a timing result or proof that failure is impossible.
-The final path is an append-only manifest. The supervisor rejects duplicate completed run
-numbers but permits a run with only an interrupted `START` record to be retried. It records
-each start, exact failure classifier/detail, captured process identities, checkpoint, cleanup
-status, and final summary so a terminal scrollback limit cannot change the evidence
-denominator.
+The final path is an append-only manifest. Set `S9_REVISION` to the clean checkout's revision
+when a manifest is used. The supervisor records SHA-256 and byte size for itself and the probe
+or prebuilt fixture executable, and fails closed if resumed batches use different binaries.
+It rejects duplicate completed run numbers. A dangling `START` is reconciled by exact
+`(pid,start_time)` identity and recorded as `S9-SUPERVISOR-INTERRUPTED` before that logical
+run number receives a new attempt identity.
+
+Child output is parsed as records no larger than 64 KiB. Readiness, checkpoints, failures and
+compact completion lines pass through live; successful attempt/liveness dumps are summarized
+instead of replayed. A failed child retains its final same-occurrence diagnostic block under
+`S9-SUPERVISOR-EVIDENCE`, capped at 96 MiB. Missing failure markers, invalid records,
+truncation, record drops, cleanup and resource guards stay explicit. A lock-protected
+reservation ledger caps cumulative local evidence and aggregate attempt time. These local
+manifests remain raw evidence; committed run documents carry their hashes and selected
+excerpts.
 
 Use fixture mode for the ignored exact stress tests:
 
@@ -285,6 +301,9 @@ Use fixture mode for the ignored exact stress tests:
 ./target/release/examples/s9_supervisor fixture \
   ngtcp2_fixture_repeats_1_mib_exactly 5 900 1 target/s9-fixture-1m.log
 ```
+
+Fixture mode builds the release test once, resolves and hashes the exact libtest executable,
+then supervises that executable directly for every run.
 
 Before stability is claimed, predetermine and run five default-profile and five release-profile
 125 × 1 MiB exact repetitions. Each process is externally bounded and every status is kept:
