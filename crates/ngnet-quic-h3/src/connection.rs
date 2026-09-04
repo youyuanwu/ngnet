@@ -108,8 +108,6 @@ pub(crate) struct State {
     pub(crate) sleeping: Option<Sleep>,
     /// The deadline that sleep is for.
     pub(crate) sleeping_until: Option<Timestamp>,
-    /// Whether the transport refused the most recent stream write.
-    pub(crate) stream_blocked: bool,
     /// Whether the previous pass parked on a full outbound queue.
     #[cfg(feature = "diagnostics")]
     pub(crate) capacity_parked: bool,
@@ -158,7 +156,6 @@ impl<S: Session> NgtcpConnection<S> {
                 emitted_since_pending: false,
                 sleeping: None,
                 sleeping_until: None,
-                stream_blocked: false,
                 #[cfg(feature = "diagnostics")]
                 capacity_parked: false,
                 #[cfg(feature = "diagnostics")]
@@ -405,18 +402,14 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
         if self.state.closed {
             return Poll::Ready(Err(pump::ended()));
         }
-        let stream_blocked = transmit::drain(
+        transmit::drain(
             &mut self.detached,
             &self.shared,
             &mut self.state,
             source,
             cx,
         )?;
-        self.state.stream_blocked = stream_blocked;
-        let timer_ready = pump::poll_timer(&self.detached, &mut self.state, cx).is_ready();
-        if self.state.stream_blocked && timer_ready {
-            cx.waker().wake_by_ref();
-        }
+        let _ = pump::poll_timer(&self.detached, &mut self.state, cx);
         Poll::Ready(Ok(()))
     }
 

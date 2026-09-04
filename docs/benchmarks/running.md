@@ -215,8 +215,8 @@ guessed zero.
 Timer-arm, timer-due and timer-ready liveness records also carry `now` and `deadline` in
 ngtcp2's monotonic nanosecond clock domain. Non-timer liveness records print both fields as
 `unavailable`. `timer-ready` means an elapsed armed edge was preserved: it can be emitted
-either when the sleep itself returns ready or when ngtcp2 moves directly from an already-due
-deadline to a replacement deadline before the old sleep is polled.
+for the currently requested deadline or for an earlier armed sleep that was kept and polled
+to readiness before ngtcp2's later replacement deadline was installed.
 
 `application_body_bytes` is the body drained by one endpoint for that exchange.
 `transport_stream_accepted` and `transport_stream_release_bytes` are QUIC stream bytes and
@@ -267,9 +267,11 @@ and verifies that the group is empty before continuing:
 
 ```sh
 cargo build -p ngnet-bench --examples --release --features diagnostics
-./target/release/examples/s9_supervisor \
+revision=$(git rev-parse --short=12 HEAD)
+mkdir -p "target/s9-evidence/$revision"
+S9_REVISION="$revision" ./target/release/examples/s9_supervisor \
   ./target/release/examples/probe ngnet-quic-h3 reliability \
-  1048576 125 100 180 1 target/s9-native-final.log
+  1048576 125 100 180 1 "target/s9-evidence/$revision/native-final.manifest"
 ```
 
 `reliability` mode is unarmed. Each exchange has its payload-scaled inner timeout and the
@@ -296,10 +298,14 @@ excerpts.
 Use fixture mode for the ignored exact stress tests:
 
 ```sh
-./target/release/examples/s9_supervisor fixture \
-  ngtcp2_fixture_repeats_16_kib_exactly 5 900 1 target/s9-fixture-16k.log
-./target/release/examples/s9_supervisor fixture \
-  ngtcp2_fixture_repeats_1_mib_exactly 5 900 1 target/s9-fixture-1m.log
+revision=$(git rev-parse --short=12 HEAD)
+mkdir -p "target/s9-evidence/$revision"
+S9_REVISION="$revision" ./target/release/examples/s9_supervisor fixture \
+  ngtcp2_fixture_repeats_16_kib_exactly 5 900 1 \
+  "target/s9-evidence/$revision/fixture-16k.manifest"
+S9_REVISION="$revision" ./target/release/examples/s9_supervisor fixture \
+  ngtcp2_fixture_repeats_1_mib_exactly 5 900 1 \
+  "target/s9-evidence/$revision/fixture-1m.manifest"
 ```
 
 Fixture mode builds the release test once, resolves and hashes the exact libtest executable,

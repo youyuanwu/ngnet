@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_INPUT_RECORD_BYTES: usize = 64 * 1024;
 const MAX_FAILURE_EVIDENCE_BYTES: usize = 96 * 1024 * 1024;
+const MAX_STREAM_FAILURE_EVIDENCE_BYTES: usize = MAX_FAILURE_EVIDENCE_BYTES / 2;
 const MAX_FALLBACK_TAIL_BYTES: usize = 1024 * 1024;
 const CUMULATIVE_EVIDENCE_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 const STORAGE_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -106,7 +107,7 @@ impl StreamCapture {
                 &mut self.evidence,
                 &mut self.evidence_bytes,
                 line,
-                MAX_FAILURE_EVIDENCE_BYTES,
+                MAX_STREAM_FAILURE_EVIDENCE_BYTES,
                 Some(&["PROBE-FAIL", "S9-FIXTURE-FAIL"]),
             );
             self.evidence_truncated |= truncated;
@@ -400,6 +401,7 @@ struct DanglingAttempt {
     attempt: String,
     identity: Option<ProcessIdentity>,
     started_unix_ms: u128,
+    outer_seconds: u64,
 }
 
 #[derive(Default)]
@@ -443,6 +445,9 @@ fn scan_manifest_reader<R: BufRead>(reader: R) -> Result<ManifestState, String> 
                 let started_unix_ms = field(&line, "started_unix_ms")
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(0);
+                let outer_seconds = field(&line, "outer_seconds")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
                 state.dangling.insert(
                     (run, attempt.to_string()),
                     DanglingAttempt {
@@ -450,6 +455,7 @@ fn scan_manifest_reader<R: BufRead>(reader: R) -> Result<ManifestState, String> 
                         attempt: attempt.to_string(),
                         identity,
                         started_unix_ms,
+                        outer_seconds,
                     },
                 );
             }
@@ -537,6 +543,18 @@ fn unix_millis() -> u128 {
         .as_millis()
 }
 
+fn interrupted_elapsed_ms(attempt: &DanglingAttempt, ended_unix_ms: u128) -> u128 {
+    ended_unix_ms
+        .saturating_sub(attempt.started_unix_ms)
+        .min(u128::from(
+            attempt
+                .outer_seconds
+                .saturating_add(10)
+                .saturating_mul(1000),
+        ))
+        .min(u128::from(u64::MAX))
+}
+
 fn sha256(path: &Path) -> Result<String, String> {
     let output = Command::new("sha256sum")
         .arg(path)
@@ -619,8 +637,17 @@ fn available_bytes(path: &Path) -> Result<u64, String> {
 }
 
 fn evidence_root(manifest: Option<&str>) -> Option<PathBuf> {
-    let revision = Path::new(manifest?).parent()?;
-    revision.parent().map(Path::to_path_buf)
+    let parent = Path::new(manifest?).parent()?;
+    if parent.as_os_str().is_empty() {
+        return Some(PathBuf::from("."));
+    }
+    Some(
+        parent
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(parent)
+            .to_path_buf(),
+    )
 }
 
 fn elapsed_attempt_millis(path: &Path) -> Result<u64, String> {
@@ -942,8 +969,18 @@ fn main() {
     let workload_bytes = std::fs::metadata(&workload)
         .expect("inspect workload executable")
         .len();
-    let reservation_guard =
-        reserve_storage(manifest, runs).unwrap_or_else(|error| panic!("campaign guard: {error}"));
+    let reservation_guard = match reserve_storage(manifest, runs) {
+        Ok(guard) => guard,
+        Err(error) => {
+            let guard = format!(
+                "S9-SUPERVISOR-GUARD reason=campaign-preflight revision={revision} \
+                 first_unexecuted={start} unexecuted={runs} error={error:?}"
+            );
+            let _ = append_manifest(manifest, &guard);
+            eprintln!("{guard}");
+            std::process::exit(1);
+        }
+    };
     let mut manifest_state = manifest
         .map(scan_manifest)
         .transpose()
@@ -970,6 +1007,7 @@ fn main() {
     }
 
     let mut interrupted = 0usize;
+    let mut recovery_failed = false;
     for dangling in manifest_state
         .dangling
         .values()
@@ -977,39 +1015,65 @@ fn main() {
         .collect::<Vec<_>>()
     {
         let mut cleanup = "not-running".to_string();
+        let mut resolved = true;
         if let Some(identity) = dangling.identity {
             match still_same_process(identity) {
                 Ok(true) => {
-                    let mut identities = process_group_pids(identity.pid).unwrap_or_default();
+                    let mut identities = match process_group_pids(identity.pid) {
+                        Ok(identities) => identities,
+                        Err(error) => {
+                            cleanup = format!("inspection-error:{error}");
+                            resolved = false;
+                            Vec::new()
+                        }
+                    };
                     if !identities.contains(&identity) {
                         identities.push(identity);
                     }
-                    terminate_pids(&identities, "-TERM");
-                    thread::sleep(Duration::from_millis(100));
-                    let survivors = identities
-                        .into_iter()
-                        .filter(|candidate| still_same_process(*candidate).unwrap_or(true))
-                        .collect::<Vec<_>>();
-                    terminate_pids(&survivors, "-KILL");
-                    thread::sleep(Duration::from_millis(100));
-                    let remaining = survivors
-                        .into_iter()
-                        .filter(|candidate| still_same_process(*candidate).unwrap_or(true))
-                        .count();
-                    cleanup = if remaining == 0 {
-                        "terminated".to_string()
-                    } else {
-                        format!("failed:{remaining}-survivors")
-                    };
+                    if resolved {
+                        terminate_pids(&identities, "-TERM");
+                        thread::sleep(Duration::from_millis(100));
+                        let survivors = identities
+                            .into_iter()
+                            .filter(|candidate| still_same_process(*candidate).unwrap_or(true))
+                            .collect::<Vec<_>>();
+                        terminate_pids(&survivors, "-KILL");
+                        thread::sleep(Duration::from_millis(100));
+                        let remaining = survivors
+                            .into_iter()
+                            .filter(|candidate| still_same_process(*candidate).unwrap_or(true))
+                            .count();
+                        cleanup = if remaining == 0 {
+                            "terminated".to_string()
+                        } else {
+                            resolved = false;
+                            format!("failed:{remaining}-survivors")
+                        };
+                    }
                 }
                 Ok(false) => {}
-                Err(error) => cleanup = format!("inspection-error:{error}"),
+                Err(error) => {
+                    cleanup = format!("inspection-error:{error}");
+                    resolved = false;
+                }
             }
+        } else {
+            cleanup = "inspection-error:missing-process-identity".to_string();
+            resolved = false;
         }
         let ended_unix_ms = unix_millis();
-        let elapsed_ms = ended_unix_ms
-            .saturating_sub(dangling.started_unix_ms)
-            .min(u128::from(u64::MAX));
+        let elapsed_ms = interrupted_elapsed_ms(&dangling, ended_unix_ms);
+        if !resolved {
+            let guard = format!(
+                "S9-SUPERVISOR-GUARD reason=interrupted-cleanup run={} attempt={} \
+                 revision={} cleanup={cleanup}",
+                dangling.run, dangling.attempt, revision
+            );
+            append_manifest(manifest, &guard).unwrap_or_else(|error| panic!("{error}"));
+            eprintln!("{guard}");
+            recovery_failed = true;
+            break;
+        }
         let record = format!(
             "S9-SUPERVISOR-INTERRUPTED run={} attempt={} revision={} \
              started_unix_ms={} ended_unix_ms={ended_unix_ms} elapsed_ms={elapsed_ms} \
@@ -1023,6 +1087,10 @@ fn main() {
         manifest_state
             .dangling
             .remove(&(dangling.run, dangling.attempt));
+    }
+    if recovery_failed {
+        drop(reservation_guard);
+        std::process::exit(1);
     }
     for run in selected_runs.clone() {
         assert!(
@@ -1047,14 +1115,23 @@ fn main() {
     let mut outer_killed = 0usize;
     let mut unclassified = 0usize;
     let mut cleanup_failed = 0usize;
+    let mut guarded = false;
+    let mut unexecuted = 0usize;
+    let selected_end = start.saturating_add(runs);
 
     for run in selected_runs {
         if let Some(root) = evidence_root(manifest) {
             let elapsed = elapsed_attempt_millis(&root).unwrap_or_else(|error| panic!("{error}"));
             if elapsed >= MAX_ATTEMPT_MILLIS {
-                eprintln!(
-                    "S9-SUPERVISOR-GUARD reason=attempt-time elapsed_ms={elapsed} cap_ms={MAX_ATTEMPT_MILLIS}"
+                unexecuted = selected_end.saturating_sub(run);
+                let guard = format!(
+                    "S9-SUPERVISOR-GUARD reason=attempt-time revision={revision} \
+                 first_unexecuted={run} unexecuted={unexecuted} \
+                 elapsed_ms={elapsed} cap_ms={MAX_ATTEMPT_MILLIS}"
                 );
+                append_manifest(manifest, &guard).unwrap_or_else(|error| panic!("{error}"));
+                eprintln!("{guard}");
+                guarded = true;
                 break;
             }
         }
@@ -1216,7 +1293,7 @@ fn main() {
             }
             remaining = survivors;
         }
-        let stdout = stdout_reader
+        let mut stdout = stdout_reader
             .join()
             .map_err(|_| "stdout reader panicked".to_string())
             .and_then(|capture| capture.map_err(|error| error.to_string()))
@@ -1224,7 +1301,7 @@ fn main() {
                 inspection_error = Some(error);
                 StreamCapture::default()
             });
-        let stderr = stderr_reader
+        let mut stderr = stderr_reader
             .join()
             .map_err(|_| "stderr reader panicked".to_string())
             .and_then(|capture| capture.map_err(|error| error.to_string()))
@@ -1258,12 +1335,12 @@ fn main() {
                 evidence.push(checkpoint.clone());
             }
             if failure_seen {
-                evidence.extend(stdout.evidence.iter().cloned());
-                evidence.extend(stderr.evidence.iter().cloned());
+                evidence.extend(stdout.evidence.drain(..));
+                evidence.extend(stderr.evidence.drain(..));
             } else {
                 evidence.push("S9-EVIDENCE failure_marker=missing".to_string());
-                evidence.extend(stdout.fallback_tail.iter().cloned());
-                evidence.extend(stderr.fallback_tail.iter().cloned());
+                evidence.extend(stdout.fallback_tail.drain(..));
+                evidence.extend(stderr.fallback_tail.drain(..));
             }
         }
         for line in &evidence {
@@ -1348,7 +1425,8 @@ fn main() {
          completed={completed} interrupted={interrupted} \
          started_unix_ms={invocation_started_unix_ms} ended_unix_ms={} elapsed_ms={} \
          classified_failures={classified} outer_killed={outer_killed} \
-         unclassified_failures={unclassified} cleanup_failures={cleanup_failed}",
+         unclassified_failures={unclassified} cleanup_failures={cleanup_failed} \
+         guarded={guarded} unexecuted={unexecuted}",
         unix_millis(),
         invocation_started.elapsed().as_millis(),
     );
@@ -1358,7 +1436,7 @@ fn main() {
         drop(reservation_guard);
         std::process::exit(1);
     }
-    let failed = classified + outer_killed + unclassified + cleanup_failed > 0;
+    let failed = guarded || classified + outer_killed + unclassified + cleanup_failed > 0;
     drop(reservation_guard);
     if failed {
         std::process::exit(1);
@@ -1700,6 +1778,42 @@ mod tests {
             .expect("read released reservations");
         assert_eq!(ledger.matches("S9-EVIDENCE-RELEASE").count(), 2);
         std::fs::remove_dir_all(root).expect("remove reservation test root");
+    }
+
+    #[test]
+    fn shallow_manifest_paths_have_a_real_evidence_root() {
+        assert_eq!(
+            evidence_root(Some("target/run.manifest")),
+            Some(PathBuf::from("target"))
+        );
+        assert_eq!(
+            evidence_root(Some("run.manifest")),
+            Some(PathBuf::from("."))
+        );
+    }
+
+    #[test]
+    fn interrupted_attempt_time_is_clamped_to_its_outer_bound_and_grace() {
+        let attempt = DanglingAttempt {
+            run: 1,
+            attempt: "a".to_string(),
+            identity: None,
+            started_unix_ms: 1_000,
+            outer_seconds: 685,
+        };
+        assert_eq!(interrupted_elapsed_ms(&attempt, 2_000), 1_000);
+        assert_eq!(
+            interrupted_elapsed_ms(&attempt, 1_000 + 24 * 60 * 60 * 1000),
+            695_000
+        );
+    }
+
+    #[test]
+    fn per_stream_failure_budgets_sum_to_the_occurrence_budget() {
+        assert_eq!(
+            MAX_STREAM_FAILURE_EVIDENCE_BYTES * 2,
+            MAX_FAILURE_EVIDENCE_BYTES
+        );
     }
 
     #[test]

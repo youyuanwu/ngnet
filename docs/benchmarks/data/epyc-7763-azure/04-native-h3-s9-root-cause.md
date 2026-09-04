@@ -15,11 +15,10 @@ expiry was observed due. In the original ordering, ngtcp2 then moved directly to
 the ready edge was consumed inside the driver's first idle poll and no transmit retry
 followed.
 
-The retained correction preserves that one elapsed timer edge when `poll_timer` replaces an
-already-due armed deadline. The newly armed deadline is still polled so its waker remains
-registered. `poll_event` uses its existing one-shot wake, while `poll_transmit` requests the
-wake only when its real stream write was refused. This is not a periodic wake, a wake budget,
-or a backup sleep.
+The retained correction does not cancel an earlier armed sleep merely because ngtcp2 reports
+a later deadline. `poll_timer` keeps and polls the earlier sleep to readiness before installing
+and polling the replacement, so the replacement's waker is registered too. `poll_event` uses
+its existing one-shot wake. This is not a periodic wake, a wake budget, or a backup sleep.
 
 The correction does **not** receive a full resolution claim. The one allowed qualification
 re-entry removed the classified residual from the next 10-process armed 1 MiB canary, but one
@@ -75,9 +74,9 @@ retry. Its armed 16 KiB canary completed 10/10. The armed 1 MiB canary completed
 Run 3 showed the second ordering of the same seam. The final client write was blocked at
 `140741232861`, 4,054 ns before `140741236915`. The sleep remained armed for that exact
 expiry, but `poll_timer` next ran at `140741238171` and replaced it with idle deadline
-`170741224355` without preserving a ready event. The re-entry correction moved the invariant
-into `poll_timer`: replacing an already-due sleep preserves one ready edge, while still
-polling and registering the new sleep.
+`170741224355` without preserving a ready event. The final correction moved the invariant
+into `poll_timer`: a later replacement cannot cancel the earlier sleep; the earlier sleep is
+polled to readiness before the replacement is installed and registered.
 
 ## Final observed processes
 
@@ -132,7 +131,7 @@ is therefore not applicable to these final schedules.
 `captured_s9_progress_seam_regression` constructs a packet-bounded large write on the
 hand-moved connection clock, reaches a transport-refused write, advances across the pacing
 deadline and asserts exactly one retry wake and no self-wake loop. It fails with wake count
-zero when the replacement-ready edge is removed and passed 100/100 exact release repetitions
+zero when earlier-sleep preservation is removed and passed 100/100 exact release repetitions
 on both retained correction revisions.
 
 All targeted native QUIC/H3 tests, exact fixtures, default workspace tests, clippy matrices,
@@ -182,9 +181,16 @@ The production change is retained because it is selected by four armed same-occu
 failures, covers both observed ordering variants, and has a deterministic falsified
 regression. What remains unsafe is claiming end-to-end resolution.
 
-The exact next capture requirement is a typed pre-readiness failure record around the native
-warm-up response-head call, emitted before panic with phase, classifier and `diagnostics_armed=false`,
-followed by a fresh supervised armed 1 MiB canary. If that class disappears, the final
-100-process 16 KiB and 100-process 1 MiB reliability schedules can restart from zero. If it
-recurs, it must be diagnosed as its own setup/lifecycle occurrence and cannot be attributed
-to the S9 pump correction without armed transport evidence.
+The correction preserves one wake per earlier deadline. If the resulting retry is refused
+again while ngtcp2 keeps only the idle deadline, no second synthetic edge is created; a future
+capture must retain that recurrence rather than assuming one retry always succeeds.
+
+The exact next capture has two bounded steps. First, emit a typed pre-readiness failure record
+around the native warm-up response-head call before panic, with phase, classifier and
+`diagnostics_armed=false`. If it reproduces, add reviewed pre-readiness transport capture:
+reset and arm immediately before warm-up, drain the warm-up interval on success or failure,
+then reset and re-arm at `PROBE-READY` so normal workload accounting stays separate. Only then
+run a fresh supervised armed 1 MiB canary. If that class disappears, the final 100-process
+16 KiB and 100-process 1 MiB reliability schedules can restart from zero. If it recurs, it
+must be diagnosed as its own setup/lifecycle occurrence and cannot be attributed to the S9
+pump correction without that same-occurrence pre-readiness transport evidence.

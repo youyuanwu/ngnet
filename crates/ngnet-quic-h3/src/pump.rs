@@ -227,23 +227,33 @@ pub(crate) fn poll_timer<S: Session>(
 
     // Rearm whenever the deadline moves, including after a pass that only wrote: ngtcp2
     // folds pacing into the same expiry, so arming only after reads can strand a write.
-    let mut replaced_due = false;
+    let mut preserved_ready = false;
     if state.sleeping_until != Some(deadline) {
-        let now = detached.now();
-        // Replacing an already-due sleep with ngtcp2's new (often idle) deadline must
-        // preserve the ready edge. Otherwise a stream refused just before pacing elapsed
-        // has neither a timer wake nor another event with which to retry.
-        let previous_due = state.sleeping_until.filter(|previous| *previous <= now);
-        replaced_due = previous_due.is_some();
-        #[cfg(feature = "diagnostics")]
-        if let Some(previous) = previous_due {
-            ngnet_quic::diagnostics::record_timer_ready(
-                detached.conn.diagnostic_id(),
-                detached.conn.role(),
-                now.as_nanos(),
-                previous.as_nanos(),
-            );
+        // A later ngtcp2 deadline must not cancel an earlier registered sleep. The earlier
+        // edge may become ready while this function is switching deadlines; keeping and
+        // polling it closes that transition race without a backup timer or wake budget.
+        if let (Some(previous), Some(sleep)) = (state.sleeping_until, state.sleeping.as_mut())
+            && previous < deadline
+        {
+            match core::pin::Pin::new(sleep).poll(cx) {
+                Poll::Ready(()) => {
+                    #[cfg(feature = "diagnostics")]
+                    ngnet_quic::diagnostics::record_timer_ready(
+                        detached.conn.diagnostic_id(),
+                        detached.conn.role(),
+                        detached.now().as_nanos(),
+                        previous.as_nanos(),
+                    );
+                    state.sleeping = None;
+                    state.sleeping_until = None;
+                    preserved_ready = true;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         }
+        let now = detached.now();
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = now;
         state.sleeping = Some(detached.sleep_until(deadline));
         state.sleeping_until = Some(deadline);
         #[cfg(feature = "diagnostics")]
@@ -271,7 +281,7 @@ pub(crate) fn poll_timer<S: Session>(
             state.sleeping_until = None;
             Poll::Ready(())
         }
-        Poll::Pending if replaced_due => Poll::Ready(()),
+        Poll::Pending if preserved_ready => Poll::Ready(()),
         Poll::Pending => Poll::Pending,
     }
 }
