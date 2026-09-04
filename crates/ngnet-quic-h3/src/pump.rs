@@ -101,7 +101,6 @@ pub(crate) fn pump<S: Session>(
     // Then the timer. Its deadline already folds in the pacing deadline, so this is also
     // what releases a connection that is waiting to send rather than waiting to hear.
     if let Some(deadline) = detached.conn.expiry().filter(|at| *at <= now) {
-        state.timer_due = true;
         #[cfg(not(feature = "diagnostics"))]
         let _ = deadline;
         #[cfg(feature = "diagnostics")]
@@ -228,14 +227,30 @@ pub(crate) fn poll_timer<S: Session>(
 
     // Rearm whenever the deadline moves, including after a pass that only wrote: ngtcp2
     // folds pacing into the same expiry, so arming only after reads can strand a write.
+    let mut replaced_due = false;
     if state.sleeping_until != Some(deadline) {
+        let now = detached.now();
+        // Replacing an already-due sleep with ngtcp2's new (often idle) deadline must
+        // preserve the ready edge. Otherwise a stream refused just before pacing elapsed
+        // has neither a timer wake nor another event with which to retry.
+        let previous_due = state.sleeping_until.filter(|previous| *previous <= now);
+        replaced_due = previous_due.is_some();
+        #[cfg(feature = "diagnostics")]
+        if let Some(previous) = previous_due {
+            ngnet_quic::diagnostics::record_timer_ready(
+                detached.conn.diagnostic_id(),
+                detached.conn.role(),
+                now.as_nanos(),
+                previous.as_nanos(),
+            );
+        }
         state.sleeping = Some(detached.sleep_until(deadline));
         state.sleeping_until = Some(deadline);
         #[cfg(feature = "diagnostics")]
         ngnet_quic::diagnostics::record_timer_rearm(
             detached.conn.diagnostic_id(),
             detached.conn.role(),
-            detached.now().as_nanos(),
+            now.as_nanos(),
             deadline.as_nanos(),
         );
     }
@@ -256,6 +271,7 @@ pub(crate) fn poll_timer<S: Session>(
             state.sleeping_until = None;
             Poll::Ready(())
         }
+        Poll::Pending if replaced_due => Poll::Ready(()),
         Poll::Pending => Poll::Pending,
     }
 }
