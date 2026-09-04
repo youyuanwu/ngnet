@@ -28,8 +28,8 @@ use std::future::Future;
 use std::io::IoSlice;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll, Waker};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
 
 use ngnet_h3::StreamId as H3StreamId;
 use ngnet_h3::http::{QuicConnection, StreamSource, WriteOutcome};
@@ -258,6 +258,25 @@ fn turn(drivers: &mut [Pin<Box<Driver>>], clock: &SharedClock, cx: &mut Context<
         let _ = driver.as_mut().poll(cx);
     }
     clock.advance(2_000_000);
+}
+
+fn drive_without_advancing(drivers: &mut [Pin<Box<Driver>>], cx: &mut Context<'_>) {
+    for driver in drivers.iter_mut() {
+        let _ = driver.as_mut().poll(cx);
+    }
+}
+
+#[derive(Default)]
+struct WakeCount(AtomicUsize);
+
+impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[test]
@@ -508,6 +527,107 @@ fn a_drain_pass_never_allocates_the_complete_large_offer() {
     assert_eq!(
         oversized, 0,
         "a drain pass allocated storage larger than one datagram; the complete offer was staged"
+    );
+}
+
+#[test]
+fn captured_s9_progress_seam_regression() {
+    let noop = Waker::noop();
+    let mut noop_cx = Context::from_waker(noop);
+    let credentials = Credentials::generate();
+    let caddr = "127.0.0.1:4573".parse().unwrap();
+    let saddr = "127.0.0.1:4574".parse().unwrap();
+    let clock = SharedClock::new();
+    let (cs, ss) = socket_pair(caddr, saddr);
+    let (client, cdrv) = build(Role::Client, cs, clock.clone(), &credentials);
+    let (server, sdrv) = build(Role::Server, ss, clock.clone(), &credentials);
+    let mut drivers: Vec<Pin<Box<Driver>>> = vec![Box::pin(cdrv), Box::pin(sdrv)];
+
+    let mut connecting = Box::pin(connect(&client, saddr, Some(TEST_SERVER_NAME)));
+    let mut accepting = Box::pin(accept(&server));
+    let mut client_conn: Option<NgtcpConnection<OsslSession>> = None;
+    let mut server_conn: Option<NgtcpConnection<OsslSession>> = None;
+    for _ in 0..1000 {
+        turn(&mut drivers, &clock, &mut noop_cx);
+        if client_conn.is_none()
+            && let Poll::Ready(result) = connecting.as_mut().poll(&mut noop_cx)
+        {
+            client_conn = Some(result.expect("the client handshake failed"));
+        }
+        if let Some(conn) = client_conn.as_mut() {
+            let _ = conn.poll_event(&mut noop_cx);
+        }
+        if server_conn.is_none()
+            && let Poll::Ready(result) = accepting.as_mut().poll(&mut noop_cx)
+        {
+            server_conn = Some(result.expect("the server accept failed"));
+        }
+        if client_conn.is_some() && server_conn.is_some() {
+            break;
+        }
+    }
+    let mut client_conn = client_conn.expect("a client connection");
+    let mut server_conn = server_conn.expect("a server connection");
+    for _ in 0..50 {
+        let _ = client_conn.poll_event(&mut noop_cx);
+        let _ = server_conn.poll_event(&mut noop_cx);
+        turn(&mut drivers, &clock, &mut noop_cx);
+    }
+
+    let stream = loop {
+        match client_conn.poll_open_uni(&mut noop_cx) {
+            Poll::Ready(result) => break result.expect("opening a uni stream"),
+            Poll::Pending => turn(&mut drivers, &clock, &mut noop_cx),
+        }
+    };
+    let mut source = OneWrite {
+        stream,
+        payload: vec![0x6b; 1024 * 1024],
+        sent: 0,
+        done: false,
+    };
+
+    let blocked_at = loop {
+        let before = source.sent;
+        let _ = client_conn.poll_transmit(&mut noop_cx, &mut source);
+        drive_without_advancing(&mut drivers, &mut noop_cx);
+        while let Poll::Ready(result) = server_conn.poll_event(&mut noop_cx) {
+            result.expect("server event");
+        }
+        while let Poll::Ready(result) = client_conn.poll_event(&mut noop_cx) {
+            result.expect("client event");
+        }
+        if source.sent == before {
+            break source.sent;
+        }
+        assert!(!source.done, "the test must reach a pacing-blocked write");
+    };
+    assert!(
+        blocked_at > 0,
+        "the blocked write must follow real progress"
+    );
+
+    clock.advance(100_000_000);
+    let wake_count = Arc::new(WakeCount::default());
+    let wake = Waker::from(Arc::clone(&wake_count));
+    let mut wake_cx = Context::from_waker(&wake);
+    assert!(
+        matches!(client_conn.poll_event(&mut wake_cx), Poll::Pending),
+        "the pacing expiry should not fabricate an application event"
+    );
+    assert_eq!(
+        wake_count.0.load(Ordering::Relaxed),
+        1,
+        "a due transport timer with a blocked stream must schedule one driver retry"
+    );
+    assert!(matches!(
+        client_conn.poll_event(&mut wake_cx),
+        Poll::Pending
+    ));
+    assert_eq!(
+        wake_count.0.load(Ordering::Relaxed),
+        1,
+        "the retry edge must not become a self-wake loop before another due expiry"
     );
 }
 

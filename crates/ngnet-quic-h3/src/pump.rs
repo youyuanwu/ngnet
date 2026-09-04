@@ -101,6 +101,7 @@ pub(crate) fn pump<S: Session>(
     // Then the timer. Its deadline already folds in the pacing deadline, so this is also
     // what releases a connection that is waiting to send rather than waiting to hear.
     if let Some(deadline) = detached.conn.expiry().filter(|at| *at <= now) {
+        state.timer_due = true;
         #[cfg(not(feature = "diagnostics"))]
         let _ = deadline;
         #[cfg(feature = "diagnostics")]

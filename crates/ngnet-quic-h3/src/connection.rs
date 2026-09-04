@@ -108,6 +108,10 @@ pub(crate) struct State {
     pub(crate) sleeping: Option<Sleep>,
     /// The deadline that sleep is for.
     pub(crate) sleeping_until: Option<Timestamp>,
+    /// Whether the transport refused the most recent stream write.
+    pub(crate) stream_blocked: bool,
+    /// Whether the most recent pump handled an expiry that can make that stream sendable.
+    pub(crate) timer_due: bool,
     /// Whether the previous pass parked on a full outbound queue.
     #[cfg(feature = "diagnostics")]
     pub(crate) capacity_parked: bool,
@@ -156,6 +160,8 @@ impl<S: Session> NgtcpConnection<S> {
                 emitted_since_pending: false,
                 sleeping: None,
                 sleeping_until: None,
+                stream_blocked: false,
+                timer_due: false,
                 #[cfg(feature = "diagnostics")]
                 capacity_parked: false,
                 #[cfg(feature = "diagnostics")]
@@ -340,6 +346,8 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
             );
         }
         pump::pump(&mut self.detached, &self.shared, &mut self.state, cx)?;
+        let retry_blocked_stream =
+            core::mem::take(&mut self.state.timer_due) && self.state.stream_blocked;
         self.collect();
 
         while let Some(record) = self.shared.peek_kind() {
@@ -373,6 +381,9 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
         if pump::poll_timer(&self.detached, &mut self.state, cx).is_ready() {
             cx.waker().wake_by_ref();
         }
+        if retry_blocked_stream {
+            cx.waker().wake_by_ref();
+        }
         #[cfg(feature = "diagnostics")]
         {
             self.state.idle_parked = true;
@@ -398,17 +409,19 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
             );
         }
         pump::pump(&mut self.detached, &self.shared, &mut self.state, cx)?;
+        self.state.timer_due = false;
         self.collect();
         if self.state.closed {
             return Poll::Ready(Err(pump::ended()));
         }
-        transmit::drain(
+        let stream_blocked = transmit::drain(
             &mut self.detached,
             &self.shared,
             &mut self.state,
             source,
             cx,
         )?;
+        self.state.stream_blocked = stream_blocked;
         let _ = pump::poll_timer(&self.detached, &mut self.state, cx);
         Poll::Ready(Ok(()))
     }

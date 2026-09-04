@@ -19,9 +19,10 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
     state: &mut State,
     source: &mut Src,
     cx: &core::task::Context<'_>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut failure: Option<Error> = None;
-    let mut blocked = false;
+    let mut stop = false;
+    let mut stream_blocked = false;
     #[cfg(feature = "diagnostics")]
     let role = detached.conn.role();
     #[cfg(feature = "diagnostics")]
@@ -75,7 +76,7 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
                         // A zero-byte acceptance here is a *serialised* zero-length STREAM
                         // frame, which ngtcp2 writes only for an offer carrying nothing but
                         // `fin`. The stream really did end, so the offer is committed.
-                        blocked = true;
+                        stop = true;
                     }
                     H3WriteOutcome::Accepted(accepted)
                 }
@@ -109,7 +110,8 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
                     | StreamWrite::ConnectionBlocked
                     | StreamWrite::Idle,
                 ) => {
-                    blocked = true;
+                    stop = true;
+                    stream_blocked = true;
                     H3WriteOutcome::Blocked
                 }
                 // A stream whose write side is finished will never take more. Saying so lets
@@ -145,12 +147,12 @@ pub(crate) fn drain<S: Session, Src: StreamSource>(
             state.closed = true;
             return Err(err);
         }
-        if blocked {
+        if stop {
             break;
         }
         if !offered {
             break;
         }
     }
-    Ok(())
+    Ok(stream_blocked)
 }
