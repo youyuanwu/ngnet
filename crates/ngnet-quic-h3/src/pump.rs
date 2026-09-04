@@ -13,6 +13,19 @@ use ngnet_quic::{Session, WriteOutcome};
 use crate::connection::{Shared, State};
 use crate::error::{Error, ErrorKind, Result};
 
+#[cfg(feature = "diagnostics")]
+fn close_reason(close: &ngnet_quic::CloseError) -> &'static str {
+    match close.reason() {
+        ngnet_quic::CloseReason::Transport(_) => "peer-transport-close",
+        ngnet_quic::CloseReason::Application(_) => "peer-application-close",
+        ngnet_quic::CloseReason::VersionNegotiation => "version-negotiation",
+        ngnet_quic::CloseReason::IdleTimeout => "idle-timeout",
+        ngnet_quic::CloseReason::Dropped => "dropped",
+        ngnet_quic::CloseReason::Retry => "retry",
+        _ => "peer-close-other",
+    }
+}
+
 /// The largest datagram this crate will produce.
 ///
 /// Capacity, not permission: the connection decides how much of it may actually be used.
@@ -57,7 +70,10 @@ pub(crate) fn pump<S: Session>(
             ) => {}
             Ok(ngnet_quic::ReadOutcome::Draining | ngnet_quic::ReadOutcome::Closing) => {
                 state.closed = true;
-                shared.record_connection_closed(detached.conn.close_error());
+                let close = detached.conn.close_error();
+                #[cfg(feature = "diagnostics")]
+                ngnet_quic::diagnostics::record_terminal(connection_id, role, close_reason(&close));
+                shared.record_connection_closed(close);
                 // Nothing further is read into a connection that has ended. Continuing
                 // would re-enter the same branch for every datagram still queued and record
                 // the close again for each.
@@ -65,6 +81,12 @@ pub(crate) fn pump<S: Session>(
             }
             Err(err) => {
                 state.closed = true;
+                #[cfg(feature = "diagnostics")]
+                ngnet_quic::diagnostics::record_terminal(
+                    connection_id,
+                    role,
+                    "read-transport-error",
+                );
                 shared.record_connection_closed_bare();
                 return Err(Error::transport(err));
             }
@@ -79,17 +101,34 @@ pub(crate) fn pump<S: Session>(
     // Then the timer. Its deadline already folds in the pacing deadline, so this is also
     // what releases a connection that is waiting to send rather than waiting to hear.
     if detached.conn.expiry().is_some_and(|at| at <= now) {
+        #[cfg(feature = "diagnostics")]
+        ngnet_quic::diagnostics::record_timer_fire(connection_id, role);
         match detached.conn.handle_expiry(now) {
             Ok(ngnet_quic::ExpiryOutcome::Handled) => {}
-            Ok(ngnet_quic::ExpiryOutcome::IdleClose | ngnet_quic::ExpiryOutcome::Terminal) => {
+            Ok(ngnet_quic::ExpiryOutcome::IdleClose) => {
                 // An idle timeout is how a connection to a peer that stopped answering ends.
                 // Reported as the connection closing, because otherwise it is silence.
                 state.closed = true;
+                #[cfg(feature = "diagnostics")]
+                ngnet_quic::diagnostics::record_terminal(connection_id, role, "idle-timeout");
+                shared.record_connection_closed(detached.conn.close_error());
+                return Ok(());
+            }
+            Ok(ngnet_quic::ExpiryOutcome::Terminal) => {
+                state.closed = true;
+                #[cfg(feature = "diagnostics")]
+                ngnet_quic::diagnostics::record_terminal(connection_id, role, "expiry-terminal");
                 shared.record_connection_closed(detached.conn.close_error());
                 return Ok(());
             }
             Err(err) => {
                 state.closed = true;
+                #[cfg(feature = "diagnostics")]
+                ngnet_quic::diagnostics::record_terminal(
+                    connection_id,
+                    role,
+                    "expiry-transport-error",
+                );
                 shared.record_connection_closed_bare();
                 return Err(Error::transport(err));
             }
@@ -180,8 +219,7 @@ pub(crate) fn poll_timer<S: Session>(
     };
 
     // Rearm whenever the deadline moves, including after a pass that only wrote: ngtcp2
-    // folds its pacing deadline into the same expiry, so a connection that rearmed only
-    // after reading would send one datagram and then wait for the peer to speak.
+    // folds pacing into the same expiry, so arming only after reads can strand a write.
     if state.sleeping_until != Some(deadline) {
         state.sleeping = Some(detached.sleep_until(deadline));
         state.sleeping_until = Some(deadline);
@@ -197,13 +235,13 @@ pub(crate) fn poll_timer<S: Session>(
     };
     match core::pin::Pin::new(sleep).poll(cx) {
         Poll::Ready(()) => {
-            state.sleeping = None;
-            state.sleeping_until = None;
             #[cfg(feature = "diagnostics")]
-            ngnet_quic::diagnostics::record_timer_fire(
+            ngnet_quic::diagnostics::record_timer_ready(
                 detached.conn.diagnostic_id(),
                 detached.conn.role(),
             );
+            state.sleeping = None;
+            state.sleeping_until = None;
             Poll::Ready(())
         }
         Poll::Pending => Poll::Pending,

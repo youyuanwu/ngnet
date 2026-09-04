@@ -44,35 +44,39 @@ The deterministic reproduction of the transport's half is
 the end-to-end story, including which stack this actually stalled, is in
 [`../h3-ngnet-quic/pending-work.md`](../h3-ngnet-quic/pending-work.md).
 
-**This is not the large-body stall and does not fix it.** That was re-measured afterwards and
-survives; see the next section.
+**This is not the large-body stall and did not fix it.** That was re-measured afterwards and
+remains open; see the next section.
 
-## The intermittent large-body failure survives, and it reaches the test suite
+## The reproduced large-body failure remains open
 
-Run 30's outer-driver liveness failure — S9 — is still open. It was re-measured on
-`epyc-7763-azure` after the FIN change above, release build, pinned to one core, against the
-new `h3-ngnet-quic` arm over the identical transport, fixtures, payload and exchange count
-(200 x 16 KiB): this stack failed 2 of 20, the hyperium-over-ngtcp2 stack 0 of 20. The failures
-were `ErrorKind::Closed`, "the connection has ended", not timeouts. Transport held fixed and
-HTTP/3 layer varied, so it belongs here.
+S9 was reproduced on the current EPYC host during this investigation: five of the first 73
+supervised native processes failed while each attempted 125 exact 1 MiB POST/echo exchanges.
+Armed 1 MiB and 16 KiB processes reproduced both response-head and body-drain forms.
 
-A later revision — not ending the drain pass on a stream-less packet, so `Offers::write_next` is
-asked again and unblocks the displaced stream within the pass — was then measured over 50 runs
-of the same workload with no failure. That is a plausible mechanism for part of this defect and
-is **not** a claim that it is fixed: fifty clean runs make a 10% rate unlikely and leave a 2%
-rate entirely plausible, and S9's original evidence is a different workload on a different host,
-which nothing here re-examined.
+The final write in captured failures was generically transport-blocked while stream,
+connection, and congestion credit remained. The adapter armed an expiry 15 ns to 11.8 µs
+away, parked, and recorded no timer-ready or driver wake before both endpoints reached idle
+timeout. Endpoint queues had capacity and no inbound drop; receive credit had been returned.
+That distinguishes this mechanism from both flow-control starvation and the pure-FIN defect
+above.
 
-`tests/ngnet-bench/tests/ngtcp2_fixture.rs::unarmed_and_armed_diagnostics_preserve_and_reconcile_echoes`
-drives 16 KiB bodies through this stack and can therefore fail the same way. It was seen to do
-so once, with that exact signature, during a full `cargo test --workspace --all-features` run —
-the contended case, with every test binary competing for four cores.
+Three bounded fallback candidates completed separate 100/100 process schedules, but none
+proved causality. The final deadline-backed candidate still produced one unarmed response-head
+failure in 30 exact-fixture processes, and an earlier self-wake candidate produced one
+close-before-response failure in eight all-feature workspace runs. The candidates were
+therefore removed rather than shipping a speculative scheduling change.
 
-It was **not** reproduced afterwards, and the attempt to attribute it is recorded rather than
-skipped: 12 isolated runs and 20 runs under deliberate CPU contention, on this branch and on
-unmodified `main`, gave 64 runs and no failure on either. So there is no measured difference
-between the two, the signature is S9's, and nothing here claims otherwise in either direction.
-It is not attributed to the FIN change, and it is not claimed fixed.
+After removal, an all-feature workspace invocation run concurrently with the other final cargo
+gates failed both the basic request/response and large flow-control exchange tests; an isolated
+rerun passed. This preserves the known contention-sensitive signature rather than treating one
+clean rerun as resolution.
+
+The committed harness and diagnostics are the result: they preserve phase, integrity,
+terminal/close category, flow and congestion credit, expiry, queue/wake state, bounded record
+loss, exact completion markers, and process cleanup. A safe correction remains blocked on an
+armed same-occurrence capture that either proves why an armed sub-tick sleep fails to wake or
+selects a different seam. See
+[`03-native-h3-s9-timer-wake.md`](../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md).
 
 ## Body bytes are copied twice
 
@@ -90,9 +94,8 @@ since that is what constructing a datagram means.
 Run [`27`](../benchmarks/data/xeon-8370c-azure/27-ngtcp2-packet-bounded-staging.md) records
 historical staged backing, accepted progress, exactness, and sampled RSS. Final-review
 [`run 30`](../benchmarks/data/xeon-8370c-azure/30-ngtcp2-final-review-resolution.md) records
-fresh diagnostic timeouts, so current persistent stability and the RSS envelope remain unmet.
-Neither record isolates copy CPU cost from packet protection, endpoint, adapter, or generic
-HTTP/3 work.
+the historical diagnostic timeouts. The later S9 reliability qualification does not isolate
+copy CPU cost from packet protection, endpoint, adapter, or generic HTTP/3 work.
 
 **What would settle the remaining copy:** route ownership-taking HTTP/3 buffers through
 `Conn::write_stream_owned`, change release to acknowledgement, and change

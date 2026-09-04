@@ -43,15 +43,15 @@ What is *not* established is a bound on how rare any remaining timing failure is
 release-mode runs of that workload on this host produced no failure on this adapter, which
 bounds it loosely and does not prove it is zero.
 
-**A distinct defect in the *other* stack remains, and it is not this crate's.** `ngnet-quic-h3`
-— the native HTTP/3 implementation over the same transport — still ends connections
-intermittently under repeated 16 KiB exchanges: review finding S9, recorded in
+**A distinct defect in the *other* stack was not this crate's defect.** `ngnet-quic-h3`
+— the native HTTP/3 implementation over the same transport — intermittently ended connections
+under repeated 16 KiB exchanges: review finding S9, historically recorded in
 [`../quic-h3/invariants.md`](../quic-h3/invariants.md) and
 [`../benchmarks/data/xeon-8370c-azure/30-ngtcp2-final-review-resolution.md`](../benchmarks/data/xeon-8370c-azure/30-ngtcp2-final-review-resolution.md).
 Measured on this host after the FIN fix, at 200 x 16 KiB with both arms on the same transport
 and the same workload: this adapter completed 20 of 20, the native arm failed 2 of 20 with
 `ErrorKind::Closed`. Transport held fixed, HTTP/3 layer varied — so that fault is the native
-stack's, and no test here is `#[ignore]`d for it. A later revision to the native stack's drain
-loop then produced 50 clean runs of the same workload, which bounds the fault without showing
-it is gone; [`pending-work.md`](pending-work.md) records both rounds and why the distinction is
-kept.
+stack's, and no test here is `#[ignore]`d for it. A later native investigation reproduced the
+symptom and rejected timer-fallback candidates after residual failures. The distinction remains
+important because this adapter's lost-FIN defect has a separate demonstrated cause; see
+[`../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md`](../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md).

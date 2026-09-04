@@ -255,6 +255,37 @@ Record exit `0`, `124` (outer timeout), or `128 + signal`, the final
 `PROBE-PROGRESS`, and the final complete snapshot. Never exclude a stalled, signalled,
 wrong-length, or unexpectedly dropped run from correctness results.
 
+For native S9 reliability, build the probe and committed process supervisor together. The
+supervisor creates one process group per run, records the last durable application checkpoint,
+and verifies that the group is empty before continuing:
+
+```sh
+cargo build -p ngnet-bench --examples --release --features diagnostics
+./target/release/examples/s9_supervisor \
+  ./target/release/examples/probe ngnet-quic-h3 reliability \
+  1048576 125 100 180 1 target/s9-native-final.log
+```
+
+`reliability` mode is unarmed. Each exchange has its payload-scaled inner timeout and the
+whole probe self-classifies before the 180-second outer bound where possible. Treat a
+`PROBE-FAIL`, outer kill, unclassified exit, or cleanup failure as a failed process. A clean
+100-process result is reliability evidence (approximately a 3% one-sided 95% upper
+failure-rate bound), not a timing result or proof that failure is impossible.
+The final path is an append-only manifest. The supervisor rejects duplicate completed run
+numbers but permits a run with only an interrupted `START` record to be retried. It records
+each start, exact failure classifier/detail, captured process identities, checkpoint, cleanup
+status, and final summary so a terminal scrollback limit cannot change the evidence
+denominator.
+
+Use fixture mode for the ignored exact stress tests:
+
+```sh
+./target/release/examples/s9_supervisor fixture \
+  ngtcp2_fixture_repeats_16_kib_exactly 5 900 1 target/s9-fixture-16k.log
+./target/release/examples/s9_supervisor fixture \
+  ngtcp2_fixture_repeats_1_mib_exactly 5 900 1 target/s9-fixture-1m.log
+```
+
 Before stability is claimed, predetermine and run five default-profile and five release-profile
 125 × 1 MiB exact repetitions. Each process is externally bounded and every status is kept:
 
@@ -328,9 +359,9 @@ done
 
 ### Validating the ngtcp2 HTTP/3 path
 
-The live-loopback large-body repetitions are ignored while the intermittent outer-driver
-liveness failure remains open; run them explicitly under the repetition/supervisor protocol
-above. Then run the active diagnostic invariant/allocation coverage:
+The live-loopback large-body repetitions remain ignored because they are long-running stress
+tests; run them explicitly under the process-group supervisor protocol above. Then run the
+active diagnostic invariant/allocation coverage:
 
 ```sh
 cargo test -p ngnet-bench --test ngtcp2_fixture --release

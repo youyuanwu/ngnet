@@ -10,7 +10,7 @@ what the run does and does not establish.
 | Machine | Status | Runs |
 | --- | --- | --- |
 | [`legacy-dev-host`](legacy-dev-host/) | **Retired, unavailable.** Every measurement taken before 2026-08-16. Noisy: unchanged control arms drifted 5–15% within a session. | 4 |
-| [`epyc-7763-azure`](epyc-7763-azure/) | Current host. AMD EPYC 7763, `Standard_D4as_v5`, 4 vCPU, no cpufreq governor exposed. **Cannot presently measure timings**: never idle (a Kubernetes control plane and two unrelated processes ran throughout), and an unchanged control arm drifted 4.2x within one session. Useful for correctness and liveness work. | 1 |
+| [`epyc-7763-azure`](epyc-7763-azure/) | Current host. AMD EPYC 7763, `Standard_D4as_v5`, 4 vCPU, no cpufreq governor exposed. **Cannot presently measure timings**: never idle (a Kubernetes control plane and two unrelated processes ran throughout), and an unchanged control arm drifted 4.2x within one session. Useful for correctness and liveness work. | 3 |
 | [`xeon-8370c-azure`](xeon-8370c-azure/) | Previous VM; historical machine label and recorded spec are Intel Xeon Platinum 8370C. Runs 12–23 report 8573C, while runs 24, 29, and 30 report 8370C again; Azure migration timing is unknown, so absolute figures across runs are not controlled. | 33 |
 
 **Absolute figures from different machines must never be tabulated together.** Nothing here
@@ -62,6 +62,7 @@ mechanism advanced for it — which is what [`../findings/`](../findings/) recor
 | [33-h3-qmux-post-revision](xeon-8370c-azure/33-h3-qmux-post-revision.md) | xeon-8370c-azure | 2026-09-01 | Equal-topology post-revision matrix — **Criterion favors hyperium, but pinned ranges overlap; inconclusive** | — |
 | [01-h3-ngnet-quic-comparison](epyc-7763-azure/01-h3-ngnet-quic-comparison.md) | epyc-7763-azure | 2026-09-02 | Hyperium H3 against ngnet H3 over one ngtcp2 transport | inconclusive; found an `h3-ngnet-quic` liveness defect |
 | [02-h3-ngnet-quic-fin-fix](epyc-7763-azure/02-h3-ngnet-quic-fin-fix.md) | epyc-7763-azure | 2026-09-02 | Root cause of run 01's defect, and reliability after the fix | fixed — a lost FIN in the transport's report of what ngtcp2 serialised; **reliability only, no timing claimed** |
+| [03-native-h3-s9-timer-wake](epyc-7763-azure/03-native-h3-s9-timer-wake.md) | epyc-7763-azure | 2026-09-03 | Native large-body S9 timer investigation | conclusive harness and evidence; fallback candidates rejected, S9 remains open |
 
 Runs [`08`](xeon-8370c-azure/08-qmux-against-h2.md) and
 [`09`](xeon-8370c-azure/09-qmux-h2-mechanisms.md) are the first cross-protocol comparison and its

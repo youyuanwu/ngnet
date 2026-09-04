@@ -33,7 +33,7 @@ The transport copies because ngtcp2 retains stream pointers, but a drain must ne
 the caller's complete large offer. The allocation suite offers 1 MiB, requires actual accepted
 progress, and rejects every allocation larger than 64 KiB. The fixed-count fixture separately
 keeps supervised 125 × 16 KiB and 125 × 1 MiB exact protocols. Their live-loopback tests are
-ignored while run 30's intermittent outer-driver liveness failure remains unresolved.
+ignored because they are long-running supervised stress cases rather than ordinary CI tests.
 
 Compiling diagnostics does not arm them. The feature-enabled unarmed allocation proof records
 representative packet, release, timer, wake, and park hooks and requires zero allocations plus

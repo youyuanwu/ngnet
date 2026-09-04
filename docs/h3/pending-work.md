@@ -221,11 +221,12 @@ process with `SIGSEGV` during Criterion collection.
 
 Run 27 historically found that packet-bounded staging and retention-offset fixes made its
 persistent exactness and diagnostic runs pass. Run 30 and final-review reproduction later
-observed both armed and unarmed release-mode stalls, so current persistent stability/RSS
-qualification is explicitly unmet. The three-arm benchmark still excludes both larger points;
-the existing Quinn-only benchmark carries them. Keep externally supervised exact/diagnostic
-protocols and restore larger Criterion points only after both liveness and calibrated
-measurement gates pass.
+observed both armed and unarmed release-mode stalls. A later investigation localized an
+imminent-timer correlation, but fallback candidates were removed after residual failures,
+recorded
+in [`../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md`](../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md).
+The three-arm benchmark still excludes both larger points because this host cannot pass the
+calibrated measurement gates; the existing Quinn-only benchmark carries them.
 
 ### Self-interop only
 

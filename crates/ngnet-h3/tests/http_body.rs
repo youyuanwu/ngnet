@@ -87,6 +87,10 @@ fn a_body_larger_than_the_transport_will_take_at_once_still_completes() {
 
     assert!(response.is_ok(), "a capped transport stalled the exchange");
     assert_eq!(server.received_body(), payload);
+    assert!(
+        knobs.writes() > payload.len() / 1024,
+        "the test did not non-vacuously retry the short-written HTTP/3 stream"
+    );
 }
 
 #[test]

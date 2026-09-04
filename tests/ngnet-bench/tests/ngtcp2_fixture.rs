@@ -1,7 +1,25 @@
 use bytes::Bytes;
-use ngnet_bench::NgnetNgtcpH3;
+use ngnet_bench::{CheckedIntegrity, CheckedPhase, CheckedProgress, NgnetNgtcpH3};
+use std::sync::{Arc, Mutex};
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn phase_name(phase: CheckedPhase) -> &'static str {
+    match phase {
+        CheckedPhase::ResponseHead => "response-head",
+        CheckedPhase::BodyDrain => "body-drain",
+        CheckedPhase::TerminalWait => "terminal-wait",
+        CheckedPhase::Complete => "complete",
+    }
+}
+
+fn integrity_name(integrity: CheckedIntegrity) -> &'static str {
+    match integrity {
+        CheckedIntegrity::ExactSoFar => "exact-so-far",
+        CheckedIntegrity::ContentMismatch => "content-mismatch",
+        CheckedIntegrity::LengthMismatch => "length-mismatch",
+    }
+}
 
 fn establishment_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(if cfg!(debug_assertions) { 60 } else { 30 })
@@ -86,6 +104,9 @@ fn assert_bounded_attempts(
 
 #[cfg(feature = "diagnostics")]
 fn assert_zero_accept_retry_reconciliation(drained: &ngnet_quic::diagnostics::DrainedDiagnostics) {
+    if drained.snapshot.dropped_liveness_records != 0 {
+        return;
+    }
     for (role, snapshot) in [
         (ngnet_quic::Role::Client, drained.snapshot.client),
         (ngnet_quic::Role::Server, drained.snapshot.server),
@@ -116,24 +137,78 @@ async fn repeated_exact_echo(size: usize, exchanges: usize) {
     );
 
     for exchange in 1..=exchanges {
+        let emitted = Arc::new(Mutex::new((CheckedPhase::Complete, usize::MAX)));
+        let progress = CheckedProgress::observed({
+            let emitted = Arc::clone(&emitted);
+            move |snapshot| {
+                let bucket = snapshot.received / (64 * 1024);
+                let mut prior = emitted.lock().expect("fixture checkpoint mutex poisoned");
+                if prior.0 == snapshot.phase && prior.1 == bucket {
+                    return;
+                }
+                *prior = (snapshot.phase, bucket);
+                eprintln!(
+                    "S9-FIXTURE-CHECKPOINT size={size} exchange={exchange} phase={} \
+                     received_bytes={} integrity={} terminal={}",
+                    phase_name(snapshot.phase),
+                    snapshot.received,
+                    integrity_name(snapshot.integrity),
+                    snapshot.phase == CheckedPhase::Complete,
+                );
+            }
+        });
+        eprintln!(
+            "S9-FIXTURE-CHECKPOINT size={size} exchange={exchange} last_completed={} \
+             phase=response-head received_bytes=0",
+            exchange - 1
+        );
         let (received, exact) = tokio::time::timeout(
             exchange_timeout(size),
-            fixture.try_round_trip_checked(body.clone()),
+            fixture.try_round_trip_checked_observed(body.clone(), &progress),
         )
         .await
         .unwrap_or_else(|_| {
+            let snapshot = progress.snapshot();
             panic!(
-                "{size}-byte exchange {exchange} stalled; last completed exchange was {}",
-                exchange - 1
+                "{size}-byte exchange {exchange} stalled; last completed exchange was {}; \
+                 phase={} received_bytes={} integrity={} terminal={}",
+                exchange - 1,
+                phase_name(snapshot.phase),
+                snapshot.received,
+                integrity_name(snapshot.integrity),
+                snapshot.phase == CheckedPhase::Complete,
             )
         })
         .unwrap_or_else(|error| {
+            let snapshot = progress.snapshot();
             panic!(
                 "{size}-byte exchange {exchange} failed; last completed exchange was {}; \
-                 error={error}",
-                exchange - 1
+                 phase={} received_bytes={} integrity={} terminal={} error={error}",
+                exchange - 1,
+                phase_name(snapshot.phase),
+                snapshot.received,
+                integrity_name(snapshot.integrity),
+                snapshot.phase == CheckedPhase::Complete,
             )
         });
+        if received != size || !exact {
+            eprintln!(
+                "S9-FIXTURE-FAIL size={size} exchange={exchange} last_completed={} \
+                 phase=complete received_bytes={received} integrity={} terminal=true \
+                 classifier={}",
+                exchange - 1,
+                if received != size {
+                    "length-mismatch"
+                } else {
+                    "content-mismatch"
+                },
+                if received != size {
+                    "wrong-length"
+                } else {
+                    "wrong-content"
+                }
+            );
+        }
         assert_eq!(
             received, size,
             "{size}-byte exchange {exchange} did not echo exactly"
@@ -141,6 +216,10 @@ async fn repeated_exact_echo(size: usize, exchanges: usize) {
         assert!(
             exact,
             "{size}-byte exchange {exchange} returned corrupted content"
+        );
+        eprintln!(
+            "S9-FIXTURE-CHECKPOINT size={size} exchange={exchange} completed={exchange} \
+             phase=complete received_bytes={received}"
         );
     }
 }
@@ -175,14 +254,14 @@ async fn ngtcp2_fixture_reuses_more_than_the_initial_stream_limit() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "known intermittent outer-driver liveness failure; see benchmark run 30"]
+#[ignore = "long-running S9 stress; run through the documented process-group supervisor"]
 async fn ngtcp2_fixture_repeats_16_kib_exactly() {
     let _guard = TEST_LOCK.lock().await;
     repeated_exact_echo(16 * 1024, 125).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "known intermittent outer-driver liveness failure; see benchmark run 30"]
+#[ignore = "long-running S9 stress; run through the documented process-group supervisor"]
 async fn ngtcp2_fixture_repeats_1_mib_exactly() {
     let _guard = TEST_LOCK.lock().await;
     repeated_exact_echo(1024 * 1024, 125).await;

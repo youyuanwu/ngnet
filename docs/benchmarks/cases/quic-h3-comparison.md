@@ -61,11 +61,12 @@ the transport's `MAX_STREAMS`, identical on both arms — and the workload is se
 
 ## Why the body sweep stops at 1 KiB
 
-Because this transport has an unresolved intermittent connection-ending stall under repeated
-16 KiB and 1 MiB workloads (review finding S9), and the existing `quic_stack_body_throughput`
-already restricts itself for that reason. A committed sweep that intermittently kills its own
-connection produces numbers nobody should trust. Larger payloads are run as supervised probes
-through `examples/probe.rs`, on both arms, rather than being inferred from one stack's history.
+The sweep was restricted because the native stack had an intermittent connection-ending stall
+under repeated 16 KiB and 1 MiB workloads (review finding S9). Timer-fallback candidates were
+rejected after residual failures, and this host also fails the calibrated measurement gates.
+The large-body points have not been re-qualified as comparative benchmarks. Larger payloads remain
+supervised reliability probes through `examples/probe.rs`, on both arms, rather than timing
+measurements inferred from one stack's history.
 
 ## What a result from this pair could support
 
