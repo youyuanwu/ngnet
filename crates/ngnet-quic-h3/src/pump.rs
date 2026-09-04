@@ -100,9 +100,16 @@ pub(crate) fn pump<S: Session>(
 
     // Then the timer. Its deadline already folds in the pacing deadline, so this is also
     // what releases a connection that is waiting to send rather than waiting to hear.
-    if detached.conn.expiry().is_some_and(|at| at <= now) {
+    if let Some(deadline) = detached.conn.expiry().filter(|at| *at <= now) {
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = deadline;
         #[cfg(feature = "diagnostics")]
-        ngnet_quic::diagnostics::record_timer_fire(connection_id, role);
+        ngnet_quic::diagnostics::record_timer_fire(
+            connection_id,
+            role,
+            now.as_nanos(),
+            deadline.as_nanos(),
+        );
         match detached.conn.handle_expiry(now) {
             Ok(ngnet_quic::ExpiryOutcome::Handled) => {}
             Ok(ngnet_quic::ExpiryOutcome::IdleClose) => {
@@ -220,13 +227,41 @@ pub(crate) fn poll_timer<S: Session>(
 
     // Rearm whenever the deadline moves, including after a pass that only wrote: ngtcp2
     // folds pacing into the same expiry, so arming only after reads can strand a write.
+    let mut preserved_ready = false;
     if state.sleeping_until != Some(deadline) {
+        // A later ngtcp2 deadline must not cancel an earlier registered sleep. The earlier
+        // edge may become ready while this function is switching deadlines; keeping and
+        // polling it closes that transition race without a backup timer or wake budget.
+        if let (Some(previous), Some(sleep)) = (state.sleeping_until, state.sleeping.as_mut())
+            && previous < deadline
+        {
+            match core::pin::Pin::new(sleep).poll(cx) {
+                Poll::Ready(()) => {
+                    #[cfg(feature = "diagnostics")]
+                    ngnet_quic::diagnostics::record_timer_ready(
+                        detached.conn.diagnostic_id(),
+                        detached.conn.role(),
+                        detached.now().as_nanos(),
+                        previous.as_nanos(),
+                    );
+                    state.sleeping = None;
+                    state.sleeping_until = None;
+                    preserved_ready = true;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        let now = detached.now();
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = now;
         state.sleeping = Some(detached.sleep_until(deadline));
         state.sleeping_until = Some(deadline);
         #[cfg(feature = "diagnostics")]
         ngnet_quic::diagnostics::record_timer_rearm(
             detached.conn.diagnostic_id(),
             detached.conn.role(),
+            now.as_nanos(),
+            deadline.as_nanos(),
         );
     }
 
@@ -239,11 +274,14 @@ pub(crate) fn poll_timer<S: Session>(
             ngnet_quic::diagnostics::record_timer_ready(
                 detached.conn.diagnostic_id(),
                 detached.conn.role(),
+                detached.now().as_nanos(),
+                deadline.as_nanos(),
             );
             state.sleeping = None;
             state.sleeping_until = None;
             Poll::Ready(())
         }
+        Poll::Pending if preserved_ready => Poll::Ready(()),
         Poll::Pending => Poll::Pending,
     }
 }

@@ -137,10 +137,11 @@ not the other, so it belongs to the native stack. That is the same rule used the
 for the defect above, when this adapter failed 6 in 10 and the native arm 0 in 10 at 1 KiB.
 
 Round 2 saw none. Fifty clean runs bounded the fault rather than disproving it. Later native
-work reproduced S9 directly and localized failures around an armed imminent timer with no
-observed wake. Several fallback candidates passed 100-process schedules, but residual failures
-remained and the candidates were removed. The native S9 symptom therefore remains open. See
-[`../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md`](../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md).
+work first localized failures around an armed imminent timer, then captured the missing fact:
+the timer was handled and replaced by the idle deadline without the blocked stream receiving
+another transmit pass. The native adapter now preserves that one ready edge. A separate
+pre-readiness 1 MiB failure blocks a full resolution claim; see
+[`../benchmarks/data/epyc-7763-azure/04-native-h3-s9-root-cause.md`](../benchmarks/data/epyc-7763-azure/04-native-h3-s9-root-cause.md).
 
 Consequences for this crate:
 

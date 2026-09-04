@@ -221,10 +221,10 @@ process with `SIGSEGV` during Criterion collection.
 
 Run 27 historically found that packet-bounded staging and retention-offset fixes made its
 persistent exactness and diagnostic runs pass. Run 30 and final-review reproduction later
-observed both armed and unarmed release-mode stalls. A later investigation localized an
-imminent-timer correlation, but fallback candidates were removed after residual failures,
-recorded
-in [`../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md`](../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md).
+observed both armed and unarmed release-mode stalls. Follow-up work selected an adapter-side
+pump/retry scheduling seam and retained a one-shot correction, but a pre-readiness residual
+blocks the final reliability claim; see
+[`../benchmarks/data/epyc-7763-azure/04-native-h3-s9-root-cause.md`](../benchmarks/data/epyc-7763-azure/04-native-h3-s9-root-cause.md).
 The three-arm benchmark still excludes both larger points because this host cannot pass the
 calibrated measurement gates; the existing Quinn-only benchmark carries them.
 

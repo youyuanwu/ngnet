@@ -28,8 +28,8 @@ use std::future::Future;
 use std::io::IoSlice;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll, Waker};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
 
 use ngnet_h3::StreamId as H3StreamId;
 use ngnet_h3::http::{QuicConnection, StreamSource, WriteOutcome};
@@ -258,6 +258,115 @@ fn turn(drivers: &mut [Pin<Box<Driver>>], clock: &SharedClock, cx: &mut Context<
         let _ = driver.as_mut().poll(cx);
     }
     clock.advance(2_000_000);
+}
+
+fn drive_without_advancing(drivers: &mut [Pin<Box<Driver>>], cx: &mut Context<'_>) {
+    for driver in drivers.iter_mut() {
+        let _ = driver.as_mut().poll(cx);
+    }
+}
+
+#[derive(Default)]
+struct WakeCount(AtomicUsize);
+
+impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn pacing_blocked_pair(
+    client_address: &str,
+    server_address: &str,
+) -> (
+    NgtcpConnection<OsslSession>,
+    NgtcpConnection<OsslSession>,
+    Vec<Pin<Box<Driver>>>,
+    SharedClock,
+    OneWrite,
+    usize,
+) {
+    let noop = Waker::noop();
+    let mut cx = Context::from_waker(noop);
+    let credentials = Credentials::generate();
+    let caddr = client_address.parse().unwrap();
+    let saddr = server_address.parse().unwrap();
+    let clock = SharedClock::new();
+    let (cs, ss) = socket_pair(caddr, saddr);
+    let (client, cdrv) = build(Role::Client, cs, clock.clone(), &credentials);
+    let (server, sdrv) = build(Role::Server, ss, clock.clone(), &credentials);
+    let mut drivers: Vec<Pin<Box<Driver>>> = vec![Box::pin(cdrv), Box::pin(sdrv)];
+
+    let mut connecting = Box::pin(connect(&client, saddr, Some(TEST_SERVER_NAME)));
+    let mut accepting = Box::pin(accept(&server));
+    let mut client_conn: Option<NgtcpConnection<OsslSession>> = None;
+    let mut server_conn: Option<NgtcpConnection<OsslSession>> = None;
+    for _ in 0..1000 {
+        turn(&mut drivers, &clock, &mut cx);
+        if client_conn.is_none()
+            && let Poll::Ready(result) = connecting.as_mut().poll(&mut cx)
+        {
+            client_conn = Some(result.expect("the client handshake failed"));
+        }
+        if let Some(conn) = client_conn.as_mut() {
+            let _ = conn.poll_event(&mut cx);
+        }
+        if server_conn.is_none()
+            && let Poll::Ready(result) = accepting.as_mut().poll(&mut cx)
+        {
+            server_conn = Some(result.expect("the server accept failed"));
+        }
+        if client_conn.is_some() && server_conn.is_some() {
+            break;
+        }
+    }
+    drop(connecting);
+    drop(accepting);
+    let mut client_conn = client_conn.expect("a client connection");
+    let mut server_conn = server_conn.expect("a server connection");
+    for _ in 0..50 {
+        let _ = client_conn.poll_event(&mut cx);
+        let _ = server_conn.poll_event(&mut cx);
+        turn(&mut drivers, &clock, &mut cx);
+    }
+
+    let stream = loop {
+        match client_conn.poll_open_uni(&mut cx) {
+            Poll::Ready(result) => break result.expect("opening a uni stream"),
+            Poll::Pending => turn(&mut drivers, &clock, &mut cx),
+        }
+    };
+    let mut source = OneWrite {
+        stream,
+        payload: vec![0x6b; 1024 * 1024],
+        sent: 0,
+        done: false,
+    };
+    let blocked_at = loop {
+        let before = source.sent;
+        let _ = client_conn.poll_transmit(&mut cx, &mut source);
+        drive_without_advancing(&mut drivers, &mut cx);
+        while let Poll::Ready(result) = server_conn.poll_event(&mut cx) {
+            result.expect("server event");
+        }
+        while let Poll::Ready(result) = client_conn.poll_event(&mut cx) {
+            result.expect("client event");
+        }
+        if source.sent == before {
+            break source.sent;
+        }
+        assert!(!source.done, "the test must reach a pacing-blocked write");
+    };
+    assert!(
+        blocked_at > 0,
+        "the blocked write must follow real progress"
+    );
+    (client_conn, server_conn, drivers, clock, source, blocked_at)
 }
 
 #[test]
@@ -511,6 +620,64 @@ fn a_drain_pass_never_allocates_the_complete_large_offer() {
     );
 }
 
+#[test]
+fn captured_s9_progress_seam_regression() {
+    let (mut event_conn, _server, _drivers, event_clock, _source, _blocked_at) =
+        pacing_blocked_pair("127.0.0.1:4573", "127.0.0.1:4574");
+    event_clock.advance(100_000_000);
+    let event_wakes = Arc::new(WakeCount::default());
+    let event_waker = Waker::from(Arc::clone(&event_wakes));
+    let mut event_cx = Context::from_waker(&event_waker);
+    assert!(
+        matches!(event_conn.poll_event(&mut event_cx), Poll::Pending),
+        "the pacing expiry should not fabricate an application event"
+    );
+    assert_eq!(
+        event_wakes.0.load(Ordering::Relaxed),
+        1,
+        "poll_event must preserve exactly one ready edge from the earlier sleep"
+    );
+    assert!(matches!(
+        event_conn.poll_event(&mut event_cx),
+        Poll::Pending
+    ));
+    assert_eq!(
+        event_wakes.0.load(Ordering::Relaxed),
+        1,
+        "poll_event must not form a self-wake loop"
+    );
+
+    let (mut transmit_conn, _server, _drivers, transmit_clock, mut source, blocked_at) =
+        pacing_blocked_pair("127.0.0.1:4583", "127.0.0.1:4584");
+    let transmit_wakes = Arc::new(WakeCount::default());
+    let transmit_waker = Waker::from(Arc::clone(&transmit_wakes));
+    let mut transmit_cx = Context::from_waker(&transmit_waker);
+    let _ = transmit_conn.poll_transmit(&mut transmit_cx, &mut source);
+    assert_eq!(
+        transmit_wakes.0.load(Ordering::Relaxed),
+        0,
+        "a pending earlier sleep must not wake before its deadline"
+    );
+
+    transmit_clock.advance(100_000_000);
+    let _ = transmit_conn.poll_transmit(&mut transmit_cx, &mut source);
+    assert_eq!(
+        source.sent, blocked_at,
+        "the preserved edge must be tested before transport progress resumes"
+    );
+    assert_eq!(
+        transmit_wakes.0.load(Ordering::Relaxed),
+        1,
+        "poll_transmit must propagate exactly one ready edge from the earlier sleep"
+    );
+    let _ = transmit_conn.poll_transmit(&mut transmit_cx, &mut source);
+    assert_eq!(
+        transmit_wakes.0.load(Ordering::Relaxed),
+        1,
+        "poll_transmit must not form a self-wake loop"
+    );
+}
+
 #[cfg(feature = "diagnostics")]
 #[test]
 fn feature_enabled_unarmed_diagnostic_checks_allocate_nothing() {
@@ -521,7 +688,7 @@ fn feature_enabled_unarmed_diagnostic_checks_allocate_nothing() {
     let ((armed, snapshot), allocations) = count_allocations(|| {
         ngnet_quic::diagnostics::record_packet(1, ngnet_quic::Role::Client, true);
         ngnet_quic::diagnostics::record_release(1, ngnet_quic::Role::Client, 7);
-        ngnet_quic::diagnostics::record_timer_rearm(1, ngnet_quic::Role::Client);
+        ngnet_quic::diagnostics::record_timer_rearm(1, ngnet_quic::Role::Client, 1, 2);
         ngnet_quic::diagnostics::record_wake_registration(1, ngnet_quic::Role::Client);
         ngnet_quic::diagnostics::record_park(1, ngnet_quic::Role::Client);
         (

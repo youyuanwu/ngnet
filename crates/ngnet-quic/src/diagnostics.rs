@@ -116,6 +116,10 @@ pub struct LivenessEvent {
     pub parked_attempt_sequence: Option<u64>,
     /// Enabling event preceding a retry, or `None` when no such event was observed.
     pub enabling_sequence: Option<u64>,
+    /// Clock sample for a timer observation, in the connection's monotonic nanosecond scale.
+    pub now: Option<u64>,
+    /// Expiry represented by a timer observation, in the same scale as `now`.
+    pub deadline: Option<u64>,
 }
 
 /// Aggregate observations for one endpoint role.
@@ -546,6 +550,31 @@ fn push_liveness(
     parked_attempt_sequence: Option<u64>,
     enabling_sequence: Option<u64>,
 ) -> u64 {
+    push_liveness_timed(
+        connection_id,
+        role,
+        kind,
+        reason,
+        attempt_sequence,
+        parked_attempt_sequence,
+        enabling_sequence,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_liveness_timed(
+    connection_id: u64,
+    role: Role,
+    kind: LivenessKind,
+    reason: &'static str,
+    attempt_sequence: Option<u64>,
+    parked_attempt_sequence: Option<u64>,
+    enabling_sequence: Option<u64>,
+    now: Option<u64>,
+    deadline: Option<u64>,
+) -> u64 {
     let sequence = next_sequence();
     let mut records = LIVENESS.lock().unwrap_or_else(|error| error.into_inner());
     if records.len() >= RECORD_LIMIT {
@@ -560,6 +589,8 @@ fn push_liveness(
             attempt_sequence,
             parked_attempt_sequence,
             enabling_sequence,
+            now,
+            deadline,
         });
     }
     sequence
@@ -884,12 +915,12 @@ pub fn record_packet(connection_id: u64, role: Role, stream_carrying: bool) {
 
 /// Records replacement of the adapter's armed sleep.
 #[doc(hidden)]
-pub fn record_timer_rearm(connection_id: u64, role: Role) {
+pub fn record_timer_rearm(connection_id: u64, role: Role, now: u64, deadline: u64) {
     let Some(_guard) = recording_guard() else {
         return;
     };
     add(&counters(role).timer_rearms, 1);
-    push_liveness(
+    push_liveness_timed(
         connection_id,
         role,
         LivenessKind::TimerArmed,
@@ -897,26 +928,56 @@ pub fn record_timer_rearm(connection_id: u64, role: Role) {
         None,
         None,
         None,
+        Some(now),
+        Some(deadline),
     );
 }
 
 /// Records a connection expiry observed due at the start of an adapter pump.
 #[doc(hidden)]
-pub fn record_timer_fire(connection_id: u64, role: Role) {
+pub fn record_timer_fire(connection_id: u64, role: Role, now: u64, deadline: u64) {
     let Some(_guard) = recording_guard() else {
         return;
     };
     add(&counters(role).timer_fires, 1);
-    record_enabling(connection_id, role, "timer");
+    let sequence = push_liveness_timed(
+        connection_id,
+        role,
+        LivenessKind::EnablingEvent,
+        "timer",
+        None,
+        None,
+        None,
+        Some(now),
+        Some(deadline),
+    );
+    LAST_ENABLING
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(connection_id, sequence);
 }
 
 /// Records that the detached adapter consumed a ready expiry sleep.
 #[doc(hidden)]
-pub fn record_timer_ready(connection_id: u64, role: Role) {
+pub fn record_timer_ready(connection_id: u64, role: Role, now: u64, deadline: u64) {
     let Some(_guard) = recording_guard() else {
         return;
     };
-    record_enabling(connection_id, role, "timer-ready");
+    let sequence = push_liveness_timed(
+        connection_id,
+        role,
+        LivenessKind::EnablingEvent,
+        "timer-ready",
+        None,
+        None,
+        None,
+        Some(now),
+        Some(deadline),
+    );
+    LAST_ENABLING
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(connection_id, sequence);
 }
 
 /// Records a new general connection-waker registration.
@@ -1273,6 +1334,33 @@ mod tests {
         assert_eq!(second.snapshot.server.logical_retained_high_water, 7);
         assert_eq!(second.snapshot.server.inbound_queue_depth, 3);
         assert_eq!(second.snapshot.server.inbound_queue_high_water, 3);
+        reset();
+    }
+
+    #[test]
+    fn timer_liveness_records_carry_the_observed_clock_and_deadline() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset();
+        arm(true);
+        record_timer_rearm(7, Role::Server, 10, 20);
+        record_timer_fire(7, Role::Server, 21, 20);
+        record_timer_ready(7, Role::Server, 22, 20);
+        record_driver_wake(7, Role::Server);
+
+        let events = take_liveness_events();
+        assert_eq!(events.len(), 4);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.reason, event.now, event.deadline))
+                .collect::<Vec<_>>(),
+            vec![
+                ("timer-armed", Some(10), Some(20)),
+                ("timer", Some(21), Some(20)),
+                ("timer-ready", Some(22), Some(20)),
+                ("driver-wake", None, None),
+            ]
+        );
         reset();
     }
 

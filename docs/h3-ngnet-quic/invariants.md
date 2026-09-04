@@ -51,7 +51,8 @@ under repeated 16 KiB exchanges: review finding S9, historically recorded in
 Measured on this host after the FIN fix, at 200 x 16 KiB with both arms on the same transport
 and the same workload: this adapter completed 20 of 20, the native arm failed 2 of 20 with
 `ErrorKind::Closed`. Transport held fixed, HTTP/3 layer varied — so that fault is the native
-stack's, and no test here is `#[ignore]`d for it. A later native investigation reproduced the
-symptom and rejected timer-fallback candidates after residual failures. The distinction remains
-important because this adapter's lost-FIN defect has a separate demonstrated cause; see
-[`../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md`](../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md).
+stack's, and no test here is `#[ignore]`d for it. A later native investigation selected and
+corrected a pump/retry scheduling seam; a separate pre-readiness residual still blocks a full
+resolution claim. The distinction remains important because this adapter's lost-FIN defect has
+a separate demonstrated cause; see
+[`../benchmarks/data/epyc-7763-azure/04-native-h3-s9-root-cause.md`](../benchmarks/data/epyc-7763-azure/04-native-h3-s9-root-cause.md).

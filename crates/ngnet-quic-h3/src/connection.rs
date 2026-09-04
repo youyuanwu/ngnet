@@ -409,7 +409,9 @@ impl<S: Session> QuicConnection for NgtcpConnection<S> {
             source,
             cx,
         )?;
-        let _ = pump::poll_timer(&self.detached, &mut self.state, cx);
+        if pump::poll_timer(&self.detached, &mut self.state, cx).is_ready() {
+            cx.waker().wake_by_ref();
+        }
         Poll::Ready(Ok(()))
     }
 

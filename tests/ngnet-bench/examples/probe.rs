@@ -341,7 +341,7 @@ fn emit_diagnostics(
         eprintln!(
             "PROBE-LIVENESS exchange={exchange} sequence={} connection_id={} role={:?} \
              kind={:?} reason={} attempt_sequence={} parked_attempt_sequence={} \
-             enabling_sequence={}",
+             enabling_sequence={} now={} deadline={}",
             event.sequence,
             event.connection_id,
             event.role,
@@ -355,6 +355,12 @@ fn emit_diagnostics(
                 .map_or_else(|| "unavailable".to_string(), |value| value.to_string()),
             event
                 .enabling_sequence
+                .map_or_else(|| "unavailable".to_string(), |value| value.to_string()),
+            event
+                .now
+                .map_or_else(|| "unavailable".to_string(), |value| value.to_string()),
+            event
+                .deadline
                 .map_or_else(|| "unavailable".to_string(), |value| value.to_string()),
         );
     }
