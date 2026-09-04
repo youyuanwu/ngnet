@@ -1169,24 +1169,23 @@ fn main() {
             (!fixture).then(|| args[5].clone()),
             true,
         );
+        let process_start_time = process.map_or_else(
+            || "unavailable".to_string(),
+            |identity| identity.start_time.to_string(),
+        );
         let start_record = if fixture {
             format!(
                 "S9-SUPERVISOR-START run={run} attempt={attempt} revision={revision} \
                  timeout_pid={supervisor_pid} start_time={} started_unix_ms={started_unix_ms} \
                  fixture={} outer_seconds={outer}",
-                process.map_or(0, |identity| identity.start_time),
-                args[2]
+                process_start_time, args[2]
             )
         } else {
             format!(
                 "S9-SUPERVISOR-START run={run} attempt={attempt} revision={revision} \
                  timeout_pid={supervisor_pid} start_time={} started_unix_ms={started_unix_ms} \
                  arm={} mode={} body={} exchanges={} outer_seconds={outer}",
-                process.map_or(0, |identity| identity.start_time),
-                args[2],
-                args[3],
-                args[4],
-                args[5]
+                process_start_time, args[2], args[3], args[4], args[5]
             )
         };
         eprintln!("{start_record}");
@@ -1842,6 +1841,16 @@ mod tests {
         assert!(!state.completed_runs.contains(&2));
         assert_eq!(state.dangling.len(), 1);
         assert!(state.dangling.contains_key(&(2, "b".to_string())));
+    }
+
+    #[test]
+    fn unavailable_start_time_is_an_unresolvable_identity() {
+        let manifest = "S9-SUPERVISOR-START run=2 attempt=a timeout_pid=9 \
+                        start_time=unavailable started_unix_ms=11 outer_seconds=685\n";
+        let state =
+            scan_manifest_reader(BufReader::new(io::Cursor::new(manifest))).expect("scan manifest");
+        let attempt = state.dangling.get(&(2, "a".to_string())).unwrap();
+        assert_eq!(attempt.identity, None);
     }
 
     #[test]

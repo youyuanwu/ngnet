@@ -17,8 +17,9 @@ followed.
 
 The retained correction does not cancel an earlier armed sleep merely because ngtcp2 reports
 a later deadline. `poll_timer` keeps and polls the earlier sleep to readiness before installing
-and polling the replacement, so the replacement's waker is registered too. `poll_event` uses
-its existing one-shot wake. This is not a periodic wake, a wake budget, or a backup sleep.
+and polling the replacement, so the replacement's waker is registered too. Both `poll_event`
+and `poll_transmit` propagate that actual one-shot readiness to the driver. This is not a
+periodic wake, a wake budget, or a backup sleep.
 
 The correction does **not** receive a full resolution claim. The one allowed qualification
 re-entry removed the classified residual from the next 10-process armed 1 MiB canary, but one
@@ -151,7 +152,9 @@ replacement for the earlier 9/10 blocker denominator or as a 3% bound.
 hand-moved connection clock, reaches a transport-refused write, advances across the pacing
 deadline and asserts exactly one retry wake and no self-wake loop. It fails with wake count
 zero when earlier-sleep preservation is removed and passed 100/100 exact release repetitions
-on both retained correction revisions.
+on both retained correction revisions. The final form exercises both call sites: a pending
+earlier sleep produces no wake, while readiness consumed first by either `poll_event` or
+`poll_transmit` produces exactly one.
 
 All targeted native QUIC/H3 tests, exact fixtures, default workspace tests, clippy matrices,
 warning-denying rustdoc builds, benchmark smoke compilation, release example compilation and
@@ -162,6 +165,13 @@ touched-file formatting passed. Two unrelated qualification caveats are retained
   repetitions and subsequent full-suite runs passed;
 - one all-feature workspace run failed four compio tests because io_uring creation returned
   `ENOMEM`; its isolated rerun passed.
+
+During final multi-model review, one of 13 repeated
+`cargo test -p ngnet-quic --all-features` runs failed
+`diagnostic_record_collections_are_bounded_and_report_drops`: the global armed store observed
+three dropped attempts where the isolated test expected one. The other 12 runs passed. The
+failure is consistent with process-global diagnostic arming overlapping another recorder, is
+not an S9 transport result, and remains recorded rather than being converted into a pass.
 
 `cargo test --doc --workspace --all-features` also fails in generated `ngnet-h2-sys`
 bindings because bindgen preserved C examples as Rust doctests. The warning-denying

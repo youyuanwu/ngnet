@@ -285,6 +285,11 @@ or prebuilt fixture executable, and fails closed if resumed batches use differen
 It rejects duplicate completed run numbers. A dangling `START` is reconciled by exact
 `(pid,start_time)` identity and recorded as `S9-SUPERVISOR-INTERRUPTED` before that logical
 run number receives a new attempt identity.
+If identity inspection or cleanup cannot prove the old process gone, the supervisor appends
+`S9-SUPERVISOR-GUARD reason=interrupted-cleanup` and exits without resolving the attempt.
+Verify the recorded process identity and descendants manually; do not edit the manifest or
+reuse its run number. Start a new manifest under a new revision directory and carry the
+guarded attempt and unexecuted count into the run record.
 
 Child output is parsed as records no larger than 64 KiB. Readiness, checkpoints, failures and
 compact completion lines pass through live; successful attempt/liveness dumps are summarized
