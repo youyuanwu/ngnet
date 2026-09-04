@@ -100,9 +100,16 @@ pub(crate) fn pump<S: Session>(
 
     // Then the timer. Its deadline already folds in the pacing deadline, so this is also
     // what releases a connection that is waiting to send rather than waiting to hear.
-    if detached.conn.expiry().is_some_and(|at| at <= now) {
+    if let Some(deadline) = detached.conn.expiry().filter(|at| *at <= now) {
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = deadline;
         #[cfg(feature = "diagnostics")]
-        ngnet_quic::diagnostics::record_timer_fire(connection_id, role);
+        ngnet_quic::diagnostics::record_timer_fire(
+            connection_id,
+            role,
+            now.as_nanos(),
+            deadline.as_nanos(),
+        );
         match detached.conn.handle_expiry(now) {
             Ok(ngnet_quic::ExpiryOutcome::Handled) => {}
             Ok(ngnet_quic::ExpiryOutcome::IdleClose) => {
@@ -227,6 +234,8 @@ pub(crate) fn poll_timer<S: Session>(
         ngnet_quic::diagnostics::record_timer_rearm(
             detached.conn.diagnostic_id(),
             detached.conn.role(),
+            detached.now().as_nanos(),
+            deadline.as_nanos(),
         );
     }
 
@@ -239,6 +248,8 @@ pub(crate) fn poll_timer<S: Session>(
             ngnet_quic::diagnostics::record_timer_ready(
                 detached.conn.diagnostic_id(),
                 detached.conn.role(),
+                detached.now().as_nanos(),
+                deadline.as_nanos(),
             );
             state.sleeping = None;
             state.sleeping_until = None;
