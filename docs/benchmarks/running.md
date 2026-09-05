@@ -279,9 +279,13 @@ whole probe self-classifies before the 180-second outer bound where possible. Tr
 `PROBE-FAIL`, outer kill, unclassified exit, or cleanup failure as a failed process. A clean
 100-process result is reliability evidence (approximately a 3% one-sided 95% upper
 failure-rate bound), not a timing result or proof that failure is impossible.
+The supervisor stops after the first result other than a clean completion, and also stops if
+invalid, dropped or truncated evidence makes continuation unsafe. Its summary records the
+unexecuted remainder; never restart that denominator in the same manifest.
 The final path is an append-only manifest. Set `S9_REVISION` to the clean checkout's revision
 when a manifest is used. The supervisor records SHA-256 and byte size for itself and the probe
-or prebuilt fixture executable, and fails closed if resumed batches use different binaries.
+or prebuilt fixture executable, plus host identity from `HOSTNAME` or the system hostname, and
+fails closed if resumed batches use different binaries.
 It rejects duplicate completed run numbers. A dangling `START` is reconciled by exact
 `(pid,start_time)` identity and recorded as `S9-SUPERVISOR-INTERRUPTED` before that logical
 run number receives a new attempt identity.
@@ -299,6 +303,15 @@ truncation, record drops, cleanup and resource guards stay explicit. A lock-prot
 reservation ledger caps cumulative local evidence and aggregate attempt time. These local
 manifests remain raw evidence; committed run documents carry their hashes and selected
 excerpts.
+
+The native fixture's establishment-internal empty warm-up has its own typed failure boundary.
+A response-head failure before readiness emits
+`phase=pre-readiness-warmup classifier=pre-readiness-response-head` with percent-encoded detail
+and the actual `diagnostics_armed` state before the probe terminates. Do not classify it as a
+workload S9 occurrence. If it recurs in diagnostic mode, retain the failed denominator and add
+reviewed bounded warm-up transport capture before another canary: reset and arm immediately
+before warm-up, disarm and drain on either outcome, then reset and re-arm after `PROBE-READY`
+so setup evidence cannot enter normal exchange accounting.
 
 Use fixture mode for the ignored exact stress tests:
 

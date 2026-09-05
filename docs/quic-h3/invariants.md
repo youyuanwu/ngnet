@@ -36,9 +36,11 @@ keeps supervised 125 × 16 KiB and 125 × 1 MiB exact protocols. Their live-loop
 ignored because they are long-running supervised stress cases rather than ordinary CI tests.
 The S9 timer correlation and rejected fallbacks are recorded in
 [`../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md`](../benchmarks/data/epyc-7763-azure/03-native-h3-s9-timer-wake.md);
-the later pump/retry root-cause evidence, one-shot correction and remaining pre-readiness
-blocker are recorded in
+the later pump/retry root-cause evidence and one-shot correction are recorded in
 [`../benchmarks/data/epyc-7763-azure/04-native-h3-s9-root-cause.md`](../benchmarks/data/epyc-7763-azure/04-native-h3-s9-root-cause.md).
+The pre-readiness boundary is now typed, and fresh supervised 100/100 schedules at both
+16 KiB and 1 MiB qualify the correction in
+[`../benchmarks/data/epyc-7763-azure/05-native-h3-s9-qualification.md`](../benchmarks/data/epyc-7763-azure/05-native-h3-s9-qualification.md).
 
 Compiling diagnostics does not arm them. The feature-enabled unarmed allocation proof records
 representative packet, release, timer, wake, and park hooks and requires zero allocations plus
