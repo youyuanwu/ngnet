@@ -636,6 +636,25 @@ fn escape_manifest(value: &str) -> String {
     escaped
 }
 
+fn normalized_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| escape_manifest(value))
+}
+
+fn host_identity() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .as_deref()
+        .and_then(normalized_host)
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .as_deref()
+                .and_then(normalized_host)
+        })
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
 fn directory_bytes(path: &Path) -> Result<u64, String> {
     let mut total = 0u64;
     let entries = match std::fs::read_dir(path) {
@@ -1017,9 +1036,7 @@ fn main() {
     let workload_bytes = std::fs::metadata(&workload)
         .expect("inspect workload executable")
         .len();
-    let host = std::env::var("HOSTNAME")
-        .map(|value| escape_manifest(value.trim()))
-        .unwrap_or_else(|_| "unavailable".to_string());
+    let host = host_identity();
     let reservation_guard = match reserve_storage(manifest, runs) {
         Ok(guard) => guard,
         Err(error) => {
@@ -1834,6 +1851,15 @@ mod tests {
     #[test]
     fn evidence_escaping_is_single_line_and_reversible_in_shape() {
         assert_eq!(escape_manifest("a\\b\nc\rd\te"), "a\\\\b\\nc\\rd\\te");
+    }
+
+    #[test]
+    fn host_identity_is_trimmed_and_escaped() {
+        assert_eq!(
+            normalized_host(" ubuntu dev\n"),
+            Some("ubuntu dev".to_string())
+        );
+        assert_eq!(normalized_host(" \n\t"), None);
     }
 
     #[test]
