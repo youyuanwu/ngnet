@@ -44,10 +44,11 @@ The deterministic reproduction of the transport's half is
 the end-to-end story, including which stack this actually stalled, is in
 [`../h3-ngnet-quic/pending-work.md`](../h3-ngnet-quic/pending-work.md).
 
-**This is not the large-body stall and did not fix it.** That was re-measured afterwards and
-now has a separate evidence-selected correction and residual blocker; see the next section.
+**This is not the large-body stall and did not fix it.** That was re-measured afterwards,
+received a separate evidence-selected correction, and has now completed its planned
+qualification; see the next section.
 
-## The reproduced large-body failure has an evidence-selected correction, but remains blocked
+## The reproduced large-body failure is corrected and qualified
 
 S9 was reproduced on the current EPYC host during this investigation: five of the first 73
 supervised native processes failed while each attempted 125 exact 1 MiB POST/echo exchanges.
@@ -77,12 +78,19 @@ directly to its 30-second idle deadline without a stream retry. A second orderin
 the old ready edge. The adapter now preserves exactly one such ready edge; its deterministic
 regression fails without it and passes without forming a self-wake loop.
 
-This is not yet an end-to-end resolution claim. After the one allowed correction re-entry,
-the final 16 KiB armed canary completed 10/10 and unarmed/fixture samples completed 10/10 for
-both sizes, but the armed 1 MiB canary completed 9/10. The remaining process failed during
-setup/warm-up before diagnostics were armed, so it cannot validate or refute the correction.
-The exact next capture is a typed pre-readiness response-head failure followed by a fresh
-armed 1 MiB canary. See
+Run 04 therefore retained the correction without an end-to-end resolution claim: its armed
+1 MiB canary completed 9/10 because one process failed during setup/warm-up before diagnostics
+were armed. The follow-up made that exact response-head boundary a typed
+`pre-readiness-response-head` failure and made the supervisor stop after the first failed or
+evidence-unsafe process.
+
+The fresh host-qualified armed 1 MiB canary then completed 10/10, so the predeclared condition
+for warm-up transport capture did not occur and no second production correction was made.
+Final reliability qualification restarted from zero and completed 100/100 supervised
+processes at 16 KiB and 100/100 at 1 MiB, each with 125 exact exchanges and every cleanup,
+identity, evidence and resource guard clean. S9 is resolved. See
+[`05-native-h3-s9-qualification.md`](../benchmarks/data/epyc-7763-azure/05-native-h3-s9-qualification.md).
+The historical 9/10 denominator remains in
 [`04-native-h3-s9-root-cause.md`](../benchmarks/data/epyc-7763-azure/04-native-h3-s9-root-cause.md).
 
 ## Body bytes are copied twice

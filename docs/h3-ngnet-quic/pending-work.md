@@ -139,9 +139,10 @@ for the defect above, when this adapter failed 6 in 10 and the native arm 0 in 1
 Round 2 saw none. Fifty clean runs bounded the fault rather than disproving it. Later native
 work first localized failures around an armed imminent timer, then captured the missing fact:
 the timer was handled and replaced by the idle deadline without the blocked stream receiving
-another transmit pass. The native adapter now preserves that one ready edge. A separate
-pre-readiness 1 MiB failure blocks a full resolution claim; see
-[`../benchmarks/data/epyc-7763-azure/04-native-h3-s9-root-cause.md`](../benchmarks/data/epyc-7763-azure/04-native-h3-s9-root-cause.md).
+another transmit pass. The native adapter now preserves that one ready edge. Its separate
+pre-readiness 1 MiB boundary is typed, and fresh 100/100 reliability schedules at both body
+sizes qualify the correction; see
+[`../benchmarks/data/epyc-7763-azure/05-native-h3-s9-qualification.md`](../benchmarks/data/epyc-7763-azure/05-native-h3-s9-qualification.md).
 
 Consequences for this crate:
 

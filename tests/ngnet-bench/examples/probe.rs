@@ -225,6 +225,46 @@ fn flush_stderr() {
     std::io::stderr().flush().expect("flushing probe output");
 }
 
+fn encode_record_value(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
+fn pre_readiness_failure_line(error: &CheckedFailure, diagnostics_armed: bool) -> String {
+    format!(
+        "PROBE-FAIL exchange=0 last_completed=0 phase=pre-readiness-warmup \
+         received_bytes=0 integrity=exact-so-far terminal=false \
+         classifier=pre-readiness-response-head supervisor=inner-error \
+         diagnostics_armed={diagnostics_armed} detail={}",
+        encode_record_value(&error.to_string())
+    )
+}
+
+fn finish_native_establishment<T>(
+    result: Result<T, CheckedFailure>,
+    diagnostics_armed: bool,
+    mut emit: impl FnMut(&str),
+) -> T {
+    match result {
+        Ok(fixture) => fixture,
+        Err(error) => {
+            let record = pre_readiness_failure_line(&error, diagnostics_armed);
+            emit(&record);
+            panic!("an ngtcp2 response head: {error}");
+        }
+    }
+}
+
 fn exchange_timeout(body_size: usize) -> Duration {
     let mib = body_size.div_ceil(1024 * 1024);
     let (base, per_started_mib) = if cfg!(debug_assertions) {
@@ -598,16 +638,23 @@ fn main() {
             "h3-qmux-duplex" => Arm::UpstreamQmuxDuplex(UpstreamH3Qmux::establish().await),
             "h3-qmux-socket" => Arm::UpstreamQmuxSocket(UpstreamH3QmuxSocket::establish().await),
             "ngnet-h3-quinn" => Arm::NgnetH3Quinn(NgnetH3Quinn::establish().await),
-            "ngnet-quic-h3" => Arm::NgnetNgtcpH3(
-                tokio::time::timeout(establishment_timeout(), NgnetNgtcpH3::establish())
-                    .await
-                    .unwrap_or_else(|_| {
-                        panic!(
-                            "ngnet-quic-h3 establishment exceeded {} ms",
-                            establishment_timeout().as_millis()
-                        )
-                    }),
-            ),
+            "ngnet-quic-h3" => {
+                let result = tokio::time::timeout(
+                    establishment_timeout(),
+                    NgnetNgtcpH3::try_establish_observed(|| {}),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "ngnet-quic-h3 establishment exceeded {} ms",
+                        establishment_timeout().as_millis()
+                    )
+                });
+                Arm::NgnetNgtcpH3(finish_native_establishment(result, false, |record| {
+                    eprintln!("{record}");
+                    flush_stderr();
+                }))
+            }
             "h3-quinn" => Arm::UpstreamH3Quinn(UpstreamH3Quinn::establish().await),
             // The two arms of the ngtcp2 HTTP/3 comparison. Both are bounded the same way as
             // `ngnet-quic-h3` above, because both run the transport with the known large-body
@@ -1052,5 +1099,37 @@ mod tests {
             ),
             "wrong-length"
         );
+    }
+
+    #[test]
+    fn pre_readiness_failure_is_exactly_one_typed_single_line_record() {
+        let mut records = Vec::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            finish_native_establishment::<()>(
+                Err(CheckedFailure::closed("head failed\npeer reset")),
+                false,
+                |record| records.push(record.to_string()),
+            );
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            records,
+            [concat!(
+                "PROBE-FAIL exchange=0 last_completed=0 phase=pre-readiness-warmup ",
+                "received_bytes=0 integrity=exact-so-far terminal=false ",
+                "classifier=pre-readiness-response-head supervisor=inner-error ",
+                "diagnostics_armed=false detail=head%20failed%0Apeer%20reset"
+            )]
+        );
+    }
+
+    #[test]
+    fn successful_native_establishment_emits_no_failure_record() {
+        let mut records = Vec::new();
+        assert_eq!(
+            finish_native_establishment(Ok(7), false, |record| records.push(record.to_string())),
+            7
+        );
+        assert!(records.is_empty());
     }
 }

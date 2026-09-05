@@ -292,7 +292,12 @@ pub fn current_thread_runtime() -> Runtime {
 
 #[cfg(test)]
 mod checked_progress_tests {
-    use super::{CheckedIntegrity, reported_integrity};
+    use std::cell::Cell;
+
+    use super::{
+        CheckedFailure, CheckedIntegrity, current_thread_runtime, observe_native_warmup,
+        reported_integrity,
+    };
 
     #[test]
     fn partial_exact_progress_is_not_a_length_mismatch() {
@@ -311,6 +316,25 @@ mod checked_progress_tests {
         assert_eq!(
             reported_integrity(2048, 1024, CheckedIntegrity::LengthMismatch, false),
             CheckedIntegrity::LengthMismatch
+        );
+    }
+
+    #[test]
+    fn native_warmup_observer_precedes_a_typed_failure() {
+        let observed = Cell::new(false);
+        let result = current_thread_runtime().block_on(observe_native_warmup(
+            || observed.set(true),
+            async {
+                assert!(observed.get());
+                Err::<(), _>(CheckedFailure::closed(
+                    "forced warm-up response-head failure",
+                ))
+            },
+        ));
+        assert!(observed.get());
+        assert_eq!(
+            result.expect_err("forced failure must remain typed").kind(),
+            super::CheckedFailureKind::Closed
         );
     }
 }
@@ -457,6 +481,14 @@ impl core::fmt::Display for CheckedFailure {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str(&self.detail)
     }
+}
+
+async fn observe_native_warmup<T>(
+    before_warmup: impl FnOnce(),
+    warmup: impl Future<Output = Result<T, CheckedFailure>>,
+) -> Result<T, CheckedFailure> {
+    before_warmup();
+    warmup.await
 }
 
 /// Shared progress cell used by an external supervisor while an exchange is pending.
@@ -2220,6 +2252,19 @@ pub struct NgnetNgtcpH3 {
 impl NgnetNgtcpH3 {
     /// Establishes and warms an ngtcp2 client/server pair outside the measured closure.
     pub async fn establish() -> Self {
+        Self::try_establish_observed(|| {})
+            .await
+            .expect("an exact ngtcp2 warm-up")
+    }
+
+    /// Establishes and warms an ngtcp2 pair, returning a typed warm-up response-head failure.
+    ///
+    /// `before_warmup` runs after both endpoints and HTTP/3 drivers exist and immediately
+    /// before the internal empty exchange. The returned result follows that exchange directly,
+    /// allowing a diagnostic caller to bracket only the warm-up interval.
+    pub async fn try_establish_observed(
+        before_warmup: impl FnOnce(),
+    ) -> Result<Self, CheckedFailure> {
         let credentials = NgtcpCredentials::generate();
         let (server_endpoint, server_endpoint_driver, address) =
             ngtcp_server_endpoint(&credentials).await;
@@ -2265,8 +2310,19 @@ impl NgnetNgtcpH3 {
             server_endpoint_driver,
             _endpoints: (client_endpoint, server_endpoint),
         };
-        assert_eq!(fixture.round_trip(Bytes::new()).await, 0);
-        fixture
+        let response = observe_native_warmup(before_warmup, async {
+            fixture
+                .handle
+                .send_request(quic_request_for(Bytes::new()))
+                .await
+                .map_err(|error| {
+                    CheckedFailure::ngnet("ngtcp2 warm-up response head failed", error)
+                })
+        })
+        .await?;
+        assert!(response.status().is_success());
+        assert_eq!(drain(response.into_body()).await, 0);
+        Ok(fixture)
     }
 
     /// Sends one request and drains the echoed response body.
