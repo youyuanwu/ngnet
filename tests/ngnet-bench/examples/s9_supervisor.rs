@@ -1017,6 +1017,9 @@ fn main() {
     let workload_bytes = std::fs::metadata(&workload)
         .expect("inspect workload executable")
         .len();
+    let host = std::env::var("HOSTNAME")
+        .map(|value| escape_manifest(value.trim()))
+        .unwrap_or_else(|_| "unavailable".to_string());
     let reservation_guard = match reserve_storage(manifest, runs) {
         Ok(guard) => guard,
         Err(error) => {
@@ -1149,7 +1152,7 @@ fn main() {
     let metadata_record = format!(
         "S9-SUPERVISOR-METADATA revision={revision} supervisor_sha256={supervisor_sha256} \
          supervisor_bytes={supervisor_bytes} workload_sha256={workload_sha256} \
-         workload_bytes={workload_bytes} fixture={fixture} feature_profile={}",
+         workload_bytes={workload_bytes} host={host} fixture={fixture} feature_profile={}",
         if fixture {
             "release-default"
         } else {
