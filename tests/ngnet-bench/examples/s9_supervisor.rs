@@ -40,6 +40,8 @@ struct StreamCapture {
     failure_detail: Option<String>,
     evidence: VecDeque<String>,
     evidence_bytes: usize,
+    pre_readiness_evidence: VecDeque<String>,
+    pre_readiness_evidence_bytes: usize,
     fallback_tail: VecDeque<String>,
     fallback_tail_bytes: usize,
     failure_seen: bool,
@@ -62,6 +64,20 @@ impl StreamCapture {
         if line.starts_with("PROBE-METADATA") {
             self.last_metadata = Some(line.clone());
         }
+        if line.starts_with("PROBE-READY") {
+            self.pre_readiness_evidence.clear();
+            self.pre_readiness_evidence_bytes = 0;
+        }
+        if is_pre_readiness_evidence(&line) {
+            let truncated = push_bounded(
+                &mut self.pre_readiness_evidence,
+                &mut self.pre_readiness_evidence_bytes,
+                line.clone(),
+                MAX_STREAM_FAILURE_EVIDENCE_BYTES,
+                None,
+            );
+            self.evidence_truncated |= truncated;
+        }
         if line.starts_with("PROBE-FAIL")
             || line.starts_with("S9-FIXTURE-FAIL")
             || line.contains("stalled; last completed exchange")
@@ -70,6 +86,19 @@ impl StreamCapture {
             self.classified_failure = true;
             self.failure_seen = true;
             self.failure_detail.get_or_insert_with(|| line.clone());
+            while let Some(record) = self.pre_readiness_evidence.pop_front() {
+                self.pre_readiness_evidence_bytes = self
+                    .pre_readiness_evidence_bytes
+                    .saturating_sub(record.len().saturating_add(1));
+                let truncated = push_bounded(
+                    &mut self.evidence,
+                    &mut self.evidence_bytes,
+                    record,
+                    MAX_STREAM_FAILURE_EVIDENCE_BYTES,
+                    Some(&["PROBE-FAIL", "S9-FIXTURE-FAIL"]),
+                );
+                self.evidence_truncated |= truncated;
+            }
         }
         if line.contains("test result: ok. 1 passed")
             || expected_completion
@@ -121,6 +150,21 @@ impl StreamCapture {
     fn max_liveness(&self) -> usize {
         self.liveness_counts.values().copied().max().unwrap_or(0)
     }
+}
+
+fn is_pre_readiness_evidence(line: &str) -> bool {
+    let scoped =
+        line.contains("scope=pre-readiness-warmup") || line.contains("phase=pre-readiness-warmup");
+    scoped
+        && [
+            "PROBE-CHECKPOINT",
+            "PROBE-DIAGNOSTIC",
+            "PROBE-LIVENESS",
+            "PROBE-SNAPSHOT",
+            "PROBE-RSS",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
 }
 
 fn field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
@@ -269,6 +313,10 @@ fn classify(
     } else {
         Outcome::UnclassifiedFailure
     }
+}
+
+fn should_continue_campaign(outcome: Outcome, diagnostic_continue: bool) -> bool {
+    outcome == Outcome::Completed && diagnostic_continue
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1360,8 +1408,10 @@ fn main() {
         let max_liveness_records = stdout.max_liveness().max(stderr.max_liveness());
         let max_dropped_attempts = stdout.max_dropped_attempts.max(stderr.max_dropped_attempts);
         let max_dropped_liveness = stdout.max_dropped_liveness.max(stderr.max_dropped_liveness);
-        let diagnostic_continue =
-            max_dropped_attempts == 0 && max_dropped_liveness == 0 && invalid_records == 0;
+        let diagnostic_continue = max_dropped_attempts == 0
+            && max_dropped_liveness == 0
+            && invalid_records == 0
+            && !evidence_truncated;
         let ended_unix_ms = unix_millis();
         let elapsed_ms = started.elapsed().as_millis();
         if let Err(error) = record_attempt_elapsed(manifest, &attempt, elapsed_ms) {
@@ -1414,7 +1464,11 @@ fn main() {
             Outcome::UnclassifiedFailure => unclassified += 1,
             Outcome::CleanupFailure => cleanup_failed += 1,
         }
-        if outcome == Outcome::CleanupFailure {
+        if !should_continue_campaign(outcome, diagnostic_continue) {
+            unexecuted = selected_end.saturating_sub(run.saturating_add(1));
+            if outcome == Outcome::Completed {
+                guarded = true;
+            }
             break;
         }
     }
@@ -1478,6 +1532,20 @@ mod tests {
             Outcome::UnclassifiedFailure
         );
         assert_eq!(classify(Some(0), "", true, true), Outcome::CleanupFailure);
+    }
+
+    #[test]
+    fn campaigns_continue_only_after_clean_completion() {
+        assert!(should_continue_campaign(Outcome::Completed, true));
+        assert!(!should_continue_campaign(Outcome::Completed, false));
+        for outcome in [
+            Outcome::ClassifiedFailure,
+            Outcome::OuterKilled,
+            Outcome::UnclassifiedFailure,
+            Outcome::CleanupFailure,
+        ] {
+            assert!(!should_continue_campaign(outcome, true));
+        }
     }
 
     #[test]
@@ -1701,6 +1769,62 @@ mod tests {
                 .back()
                 .expect("diagnostic retained")
                 .contains("exchange=2")
+        );
+    }
+
+    #[test]
+    fn pre_readiness_evidence_preceding_the_marker_is_retained() {
+        let mut capture = StreamCapture::default();
+        capture.observe(
+            "PROBE-DIAGNOSTIC exchange=0 scope=pre-readiness-warmup sequence=1".to_string(),
+            false,
+            None,
+        );
+        capture.observe(
+            "PROBE-FAIL exchange=0 phase=pre-readiness-warmup \
+             classifier=pre-readiness-response-head"
+                .to_string(),
+            false,
+            None,
+        );
+        assert_eq!(capture.evidence.len(), 2);
+        assert!(
+            capture
+                .evidence
+                .front()
+                .expect("warm-up evidence retained")
+                .starts_with("PROBE-DIAGNOSTIC")
+        );
+        assert!(
+            capture
+                .evidence
+                .back()
+                .expect("failure retained")
+                .starts_with("PROBE-FAIL")
+        );
+    }
+
+    #[test]
+    fn readiness_discards_successful_pre_readiness_evidence() {
+        let mut capture = StreamCapture::default();
+        capture.observe(
+            "PROBE-SNAPSHOT exchange=0 scope=pre-readiness-warmup role=client".to_string(),
+            false,
+            None,
+        );
+        capture.observe("PROBE-READY".to_string(), false, None);
+        capture.observe(
+            "PROBE-FAIL exchange=1 classifier=s9-response-head-timeout".to_string(),
+            false,
+            None,
+        );
+        assert_eq!(capture.evidence.len(), 1);
+        assert!(
+            capture
+                .evidence
+                .front()
+                .expect("only workload failure retained")
+                .starts_with("PROBE-FAIL")
         );
     }
 
