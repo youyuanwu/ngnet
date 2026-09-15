@@ -45,7 +45,7 @@ repository = "https://github.com/youyuanwu/ngnet"
 # supplies its own extension instead; see `crates/ngnet-axum/src/peer.rs` for why the
 # substitution is not quite like for like.
 axum = { version = "0.8", default-features = false }
-bindgen = "0.72"
+bindgen = "0.73"
 bytes = "1"
 # Compiles the vendored dwnx sources for `ngnet-qmux-sys`. That crate is the only one here
 # that needs a C compiler driver rather than `cmake`, because dwnx ships autotools and no
