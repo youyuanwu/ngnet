@@ -61,7 +61,7 @@ jobs:
       # place and a contributor's local `cargo test` uses the same compiler this does.
       # Caching comes with this action, which is worth having when a cold build is dominated
       # by compiling libnghttp2 from source.
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
 
       - name: Install build prerequisites
         run: |
