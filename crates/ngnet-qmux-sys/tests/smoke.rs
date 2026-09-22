@@ -27,7 +27,7 @@ fn version_matches_vendored_source() {
 }
 
 #[test]
-fn default_settings_are_zero() {
+fn default_settings_match_library() {
     let mut settings = mem::MaybeUninit::<sys::dwnx_settings>::uninit();
     let settings = unsafe {
         sys::dwnx_settings_default(settings.as_mut_ptr());
@@ -37,6 +37,8 @@ fn default_settings_are_zero() {
     assert_eq!(settings.conn_id, 0);
     assert_eq!(settings.initial_ts, 0);
     assert!(settings.log_write.is_none());
+    assert_eq!(settings.glitch_ratelim_burst, 10_000);
+    assert_eq!(settings.glitch_ratelim_rate, 330);
 }
 
 /// The C defaults leave every limit at zero and set only the record size.

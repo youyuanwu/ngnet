@@ -26,7 +26,7 @@ default:
 # ngtcp2's `third-party/urlparse` looks like a library dependency from its path, but the
 # target is wrapped in `if(LIBEV_FOUND AND LIBNGHTTP3_FOUND)` and so is only ever compiled
 # for the example applications, which `ENABLE_LIB_ONLY=ON` does not build. dwnx's bundled
-# `http-parser` is the same story: `ngnet-qmux-sys` compiles the 25 files of `lib/` and
+# `http-parser` is the same story: `ngnet-qmux-sys` compiles the 26 files of `lib/` and
 # nothing else, so the parser its examples use never enters the build.
 #
 # The one nested submodule that *is* required is `nghttp3/lib/sfparse`: the structured-field

@@ -1,8 +1,6 @@
 //! Connection settings.
 //!
-//! dwnx's `dwnx_settings` is small: a connection id used only for logging, the timestamp the
-//! connection starts from, and an optional log callback. It is copied by the constructor, so
-//! nothing here has to outlive the call.
+//! dwnx's `dwnx_settings` is copied by the constructor, so nothing here has to outlive the call.
 
 use ngnet_qmux_sys as sys;
 
@@ -12,7 +10,7 @@ use crate::time::Timestamp;
 
 /// Local, connection-scoped configuration.
 ///
-/// Starts from dwnx's own defaults, which are all-zero.
+/// Starts from dwnx's own defaults.
 #[derive(Clone, Debug)]
 pub struct Settings {
     raw: sys::dwnx_settings,
