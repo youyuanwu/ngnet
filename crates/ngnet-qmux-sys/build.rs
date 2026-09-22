@@ -40,6 +40,7 @@ const SOURCES: &[&str] = &[
     "dwnx_pq.c",
     "dwnx_qre.c",
     "dwnx_range.c",
+    "dwnx_ratelim.c",
     "dwnx_record_reader.c",
     "dwnx_settings.c",
     "dwnx_str.c",
