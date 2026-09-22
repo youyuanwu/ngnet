@@ -3,7 +3,7 @@
 //! This is the one `-sys` crate in the workspace that does not drive CMake, because dwnx does
 //! not ship a CMakeLists.txt. What it ships is autotools, and the job autotools would do here
 //! is small enough to do directly: probe a handful of headers, substitute two values into a
-//! version header, and compile 25 C files with no external dependencies. Doing that with `cc`
+//! version header, and compile 26 C files with no external dependencies. Doing that with `cc`
 //! keeps autoconf, automake and libtool off the list of things a contributor needs installed.
 //!
 //! The probing is the part worth reading carefully. `configure.ac` checks far more than the
@@ -40,6 +40,7 @@ const SOURCES: &[&str] = &[
     "dwnx_pq.c",
     "dwnx_qre.c",
     "dwnx_range.c",
+    "dwnx_ratelim.c",
     "dwnx_record_reader.c",
     "dwnx_settings.c",
     "dwnx_str.c",

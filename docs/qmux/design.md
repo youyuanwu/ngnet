@@ -63,7 +63,7 @@ and keeping it in step with a `Makefile.am` that is still moving. Compiling the 
 directly with `cc` needs only a C compiler.
 
 The third is viable here in a way it would not be for the other three libraries, because
-`libdwnx` has no external dependencies at all: 25 C files, no TLS, no event loop, no
+`libdwnx` has no external dependencies at all: 26 C files, no TLS, no event loop, no
 structured-field parser, nothing to find and nothing to configure against. The whole of what
 `configure` does that matters is generate a version header and probe a handful of platform
 features.

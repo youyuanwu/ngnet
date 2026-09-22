@@ -28,7 +28,7 @@ doctest = false
 # `cc` rather than `cmake`, which every other `-sys` crate in this workspace uses. dwnx ships
 # an autotools build and no CMakeLists.txt, so there is no cmake project to drive. Compiling
 # the sources directly is possible precisely because the library has no external dependencies:
-# 25 C files, no configure-time feature detection that matters (see build.rs), and no linking
+# 26 C files, no configure-time feature detection that matters (see build.rs), and no linking
 # beyond libc. The alternative -- running autoreconf and configure from a build script -- would
 # make autoconf, automake and libtool prerequisites for every contributor and CI job.
 cc.workspace = true
