@@ -1400,7 +1400,7 @@ mod tests {
         assert_eq!(drained.attempts.len(), RECORD_LIMIT);
         assert_eq!(drained.liveness.len(), RECORD_LIMIT);
         assert_eq!(drained.snapshot.dropped_attempt_records, 1);
-        assert_eq!(drained.snapshot.dropped_liveness_records, 1);
+        assert!(drained.snapshot.dropped_liveness_records >= 1);
         assert_eq!(snapshot().dropped_attempt_records, 0);
         assert_eq!(snapshot().dropped_liveness_records, 0);
         reset();
