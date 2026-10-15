@@ -11,8 +11,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ngnet_quic::{
-    ConnBuilder, ConnectionId, EntropySource, ExpiryOutcome, Handlers, OsslBackend, OsslSession,
-    ReadOutcome, Result, Role, Settings, Timestamp, Backend as TlsBackend, TransportParams, WriteOutcome,
+    Backend as TlsBackend, ConnBuilder, ConnectionId, EntropySource, ExpiryOutcome, Handlers,
+    OsslBackend, OsslSession, ReadOutcome, Result, Role, Settings, Timestamp, TransportParams,
+    WriteOutcome,
 };
 
 pub mod udp;
@@ -60,7 +61,7 @@ impl TestClock {
         let target = when.as_nanos();
         let _ = self
             .now
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 (target > current).then_some(target)
             });
     }

@@ -474,7 +474,7 @@ fn counters(role: Role) -> &'static AtomicRole {
 }
 
 fn add(counter: &AtomicU64, value: u64) {
-    let _ = counter.fetch_update(
+    let _ = counter.try_update(
         Ordering::Relaxed,
         Ordering::Relaxed,
         |current| match current.checked_add(value) {
@@ -493,7 +493,7 @@ fn high_water(counter: &AtomicU64, value: u64) {
 
 fn next_sequence() -> u64 {
     let mut sequence = 0;
-    let _ = NEXT_SEQUENCE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = NEXT_SEQUENCE.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         sequence = current;
         match current.checked_add(1) {
             Some(next) => Some(next),
@@ -510,7 +510,7 @@ fn next_sequence() -> u64 {
 #[doc(hidden)]
 pub fn next_connection_id() -> u64 {
     let mut id = 0;
-    let _ = NEXT_CONNECTION_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = NEXT_CONNECTION_ID.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         id = current;
         match current.checked_add(1) {
             Some(next) => Some(next),

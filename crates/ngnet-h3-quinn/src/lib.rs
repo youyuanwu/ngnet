@@ -81,7 +81,7 @@ impl ReadBudget {
     fn take(&self, bytes: u64) {
         let _ = self
             .bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
                 Some(available.saturating_sub(bytes))
             });
     }
