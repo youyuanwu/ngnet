@@ -189,9 +189,10 @@ where
 
 /// Build the callback table dwnx is given.
 ///
-/// The mandatory random source and every application event callback are populated. The
+/// The mandatory random source and every stream event callback are populated. The
 /// write-offset notification stays unset because this API reports accepted bytes synchronously
 /// from each write, before the asynchronous layer can dequeue a stream-close event.
+/// Datagram reception stays unset because this API currently exposes only streams.
 pub(crate) fn callbacks() -> sys::dwnx_callbacks {
     sys::dwnx_callbacks {
         rand: Some(fill_random),
@@ -208,6 +209,7 @@ pub(crate) fn callbacks() -> sys::dwnx_callbacks {
         extend_max_remote_streams_bidi: Some(on_extend_max_remote_streams_bidi),
         extend_max_remote_streams_uni: Some(on_extend_max_remote_streams_uni),
         write_stream_data_offset: None,
+        recv_datagram: None,
     }
 }
 

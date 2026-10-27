@@ -2166,6 +2166,10 @@ fn pack_vectored(
                 if fragments.is_empty() {
                     break;
                 }
+                if taken == 0 {
+                    verdict = Verdict::Blocked;
+                    break;
+                }
             }
             Push::Complete { consumed: taken } => {
                 let taken = taken.unwrap_or(0);

@@ -24,16 +24,16 @@
 //!
 //! # What is pinned here that is not a property of this crate's own code
 //!
-//! Two of these tests describe defects rather than features, and they assert the defective
+//! One of these tests describes a defect rather than a feature, and it asserts the defective
 //! behaviour on purpose, so that a later change to it is a test failure and a decision rather
 //! than a silent difference:
 //!
 //! - QMux stream capacity is never recycled and this crate never extends it, so a connection
 //!   admits exactly as many client-opened streams as the server's `max_streams_bidi` allowed,
 //!   and the next request **hangs** rather than failing.
-//! - A stream allowance above dwnx's `DWNX_MAX_STREAMS` (`1 << 60`) is not rejected where it
-//!   is configured — it is rejected by the peer decoding it, which fails the connection during
-//!   setup.
+//!
+//! Stream allowances above dwnx's `DWNX_MAX_STREAMS` (`1 << 60`) are rejected locally before
+//! constructing the connection.
 
 use core::future::poll_fn;
 use std::collections::HashMap;
@@ -484,18 +484,7 @@ async fn a_stream_allowance_at_the_transport_maximum_is_accepted() {
 }
 
 #[tokio::test]
-async fn a_stream_allowance_above_the_transport_maximum_fails_the_connection() {
-    // The other known defect worth stating: a value above `DWNX_MAX_STREAMS` is not rejected
-    // where it is configured. It is below the variable-length integer bound that
-    // `TransportParams::validate` checks, so the entry point accepts it and the connection is
-    // built; the peer is what rejects it, when it decodes the parameters and answers
-    // `DWNX_ERR_MALFORMED_TRANSPORT_PARAM`. So the failure arrives during setup, on the other
-    // end, and reaches this end as a connection that has gone away.
-    //
-    // Asserted at the granularity of "fails, promptly" rather than on a particular error kind:
-    // the observed shapes on this host are a request that resolves to `ErrorKind::Closed` and a
-    // client driver that resolves to a transport error naming a protocol violation, and neither
-    // is something this crate chooses.
+async fn a_stream_allowance_above_the_transport_maximum_is_rejected_locally() {
     const OVER: u64 = (1 << 60) + 1;
 
     LocalSet::new()
@@ -507,31 +496,21 @@ async fn a_stream_allowance_above_the_transport_maximum_fails_the_connection() {
                 |_request| async move { ok("never answered") },
                 TransportConfig::new().max_streams_bidi(OVER),
                 HttpConfig::default(),
-            )
-            .expect("the entry point accepts it; the peer is what refuses it");
-            tokio::task::spawn_local(async move {
-                let _ = server.await;
-            });
-
-            let (sender, connection) =
-                ngnet_qmux_h3::connect::<_, _, Payload>(client_io, clock).expect("the client");
-            let driving = tokio::task::spawn_local(connection);
-
-            let outcome = timeout(LIMIT, sender.send_request(get("https://qmux.test/")))
-                .await
-                .expect("the request must fail rather than hang");
+            );
             assert!(
-                outcome.is_err(),
-                "an allowance above the transport maximum must not yield a working connection"
+                server.is_err(),
+                "an invalid bidirectional allowance must be rejected before calling dwnx"
             );
 
-            let driven = timeout(LIMIT, driving)
-                .await
-                .expect("the client driver must resolve rather than hang")
-                .expect("the client driver task");
+            let client = ngnet_qmux_h3::connect_with::<_, _, Payload>(
+                client_io,
+                clock,
+                TransportConfig::new().max_streams_uni(OVER),
+                HttpConfig::default(),
+            );
             assert!(
-                driven.is_err(),
-                "the connection must fail during setup, not merely refuse the request"
+                client.is_err(),
+                "an invalid unidirectional allowance must be rejected before calling dwnx"
             );
         })
         .await;

@@ -39,6 +39,9 @@ use crate::time::Duration;
 /// The maximum value representable as a QUIC variable-length integer.
 const MAX_VARINT: u64 = sys::NGNET_QMUX_MAX_VARINT;
 
+/// dwnx's internal `DWNX_MAX_STREAMS`, the inclusive transport-parameter limit.
+const MAX_STREAMS: u64 = 1 << 60;
+
 /// The parameters advertised to, or received from, the peer.
 #[derive(Clone, Debug)]
 pub struct TransportParams {
@@ -203,7 +206,7 @@ impl TransportParams {
     /// Returns an error if any value would trip an assertion in `dwnx_conn_client_new` or
     /// `dwnx_conn_server_new`, which would otherwise abort the process.
     pub fn validate(&self) -> Result<(), Error> {
-        // The five limits dwnx asserts against the varint bound.
+        // The data limits dwnx asserts against the varint bound.
         for (value, what) in [
             (
                 self.raw.initial_max_stream_data_bidi_local,
@@ -217,14 +220,6 @@ impl TransportParams {
                 self.raw.initial_max_data,
                 "initial_max_data exceeds the varint bound",
             ),
-            (
-                self.raw.initial_max_streams_bidi,
-                "initial_max_streams_bidi exceeds the varint bound",
-            ),
-            (
-                self.raw.initial_max_streams_uni,
-                "initial_max_streams_uni exceeds the varint bound",
-            ),
             // Not asserted by the constructor -- an upstream oversight, since its siblings are
             // -- but asserted later when the parameter is encoded into a frame. Checked here
             // so the abort happens nowhere.
@@ -234,6 +229,21 @@ impl TransportParams {
             ),
         ] {
             if value > MAX_VARINT {
+                return Err(Error::validation(ErrorKind::InvalidArgument, what));
+            }
+        }
+
+        for (value, what) in [
+            (
+                self.raw.initial_max_streams_bidi,
+                "initial_max_streams_bidi exceeds the stream count bound",
+            ),
+            (
+                self.raw.initial_max_streams_uni,
+                "initial_max_streams_uni exceeds the stream count bound",
+            ),
+        ] {
+            if value > MAX_STREAMS {
                 return Err(Error::validation(ErrorKind::InvalidArgument, what));
             }
         }
@@ -312,6 +322,22 @@ mod tests {
     #[test]
     fn defaults_validate() {
         TransportParams::new().validate().unwrap();
+    }
+
+    #[test]
+    fn stream_count_limits_are_inclusive() {
+        TransportParams::new()
+            .with_initial_max_streams_bidi(MAX_STREAMS)
+            .with_initial_max_streams_uni(MAX_STREAMS)
+            .validate()
+            .unwrap();
+
+        for params in [
+            TransportParams::new().with_initial_max_streams_bidi(MAX_STREAMS + 1),
+            TransportParams::new().with_initial_max_streams_uni(MAX_STREAMS + 1),
+        ] {
+            assert!(params.validate().is_err());
+        }
     }
 
     #[test]
