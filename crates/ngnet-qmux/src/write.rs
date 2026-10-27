@@ -599,8 +599,8 @@ impl<'h> Conn<'h> {
                     let consumed = consumed.unwrap_or(0);
                     consumed_total += consumed;
                     remaining = &remaining[consumed..];
-                    if remaining.is_empty() {
-                        // Everything is packed; let the record close.
+                    if remaining.is_empty() || consumed == 0 {
+                        // Everything is packed, or flow control prevents further progress.
                         break;
                     }
                 }

@@ -110,6 +110,36 @@ fn feed(conn: &mut Conn<'_>, bytes: &[u8], fragment: bool) -> Result<ReadOutcome
     }
 }
 
+#[test]
+fn connection_credit_exhaustion_finishes_the_record() {
+    let mut client = Conn::builder(Role::Client)
+        .transport_params(params())
+        .build()
+        .unwrap();
+    let mut server = Conn::builder(Role::Server)
+        .transport_params(params().with_initial_max_data(16))
+        .build()
+        .unwrap();
+    let (client_hello, _) = drain(&mut client, WriteRequest::control_only()).unwrap();
+    let (server_hello, _) = drain(&mut server, WriteRequest::control_only()).unwrap();
+    server.read(&client_hello, now()).unwrap();
+    client.read(&server_hello, now()).unwrap();
+
+    let stream = client.open_bidi_stream().unwrap().opened().unwrap();
+    let mut buf = [0; BUF];
+    let (record, consumed) = client
+        .write(&mut buf, WriteRequest::stream(stream, &[0; 32]), now())
+        .unwrap();
+    assert_eq!(consumed, 16);
+    server.read(record.bytes().unwrap(), now()).unwrap();
+    assert_eq!(client.max_data_left(), 0);
+
+    let (_, consumed) = client
+        .write(&mut buf, WriteRequest::stream(stream, &[0; 16]), now())
+        .unwrap();
+    assert_eq!(consumed, 0);
+}
+
 /// The headline test: a stream transfer between two connections, end to end.
 fn transfer(fragment: bool) {
     let client_seen = Arc::new(Mutex::new(Observed::default()));

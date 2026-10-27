@@ -218,11 +218,9 @@ parameter is the whole allowance for the connection's life.
 
 Raising the initial value is a workaround and not a fix, and it has a ceiling. dwnx caps a
 transport parameter at `DWNX_MAX_STREAMS`, `1 << 60`
-(`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_transport_params.h`). Values at or above
-`1 << 61` pass
-`TransportParams::validate`, which only checks that the number fits a QUIC varint, and then
-fail the connection at setup with `ErrorKind::Closed` — a validation gap on the QMux side worth
-noting on its own. So the largest allowance a connection can actually be given is `1 << 60`,
+(`crates/ngnet-qmux-sys/vendor/dwnx/lib/dwnx_transport_params.h`). Values above this bound are
+rejected locally by `TransportParams::validate`, before dwnx's constructor asserts.
+So the largest allowance a connection can actually be given is `1 << 60`,
 which postpones the hang rather than removing it, and a long-lived connection is precisely the
 case where a cumulative budget runs out.
 
