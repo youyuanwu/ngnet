@@ -9,7 +9,7 @@ use std::ptr;
 use ngnet_h3_sys::*;
 
 /// The vendored submodule this crate builds against.
-const EXPECTED_VERSION: &str = "1.18.0";
+const EXPECTED_VERSION: &str = "1.19.0";
 
 #[test]
 fn reports_the_vendored_version() {

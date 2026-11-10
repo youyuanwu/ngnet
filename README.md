@@ -247,7 +247,7 @@ This repo vendors four upstream C libraries as git submodules:
 | Submodule | Tag | Purpose |
 | --- | --- | --- |
 | [`crates/ngnet-h2-sys/vendor/nghttp2`](https://github.com/nghttp2/nghttp2) | `v1.70.0` | HTTP/2, packaged with `ngnet-h2-sys`. |
-| [`crates/ngnet-h3-sys/vendor/nghttp3`](https://github.com/ngtcp2/nghttp3) | `v1.18.0` | HTTP/3 (RFC 9114) framing and QPACK (RFC 9204), packaged with `ngnet-h3-sys`. |
+| [`crates/ngnet-h3-sys/vendor/nghttp3`](https://github.com/ngtcp2/nghttp3) | `v1.19.0` | HTTP/3 (RFC 9114) framing and QPACK (RFC 9204), packaged with `ngnet-h3-sys`. |
 | [`crates/ngnet-quic-sys/vendor/ngtcp2`](https://github.com/ngtcp2/ngtcp2) | `v1.25.0` | QUIC transport (RFC 9000), packaged with `ngnet-quic-sys`. |
 | [`crates/ngnet-qmux-sys/vendor/dwnx`](https://github.com/ngtcp2/dwnx) | *(untagged)* | QMux (draft-ietf-quic-qmux), behind `ngnet-qmux-sys`. Pre-release and never tagged, so this one is pinned to a commit rather than a version. |
 
