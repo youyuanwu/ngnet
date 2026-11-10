@@ -27,13 +27,13 @@ use ngnet_quic_sys as sys;
 #[test]
 fn every_struct_version_constant_has_the_value_the_bindings_define() {
     assert_eq!(sys::NGTCP2_PKT_INFO_VERSION, 1, "ngtcp2_pkt_info");
-    assert_eq!(sys::NGTCP2_SETTINGS_VERSION, 4, "ngtcp2_settings");
+    assert_eq!(sys::NGTCP2_SETTINGS_VERSION, 5, "ngtcp2_settings");
     assert_eq!(
         sys::NGTCP2_TRANSPORT_PARAMS_VERSION,
         1,
         "ngtcp2_transport_params"
     );
-    assert_eq!(sys::NGTCP2_CALLBACKS_VERSION, 5, "ngtcp2_callbacks");
+    assert_eq!(sys::NGTCP2_CALLBACKS_VERSION, 6, "ngtcp2_callbacks");
     assert_eq!(sys::NGTCP2_CONN_INFO_VERSION, 2, "ngtcp2_conn_info");
 }
 
