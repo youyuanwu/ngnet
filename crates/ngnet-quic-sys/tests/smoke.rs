@@ -13,7 +13,7 @@ use std::ptr;
 use ngnet_quic_sys::*;
 
 /// The vendored submodule this crate builds against.
-const EXPECTED_VERSION: &str = "1.25.0";
+const EXPECTED_VERSION: &str = "1.26.0";
 
 #[test]
 fn reports_the_vendored_version() {
