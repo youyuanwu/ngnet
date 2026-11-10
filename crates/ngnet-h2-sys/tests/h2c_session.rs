@@ -74,6 +74,9 @@ fn library_reports_expected_version() {
         let info = nghttp2_version(0);
         assert!(!info.is_null());
         let version = std::ffi::CStr::from_ptr((*info).version_str);
-        assert_eq!(version.to_str().unwrap(), "1.70.0");
+        assert_eq!(
+            version,
+            std::ffi::CStr::from_bytes_with_nul(NGHTTP2_VERSION).unwrap()
+        );
     }
 }
