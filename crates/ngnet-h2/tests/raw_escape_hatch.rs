@@ -26,8 +26,8 @@ fn unwrapped_capability_is_reachable_through_the_escape_hatch() {
     let version = unsafe { CStr::from_ptr((*info).version_str) };
 
     assert_eq!(
-        version.to_str().unwrap(),
-        "1.70.0",
+        version,
+        CStr::from_bytes_with_nul(ngnet_h2::raw::NGHTTP2_VERSION).unwrap(),
         "the escape hatch should reach the same library the safe API is built on"
     );
 }
