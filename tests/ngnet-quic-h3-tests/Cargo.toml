@@ -20,13 +20,6 @@ diagnostics = ["ngnet-quic/diagnostics", "ngnet-quic-h3/diagnostics"]
 # and a library target cannot see dev-dependencies.
 [dependencies]
 ngnet-quic = { workspace = true, features = ["tokio"] }
-ngnet-h3.workspace = true
-# The production Quinn adapter, reused here rather than maintaining test-only copies.
-ngnet-h3-quinn.workspace = true
-
-bytes.workspace = true
-http.workspace = true
-http-body.workspace = true
 
 # The foreign QUIC implementation these tests interoperate against. Test-only: the crates
 # under test depend on nothing of the sort, and a dependency-graph check proves it.
@@ -35,5 +28,11 @@ rcgen.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+ngnet-h3.workspace = true
+# The production Quinn adapter, reused here rather than maintaining test-only copies.
+ngnet-h3-quinn.workspace = true
 ngnet-quic-h3.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
 http-body-util.workspace = true
