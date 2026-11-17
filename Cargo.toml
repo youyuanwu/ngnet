@@ -84,7 +84,6 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 # The published crates carry a version alongside their path: cargo resolves the path for
 # workspace builds and writes the version into the registry manifest at publish time, and
 # refuses to publish a path dependency that has none.
-ngnet-axum = { path = "crates/ngnet-axum" }
 ngnet-h2 = { path = "crates/ngnet-h2", version = "0.0.1" }
 ngnet-h2-sys = { path = "crates/ngnet-h2-sys", version = "0.0.1" }
 ngnet-h3 = { path = "crates/ngnet-h3", version = "0.0.1" }
@@ -110,7 +109,6 @@ ngnet-qmux = { path = "crates/ngnet-qmux" }
 # that neither transport family reaches the other.
 ngnet-quic-h3 = { path = "crates/ngnet-quic-h3", version = "0.0.1" }
 ngnet-qmux-h3 = { path = "crates/ngnet-qmux-h3" }
-ngnet-util = { path = "crates/ngnet-util" }
 # Build-time only, and only for the `crypto-ossl` feature of `ngnet-quic-sys`:
 # it locates the system OpenSSL that ngtcp2's crypto helper is compiled against.
 pkg-config = "0.3"
